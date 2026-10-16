@@ -62,6 +62,33 @@ pub use tools_assembly::BrowserSuite;
 /// against churn on large sessions.
 const LIVE_HISTORY_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Close a held turn and hand the facade its answer seeds. `cancelled` is
+/// the close verdict; the seeds (if any) ride one `QuestionAnswered`
+/// notice — the facade inserts them as a harness-authored user message and
+/// launches the seed turn, which is what re-opens the run cycle.
+async fn close_held_turn(
+    session: &AgentSession,
+    state: &Arc<EngineState>,
+    cwd: &Path,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    seeds: Vec<String>,
+    cancelled: bool,
+) {
+    let Some(held) = state.held_settle.lock().unwrap().take() else {
+        return;
+    };
+    run::finish_held_settle(held, cancelled, session, state, cwd, notice_tx).await;
+    if !cancelled && !seeds.is_empty() {
+        send_notice(
+            notice_tx,
+            BackendNotice::QuestionAnswered {
+                seed: seeds.join("\n\n"),
+            },
+            "ask answer seed",
+        );
+    }
+}
+
 /// Commands the gpui side sends to the harness actor.
 pub(crate) enum SessionCmd {
     /// Start a turn with the given user text and attached images.
@@ -84,6 +111,15 @@ pub(crate) enum SessionCmd {
         id: String,
         text: String,
         images: Vec<manox_harness::types::ContentBlock>,
+    },
+    /// Settle one delivered `AskUserQuestion` card. The actor journals the
+    /// decision durably at its idle append point (journal order ahead of the
+    /// boundary the settle implies) and, while the turn-end is held open on
+    /// an answered ask, closes the held turn and seeds the answer as the
+    /// next turn's user message.
+    SettleQuestion {
+        id: String,
+        outcome: crate::questions::AskOutcome,
     },
     /// Retract a queued steer.
     CancelSteer(String),
@@ -313,9 +349,21 @@ struct EngineState {
     /// The host permission gate wrapping every mutating tool (mode +
     /// pending interaction round trips).
     gate: Arc<ApprovalGate>,
-    /// The user-questions seam's pending registry (the ask tool parks here;
-    /// the gateway settles here through `Thread::respond_question`).
+    /// The user-questions seam's delivery registry (the ask tool delivers
+    /// here; the gateway settles here through `Thread::respond_question`).
     question_gate: Arc<crate::questions::UserQuestionGate>,
+    /// A run that ended on a delivered ask holds its turn open until the
+    /// answer settles (the ahp reducer only settles input parts on the
+    /// ACTIVE turn): the settle path parks its turn-finish here, and the
+    /// settling cmd closes it. `None` whenever no run is held.
+    held_settle: Mutex<Option<run::HeldSettle>>,
+    /// A held turn is open awaiting answers. Guards the idle arms (prompt
+    /// dismisses the cards, abort cancels them, steering never resumes into
+    /// an open turn) and arms the settle path's hold.
+    awaiting_answers: AtomicBool,
+    /// The user aborted while answers were pending: the held turn closes as
+    /// cancelled instead of complete.
+    awaiting_abort: AtomicBool,
     /// Shared goal state with the thread facade; the goal tools read/write
     /// through it, `GoalChanged` rides the notice channel. `None` when the
     /// threads db is unavailable (goal features degrade off).
@@ -442,10 +490,10 @@ pub fn spawn_engine(
     // change — the gate journals it as an `approval` decision entry through
     // the actor queue (the request entry rides the notice tap).
     gate.set_journal_sink(cmd_tx.clone());
-    // The question seam owns its own pending registry and journals its verdicts
-    // as `question` decision entries through the same actor queue.
+    // The question seam owns its own delivery registry; verdicts journal at
+    // the actor's idle append point via `SettleQuestion` (journal order
+    // ahead of the boundary the settle implies).
     let question_gate = Arc::new(crate::questions::UserQuestionGate::new(notice_tx.clone()));
-    question_gate.set_journal_sink(cmd_tx.clone());
     // The thread-scoped journal feed; session relays publish into it as
     // sessions come and go (capacity matches the storage broadcast, L5).
     let (journal_feed_handle, _) =
@@ -473,6 +521,9 @@ pub fn spawn_engine(
         current_resources: Mutex::new(None),
         gate,
         question_gate,
+        held_settle: Mutex::new(None),
+        awaiting_answers: AtomicBool::new(false),
+        awaiting_abort: AtomicBool::new(false),
         plan: crate::plan_mode::PlanSessionState::new(),
         plan_review_request_id: Mutex::new(None),
         goal_bridge,
@@ -814,7 +865,13 @@ impl ThreadEngine for Engine {
     }
 
     fn respond_question(&self, id: &str, outcome: crate::questions::AskOutcome) {
-        self.state.question_gate.respond(id, outcome);
+        // Settling rides the actor: the decision row must land at the idle
+        // append point in journal order, and only the actor may close a held
+        // turn or seed the answer.
+        let _ = self.cmd_tx.send(SessionCmd::SettleQuestion {
+            id: id.to_string(),
+            outcome,
+        });
     }
 
     fn pending_question_entries(&self) -> Vec<(String, PendingAuthMeta)> {
@@ -962,7 +1019,7 @@ async fn run_actor(
         // projects the session's own model only when the builder carries
         // none, and the actor adopts
         // it right after the open below.
-        let (builder, orchestrators, read_only_subagent) = session_builder(
+        let (builder, orchestrators) = session_builder(
             &tool_cwd,
             &sessions_dir,
             &runtime,
@@ -980,7 +1037,7 @@ async fn run_actor(
         match builder.open(session_path).await {
             Ok(mut s) => {
                 attach_orchestrators(&mut s, &orchestrators);
-                attach_plan_hooks(&mut s, &state.plan, &tool_cwd, read_only_subagent);
+                attach_plan_hooks(&mut s, &state.plan);
                 attach_plugin_hooks(&mut s, &tool_cwd);
                 attach_prefix_gate(&mut s, &notice_tx, &thread_id);
                 adopt_session_model(&s, &mut harness_model, &state);
@@ -997,7 +1054,7 @@ async fn run_actor(
     let mut session = match session {
         Some(s) => s,
         None => {
-            let (builder, orchestrators, read_only_subagent) = session_builder(
+            let (builder, orchestrators) = session_builder(
                 &cwd,
                 &sessions_dir,
                 &runtime,
@@ -1018,7 +1075,7 @@ async fn run_actor(
             match builder.with_session_id(thread_id.clone()).build().await {
                 Ok(mut s) => {
                     attach_orchestrators(&mut s, &orchestrators);
-                    attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
+                    attach_plan_hooks(&mut s, &state.plan);
                     attach_plugin_hooks(&mut s, &cwd);
                     attach_prefix_gate(&mut s, &notice_tx, &thread_id);
                     // A fresh session is pinned to the facade thread's id.
@@ -1210,6 +1267,9 @@ async fn run_actor(
     }
     let mut run_steers: Vec<String> = Vec::new();
     let mut shutdown_after_run = false;
+    // Answer seeds collected while a held turn is open; they ride one
+    // `QuestionAnswered` notice when the held turn closes.
+    let mut held_seeds: Vec<String> = Vec::new();
 
     loop {
         // Mid-run appends parked their persistence (the run owned the
@@ -1298,6 +1358,19 @@ async fn run_actor(
                 origin_rpc,
                 accepted_entry,
             } => {
+                // The user speaks while answers are pending: the open cards
+                // dismiss (their seeds drop — the message supersedes; the
+                // answered decisions stay journaled), the held turn closes,
+                // and this prompt runs as usual. Inline, so the new run's
+                // turn_start follows the held turn's turn_finish.
+                if state.awaiting_answers.load(Ordering::Relaxed) {
+                    held_seeds.clear();
+                    let appender = session.journal_appender();
+                    for (id, meta) in state.question_gate.withdraw_all() {
+                        run::journal_ask_decision(&appender, &id, &meta, "dismissed").await;
+                    }
+                    close_held_turn(&session, &state, &cwd, &notice_tx, Vec::new(), false).await;
+                }
                 // #805 companion: the host registers its client tools only
                 // after it learns this session's id — i.e. after Open/Create
                 // spawned this engine — so re-consult the embedder provider
@@ -1430,6 +1503,52 @@ async fn run_actor(
                     break;
                 }
             }
+            SessionCmd::SettleQuestion { id, outcome } => {
+                // The decision row lands at the idle append point, in
+                // journal order ahead of the boundary the settle implies
+                // (the #890 replay contract). Unknown ids are already
+                // settled — the first settle wins.
+                let Some(meta) = state.question_gate.withdraw(&id) else {
+                    continue;
+                };
+                let appender = session.journal_appender();
+                run::journal_ask_decision(
+                    &appender,
+                    &id,
+                    &meta,
+                    crate::questions::ask_verdict(&outcome),
+                )
+                .await;
+                let seed = match outcome {
+                    crate::questions::AskOutcome::Answered(answers) => {
+                        Some(crate::questions::answer_seed_payload(&meta.input, answers))
+                    }
+                    crate::questions::AskOutcome::Dismissed
+                    | crate::questions::AskOutcome::Cancelled => None,
+                };
+                if !state.awaiting_answers.load(Ordering::Relaxed) {
+                    // No held turn: a replayed card settled after a restart.
+                    // The journal decision is all there is — the stale open
+                    // turn predates this process, and seeding into it would
+                    // anchor a run to a foreign turn.
+                    continue;
+                }
+                if let Some(seed) = seed {
+                    held_seeds.push(seed);
+                }
+                if state.question_gate.pending_entries().is_empty() {
+                    let cancelled = state.awaiting_abort.swap(false, Ordering::Relaxed);
+                    close_held_turn(
+                        &session,
+                        &state,
+                        &cwd,
+                        &notice_tx,
+                        std::mem::take(&mut held_seeds),
+                        cancelled,
+                    )
+                    .await;
+                }
+            }
             SessionCmd::Steer { id, text, images } => {
                 // S1 (idle-steer): a steer that arrives while
                 // the actor is idle no longer waits for an unrelated next turn.
@@ -1441,28 +1560,46 @@ async fn run_actor(
                     .handle()
                     .steer_with_id(steer_message(id.clone(), text, images), id.clone());
                 run_steers.push(id);
-                resume_steering_queue(
-                    &mut session,
-                    &mut cmd_rx,
-                    &mut run_steers,
-                    &mut shutdown_after_run,
-                    Arc::clone(&live_mirror),
-                    &state,
-                    &notice_tx,
-                    &mut harness_model,
-                    &sessions_dir,
-                    &cwd,
-                )
-                .await;
-                if shutdown_after_run {
-                    break;
+                // While a held turn awaits answers the steer waits in the
+                // kernel queue — the seeded (or next) run drains it first.
+                if !state.awaiting_answers.load(Ordering::Relaxed) {
+                    resume_steering_queue(
+                        &mut session,
+                        &mut cmd_rx,
+                        &mut run_steers,
+                        &mut shutdown_after_run,
+                        Arc::clone(&live_mirror),
+                        &state,
+                        &notice_tx,
+                        &mut harness_model,
+                        &sessions_dir,
+                        &cwd,
+                    )
+                    .await;
+                    if shutdown_after_run {
+                        break;
+                    }
                 }
             }
             SessionCmd::CancelSteer(id) => {
                 session.handle().cancel_steer(&id);
             }
             SessionCmd::Abort => {
-                session.abort();
+                if state.awaiting_answers.load(Ordering::Relaxed) {
+                    // Abort while answers are pending: the open cards cancel,
+                    // the held turn closes as cancelled, and the run cycle
+                    // stays idle. The #890 wire publishes land behind this as
+                    // no-op settles (unknown ids).
+                    state.awaiting_abort.store(true, Ordering::Relaxed);
+                    held_seeds.clear();
+                    let appender = session.journal_appender();
+                    for (id, meta) in state.question_gate.withdraw_all() {
+                        run::journal_ask_decision(&appender, &id, &meta, "cancelled").await;
+                    }
+                    close_held_turn(&session, &state, &cwd, &notice_tx, Vec::new(), true).await;
+                } else {
+                    session.abort();
+                }
             }
             SessionCmd::SetModel(new_model) => {
                 // Streams dispatch by `model.provider` through the shared

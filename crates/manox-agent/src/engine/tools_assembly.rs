@@ -293,11 +293,7 @@ pub(super) fn build_tools(
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     granted_roots: &crate::granted_roots::GrantedRoots,
     bus: &Arc<crate::steer_bus::AgentBus>,
-) -> (
-    Vec<Arc<dyn HarnessAgentTool>>,
-    SessionOrchestrators,
-    crate::plan_mode::ReadOnlySubagentResolver,
-) {
+) -> (Vec<Arc<dyn HarnessAgentTool>>, SessionOrchestrators) {
     // Bash execution backend: seatbelt-wrapped one-shot commands when the
     // OS backend is available (the per-call file-effect profile is rendered
     // from the effective `PermissionMode`; shell state does not persist —
@@ -457,9 +453,9 @@ pub(super) fn build_tools(
             Arc::new(wrapper) as Arc<dyn HarnessAgentTool>
         })
         .collect();
-    tools.push(Arc::new(
-        AskUserQuestionTool::new(Arc::clone(question_gate)).with_plan_state(Arc::clone(plan)),
-    ));
+    tools.push(Arc::new(AskUserQuestionTool::new(Arc::clone(
+        question_gate,
+    ))));
     // Plan proposal rides ungated like AskUserQuestion: submitting a plan is
     // the verdict request itself, not a side effect.
     tools.push(Arc::new(crate::plan_mode::ProposePlanTool::new(
@@ -742,13 +738,8 @@ pub(super) fn build_tools(
     let subagent_env: Arc<dyn manox_harness::env::ExecutionEnv> = Arc::new(
         manox_harness::env::TokioExecutionEnv::new(cwd.to_path_buf()),
     );
-    // The plan-mode read-only map keys off the SANITIZED wire name the
-    // model actually calls — registry names and tool names diverge once
-    // plugin namespacing is sanitized away.
-    let mut read_only_by_tool: HashMap<String, bool> = HashMap::new();
     for (tool_name, def, allow) in &delegation_defs {
         let capability = subagent_capability(def);
-        read_only_by_tool.insert(tool_name.clone(), capability == "read-only");
         let config = DelegationToolConfig {
             provider: "spawn".into(),
             name: tool_name.clone(),
@@ -782,21 +773,12 @@ pub(super) fn build_tools(
     tools.push(Arc::new(crate::subagent::InterruptAgentTool::new(
         Arc::clone(&subagent_runtime),
     )));
-    // Plan-mode gate resolver: whether a delegation tool name targets a
-    // read-only definition, keyed by the sanitized wire name the model
-    // calls. Built from the same assembly pass that names the tools, so it
-    // cannot diverge from what is actually registered.
-    let read_only_subagent: crate::plan_mode::ReadOnlySubagentResolver = {
-        let map = Arc::new(read_only_by_tool);
-        Arc::new(move |name: &str| map.get(name).copied().unwrap_or(false))
-    };
     (
         tools,
         SessionOrchestrators {
             monitor,
             background: manager,
         },
-        read_only_subagent,
     )
 }
 

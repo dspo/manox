@@ -1,15 +1,16 @@
-//! Plan mode: structured plan proposal, research discipline, and write gating.
+//! Plan mode: structured plan proposal, research discipline, and the
+//! turn-end exit gate.
 //!
-//! The model researches read-only, writes the plan to a session-local file
+//! The model researches with every tool the session already has (full tool
+//! parity — working-tree impact is the template's pollution discipline, not
+//! a mechanical gate), writes the plan to a session-local file
 //! (`~/.manox/plans/<slug>-plan.md`), and submits it for the user's verdict
 //! through the [`ProposePlanTool`] — a structured tool call, not free-text
-//! parsing. While plan mode is active a `ToolCall` hook hard-blocks mutating
-//! tools (plan-file and temp-scratch writes excepted, ungated), admits Bash
-//! only for single read-only `git` commands (see [`git_read_only`]), and a
-//! `BeforeAgentStart` hook injects the plan-mode instructions every turn.
-//! All wiring rides the kernel's existing extension points.
-
-mod git_read_only;
+//! parsing. Two hooks ride the kernel's extension points: a
+//! `BeforeAgentStart` hook injects the plan-mode instructions every turn,
+//! and a `BeforeTurnEnd` hook enforces the exit gate — a plan-mode run must
+//! end by calling one of the exit tools, and the harness bounces a bare
+//! stop with a continuation message.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -20,32 +21,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::thread::ThreadEvent;
 use crate::thread_engine::BackendNotice;
-/// Resolves whether a subagent type is read-only (eligible to dispatch under
-/// plan mode). Built by the host from the live `AgentRegistry` so the gate
-/// shares the `AgentRegistry`'s capability routing — write/bash
-/// subagents (`Sailor`) stay blocked.
-pub type ReadOnlySubagentResolver = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Tool name the model calls to submit a plan for review.
 pub const PROPOSE_PLAN: &str = "ProposePlan";
 
-/// Tools that stay available while plan mode is active. Read-only research
-/// tools plus the interaction/proposal devices; everything else is blocked
-/// (the working tree must stay untouched while planning) — Bash excepted,
-/// which the gate admits only per-command as a read-only `git` invocation
-/// (see [`git_read_only`]). The `Agent` tool is conditionally allowed for
-/// read-only subagents (e.g. `Explore`) — see the gate's dispatch check;
-/// write/bash subagents (`Sailor`) and worktree isolation stay blocked.
-const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
-    "Read",
-    "Grep",
-    "Glob",
-    "Ls",
-    "BashOutput",
-    crate::subagent::ListAgentsTool::NAME,
-    crate::tools::ASK_USER_QUESTION,
-    PROPOSE_PLAN,
-];
+/// The tools a plan-mode run may end by calling — the exit whitelist the
+/// `BeforeTurnEnd` gate enforces. `AskUserQuestion` covers clarifications;
+/// `ProposePlan` is the proposal itself. Everything else keeps the run
+/// going (the harness injects a continuation message instead of stopping).
+pub const PLAN_MODE_EXIT_TOOLS: &[&str] = &[PROPOSE_PLAN, crate::tools::ASK_USER_QUESTION];
 
 /// Tools allowed only when the target is plan-mode-writable (plans dir or
 /// temp scratch).
@@ -219,9 +203,10 @@ fn resolve_with_existing_prefix(path: &Path) -> PathBuf {
 /// lexically after resolution.
 ///
 /// Known divergence from the tools' own resolution: the call's `cwd`
-/// `[anchor, ...route]` array is NOT applied here — the `ToolCall` hook is
-/// synchronous and carries no `ToolContext`, so the sticky cwd that a
-/// relative anchor would resolve against is unreachable. A relative target
+/// `[anchor, ...route]` array is NOT applied here — the permission-gate
+/// exemption check is synchronous and carries no `ToolContext`, so the
+/// sticky cwd that a relative anchor would resolve against is
+/// unreachable. A relative target
 /// is therefore judged against the captured session cwd while the tool may
 /// land it elsewhere. The failure direction is fail-closed (a plan-file
 /// write through a different anchor is rejected, never smuggled in);
@@ -280,9 +265,9 @@ fn is_plan_mode_writable_path(path: &Path, plans_dir: &Path) -> bool {
 
 /// Permission-gate policy input: while plan mode is active, Write/Edit calls
 /// targeting the plans dir or temp scratch bypass the permission gate (the
-/// model drafts the plan incrementally and scribbles research artifacts without a
-/// denial per write; the `ToolCall` hook blocks every other target before
-/// the permission gate sees it).
+/// model drafts the plan incrementally and scribbles research artifacts
+/// without a denial per write; every other target is permission-gated
+/// exactly as outside plan mode — full tool parity).
 pub struct PlanGatePolicy {
     pub state: Arc<PlanSessionState>,
     pub plans_dir: PathBuf,
@@ -299,82 +284,47 @@ impl PlanGatePolicy {
     }
 }
 
-/// Whether a delegation tool call targets a read-only definition eligible to
-/// run under plan mode. The delegation shape is `description` + `prompt`
-/// addressed to a tool named after the definition; the resolver resolves the
-/// tool name's capability (non-delegation names resolve false, so Bash &
-/// friends never slip through this arm), and `isolation: "worktree"` is
-/// rejected (materializing a working tree is a working-tree write, blocked
-/// under plan mode's read-only guarantee).
-fn is_read_only_subagent_dispatch(
-    tool_name: &str,
-    args: &serde_json::Value,
-    is_read_only_subagent: &ReadOnlySubagentResolver,
-) -> bool {
-    if args.get("description").is_none() || args.get("prompt").is_none() {
-        return false;
-    }
-    if args.get("to").is_some() || args.get("reason").is_some() {
-        return false;
-    }
-    if args.get("isolation").and_then(|v| v.as_str()) == Some("worktree") {
-        return false;
-    }
-    is_read_only_subagent(tool_name)
-}
-
-/// The `ToolCall` hook enforcing plan mode's read-only guarantee: research
-/// tools and the proposal devices pass; Write/Edit pass only for plan-file
-/// and temp-scratch targets; a `Bash` call passes only when its command is a
-/// single read-only `git` invocation ([`git_read_only`]); an `Agent` call
-/// passes only for a read-only subagent (e.g. `Explore`) without worktree
-/// isolation; every other tool (Monitor, write/bash sub-agents, MCP, …) is
-/// blocked with a reason the model can act on.
-pub fn gate_handler(
-    state: Arc<PlanSessionState>,
-    plans_dir: PathBuf,
-    cwd: PathBuf,
-    is_read_only_subagent: ReadOnlySubagentResolver,
-) -> manox_harness::harness::HookHandler {
+/// The `BeforeTurnEnd` hook enforcing the plan-mode exit gate: a run that
+/// ends on its own must have closed with an exit-tool call, with no
+/// non-exit tool call after it (parallel batches tolerated; trailing text
+/// is not a violation). A bare stop is vetoed — the harness injects the
+/// continuation message and the model runs on (the loop bounds the
+/// round-trips; interrupts, stream errors and queued user input never
+/// reach this hook).
+pub fn turn_end_gate_handler(state: Arc<PlanSessionState>) -> manox_harness::harness::HookHandler {
     Arc::new(move |mut ctx| {
         if !state.enabled() {
             return ctx;
         }
-        let tool_name = ctx
+        // The run's closing move is its LAST tool batch (where the run
+        // stopped — parallel batches included); earlier batches are the
+        // research and never judged.
+        let last_batch: Vec<String> = ctx
             .data
-            .get("tool_name")
-            .and_then(|v| v.as_str())
+            .get("last_batch")
+            .and_then(|v| v.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
-        let allowed = PLAN_MODE_ALLOWED_TOOLS.contains(&tool_name)
-            || is_read_only_git_bash_call(tool_name, &ctx.data["args"])
-            || (PLAN_MODE_PATH_GATED_TOOLS.contains(&tool_name)
-                && is_plan_mode_writable_param(tool_name, &ctx.data["args"], &plans_dir, &cwd))
-            || is_read_only_subagent_dispatch(tool_name, &ctx.data["args"], &is_read_only_subagent);
-        if !allowed {
-            ctx.block_reason = Some(format!(
-                "Plan mode is active: the working tree is read-only while planning. \
-                 Only the plan file under {} and temp scratch (/tmp, /private/tmp) may be \
-                 written (Write/Edit); research with Read/Grep/Glob/Ls, run read-only git \
-                 through Bash as a single command with no pipes, redirects, expansions, \
-                 quotes, or globs (e.g. `git log`, `git -C <path> diff`, \
-                 `git config --get <key>`), or use a \
-                 read-only subagent (no worktree isolation); ask with AskUserQuestion, \
-                 and submit the plan with {PROPOSE_PLAN}.",
-                plans_dir.display()
+        let closes_with_exit_tool = !last_batch.is_empty()
+            && last_batch
+                .iter()
+                .any(|name| PLAN_MODE_EXIT_TOOLS.iter().any(|tool| name == *tool));
+        if !closes_with_exit_tool {
+            let exit_tools = PLAN_MODE_EXIT_TOOLS.join(" or ");
+            ctx = ctx.with_turn_end_veto(format!(
+                "[harness] Plan mode is active: this turn must end with a \
+                 {exit_tools} call. Do the remaining research, then call \
+                 ProposePlan with your plan's slug to submit it, or \
+                 AskUserQuestion if a decision is genuinely the user's. \
+                 Continue now."
             ));
         }
         ctx
     })
-}
-
-/// The Bash arm of the plan-mode gate: the call passes only when the
-/// command string classifies as a single read-only `git` invocation.
-fn is_read_only_git_bash_call(tool_name: &str, args: &serde_json::Value) -> bool {
-    tool_name == "Bash"
-        && args
-            .get("command")
-            .and_then(|v| v.as_str())
-            .is_some_and(git_read_only::is_read_only_git_command)
 }
 
 /// The `BeforeAgentStart` hook injecting the rendered plan-mode instructions
@@ -856,219 +806,86 @@ mod tests {
         ));
     }
 
+    /// The exit gate judges the run's LAST tool batch: a batch containing an
+    /// exit tool is an exit close (parallel siblings tolerated); a bare
+    /// stop or a non-exit final batch is vetoed with a continuation message
+    /// naming the exit tools.
     #[test]
-    fn gate_blocks_mutating_tools_while_active() {
+    fn turn_end_gate_passes_exit_tool_closes() {
         let state = PlanSessionState::new();
-        let plans = PathBuf::from("/home/u/.manox/plans");
-        let cwd = PathBuf::from("/home/u/proj");
-        // Read-only resolver: Explore is read-only; Sailor is not.
-        let read_only: ReadOnlySubagentResolver = Arc::new(|name: &str| name == "Explore");
-        let hook = gate_handler(Arc::clone(&state), plans.clone(), cwd.clone(), read_only);
-
-        let run = |tool: &str, args: serde_json::Value| {
-            let ctx = manox_harness::harness::HookContext::new(
-                manox_harness::harness::HookPoint::ToolCall,
-            )
-            .with_data(
-                serde_json::json!({ "tool_call_id": "c1", "tool_name": tool, "args": args }),
-            );
-            hook(ctx)
-        };
-
-        // Inactive: nothing blocked.
-        assert!(
-            run("Bash", serde_json::json!({"command": "ls"}))
-                .block_reason
-                .is_none()
-        );
-
         state.set(true, None);
-        // Research + devices pass.
+        let hook = turn_end_gate_handler(Arc::clone(&state));
+        let run = |last_batch: serde_json::Value| {
+            hook(
+                manox_harness::harness::HookContext::new(
+                    manox_harness::harness::HookPoint::BeforeTurnEnd,
+                )
+                .with_data(serde_json::json!({
+                    "tool_calls": ["Read", "Grep"],
+                    "last_batch": last_batch,
+                })),
+            )
+        };
+        // Closed with the proposal: pass.
         assert!(
-            run("Read", serde_json::json!({"path": "src/main.rs"}))
-                .block_reason
+            run(serde_json::json!(["ProposePlan"]))
+                .turn_end_veto
                 .is_none()
         );
-        assert!(run("Grep", serde_json::json!({})).block_reason.is_none());
+        // Closed with a question: pass.
         assert!(
-            run("AskUserQuestion", serde_json::json!({}))
-                .block_reason
+            run(serde_json::json!(["Grep", "AskUserQuestion"]))
+                .turn_end_veto
                 .is_none()
         );
+        // Parallel batch around the exit tool: still an exit close.
         assert!(
-            run(PROPOSE_PLAN, serde_json::json!({"slug": "x"}))
-                .block_reason
+            run(serde_json::json!(["ProposePlan", "Read"]))
+                .turn_end_veto
                 .is_none()
         );
-        // Plan-file writes pass; working-tree writes don't.
+        // Bare stop (no final batch): vetoed, naming the exit tools.
+        let veto = run(serde_json::json!([]))
+            .turn_end_veto
+            .expect("a bare stop is bounced");
         assert!(
-            run(
-                "Write",
-                serde_json::json!({"path": "/home/u/.manox/plans/x-plan.md"})
-            )
-            .block_reason
-            .is_none()
+            veto.inject.contains("ProposePlan"),
+            "names the proposal: {veto:?}"
         );
         assert!(
-            run("Write", serde_json::json!({"path": "src/main.rs"}))
-                .block_reason
+            veto.inject.contains("AskUserQuestion"),
+            "names the question device: {veto:?}"
+        );
+        // A final batch with no exit tool: vetoed even after earlier exit
+        // calls — the closing move is what the gate judges.
+        assert!(
+            run(serde_json::json!(["Bash", "Read"]))
+                .turn_end_veto
                 .is_some()
         );
-        assert!(
-            run(
-                "Edit",
-                serde_json::json!({"path": "/home/u/.manox/plans/../../x.md"})
-            )
-            .block_reason
-            .is_some()
-        );
-        assert!(
-            run(
-                "Edit",
-                serde_json::json!({"patch": "*** Begin Patch\n[/home/u/.manox/plans/x-plan.md#1A2B3C]\nDEL 1\n*** End Patch"})
-            )
-            .block_reason
-            .is_none()
-        );
-        // Temp-scratch writes pass; working-tree writes still don't.
-        assert!(
-            run("Write", serde_json::json!({"path": "/tmp/scratch.md"}))
-                .block_reason
-                .is_none()
-        );
-        assert!(
-            run(
-                "Edit",
-                serde_json::json!({"patch": "*** Begin Patch\n[/tmp/scratch.md#1A2B3C]\nDEL 1\n*** End Patch"})
-            )
-            .block_reason
-            .is_none()
-        );
-        assert!(
-            run(
-                "Edit",
-                serde_json::json!({"patch": "*** Begin Patch\n[src/main.rs#1A2B3C]\nDEL 1\n*** End Patch"})
-            )
-            .block_reason
-            .is_some()
-        );
-        // Decoy `path` cannot smuggle a working-tree Edit past the gate.
-        assert!(
-            run(
-                "Edit",
-                serde_json::json!({
-                    "path": "/tmp/decoy.md",
-                    "patch": "*** Begin Patch\n[src/main.rs#1A2B3C]\nDEL 1\n*** End Patch"
-                })
-            )
-            .block_reason
-            .is_some()
-        );
-        // Bash: read-only git passes, everything else stays blocked.
-        assert!(
-            run(
-                "Bash",
-                serde_json::json!({"command": "git log --oneline -n 5"})
-            )
-            .block_reason
-            .is_none()
-        );
-        assert!(
-            run(
-                "Bash",
-                serde_json::json!({"command": "git -C ../manox diff --stat"})
-            )
-            .block_reason
-            .is_none()
-        );
-        assert!(
-            run("Bash", serde_json::json!({"command": "ls"}))
-                .block_reason
-                .is_some()
-        );
-        assert!(
-            run("Bash", serde_json::json!({"command": "git push"}))
-                .block_reason
-                .is_some()
-        );
-        assert!(
-            run("Bash", serde_json::json!({"command": "git log | head -5"}))
-                .block_reason
-                .is_some()
-        );
-        // Read-only subcommands whose pager flag spawns an arbitrary program,
-        // and `stash show`'s pass-through `--output`, stay blocked.
-        assert!(
-            run(
-                "Bash",
-                serde_json::json!({"command": "git grep -O/tmp/x pattern"})
-            )
-            .block_reason
-            .is_some()
-        );
-        assert!(
-            run(
-                "Bash",
-                serde_json::json!({"command": "git stash show --output=./f.txt"})
-            )
-            .block_reason
-            .is_some()
-        );
-        assert!(run("Monitor", serde_json::json!({})).block_reason.is_some());
-        assert!(
-            run("mcp__srv__tool", serde_json::json!({}))
-                .block_reason
-                .is_some()
-        );
-        // Read-only subagent (Explore) passes; write/bash (Sailor) and
-        // worktree-isolated dispatch are blocked. The resolver is name-based:
-        // a delegation tool is named after its definition.
-        assert!(
-            run(
-                "Explore",
-                serde_json::json!({"description": "survey", "prompt": "x"})
-            )
-            .block_reason
-            .is_none()
-        );
-        assert!(
-            run(
-                "Sailor",
-                serde_json::json!({"description": "work", "prompt": "x"})
-            )
-            .block_reason
-            .is_some()
-        );
-        assert!(
-            run(
-                "Explore",
-                serde_json::json!({"description": "survey", "prompt": "x", "isolation": "worktree"})
-            )
-            .block_reason
-            .is_some()
-        );
-        // The retired Steer envelope shape never passes the delegation arm.
-        assert!(
-            run(
-                "Steer",
-                serde_json::json!({"to": {"agent_address": "e1", "spawn": "Explore"}, "reason": "Dispatch", "prompt": "x"})
-            )
-            .block_reason
-            .is_some()
-        );
-        assert!(
-            run("Explore", serde_json::json!({"prompt": "x"}))
-                .block_reason
-                .is_some()
-        );
+    }
 
-        // Exit plan mode: everything passes again.
+    #[test]
+    fn turn_end_gate_only_while_active() {
+        let state = PlanSessionState::new();
+        let hook = turn_end_gate_handler(Arc::clone(&state));
+        let run = |last_batch: serde_json::Value| {
+            hook(
+                manox_harness::harness::HookContext::new(
+                    manox_harness::harness::HookPoint::BeforeTurnEnd,
+                )
+                .with_data(serde_json::json!({
+                    "tool_calls": ["Read"],
+                    "last_batch": last_batch,
+                })),
+            )
+        };
+        // Inactive: a bare stop passes.
+        assert!(run(serde_json::json!([])).turn_end_veto.is_none());
+        state.set(true, None);
+        assert!(run(serde_json::json!([])).turn_end_veto.is_some());
         state.set(false, None);
-        assert!(
-            run("Bash", serde_json::json!({"command": "ls"}))
-                .block_reason
-                .is_none()
-        );
+        assert!(run(serde_json::json!([])).turn_end_veto.is_none());
     }
 
     #[test]

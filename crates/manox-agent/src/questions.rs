@@ -1,115 +1,57 @@
 //! The `AskUserQuestion` interactive round trip (host-layer tool).
 //!
-//! The user-questions seam: the host's `AskUserQuestion` interactive round
-//! trip and the pending registry it parks on.
+//! The user-questions seam: the host's `AskUserQuestion` card and the
+//! pending registry the delivered card settles against.
 //!
 //! The kernel exposes the `requires_approval` seam on `AgentTool` but
 //! ships no interactive ask surface — that is a host concern. This module owns
-//! it end to end: the tool parses and validates the model's questions, parks
-//! one card per call on [`UserQuestionGate`], and folds the id-routed answers
-//! into a canonical JSON tool result. The gate is this seam's own settlement
-//! vocabulary ([`AskOutcome`]); the approval gate and its mode policy live in
-//! `approval` and are not involved.
+//! it end to end: the tool parses and validates the model's questions,
+//! delivers one card per call on [`UserQuestionGate`], and ends the turn
+//! (`terminate`) — the model never waits on the answer. The user's answer
+//! arrives out-of-band as the seed of the NEXT turn (the plan-review card's
+//! established shape), routed by card id through the gateway. The gate is
+//! this seam's settlement registry; the approval gate and its mode policy
+//! live in `approval` and are not involved.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use manox_harness::tool::{AgentTool as HarnessAgentTool, AgentToolResult, ToolContext, ToolError};
-use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::permission::{AskAnswer, PendingAuthMeta};
 use crate::thread::{ThreadEvent, ToolCallStatus};
 use crate::thread_engine::{BackendNotice, send_notice};
 
-/// How one parked question settled. The question seam's own vocabulary — the
-/// approval path's `ToolAuthorizationResponse` never carries an ask again.
+/// How one delivered question settled. The question seam's own vocabulary.
 #[derive(Debug)]
 pub enum AskOutcome {
     /// The canonical id-routed tri-state answers, one per answered or
     /// explicitly skipped question.
     Answered(Vec<AskAnswer>),
     /// The user CLOSED the card to speak instead: an explicit "not now, let
-    /// me talk" that is neither an answer nor a rejection nor a turn
-    /// interrupt.
+    /// me talk" that is neither an answer nor a rejection. The card is
+    /// withdrawn and the user's next message drives the next turn.
     Dismissed,
-    /// The question settled without any user input (no capable answerer, a
-    /// withdrawn delivery, or an abandoned replay waiter) — an explicit
-    /// non-answer the model must not read as consent.
-    Expired,
-    /// The turn was cancelled while the card was parked (the caller's signal
-    /// fired); the model sees the tool-denied line, exactly as before.
+    /// The turn was cancelled with the card still open; the decision
+    /// journals `cancelled` so no replay resurrects the card.
     Cancelled,
 }
 
-/// The question a composed answerer is offered: the parked tool call and its
-/// model-supplied input, so an in-process answerer can decide from the same
-/// bytes the card renders.
-#[derive(Clone, Copy)]
-pub struct AskRequest<'a> {
-    pub tool_call_id: &'a str,
-    pub input: &'a serde_json::Value,
-}
-
-/// The settle channel of one parked question: an answerer that needs the wire
-/// answerer (a human at a client) awaits it here instead of delegating.
-pub struct QuestionSettle {
-    rx: AsyncMutex<oneshot::Receiver<AskOutcome>>,
-}
-
-impl QuestionSettle {
-    fn new(rx: oneshot::Receiver<AskOutcome>) -> Self {
-        Self {
-            rx: AsyncMutex::new(rx),
-        }
-    }
-
-    /// Wait for the gateway's settle. A dropped responder (turn cancelled
-    /// before any settle) reads as `Cancelled`, exactly like the tool's own
-    /// signal arm.
-    pub async fn wait(&self) -> AskOutcome {
-        let mut rx = self.rx.lock().await;
-        match (&mut *rx).await {
-            Ok(outcome) => outcome,
-            Err(_) => AskOutcome::Cancelled,
-        }
-    }
-}
-
-/// One composed answerer of the user-questions seam. Returning `Some` claims
-/// the request (first claim wins); returning `None` delegates to the next
-/// answerer. The wire answerer — the fan-out to capable clients — is the
-/// implicit last resort and needs no registration: when every composed
-/// answerer delegates, the tool parks on the settle channel like before.
-#[async_trait::async_trait]
-pub trait UserQuestionAnswerer: Send + Sync {
-    /// Stable name, for diagnostics.
-    fn name(&self) -> &str;
-    /// Claim the request or delegate it.
-    async fn ask(&self, request: AskRequest<'_>, settle: &QuestionSettle) -> Option<AskOutcome>;
-}
-
-/// One parked question: the responder the tool awaits plus the card metadata
-/// the workspace re-surfaces after a thread switch.
+/// One delivered question: the card metadata the workspace re-surfaces
+/// after a thread switch and the answer seed folds against.
 struct PendingQuestion {
-    tx: oneshot::Sender<AskOutcome>,
     meta: PendingAuthMeta,
 }
 
-/// The user-questions seam's pending registry: the ask tool parks here and the
-/// gateway settles here through `Thread::respond_question`. One gate per
-/// session; the delegated flag mirrors the approval gate's, so a subagent
-/// caller is refused before any card is parked.
+/// The user-questions seam's delivery registry: the ask tool delivers here
+/// and the gateway settles here through `Thread::respond_question`. One gate
+/// per session; the delegated flag mirrors the approval gate's, so a
+/// subagent caller is refused before any card is delivered.
 pub struct UserQuestionGate {
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     pending: Mutex<HashMap<String, PendingQuestion>>,
-    /// The actor command sender that carries verdict journaling (K3), set once
-    /// the engine exists.
-    journal_sink: Mutex<Option<mpsc::UnboundedSender<crate::engine::SessionCmd>>>,
-    /// Composed answerers, consulted in registration order before the wire
-    /// answerer. Host assemblies (a TUI, an automation policy, a test) add
-    /// theirs here; the client fan-out needs no entry.
-    answerers: Mutex<Vec<Arc<dyn UserQuestionAnswerer>>>,
     delegated: bool,
 }
 
@@ -118,8 +60,6 @@ impl UserQuestionGate {
         Self {
             notice_tx,
             pending: Mutex::new(HashMap::new()),
-            journal_sink: Mutex::new(None),
-            answerers: Mutex::new(Vec::new()),
             delegated: false,
         }
     }
@@ -135,11 +75,6 @@ impl UserQuestionGate {
         self.delegated
     }
 
-    /// Wire the actor command sender that carries verdict journaling (K3).
-    pub(crate) fn set_journal_sink(&self, tx: mpsc::UnboundedSender<crate::engine::SessionCmd>) {
-        *self.journal_sink.lock().unwrap() = Some(tx);
-    }
-
     fn emit(&self, event: ThreadEvent) {
         send_notice(
             &self.notice_tx,
@@ -148,78 +83,43 @@ impl UserQuestionGate {
         );
     }
 
-    /// Park one question: stores the responder, returns the receiver the tool
-    /// awaits.
-    fn register(&self, id: &str, meta: PendingAuthMeta) -> oneshot::Receiver<AskOutcome> {
-        let (tx, rx) = oneshot::channel();
+    /// Deliver one question: stores the card metadata under the call id.
+    fn register(&self, id: &str, meta: PendingAuthMeta) {
         self.pending
             .lock()
             .unwrap()
-            .insert(id.to_string(), PendingQuestion { tx, meta });
-        rx
+            .insert(id.to_string(), PendingQuestion { meta });
     }
 
-    /// Re-park a replayed card only when the id is not already parked (the
+    /// Re-register a replayed card only when the id is not already open (the
     /// approval gate's same rule: a re-open racing a live card keeps the
-    /// live responder). No awaiting tool future sits behind a replayed
-    /// park, so the settle receiver is dropped on the spot.
+    /// live one).
     pub(crate) fn register_if_absent(&self, id: &str, meta: PendingAuthMeta) -> bool {
         let mut pending = self.pending.lock().unwrap();
         if pending.contains_key(id) {
             return false;
         }
-        let (tx, _rx) = oneshot::channel();
-        pending.insert(id.to_string(), PendingQuestion { tx, meta });
+        pending.insert(id.to_string(), PendingQuestion { meta });
         true
     }
 
-    /// Drop a parked question without an answer (turn cancelled). The
-    /// cancelled card still journals its decision, or the `pending_auth` fold
-    /// would keep a card alive that no client can ever answer.
-    fn discard(&self, id: &str) {
-        if let Some(pending) = self.pending.lock().unwrap().remove(id) {
-            self.journal_decision(id, &pending.meta.tool_name, "cancelled");
-        }
+    /// Withdraw one open question, returning its card metadata. `None` =
+    /// unknown id (already settled or never delivered) — the first settle
+    /// wins. The caller journals the decision durably: at the engine actor,
+    /// where the idle append point is, in journal order ahead of any turn
+    /// boundary the settle implies.
+    pub(crate) fn withdraw(&self, id: &str) -> Option<PendingAuthMeta> {
+        self.pending.lock().unwrap().remove(id).map(|p| p.meta)
     }
 
-    /// Settle a parked question. Unknown ids are ignored (already settled) —
-    /// the first settle wins.
-    pub fn respond(&self, id: &str, outcome: AskOutcome) {
-        if let Some(pending) = self.pending.lock().unwrap().remove(id) {
-            let verdict = match &outcome {
-                AskOutcome::Answered(_) => "answered",
-                AskOutcome::Dismissed => "dismissed",
-                AskOutcome::Expired => "expired",
-                AskOutcome::Cancelled => "cancelled",
-            };
-            self.journal_decision(id, &pending.meta.tool_name, verdict);
-            let _ = pending.tx.send(outcome);
-        }
+    /// Withdraw every open question (a dying turn's cleanup); the caller
+    /// journals each as `cancelled`.
+    pub(crate) fn withdraw_all(&self) -> Vec<(String, PendingAuthMeta)> {
+        let mut pending = self.pending.lock().unwrap();
+        pending.drain().map(|(id, p)| (id, p.meta)).collect()
     }
 
-    /// Append one composed answerer; earlier registrations are asked first.
-    pub fn register_answerer(&self, answerer: Arc<dyn UserQuestionAnswerer>) {
-        self.answerers.lock().unwrap().push(answerer);
-    }
-
-    /// Offer the request to the composed answerers in order. The first claim
-    /// wins; when every answerer delegates (or none is registered) the caller
-    /// falls back to the wire answerer by awaiting the settle channel.
-    async fn compose(
-        &self,
-        request: AskRequest<'_>,
-        settle: &QuestionSettle,
-    ) -> Option<AskOutcome> {
-        let answerers: Vec<Arc<dyn UserQuestionAnswerer>> = self.answerers.lock().unwrap().clone();
-        for answerer in answerers {
-            if let Some(outcome) = answerer.ask(request, settle).await {
-                return Some(outcome);
-            }
-        }
-        None
-    }
-
-    /// Parked questions with their card metadata, so the workspace can
+    /// Open questions with their card metadata, so the workspace can
     /// re-surface a card after switching back to a parked thread.
     pub fn pending_entries(&self) -> Vec<(String, PendingAuthMeta)> {
         self.pending
@@ -229,54 +129,20 @@ impl UserQuestionGate {
             .map(|(id, pending)| (id.clone(), pending.meta.clone()))
             .collect()
     }
-
-    /// Queue the card's decision entry onto the engine actor (K3). Without a
-    /// sink (a standalone gate) or with the actor already gone the decision
-    /// does not journal: a gate with no engine has no session to append to.
-    fn journal_decision(&self, id: &str, tool_name: &str, verdict: &str) {
-        let Some(tx) = self.journal_sink.lock().unwrap().clone() else {
-            return;
-        };
-        let _ = tx.send(crate::engine::SessionCmd::AppendJournal {
-            kind: "question".into(),
-            payload: serde_json::json!({
-                "kind": "decision",
-                "authId": id,
-                "payload": { "toolName": tool_name, "verdict": verdict },
-            }),
-        });
-    }
 }
 
-/// The harness `AskUserQuestion` tool. Schema and semantics ported from
-/// the retired manox tool: the run IS the round trip — the question card
-/// renders from the `ToolCallAuthorization` event and the user's answers come
-/// back through [`UserQuestionGate`], short-circuited into a `ToolResult`
-/// without any execution. Read-only by contract: permission modes never touch
-/// it.
+/// The harness `AskUserQuestion` tool. The call DELIVERS the question card
+/// and ends the turn (`terminate`): the card renders from the
+/// `ToolCallAuthorization` event, the user's answer arrives out-of-band as
+/// the next turn's seed, and the model never waits on it. Read-only by
+/// contract: permission modes never touch it.
 pub struct AskUserQuestionTool {
     gate: Arc<UserQuestionGate>,
-    /// Live plan-mode flag, so a dismissed question card can tell the model
-    /// to *stay in plan mode* when the user closes it mid-planning (the
-    /// plan-review dismissal wording) versus the plain stop-and-
-    /// wait line outside plan mode. `None` in bare test constructions → the
-    /// general wording.
-    plan: Option<Arc<crate::plan_mode::PlanSessionState>>,
 }
 
 impl AskUserQuestionTool {
     pub fn new(gate: Arc<UserQuestionGate>) -> Self {
-        Self { gate, plan: None }
-    }
-
-    /// Attach the session's live plan-mode state (host assembly).
-    pub fn with_plan_state(mut self, plan: Arc<crate::plan_mode::PlanSessionState>) -> Self {
-        self.plan = Some(plan);
-        self
-    }
-
-    fn plan_mode_active(&self) -> bool {
-        self.plan.as_ref().is_some_and(|p| p.enabled())
+        Self { gate }
     }
 }
 
@@ -296,8 +162,9 @@ impl HarnessAgentTool for AskUserQuestionTool {
          label in `approve`, and only when a `detail` accompanies the question). \
          Mark the recommended default with recommended=true when one exists. The \
          user may also answer a question with free text or explicitly skip it. \
-         Do not use this tool to ask for plan approval or to confirm obvious \
-         defaults."
+         Calling this tool ENDS your turn: the card is the last thing you emit, \
+         and the user's answers arrive as their next message. Do not use this \
+         tool to ask for plan approval — submit plans with ProposePlan."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -312,7 +179,7 @@ impl HarnessAgentTool for AskUserQuestionTool {
         &self,
         tool_call_id: &str,
         mut params: serde_json::Value,
-        signal: CancellationToken,
+        _signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         // D5 `DELEGATED_CALLER` (only the runtime root may ask a human).
@@ -320,7 +187,7 @@ impl HarnessAgentTool for AskUserQuestionTool {
         // with a synthetic fail-closed gate (see `engine`'s subagent build), so
         // a bare `ApprovalGate` on the *main* line is the marker of the runtime
         // root. Any caller that is not the root is rejected before its question
-        // can park on the human. This is defense-in-depth behind the
+        // can reach the human. This is defense-in-depth behind the
         // `select_tools` assembly strip (D5): today the child snapshot already
         // lacks this tool, so the guard closes the hole a future mis-assembly
         // or a name-padded custom definition would open.
@@ -345,7 +212,7 @@ impl HarnessAgentTool for AskUserQuestionTool {
         // non-localizing consumer see, and is never translated here.
         let title = CLARIFY_TITLE.to_string();
 
-        let rx = self.gate.register(
+        self.gate.register(
             tool_call_id,
             PendingAuthMeta {
                 tool_name: crate::tools::ASK_USER_QUESTION.to_string(),
@@ -366,84 +233,48 @@ impl HarnessAgentTool for AskUserQuestionTool {
             summary: title,
             input: params.clone(),
         });
+        Ok(AgentToolResult {
+            content: vec![manox_harness::types::ContentBlock::Text {
+                text: ASK_DELIVERED_TEXT.to_string(),
+                signature: None,
+            }],
+            details: Some(serde_json::json!({ "delivered": true })),
+            is_error: false,
+            usage: None,
+            added_tool_names: None,
+            // The turn ends at the delivery: the card stays the
+            // conversation's last item and the answer seeds the NEXT turn
+            // (the plan-review card's established shape) — the model never
+            // waits on a parked result.
+            terminate: true,
+        })
+    }
+}
 
-        let settle = QuestionSettle::new(rx);
-        // The whole composition runs INSIDE the select: a composed answerer
-        // that decides to wait on the wire answerer (the fan-out to capable
-        // clients) must not make the turn uncancellable.
-        let outcome = tokio::select! {
-            outcome = async {
-                match self
-                    .gate
-                    .compose(
-                        AskRequest {
-                            tool_call_id,
-                            input: &params,
-                        },
-                        &settle,
-                    )
-                    .await
-                {
-                    Some(claimed) => claimed,
-                    None => settle.wait().await,
-                }
-            } => outcome,
-            _ = signal.cancelled() => {
-                self.gate.discard(tool_call_id);
-                AskOutcome::Cancelled
-            }
-        };
-        self.gate.discard(tool_call_id);
+/// The model-facing tool result of a delivered ask. English, never
+/// localized.
+const ASK_DELIVERED_TEXT: &str = "Question delivered to the user. This turn ends here — the \
+     card is the conversation's last item. The user's answers arrive as their next message \
+     (a closed card means they will speak instead); do not repeat or answer the questions \
+     yourself.";
 
-        match outcome {
-            AskOutcome::Answered(answers) => {
-                // PR-2 (C3): the model-facing encoding is the CANONICAL JSON
-                // line — the same vocabulary the client answered with:
-                // `{"answers":[{"id":…,"selected":[…],"custom":…?},…]}`.
-                // Skip is exactly `selected: []` with no `custom` (the
-                // prose skip line and the localized Question:/Answer:
-                // wrapper are gone: free text can only ever attach to its
-                // own question, single-select custom replaces the
-                // selection, multi-select custom supplements it — folded
-                // by `fold_ask_answers`).
-                let rows = fold_ask_answers(&params, answers);
-                let text = serde_json::json!({ "answers": rows }).to_string();
-                Ok(AgentToolResult::text(text))
-            }
-            // A lapsed delivery (no client able to answer, or a withdrawn
-            // delivery) with NO human action. This is NOT an empty answer:
-            // the text names that explicitly so the model re-asks or proceeds
-            // under stated assumptions instead of reading silence as consent.
-            AskOutcome::Expired => Ok(AgentToolResult::error(
-                "[no-answer] The user did not answer this question — no client was \
-                 available to answer it, or the pending question was withdrawn. Do not \
-                 treat this as input or consent. Re-ask with fewer, simpler questions \
-                 or continue under explicitly stated assumptions.",
-            )),
-            // The user closed the card to speak instead:
-            // NOT an answer, NOT a rejection, NOT a turn interrupt. The model
-            // stops and waits for the forthcoming message. In plan mode the
-            // guidance keeps the "stay in plan mode" clause; elsewhere the
-            // same guidance drops it. Never re-asked as a denial.
-            AskOutcome::Dismissed => {
-                let text = if self.plan_mode_active() {
-                    "The user dismissed the review to speak instead; stay in plan mode, \
-                     stop here, and wait for their message."
-                } else {
-                    "The user dismissed your questions to speak instead; stop here and \
-                     wait for their message."
-                };
-                Ok(AgentToolResult::text(text))
-            }
-            // The turn was cancelled while the card was parked: the model sees
-            // the tool-denied render, exactly as the pre-seam path did.
-            AskOutcome::Cancelled => {
-                let text =
-                    crate::prompt::render_static(crate::prompt::PromptTemplate::WrapperToolDenied)
-                        .expect("tool denied render");
-                Ok(AgentToolResult::error(text))
-            }
-        }
+/// The model-facing seed of the turn that opens after an answered ask: one
+/// prose line naming its origin, then the canonical answers JSON line — the
+/// same vocabulary the tool result used to carry.
+pub fn answer_seed_payload(input: &serde_json::Value, answers: Vec<AskAnswer>) -> String {
+    let rows = fold_ask_answers(input, answers);
+    format!(
+        "The user answered your AskUserQuestion card:\n{}",
+        serde_json::json!({ "answers": rows })
+    )
+}
+
+/// The journal verdict word for a settled ask (`question` decision rows).
+pub fn ask_verdict(outcome: &AskOutcome) -> &'static str {
+    match outcome {
+        AskOutcome::Answered(_) => "answered",
+        AskOutcome::Dismissed => "dismissed",
+        AskOutcome::Cancelled => "cancelled",
     }
 }
 
@@ -708,6 +539,26 @@ mod tests {
         )
     }
 
+    /// Extract the single text block of a tool result.
+    fn result_text(result: &AgentToolResult) -> String {
+        match &result.content[0] {
+            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    fn ask_params() -> serde_json::Value {
+        serde_json::json!({
+            "questions": [{
+                "question": "q", "header": "h", "multiSelect": false,
+                "options": [
+                    {"label": "a", "description": ""},
+                    {"label": "b", "description": ""},
+                ],
+            }],
+        })
+    }
+
     #[test]
     fn validate_ask_input_drops_the_batch1_caps() {
         // One question, two options — the historical minimum still passes.
@@ -949,8 +800,11 @@ mod tests {
     /// PR-2 (C3): the tool's success result is ONE canonical JSON line —
     /// `{"answers": [...]}` — with no wrapper prose; the model sees exactly
     /// the vocabulary the client answered with.
+    /// The delivered ask ENDS the turn (`terminate`), leaves the card on the
+    /// gate, and its tool text tells the model the answer arrives as the
+    /// user's next message.
     #[tokio::test]
-    async fn ask_success_result_is_the_canonical_json_line() {
+    async fn ask_delivery_terminates_the_turn_and_registers_the_card() {
         let (gate, _rx) = gate_with_events();
         let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
@@ -963,238 +817,97 @@ mod tests {
                 ],
             }],
         });
-        let settle = {
-            let gate = Arc::clone(&gate);
-            tokio::spawn(async move {
-                while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
-                    tokio::task::yield_now().await;
-                }
-                gate.respond(
-                    "ask-1",
-                    AskOutcome::Answered(vec![AskAnswer::new(
-                        "shape-q".into(),
-                        vec!["round".into()],
-                        None,
-                    )]),
-                );
-            })
-        };
         let result = tool
             .execute("ask-1", params, CancellationToken::new(), &ctx)
             .await
             .expect("the ask tool returns a tool result, not a hard error");
-        settle.await.unwrap();
         assert!(!result.is_error);
+        assert!(result.terminate, "a delivered ask ends the turn");
         let text = result_text(&result);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&text).expect("the success result is one JSON line: {text}");
-        assert_eq!(
-            parsed,
-            serde_json::json!({"answers": [{"id": "shape-q", "selected": ["round"]}]})
+        assert!(
+            text.contains("This turn ends here"),
+            "the delivery text names the turn end: {text}"
         );
+        let cards = gate.pending_entries();
+        assert_eq!(cards.len(), 1, "the card stays open for the answer");
+        assert_eq!(cards[0].0, "ask-1");
+        assert_eq!(cards[0].1.input["questions"][0]["id"], "shape-q");
     }
 
-    /// R1: an adjudication settled without user input (`Expired`) reaches
-    /// the model as an explicit `[no-answer]` error, not an empty answer
-    /// text that reads as consent.
+    /// The answer seed folds by card id against the delivered input: an
+    /// answer for another card settles nothing, single-select custom
+    /// replaces the selection.
     #[tokio::test]
-    async fn ask_expired_adjudication_answers_no_answer() {
+    async fn ask_card_routes_the_answer_seed_by_id() {
         let (gate, _rx) = gate_with_events();
         let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
         let params = serde_json::json!({
             "questions": [{
-                "question": "q", "header": "h", "multiSelect": false,
+                "id": "frozen-q", "question": "q?", "header": "h", "multiSelect": false,
                 "options": [
                     {"label": "a", "description": ""},
                     {"label": "b", "description": ""},
                 ],
             }],
         });
-        let settle = {
-            let gate = Arc::clone(&gate);
-            tokio::spawn(async move {
-                while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
-                    tokio::task::yield_now().await;
-                }
-                gate.respond("ask-1", AskOutcome::Expired);
-            })
-        };
-        let result = tool
-            .execute("ask-1", params, CancellationToken::new(), &ctx)
+        tool.execute("ask-1", params, CancellationToken::new(), &ctx)
             .await
-            .unwrap();
-        settle.await.unwrap();
-        assert!(result.is_error, "expired must not read as a plain answer");
-        let text = match &result.content[0] {
-            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
-            other => panic!("expected text content, got {other:?}"),
-        };
-        assert!(text.contains("[no-answer]"), "expired verdict text: {text}");
-    }
-
-    /// Extract the single text block of a tool result.
-    fn result_text(result: &AgentToolResult) -> String {
-        match &result.content[0] {
-            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
-            other => panic!("expected text content, got {other:?}"),
-        }
-    }
-
-    fn ask_params() -> serde_json::Value {
-        serde_json::json!({
-            "questions": [{
-                "question": "q", "header": "h", "multiSelect": false,
-                "options": [
-                    {"label": "a", "description": ""},
-                    {"label": "b", "description": ""},
-                ],
-            }],
-        })
-    }
-
-    /// Drive the ask tool and settle its parked card with `response`.
-    async fn run_ask_settled(
-        tool: &AskUserQuestionTool,
-        gate: &Arc<UserQuestionGate>,
-        ctx: &LocalToolContext,
-        outcome: AskOutcome,
-    ) -> AgentToolResult {
-        let settle = {
-            let gate = Arc::clone(gate);
-            tokio::spawn(async move {
-                while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
-                    tokio::task::yield_now().await;
-                }
-                gate.respond("ask-1", outcome);
-            })
-        };
-        let result = tool
-            .execute("ask-1", ask_params(), CancellationToken::new(), ctx)
-            .await
-            .expect("the ask tool returns a tool result, not a hard error");
-        settle.await.unwrap();
-        result
-    }
-
-    /// PR-0b: a card the user CLOSED to speak (`Dismissed`) is a distinct,
-    /// non-rejection, non-timeout outcome. Outside plan mode it tells the
-    /// model to stop and wait for the message — with no "plan mode" clause and
-    /// NOT the `[no-answer]`/denial text the old conflation produced.
-    #[tokio::test]
-    async fn ask_dismissed_outside_plan_mode_waits_for_message() {
-        let (gate, _rx) = gate_with_events();
-        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
-        let ctx = tool_ctx();
-        let result = run_ask_settled(&tool, &gate, &ctx, AskOutcome::Dismissed).await;
-        assert!(!result.is_error, "a dismissal is guidance, not an error");
-        let text = result_text(&result);
-        assert!(
-            text.contains("dismissed") && text.contains("wait for their message"),
-            "dismissal verdict text: {text}"
+            .expect("delivered");
+        let meta = gate.withdraw("ask-1").expect("the card is open");
+        let seed = answer_seed_payload(
+            &meta.input,
+            vec![
+                AskAnswer::new("frozen-q".into(), vec!["a".into()], None),
+                AskAnswer::new("other-card".into(), vec!["x".into()], None),
+                AskAnswer::new("frozen-q".into(), vec!["b".into()], Some("free".into())),
+            ],
         );
-        assert!(
-            !text.contains("plan mode"),
-            "general line has no plan clause: {text}"
-        );
-        assert!(
-            !text.contains("[no-answer]") && !text.contains("denied"),
-            "dismissal must not read as expiry or denial: {text}"
-        );
-    }
-
-    /// PR-0b: inside plan mode the "stay in plan mode" clause is present,
-    /// so the model keeps drafting rather than exiting or re-asking.
-    #[tokio::test]
-    async fn ask_dismissed_in_plan_mode_keeps_plan_clause() {
-        let (gate, _rx) = gate_with_events();
-        let plan = crate::plan_mode::PlanSessionState::new();
-        plan.set(true, None);
-        let tool = AskUserQuestionTool::new(Arc::clone(&gate)).with_plan_state(plan);
-        let ctx = tool_ctx();
-        let result = run_ask_settled(&tool, &gate, &ctx, AskOutcome::Dismissed).await;
-        assert!(!result.is_error);
-        let text = result_text(&result);
-        assert!(
-            text.contains("stay in plan mode") && text.contains("wait for their message"),
-            "plan-mode dismissal keeps the stay clause: {text}"
-        );
-    }
-
-    /// B2-PR-1 end-to-end at the tool seam: the minted `id` is visible on
-    /// BOTH the delivered authorization input and the re-surfaced pending
-    /// card, and an answer routed by that id settles as a rendered answer.
-    #[tokio::test]
-    async fn ask_mints_id_on_the_card_and_routes_the_answer_by_id() {
-        let (gate, mut notices) = gate_with_events();
-        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
-        let ctx = tool_ctx();
-        let settle = {
-            let gate = Arc::clone(&gate);
-            tokio::spawn(async move {
-                while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
-                    tokio::task::yield_now().await;
-                }
-                let input = gate
-                    .pending_entries()
-                    .into_iter()
-                    .find(|(id, _)| id == "ask-1")
-                    .expect("parked card")
-                    .1
-                    .input;
-                let qid = input["questions"][0]["id"]
-                    .as_str()
-                    .expect("the parked card carries a minted id")
-                    .to_string();
-                assert!(
-                    uuid::Uuid::parse_str(&qid).is_ok(),
-                    "the minted id is a uuid: {qid}"
-                );
-                gate.respond(
-                    "ask-1",
-                    AskOutcome::Answered(vec![AskAnswer::new(qid, vec!["a".into()], None)]),
-                );
-            })
-        };
-        let result = tool
-            .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
-            .await
-            .unwrap();
-        settle.await.unwrap();
-        assert!(!result.is_error, "an id-routed answer renders as an answer");
-        // The authorization event delivered to the client carried the minted
-        // id in its input (the same id the settle above read back).
-        let mut card_ids = Vec::new();
-        while let Ok(notice) = notices.try_recv() {
-            if let BackendNotice::Event(event) = notice
-                && let ThreadEvent::ToolCallAuthorization { input, .. } = *event
-            {
-                card_ids.extend(
-                    input["questions"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|q| q["id"].as_str().unwrap_or("").to_string()),
-                );
-            }
-        }
-        assert_eq!(card_ids.len(), 1, "one authorization event");
-        assert!(uuid::Uuid::parse_str(&card_ids[0]).is_ok());
-        // PR-2 (C3): the settle arrives as the canonical JSON line, routed
-        // by the minted id — the selected label, language-independent, is
-        // what the model reads.
-        let parsed: serde_json::Value =
-            serde_json::from_str(&result_text(&result)).expect("canonical JSON line");
         assert_eq!(
-            parsed["answers"][0]["selected"][0], "a",
-            "the id-routed answer is the settle payload"
+            seed,
+            "The user answered your AskUserQuestion card:\n\
+             {\"answers\":[{\"id\":\"frozen-q\",\"selected\":[\"a\"]},{\"id\":\"frozen-q\",\"selected\":[],\"custom\":\"free\"}]}",
+            "one row per in-card answer, `id` then `selected` then `custom`, \
+             single-select custom replacing the selection, foreign ids dropped"
         );
-        assert_eq!(parsed["answers"][0]["id"], card_ids[0]);
     }
 
-    /// D5 `DELEGATED_CALLER`: the ask tool refuses to park a human when it is
-    /// handed a delegated (subagent) gate — it returns before registering any
-    /// pending interaction or emitting an authorization event.
+    /// First settle wins: a withdrawn id is gone, and a second withdrawal
+    /// reads as unknown. `withdraw_all` drains whatever is still open.
+    #[tokio::test]
+    async fn withdraw_first_settle_wins_and_all_drains() {
+        let (gate, _rx) = gate_with_events();
+        gate.register(
+            "ask-1",
+            PendingAuthMeta {
+                tool_name: crate::tools::ASK_USER_QUESTION.to_string(),
+                summary: "t".into(),
+                input: serde_json::json!({}),
+            },
+        );
+        assert!(gate.withdraw("ask-1").is_some(), "first settle wins");
+        assert!(gate.withdraw("ask-1").is_none(), "already settled");
+        gate.register(
+            "a",
+            PendingAuthMeta {
+                tool_name: crate::tools::ASK_USER_QUESTION.to_string(),
+                summary: "t".into(),
+                input: serde_json::json!({}),
+            },
+        );
+        gate.register(
+            "b",
+            PendingAuthMeta {
+                tool_name: crate::tools::ASK_USER_QUESTION.to_string(),
+                summary: "t".into(),
+                input: serde_json::json!({}),
+            },
+        );
+        let drained = gate.withdraw_all();
+        assert_eq!(drained.len(), 2, "every open card drains");
+        assert!(gate.pending_entries().is_empty());
+    }
+
     #[tokio::test]
     async fn ask_from_delegated_gate_is_rejected_as_delegated_caller() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1224,8 +937,8 @@ mod tests {
     /// W1 byte-freeze: the model-visible surface of `AskUserQuestion`. The
     /// description and the parameter schema travel inside the cached prefix of
     /// every request, so a later work package may not move a single byte of
-    /// them (nor of the answer row it produces) without a conscious update to
-    /// the literals below.
+    /// them (nor of the seed payload an answer produces) without a conscious
+    /// update to the literals below.
     #[test]
     fn ask_surface_bytes_are_frozen() {
         let (gate, _rx) = gate_with_events();
@@ -1241,8 +954,9 @@ mod tests {
              label in `approve`, and only when a `detail` accompanies the question). \
              Mark the recommended default with recommended=true when one exists. The \
              user may also answer a question with free text or explicitly skip it. \
-             Do not use this tool to ask for plan approval or to confirm obvious \
-             defaults."
+             Calling this tool ENDS your turn: the card is the last thing you emit, \
+             and the user's answers arrive as their next message. Do not use this \
+             tool to ask for plan approval — submit plans with ProposePlan."
         );
         assert_eq!(
             serde_json::to_string(&tool.parameters_schema()).unwrap(),
@@ -1250,83 +964,23 @@ mod tests {
         );
     }
 
-    /// W1 byte-freeze: the result strings `AskUserQuestion` hands back to the
-    /// model — the canonical answer row (key order and skip spelling included)
-    /// and every non-answer verdict, byte for byte.
+    /// W1 byte-freeze: the delivery text the tool hands back and the
+    /// delegated refusal, byte for byte.
     #[tokio::test]
     async fn ask_result_bytes_are_frozen() {
         let (gate, _rx) = gate_with_events();
         let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
-        let params = serde_json::json!({
-            "questions": [{
-                "id": "frozen-q", "question": "q?", "header": "h", "multiSelect": false,
-                "options": [
-                    {"label": "a", "description": ""},
-                    {"label": "b", "description": ""},
-                ],
-            }],
-        });
-        let settle = {
-            let gate = Arc::clone(&gate);
-            tokio::spawn(async move {
-                while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
-                    tokio::task::yield_now().await;
-                }
-                gate.respond(
-                    "ask-1",
-                    AskOutcome::Answered(vec![
-                        AskAnswer::new("frozen-q".into(), vec!["a".into()], None),
-                        AskAnswer::new("frozen-q".into(), vec!["b".into()], Some("free".into())),
-                    ]),
-                );
-            })
-        };
-        let answered = tool
-            .execute("ask-1", params, CancellationToken::new(), &ctx)
+        let delivered = tool
+            .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
             .await
-            .expect("the ask tool returns a tool result, not a hard error");
-        settle.await.unwrap();
-        assert!(!answered.is_error);
+            .expect("the ask tool returns a tool result");
         assert_eq!(
-            result_text(&answered),
-            r#"{"answers":[{"id":"frozen-q","selected":["a"]},{"id":"frozen-q","selected":[],"custom":"free"}]}"#,
-            "one row per answer, `id` then `selected` then `custom`, single-select \
-             custom replacing the selection"
-        );
-
-        let (gate, _rx) = gate_with_events();
-        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
-        let expired = run_ask_settled(&tool, &gate, &ctx, AskOutcome::Expired).await;
-        assert!(expired.is_error);
-        assert_eq!(
-            result_text(&expired),
-            "[no-answer] The user did not answer this question — no client was \
-             available to answer it, or the pending question was withdrawn. Do not \
-             treat this as input or consent. Re-ask with fewer, simpler questions \
-             or continue under explicitly stated assumptions."
-        );
-
-        let (gate, _rx) = gate_with_events();
-        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
-        let dismissed = run_ask_settled(&tool, &gate, &ctx, AskOutcome::Dismissed).await;
-        assert!(!dismissed.is_error);
-        assert_eq!(
-            result_text(&dismissed),
-            "The user dismissed your questions to speak instead; stop here and \
-             wait for their message."
-        );
-
-        let (gate, _rx) = gate_with_events();
-        let plan = crate::plan_mode::PlanSessionState::new();
-        plan.set(true, None);
-        let plan_tool = AskUserQuestionTool::new(Arc::clone(&gate)).with_plan_state(plan);
-        let dismissed_in_plan =
-            run_ask_settled(&plan_tool, &gate, &ctx, AskOutcome::Dismissed).await;
-        assert_eq!(
-            result_text(&dismissed_in_plan),
-            "The user dismissed the review to speak instead; stay in plan mode, \
-             stop here, and wait for their message."
+            result_text(&delivered),
+            "Question delivered to the user. This turn ends here — the card is the \
+             conversation's last item. The user's answers arrive as their next message \
+             (a closed card means they will speak instead); do not repeat or answer \
+             the questions yourself."
         );
 
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -1336,141 +990,11 @@ mod tests {
             .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
             .await
             .expect("a delegated refusal is a tool result, not a hard error");
-        assert!(refused.is_error);
         assert_eq!(
             result_text(&refused),
             "[DELEGATED_CALLER] A delegated subagent cannot ask the user questions. \
              Include the open question in your final summary so the parent agent — \
              which can ask — resolves it."
-        );
-    }
-
-    /// One composed answerer that claims every request, recording the id it
-    /// saw so the test can prove composition reads the same parked bytes the
-    /// card renders.
-    struct ClaimingAnswerer {
-        seen_question: std::sync::Mutex<Option<String>>,
-    }
-
-    #[async_trait::async_trait]
-    impl UserQuestionAnswerer for ClaimingAnswerer {
-        fn name(&self) -> &str {
-            "test-claimer"
-        }
-
-        async fn ask(
-            &self,
-            request: AskRequest<'_>,
-            _settle: &QuestionSettle,
-        ) -> Option<AskOutcome> {
-            let qid = request.input["questions"][0]["id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            *self.seen_question.lock().unwrap() = Some(qid.clone());
-            Some(AskOutcome::Answered(vec![AskAnswer::new(
-                qid,
-                vec!["a".into()],
-                None,
-            )]))
-        }
-    }
-
-    /// One composed answerer that delegates every request to the next one.
-    struct DelegatingAnswerer;
-
-    #[async_trait::async_trait]
-    impl UserQuestionAnswerer for DelegatingAnswerer {
-        fn name(&self) -> &str {
-            "test-delegator"
-        }
-
-        async fn ask(
-            &self,
-            _request: AskRequest<'_>,
-            _settle: &QuestionSettle,
-        ) -> Option<AskOutcome> {
-            None
-        }
-    }
-
-    /// A2: a composed answerer claims the request, so the tool renders its
-    /// answer without any wire settle — and it saw the parked card's minted id.
-    #[tokio::test]
-    async fn composed_answerer_claim_wins_without_a_wire_settle() {
-        let (gate, _rx) = gate_with_events();
-        let claimer = Arc::new(ClaimingAnswerer {
-            seen_question: std::sync::Mutex::new(None),
-        });
-        gate.register_answerer(Arc::clone(&claimer) as Arc<dyn UserQuestionAnswerer>);
-        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
-        let ctx = tool_ctx();
-        let result = tool
-            .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
-            .await
-            .expect("the ask tool returns a tool result");
-        assert!(!result.is_error);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&result_text(&result)).expect("canonical JSON line");
-        assert_eq!(parsed["answers"][0]["selected"][0], "a");
-        let seen = claimer
-            .seen_question
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("the answerer saw the request");
-        assert_eq!(
-            parsed["answers"][0]["id"].as_str(),
-            Some(seen.as_str()),
-            "composition reads the same parked id the card carries"
-        );
-        assert!(
-            gate.pending_entries().is_empty(),
-            "a composed claim leaves no parked card behind"
-        );
-    }
-
-    /// A2: delegation falls through — a delegating answerer before the wire
-    /// answerer must not consume the request.
-    #[tokio::test]
-    async fn composed_answerer_delegation_falls_through_to_the_wire() {
-        let (gate, _rx) = gate_with_events();
-        gate.register_answerer(Arc::new(DelegatingAnswerer) as Arc<dyn UserQuestionAnswerer>);
-        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
-        let ctx = tool_ctx();
-        let settle = {
-            let gate = Arc::clone(&gate);
-            tokio::spawn(async move {
-                while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
-                    tokio::task::yield_now().await;
-                }
-                let qid = gate
-                    .pending_entries()
-                    .into_iter()
-                    .find(|(id, _)| id == "ask-1")
-                    .expect("parked card")
-                    .1
-                    .input["questions"][0]["id"]
-                    .as_str()
-                    .expect("minted id")
-                    .to_string();
-                gate.respond(
-                    "ask-1",
-                    AskOutcome::Answered(vec![AskAnswer::new(qid, vec!["b".into()], None)]),
-                );
-            })
-        };
-        let result = tool
-            .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
-            .await
-            .expect("the ask tool returns a tool result");
-        settle.await.unwrap();
-        assert!(!result.is_error);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&result_text(&result)).expect("canonical JSON line");
-        assert_eq!(
-            parsed["answers"][0]["selected"][0], "b",
-            "the delegated request reached the wire settle"
         );
     }
 }

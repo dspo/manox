@@ -149,6 +149,9 @@ async fn run_loop_inner(
 ) -> Result<(), anyhow::Error> {
     sink.emit(AgentEvent::AgentStart).await?;
     let mut turn_count: usize = 0;
+    // Turn-end gate budget: how many vetoes the gate may spend on this run
+    // before a bare stop goes through.
+    let mut turn_end_bounces: usize = 0;
 
     // Check for steering messages at start (may have been queued while idle).
     let mut pending_messages: Vec<AgentMessage> = config
@@ -314,11 +317,14 @@ async fn run_loop_inner(
                     .await?
                 };
 
-                // Check if all finalized calls want to terminate.
-                let all_terminate = executed.iter().all(|ec| ec.result.terminate);
+                // Any finalized call asking to terminate ends the run: the
+                // interaction devices (AskUserQuestion, ProposePlan) may land
+                // in a parallel batch beside research tools, and their stop
+                // must not depend on the siblings.
+                let any_terminate = executed.iter().any(|ec| ec.result.terminate);
 
                 tool_results = result_messages;
-                has_more_tool_calls = !all_terminate;
+                has_more_tool_calls = !any_terminate;
 
                 for result in &tool_results {
                     // A tool result is a settled message in its own turn; give
@@ -392,6 +398,39 @@ async fn run_loop_inner(
                 .as_ref()
                 .map(|f| f())
                 .unwrap_or_default();
+
+            // Turn-end gate: a run about to end on its own (no tool call
+            // asked to continue, no steering queued — queued input always
+            // yields) may be vetoed into continuing. The veto injects one
+            // user message and the inner loop runs on; the budget bounds
+            // the round-trip so a gate and a stubborn model cannot spin.
+            if !has_more_tool_calls
+                && pending_messages.is_empty()
+                && let Some(before_turn_end) = &config.before_turn_end
+            {
+                let calls = executed_tool_call_names(new_messages);
+                let last_batch: Vec<String> = tool_calls
+                    .iter()
+                    .map(|(name, _, _)| (*name).to_string())
+                    .collect();
+                if let Some(bounce) = before_turn_end(&calls, &last_batch)
+                    && turn_end_bounces < config.max_turn_end_bounces.unwrap_or(2)
+                {
+                    turn_end_bounces += 1;
+                    let message = AgentMessage::user(bounce);
+                    sink.emit(AgentEvent::MessageStart {
+                        message: Box::new(message.clone()),
+                    })
+                    .await?;
+                    sink.emit(AgentEvent::MessageEnd {
+                        message: Box::new(message.clone()),
+                    })
+                    .await?;
+                    context.messages.push(message.clone());
+                    new_messages.push(message);
+                    has_more_tool_calls = true;
+                }
+            }
         }
 
         // Inner loop exhausted — check for follow-up messages.
@@ -438,6 +477,22 @@ async fn run_loop_inner(
     })
     .await?;
     Ok(())
+}
+
+/// The tool-call names executed during the run, in emission order — the
+/// turn-end gate's view of what the run did.
+fn executed_tool_call_names(messages: &[AgentMessage]) -> Vec<String> {
+    let mut names = Vec::new();
+    for message in messages {
+        if let AgentMessage::Assistant { content, .. } = message {
+            for block in content {
+                if let ContentBlock::ToolUse { name, .. } = block {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+    names
 }
 
 /// Stream an assistant response from the LLM and emit lifecycle events.
@@ -2621,5 +2676,297 @@ mod tests {
             "the error keeps the stream's timestamp"
         );
         assert_eq!(api, "mock");
+    }
+
+    // ── turn-final devices: any-terminate batches and the turn-end gate ──────
+
+    /// A tool whose result terminates the run (the interaction-device shape:
+    /// `AskUserQuestion`, `ProposePlan`).
+    struct TerminatingTool;
+
+    #[async_trait::async_trait]
+    impl AgentTool for TerminatingTool {
+        fn name(&self) -> &str {
+            "ask"
+        }
+        fn description(&self) -> &str {
+            "ends the turn"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: serde_json::Value,
+            _signal: CancellationToken,
+            _ctx: &dyn ToolContext,
+        ) -> Result<AgentToolResult, ToolError> {
+            Ok(AgentToolResult {
+                content: vec![ContentBlock::Text {
+                    text: "delivered".into(),
+                    signature: None,
+                }],
+                details: None,
+                is_error: false,
+                usage: None,
+                added_tool_names: None,
+                terminate: true,
+            })
+        }
+    }
+
+    fn tool_use(name: &str, id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        }
+    }
+
+    fn assistant(content: Vec<ContentBlock>) -> AgentMessage {
+        AgentMessage::Assistant {
+            content,
+            model: "mock".into(),
+            provider: "mock".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn loop_context_with(tools: Vec<Arc<dyn AgentTool>>) -> AgentContext {
+        AgentContext {
+            system_prompt: "test".into(),
+            messages: Vec::new(),
+            tools: tools.into(),
+            model: Model {
+                provider: "mock".into(),
+                id: "mock".into(),
+                api: "test".into(),
+                context_window: 100_000,
+                max_tokens: 8_192,
+                thinking: ThinkingKind::None,
+                metadata: Default::default(),
+            },
+            thinking_level: None,
+            cache_retention: Default::default(),
+            session_id: None,
+            metadata: Default::default(),
+            stream_options: Default::default(),
+        }
+    }
+
+    /// ANY terminating result in a parallel batch ends the run: the
+    /// interaction device's stop must not depend on its siblings, and the
+    /// siblings still execute and journal.
+    #[tokio::test]
+    async fn any_terminate_in_a_batch_ends_the_run() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let mut context = loop_context_with(vec![Arc::new(EchoTool), Arc::new(TerminatingTool)]);
+        let stream = StatefulMockStreamFn::new(vec![assistant(vec![
+            tool_use("ask", "call_ask"),
+            tool_use("echo", "call_echo"),
+        ])]);
+        run_loop(
+            &[AgentMessage::user("go")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(stream),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+        let events = sink.events.lock().unwrap();
+        let turns = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnStart))
+            .count();
+        assert_eq!(
+            turns, 1,
+            "the batch's terminate ends the run: {turns} turns"
+        );
+        let sibling_result = events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageEnd { message }
+                if matches!(
+                    &**message,
+                    AgentMessage::ToolResult { tool_name, .. } if tool_name == "echo"
+                )
+            )
+        });
+        assert!(sibling_result, "the non-terminating sibling still journals");
+    }
+
+    /// The turn-end gate vetoes a bare stop: the continuation message enters
+    /// the transcript as a user message and the run continues.
+    #[tokio::test]
+    async fn turn_end_gate_bounces_a_bare_stop() {
+        let sink = MockSink::new();
+        let seen_calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&seen_calls);
+        let fired = Arc::new(Mutex::new(false));
+        let fire = Arc::clone(&fired);
+        let config = AgentLoopConfig {
+            before_turn_end: Some(Box::new(move |calls: &[String], _last_batch: &[String]| {
+                seen.lock().unwrap().extend(calls.iter().cloned());
+                let mut fired = fire.lock().unwrap();
+                if calls.is_empty() && !*fired {
+                    *fired = true;
+                    return Some("[harness] end the turn with the exit tool".into());
+                }
+                None
+            })),
+            ..Default::default()
+        };
+        let mut context = loop_context_with(vec![Arc::new(EchoTool)]);
+        let stream = StatefulMockStreamFn::new(vec![]);
+        let messages = run_loop(
+            &[AgentMessage::user("go")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(stream),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+        let bounces = messages
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    AgentMessage::User { content, .. }
+                    if content
+                        .iter()
+                        .any(|c| matches!(c, ContentBlock::Text { text, .. } if text.contains("[harness]")))
+                )
+            })
+            .count();
+        assert_eq!(
+            bounces, 1,
+            "exactly one injected continuation: {messages:?}"
+        );
+        assert!(
+            seen_calls.lock().unwrap().is_empty(),
+            "the gate observed the bare stop's (empty) tool-call list"
+        );
+    }
+
+    /// The bounce budget bounds the round-trip: an always-vetoing gate gets
+    /// two continuations, then the bare stop goes through.
+    #[tokio::test]
+    async fn turn_end_gate_budget_bounds_the_bounce() {
+        let sink = MockSink::new();
+        let vetoes = Arc::new(Mutex::new(0usize));
+        let count = Arc::clone(&vetoes);
+        let config = AgentLoopConfig {
+            before_turn_end: Some(Box::new(
+                move |_calls: &[String], _last_batch: &[String]| {
+                    *count.lock().unwrap() += 1;
+                    Some("[harness] bounce".into())
+                },
+            )),
+            ..Default::default()
+        };
+        let mut context = loop_context_with(vec![]);
+        let stream = StatefulMockStreamFn::new(vec![]);
+        run_loop(
+            &[AgentMessage::user("go")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(stream),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+        assert_eq!(*vetoes.lock().unwrap(), 3, "initial + two bounces");
+        let events = sink.events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
+            "the run still ends after the budget"
+        );
+    }
+
+    /// Queued steering yields: a steer present at the would-be end skips the
+    /// gate and runs its own turn; the gate only judges a quiet stop.
+    #[tokio::test]
+    async fn turn_end_gate_yields_to_queued_steering() {
+        let sink = MockSink::new();
+        let evaluated = Arc::new(Mutex::new(0usize));
+        let count = Arc::clone(&evaluated);
+        let polls = Arc::new(Mutex::new(0usize));
+        let poll_count = Arc::clone(&polls);
+        let fired = Arc::new(Mutex::new(false));
+        let fire = Arc::clone(&fired);
+        let config = AgentLoopConfig {
+            get_steering_messages: Some(Box::new(move || {
+                // Call 1 is the run-start poll; the steer arrives during
+                // turn 1 (call 2, the turn-end poll) so the gate must skip
+                // a queued-input end.
+                let mut polls = poll_count.lock().unwrap();
+                *polls += 1;
+                if *polls == 2 {
+                    vec![AgentMessage::user("[steered] keep going")]
+                } else {
+                    Vec::new()
+                }
+            })),
+            before_turn_end: Some(Box::new(
+                move |_calls: &[String], _last_batch: &[String]| {
+                    *count.lock().unwrap() += 1;
+                    let mut fired = fire.lock().unwrap();
+                    if !*fired {
+                        *fired = true;
+                        Some("[harness] bounce".into())
+                    } else {
+                        None
+                    }
+                },
+            )),
+            ..Default::default()
+        };
+        let mut context = loop_context_with(vec![]);
+        let stream = StatefulMockStreamFn::new(vec![]);
+        run_loop(
+            &[AgentMessage::user("go")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(stream),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .expect("the run completes");
+        // Turn 1 ends with the steering queued (gate skipped); the steering
+        // turn ends quiet and the gate evaluates (once vetoing, once
+        // letting the post-bounce stop through).
+        assert_eq!(*evaluated.lock().unwrap(), 2);
+        let events = sink.events.lock().unwrap();
+        let turns = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnStart))
+            .count();
+        assert!(turns >= 3, "steering turn + bounces ran: {turns}");
     }
 }

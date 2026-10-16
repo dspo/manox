@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    AfterToolCallHook, Agent, BeforeProviderRequestHook, BeforeToolCallHook, EventMiddleware,
-    LoopHooks, PrepareTurnHook, RunHandle,
+    AfterToolCallHook, Agent, BeforeProviderRequestHook, BeforeToolCallHook, BeforeTurnEndHook,
+    EventMiddleware, LoopHooks, PrepareTurnHook, RunHandle,
 };
 use crate::agent_loop::StreamFn;
 use crate::compaction::{self, CompactionPreparation, CompactionResult, CompactionSettings};
@@ -591,6 +591,12 @@ pub enum HookPoint {
     BeforeProviderPayload,
     /// The provider responded with a status (fires per attempt).
     AfterProviderResponse,
+    /// The run is about to end on its own (no pending tool calls, no queued
+    /// steering) after a natural assistant stop. The payload carries the
+    /// tool-call names executed during the run, in order; a handler may veto
+    /// the stop with a continuation message, which the loop injects as a
+    /// user message before running on.
+    BeforeTurnEnd,
 }
 
 /// A hook handler receives context about the event and can mutate it.
@@ -779,6 +785,18 @@ pub struct HookContext {
     /// At the `SessionBeforeTree` point, supplies the branch summary
     /// directly so the harness skips the summarization model call.
     pub tree_summary: Option<BranchSummaryHookOverride>,
+    /// At the `BeforeTurnEnd` point, vetoes the stop: the loop injects
+    /// `inject` as a user message and continues the run (bounded by the
+    /// loop's bounce budget).
+    pub turn_end_veto: Option<TurnEndVeto>,
+}
+
+/// A `BeforeTurnEnd` handler's veto: the continuation message the loop
+/// injects as a user message before running on.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnEndVeto {
+    pub inject: String,
 }
 
 impl HookContext {
@@ -800,6 +818,7 @@ impl HookContext {
             tree_label: None,
             tree_replace_instructions: None,
             tree_summary: None,
+            turn_end_veto: None,
         }
     }
 
@@ -880,6 +899,15 @@ impl HookContext {
     /// the agent's configured prompt again.
     pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
         self.system_prompt_override = Some(system_prompt.into());
+        self
+    }
+
+    /// At `BeforeTurnEnd`, veto the stop: the loop injects the continuation
+    /// message and runs on (within its bounce budget).
+    pub fn with_turn_end_veto(mut self, inject: impl Into<String>) -> Self {
+        self.turn_end_veto = Some(TurnEndVeto {
+            inject: inject.into(),
+        });
         self
     }
 }
@@ -3818,6 +3846,23 @@ fn build_loop_hooks<S: SessionStorage + 'static>(
         hc.tool_result.unwrap_or_else(|| r.clone())
     });
 
+    let turn_end = Arc::clone(&hooks);
+    let before_turn_end: BeforeTurnEndHook =
+        Arc::new(move |calls: &[String], last_batch: &[String]| {
+            let mut hc = HookContext::new(HookPoint::BeforeTurnEnd).with_data(serde_json::json!({
+                "tool_calls": calls,
+                "last_batch": last_batch,
+            }));
+            let list = turn_end.lock().unwrap();
+            for (point, handler) in list.iter() {
+                if *point == HookPoint::BeforeTurnEnd {
+                    hc = handler(hc);
+                }
+            }
+            drop(list);
+            hc.turn_end_veto.map(|veto| veto.inject)
+        });
+
     let runtime = Arc::clone(&control);
     let durable = Arc::clone(&session);
     let prepare_next_turn: PrepareTurnHook = Arc::new(move || {
@@ -3887,6 +3932,7 @@ fn build_loop_hooks<S: SessionStorage + 'static>(
         after_tool_call: Some(after_tool_call),
         prepare_next_turn: Some(prepare_next_turn),
         should_stop_after_turn: None,
+        before_turn_end: Some(before_turn_end),
     }
 }
 

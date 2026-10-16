@@ -1190,6 +1190,20 @@ impl Thread {
                     self.run_turn();
                 }
             }
+            BackendNotice::QuestionAnswered { seed } => {
+                // An answered ask closed the held turn; the answer seeds the
+                // next turn exactly like an approved plan does
+                // (`plan_seed`): a harness-authored user message, then the
+                // turn fires.
+                let ui = MessageUiMetadata {
+                    model_id: self.model.as_ref().map(|m| m.id.clone()),
+                    approval_mode: Some(self.permission_mode.as_i64()),
+                    author: Some(crate::MessageAuthor::Harness),
+                    ..Default::default()
+                };
+                self.insert_user_message_with_ui_metadata(seed, Some(ui));
+                self.run_turn();
+            }
             BackendNotice::Fatal(err) => {
                 self.running = false;
                 // The actor will not send `Ready` (it bailed out): clear the
@@ -1987,7 +2001,7 @@ impl Thread {
     }
 
     /// Toggle plan mode: the engine persists the flag in the session
-    /// sidecar, wires the read-only gate, and injects the plan-mode
+    /// sidecar, wires the turn-end exit gate, and injects the plan-mode
     /// instructions (rendered for the configured agent language) every turn.
     pub fn set_plan_mode(&mut self, enabled: bool) {
         self.plan_mode = enabled;

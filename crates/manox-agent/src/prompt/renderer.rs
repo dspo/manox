@@ -489,7 +489,8 @@ mod tests {
         );
         assert!(
             active.ends_with(
-                "You MUST keep going until the plan is decision-complete.\n</critical>\n"
+                "Keep researching until the plan is decision-complete, then propose\n\
+                 it or ask.\n</critical>\n"
             ),
             "closing bytes (including the trailing newline) are frozen"
         );

@@ -1,7 +1,8 @@
 //! Plan review verdicts and plan-mode prompt rendering.
 //!
-//! Plan mode is a structured propose flow: the model researches read-only,
-//! writes the plan to a file, and submits it through the `ProposePlan` tool
+//! Plan mode is a structured propose flow: the model researches with full
+//! tool parity (keeping the working tree clean — see the template), writes
+//! the plan to a file, and submits it through the `ProposePlan` tool
 //! (see [`crate::plan_mode`]); the user picks one of four execution verdicts
 //! on the review card. The plan-mode instructions are English-only prose,
 //! injected every turn while plan mode is active.

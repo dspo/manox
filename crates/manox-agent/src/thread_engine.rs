@@ -345,6 +345,10 @@ pub enum BackendNotice {
         /// Steers stranded by an aborted/failed run.
         stranded: Vec<String>,
     },
+    /// An answered `AskUserQuestion` closed the held turn: the facade
+    /// inserts `seed` as a harness-authored user message and launches the
+    /// seed turn (the plan-review `plan_seed` shape, generalized to asks).
+    QuestionAnswered { seed: String },
     /// The display-only preview streamed another batch of the session
     /// transcript into the mirrored history (the authoritative restore is
     /// still running; it replaces the preview at `Ready`). The facade
