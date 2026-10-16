@@ -42,6 +42,7 @@ const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "Glob",
     "Ls",
     "BashOutput",
+    "TaskList",
     crate::subagent::ListAgentsTool::NAME,
     crate::tools::ASK_USER_QUESTION,
     PROPOSE_PLAN,
@@ -328,7 +329,7 @@ fn is_read_only_subagent_dispatch(
 /// and temp-scratch targets; a `Bash` call passes only when its command is a
 /// single read-only `git` invocation ([`git_read_only`]); an `Agent` call
 /// passes only for a read-only subagent (e.g. `Explore`) without worktree
-/// isolation; every other tool (Monitor, write/bash sub-agents, MCP, …) is
+/// isolation; every other tool (write/bash sub-agents, MCP, …) is
 /// blocked with a reason the model can act on.
 pub fn gate_handler(
     state: Arc<PlanSessionState>,
@@ -1014,7 +1015,11 @@ mod tests {
             .block_reason
             .is_some()
         );
-        assert!(run("Monitor", serde_json::json!({})).block_reason.is_some());
+        assert!(
+            run("TaskStop", serde_json::json!({}))
+                .block_reason
+                .is_some()
+        );
         assert!(
             run("mcp__srv__tool", serde_json::json!({}))
                 .block_reason

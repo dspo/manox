@@ -10,7 +10,7 @@ When several tool calls or subagent spawns are independent, emit them together i
 Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval in read-only mode, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).
 
 ## Concurrency model
-Foreground tool calls (Bash without `run_in_background`) block this turn. Background Bash (`run_in_background: true`) returns immediately and wakes the idle session on completion — never use `sleep` or poll loops to wait for a background task. `Monitor` streams events continuously for long-running observation (log tail, event stream). Use `BashOutput` to fetch full output and `TaskStop` to cancel.
+Foreground tool calls (Bash without `run_in_background`) block this turn. Background Bash (`run_in_background: true`) returns a task id immediately and its completion arrives as a message that wakes the idle session — never use `sleep` or poll loops to wait for a background task. While it runs, keep working on independent steps; block on it with `BashOutput` (`wait: true`, `timeout_ms`) only when your next step genuinely needs its result (a CI run gating a merge, a build the next command consumes) — an expired wait leaves the task running. `TaskList` enumerates background tasks; `TaskStop` cancels one.
 
 ## Subagents & parallel work
 {{ subagents_prose }}{% if skills %}

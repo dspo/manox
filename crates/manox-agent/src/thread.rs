@@ -1040,7 +1040,7 @@ impl Thread {
                         );
                     }
                 }
-                // Runs the actor starts on its own (monitor idle-wakeups,
+                // Runs the actor starts on its own (idle-wakeups,
                 // plan-approval seeds) announce themselves with `TurnStarted`;
                 // mirror them onto the running flag so a switch-away parks the
                 // thread instead of dropping it mid-run. Idempotent with the
@@ -2934,7 +2934,7 @@ pub(crate) mod tests {
 
     /// `LiveHistory` re-mirrors the engine's live transcript into `messages`
     /// (the switch-back rebuild reads the mirror) without emitting a UI
-    /// event; an actor-initiated `TurnStarted` (monitor wakeup, plan-approval
+    /// event; an actor-initiated `TurnStarted` (idle wakeup, plan-approval
     /// seed) flips the running flag so a switch-away parks the thread instead
     /// of dropping it mid-run, and `Settled` clears it.
     #[tokio::test]

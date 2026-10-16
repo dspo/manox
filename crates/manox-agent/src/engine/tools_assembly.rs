@@ -1,6 +1,6 @@
-//! Engine tool assembly: the subagent/monitor/task-stop tools, browser
-//! suites, `build_tools`, the session orchestrators, and the embedder/MCP
-//! refresh paths.
+//! Engine tool assembly: the subagent/task tools, browser suites,
+//! `build_tools`, the session orchestrator, and the embedder/MCP refresh
+//! paths.
 
 use super::*;
 
@@ -116,14 +116,71 @@ impl manox_harness::tool::AgentTool for SubagentBashTool {
 }
 
 /// The host `TaskStop`: one registry covers every task kind (Sailors
-/// register directly; bash/monitor/ws register through the session's host
+/// register directly; background bash registers through the session's host
 /// observer with an on_stop hook into the producer), so one lookup stops
 /// anything the model can name. Unknown ids list the running tasks.
 pub(super) struct HostTaskStop;
 
-pub(super) const TASKSTOP_DESCRIPTION: &str = "Stop a background task by id — a background bash, a monitor, \
+pub(super) const TASKSTOP_DESCRIPTION: &str = "Stop a background task by id — a background bash \
     or an asynchronously-dispatched Sailor subagent (`sailor_id`). Cancels the task's token; the \
     task settles to Stopped. Idempotent for an already-terminal task.";
+
+/// The host `TaskList`: one line per background task this session owns —
+/// background bash and dispatched subagents alike — including finished ones
+/// not yet reaped, so the model can recover an id or take stock of what is
+/// still running. Read-only; pairs with [`HostTaskStop`] (the same registry
+/// both read and stop).
+pub(super) struct HostTaskList {
+    owner_thread_id: String,
+}
+
+pub(super) const TASKLIST_DESCRIPTION: &str = "List this session's background tasks — id, kind, \
+    status, and command — including finished ones not yet reaped. `BashOutput` reads a `bash` \
+    task; a `subagent` delivers its report as a message when it finishes. `TaskStop` stops either.";
+
+#[async_trait::async_trait]
+impl manox_harness::tool::AgentTool for HostTaskList {
+    fn name(&self) -> &str {
+        "TaskList"
+    }
+    fn description(&self) -> &str {
+        TASKLIST_DESCRIPTION
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        _params: serde_json::Value,
+        _signal: tokio_util::sync::CancellationToken,
+        _ctx: &dyn manox_harness::tool::ToolContext,
+    ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
+        Ok(manox_harness::tool::AgentToolResult::text(
+            crate::background_task::render_task_list(&self.owner_thread_id),
+        ))
+    }
+
+    async fn execute_with_progress(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn manox_harness::tool::ToolContext,
+        _progress: &dyn manox_harness::tool::ToolProgress,
+    ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
+        // TaskList never streams; route both entry points through execute.
+        self.execute(tool_call_id, params, signal, ctx).await
+    }
+}
 
 #[async_trait::async_trait]
 impl manox_harness::tool::AgentTool for HostTaskStop {
@@ -277,9 +334,9 @@ impl BrowserSuite {
 /// no gate — permission policy is a harness concern); `AskUserQuestion` joins
 /// ungated because asking the user is itself the interaction.
 ///
-/// Returns the tools plus the session-scoped orchestrators that must attach
-/// once the session exists (their steerers and lifecycle hooks need a live
-/// session handle).
+/// Returns the tools plus the session-scoped background manager that must
+/// attach once the session exists (its steerer and lifecycle hook need a
+/// live session handle).
 #[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
 pub(super) fn build_tools(
     cwd: &Path,
@@ -295,7 +352,7 @@ pub(super) fn build_tools(
     bus: &Arc<crate::steer_bus::AgentBus>,
 ) -> (
     Vec<Arc<dyn HarnessAgentTool>>,
-    SessionOrchestrators,
+    Arc<BackgroundManager>,
     crate::plan_mode::ReadOnlySubagentResolver,
 ) {
     // Bash execution backend: seatbelt-wrapped one-shot commands when the
@@ -346,7 +403,6 @@ pub(super) fn build_tools(
         Arc::clone(&bash_ops);
     let subagent_background = Arc::new(BackgroundRegistry::new());
     let manager = BackgroundManager::new(Arc::clone(&background));
-    let monitor = MonitorManager::new(Arc::clone(&background));
     // Unsandboxed backend (no confinement): selected per call when the
     // effective mode is `danger-full-access` (the standing session mode, or
     // an approved `sandbox_permissions` grant). Installed only where a
@@ -399,8 +455,10 @@ pub(super) fn build_tools(
         Arc::new(manox_harness::tools::glob::GlobTool),
         Arc::new(manox_harness::tools::ls::LsTool),
         Arc::new(bash),
-        Arc::new(MonitorTool::new(Arc::clone(&monitor))),
         Arc::new(BashOutputTool::new(background.clone())),
+        Arc::new(HostTaskList {
+            owner_thread_id: session_id.to_string(),
+        }),
         Arc::new(HostTaskStop),
         Arc::new(crate::web_fetch::WebFetchTool::new()),
     ];
@@ -415,19 +473,10 @@ pub(super) fn build_tools(
     // of the host gate whenever a seatbelt is mounted: the mode drives the
     // seatbelt directly, and a `sandbox_permissions` escalation is resolved
     // inside the tool through the host-injected approver (never the gate).
-    // `Monitor`'s command half spawns through the same sandbox-wrapped
-    // background registry under workspace-write.
     let confined_bash_auto_allow: Option<crate::approval::AutoAllowResolver> = sandbox_available
         .then(|| {
             let allow: crate::approval::AutoAllowResolver =
-                Arc::new(move |name: &str, params: &serde_json::Value| match name {
-                    "Bash" => true,
-                    "Monitor" => params
-                        .get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|c| !c.trim().is_empty()),
-                    _ => false,
-                });
+                Arc::new(move |name: &str, _params: &serde_json::Value| matches!(name, "Bash"));
             allow
         });
     // Write/Edit carry the host escalation config (shared approver + standing
@@ -444,7 +493,7 @@ pub(super) fn build_tools(
                 .with_plan_policy(Arc::clone(&plan_policy))
                 .with_granted_roots(granted_roots.clone());
             if let Some(allow) = &confined_bash_auto_allow
-                && matches!(name.as_str(), "Bash" | "Monitor")
+                && name == "Bash"
             {
                 wrapper = wrapper.with_auto_allow(Arc::clone(allow));
             }
@@ -790,19 +839,7 @@ pub(super) fn build_tools(
         let map = Arc::new(read_only_by_tool);
         Arc::new(move |name: &str| map.get(name).copied().unwrap_or(false))
     };
-    (
-        tools,
-        SessionOrchestrators {
-            monitor,
-            background: manager,
-        },
-        read_only_subagent,
-    )
-}
-
-pub(super) struct SessionOrchestrators {
-    pub(super) monitor: Arc<MonitorManager>,
-    pub(super) background: Arc<BackgroundManager>,
+    (tools, manager, read_only_subagent)
 }
 
 /// Re-mount the embedder's registered tools (the `RegisterSessionTools`

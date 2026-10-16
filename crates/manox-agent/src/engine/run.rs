@@ -5,7 +5,7 @@ use super::*;
 
 /// Drive one session run to completion while still servicing mid-run
 /// commands (abort/steer/cancel/shutdown) through the session handle.
-/// Shared by user prompts, monitor idle-wakeups, and plan-approval seeds.
+/// Shared by user prompts, idle-wakeups, and plan-approval seeds.
 /// Returns the run result and whether an abort was requested.
 ///
 /// While the run is in flight, a periodic tick refreshes the engine's
@@ -32,7 +32,7 @@ where
     tokio::pin!(run);
     // W4 boundary: a pending plan-mode selection commits at the start of
     // whatever run comes next — a user prompt, a drained steer, a goal round
-    // or a monitor wake-up — so no run can execute under the old mode while
+    // or an idle wake-up — so no run can execute under the old mode while
     // the projection already shows the selection pending. It lands before the
     // run future is polled, hence before request assembly or the injected
     // instructions can observe the old state.
@@ -289,7 +289,7 @@ where
     (result, abort_requested)
 }
 
-/// Post-run settlement shared by user prompts and monitor idle-wakeups:
+/// Post-run settlement shared by user prompts and idle-wakeups:
 /// error notice, running flag, history/usage/session-list mirrors, steer
 /// accounting, title eligibility, and the `Settled` notice.
 #[allow(clippy::too_many_arguments)] // settlement plumbing: each input is a distinct sink
@@ -553,7 +553,7 @@ pub(super) async fn chain_goal_rounds(
 /// message per `OneAtATime` round exits after that round's run.
 ///
 /// This is the single entry point the actor uses for BOTH the wake-driven
-/// resume (a monitor steered events while idle) and the
+/// resume (a producer steered events while idle) and the
 /// between-runs facade `Steer` (S1: an idle steer now starts its own run
 /// instead of waiting for the next turn), and it is called after every
 /// normal settle to drain a steer that landed in the run's final moments
@@ -817,7 +817,8 @@ pub(super) fn subscribe_harness_events(
     let tx = notice_tx.clone();
     let wake = wakeup_tx.clone();
     session.subscribe_harness(Arc::new(move |event| match event {
-        // Idle-wakeup signal: a monitor steered events into the queue. The
+        // Idle-wakeup signal: a producer steered events into the queue (a
+        // background task completion, a subagent finish). The
         // actor decides whether the session is idle and resumes it
         // (`continue_` drains the steering queue first) — the listener stays
         // stateless and never touches the session itself.

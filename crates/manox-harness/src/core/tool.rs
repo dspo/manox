@@ -21,7 +21,7 @@ pub mod nudge {
     pub const GREP_TOOL_PREF: u8 = 1 << 0;
     /// Bit 1: long sleep (>=10s) → background suggestion shown.
     pub const SLEEP_BACKGROUND: u8 = 1 << 1;
-    /// Bit 2: poll loop (while/for/until + sleep) → background/Monitor shown.
+    /// Bit 2: poll loop (while/for/until + sleep) → background suggested.
     pub const POLL_LOOP: u8 = 1 << 2;
     /// Bit 3: gh run watch / gh pr checks --watch → background shown.
     pub const GH_WATCH: u8 = 1 << 3;

@@ -87,7 +87,7 @@ pub use thread_store::{
 /// command / hook registries. Call at App startup.
 pub fn init() {
     // Login-shell PATH install (background): GUI processes inherit a minimal
-    // launchd PATH, so bash/MCP/monitor subprocesses would lose Homebrew
+    // launchd PATH, so bash/MCP subprocesses would lose Homebrew
     // binaries. Resolved once and applied process-wide; first thing so later
     // init work (provider shell credentials, MCP spawns) benefits as soon as
     // the resolver lands.

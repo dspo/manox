@@ -8,7 +8,7 @@
 //! - `DangerFullAccess` runs every gated call ungated (bash unsandboxed).
 //! - `WorkspaceWrite` runs a gated call when its target is provably inside
 //!   the workspace (`path_policy` for `Write`/`Edit`; sandbox-confined
-//!   `Bash`/`Monitor` bypass via the auto-allow resolver); anything the
+//!   `Bash` bypass via the auto-allow resolver); anything the
 //!   policy cannot classify is denied (fail-closed).
 //! - `ReadOnly` denies every gated call; reads stay ungated.
 //!

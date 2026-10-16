@@ -11,7 +11,7 @@
 //! The manox harness has a single injection point: the process environment itself.
 //! Every spawn site inherits it — the kernel's bash tool
 //! (`TokioExecutionEnv`), MCP stdio servers
-//! (supervisor bus), and monitor/background commands.
+//! (supervisor bus), and background commands.
 //! [`install`] resolves the login shell's PATH once on a background thread
 //! and applies it process-wide, so no kernel or extension changes are
 //! needed.
@@ -53,7 +53,7 @@ pub fn resolved_login_path() -> &'static str {
 ///
 /// Called once from `manox_agent::init`. When the resolver returns, the process
 /// `PATH` is replaced, so every later subprocess spawn (bash tool,
-/// MCP stdio servers, monitors) inherits the user's environment.
+/// MCP stdio servers, background tasks) inherits the user's environment.
 /// Subprocesses spawned before the resolver lands inherit the launcher's
 /// minimal PATH — the pre-install situation, never worse.
 pub fn install() {

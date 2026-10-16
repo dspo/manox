@@ -1468,7 +1468,7 @@ fn test_model_switched() -> HarnessModel {
 
 /// H3 guard: the plan-mode boundary commit sits at the shared run start,
 /// so a run that does not come through the actor's Prompt arm (a goal
-/// round, a drained steer, a monitor wake-up — modelled here by calling
+/// round, a drained steer, an idle wake-up — modelled here by calling
 /// `drive_run` directly) still commits a pending selection before the run
 /// future is polled. Reverting the commit to the Prompt arm alone makes
 /// this test fail with `enabled() == false`.
