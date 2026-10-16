@@ -362,6 +362,7 @@ mod accept_without_a_reactor_tests {
             &self,
             _: &str,
             _: &str,
+            _: crate::runtime_trait::QuestionResponse,
             _: Vec<manox_agent::permission::AskAnswer>,
         ) -> Result<(), crate::error::RuntimeError> {
             Ok(())

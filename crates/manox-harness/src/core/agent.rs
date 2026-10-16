@@ -209,6 +209,9 @@ struct ActiveRun {
 pub type BeforeProviderRequestHook = Arc<dyn Fn(&AgentContext) -> AgentContext + Send + Sync>;
 pub type BeforeToolCallHook = Arc<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>;
 pub type AfterToolCallHook = Arc<dyn Fn(&AgentToolResult) -> AgentToolResult + Send + Sync>;
+/// Observes a run about to end on its own (the executed tool-call names, in
+/// order) and returns the veto continuation text, or `None` to let it end.
+pub type BeforeTurnEndHook = Arc<dyn Fn(&[String], &[String]) -> Option<String> + Send + Sync>;
 pub type PrepareTurnHook = Arc<
     dyn Fn() -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<Option<TurnUpdate>, anyhow::Error>> + Send>,
@@ -242,6 +245,9 @@ pub struct LoopHooks {
     /// Stops the run after a turn settles — a graceful stop before the next
     /// LLM call.
     pub should_stop_after_turn: Option<StopAfterTurnHook>,
+    /// Observes a run about to end on its own and may veto the stop with a
+    /// continuation message (the turn-end gate).
+    pub before_turn_end: Option<BeforeTurnEndHook>,
 }
 
 /// The Agent wraps the raw agent loop with state management, event
@@ -708,6 +714,11 @@ impl Agent {
                       new: &[AgentMessage]| { h(msg, results, ctx, new) },
             ) as crate::types::StopAfterTurnFn
         });
+        let before_turn_end = self.loop_hooks.before_turn_end.as_ref().map(|h| {
+            let h = Arc::clone(h);
+            Box::new(move |calls: &[String], last: &[String]| h(calls, last))
+                as crate::types::BeforeTurnEndFn
+        });
         AgentLoopConfig {
             get_steering_messages: Some(Box::new(move || steering.lock().unwrap().drain())),
             get_follow_up_messages: Some(Box::new(move || follow_up.lock().unwrap().drain())),
@@ -717,6 +728,8 @@ impl Agent {
             before_tool_call: before_tool,
             after_tool_call: after_tool,
             before_provider_request: before_provider,
+            before_turn_end,
+            max_turn_end_bounces: None,
             sequential_tool_execution: false,
             max_turns: None,
         }

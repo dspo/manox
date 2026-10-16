@@ -326,9 +326,8 @@ pub(super) fn session_builder(
 ) -> (
     manox_harness::coding_agent::AgentSessionBuilder,
     Arc<BackgroundManager>,
-    crate::plan_mode::ReadOnlySubagentResolver,
 ) {
-    let (tools, background, read_only_subagent) = build_tools(
+    let (tools, background) = build_tools(
         cwd,
         runtime,
         model,
@@ -404,7 +403,7 @@ pub(super) fn session_builder(
     if let Some(model) = model {
         builder = builder.with_model(model.clone());
     }
-    (builder, background, read_only_subagent)
+    (builder, background)
 }
 /// Adopt the session's own model after a restore: the reopened session
 /// projects its persisted model onto the harness, and the actor's working
@@ -422,27 +421,21 @@ pub(super) fn adopt_session_model(
 
 /// Register plan-mode extension hooks on a freshly built/restored session:
 /// `BeforeAgentStart` injects the rendered plan-mode instructions every turn
-/// while active; `ToolCall` enforces the read-only guarantee (plan-file
-/// writes excepted). Both read through the shared [`PlanSessionState`].
+/// while active; `BeforeTurnEnd` enforces the exit gate — a plan-mode run
+/// must end by calling one of the exit tools, and the harness bounces a
+/// bare stop with a continuation message. Both read through the shared
+/// [`PlanSessionState`].
 pub(super) fn attach_plan_hooks(
     session: &mut AgentSession,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
-    cwd: &Path,
-    read_only_subagent: crate::plan_mode::ReadOnlySubagentResolver,
 ) {
     session.on(
         manox_harness::harness::HookPoint::BeforeAgentStart,
         crate::plan_mode::injection_handler(Arc::clone(plan)),
     );
-    let plans_dir = crate::paths::plans_dir().unwrap_or_else(|_| PathBuf::from(".manox/plans"));
     session.on(
-        manox_harness::harness::HookPoint::ToolCall,
-        crate::plan_mode::gate_handler(
-            Arc::clone(plan),
-            plans_dir,
-            cwd.to_path_buf(),
-            read_only_subagent,
-        ),
+        manox_harness::harness::HookPoint::BeforeTurnEnd,
+        crate::plan_mode::turn_end_gate_handler(Arc::clone(plan)),
     );
 }
 
@@ -542,7 +535,7 @@ pub(super) async fn rebuild_session(
     // Like the startup restore, a session swap passes no model override so
     // the opened session's own persisted model wins; the actor adopts it
     // right after the open.
-    let (builder, background, read_only_subagent) = session_builder(
+    let (builder, background) = session_builder(
         &cwd,
         sessions_dir,
         runtime,
@@ -560,7 +553,7 @@ pub(super) async fn rebuild_session(
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
             attach_orchestrators(&mut s, &background);
-            attach_plan_hooks(&mut s, plan, &cwd, read_only_subagent);
+            attach_plan_hooks(&mut s, plan);
             // Session swaps (Open) must carry the
             // same plugin lifecycle hooks as fresh builds, or the swapped
             // session's PreToolUse/PostToolUse fire-and-forget shell-outs

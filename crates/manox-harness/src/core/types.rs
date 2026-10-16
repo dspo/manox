@@ -677,6 +677,12 @@ pub type AfterToolCallFn = Box<dyn Fn(&AgentToolResult) -> AgentToolResult + Sen
 /// return a mutated copy; the returned context is what the provider sees.
 pub type BeforeProviderRequestFn = Box<dyn Fn(&AgentContext) -> AgentContext + Send + Sync>;
 
+/// Observes a run about to end on its own (no pending tool calls, no queued
+/// steering) with the tool-call names executed during the run, in order.
+/// Returning `Some(text)` vetoes the stop: `text` is injected as a user
+/// message and the loop continues; `None` lets the run end.
+pub type BeforeTurnEndFn = Box<dyn Fn(&[String], &[String]) -> Option<String> + Send + Sync>;
+
 /// Configuration for a single agent loop invocation.
 #[derive(Default)]
 pub struct AgentLoopConfig {
@@ -698,6 +704,12 @@ pub struct AgentLoopConfig {
     pub after_tool_call: Option<AfterToolCallFn>,
     /// Called right before the context is handed to the provider, each turn.
     pub before_provider_request: Option<BeforeProviderRequestFn>,
+    /// Called when the run is about to end on its own; may veto with a
+    /// continuation message (the turn-end gate).
+    pub before_turn_end: Option<BeforeTurnEndFn>,
+    /// Veto budget per run once `before_turn_end` keeps bouncing the stop;
+    /// `None` defaults to 2. Beyond the budget the run ends regardless.
+    pub max_turn_end_bounces: Option<usize>,
     /// Whether tools execute sequentially (default: parallel).
     pub sequential_tool_execution: bool,
     /// Maximum number of turns before forcing a stop.

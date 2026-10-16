@@ -55,6 +55,20 @@ pub struct ImageAttachment {
     pub mime_type: String,
 }
 
+/// How a client settled a question card. A turn-final ask never feeds its
+/// answer back as a tool result, so the non-answer closes must reach the
+/// settle with their own meaning — an empty answer is not a cancel, and a
+/// cancel is not a dismissal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionResponse {
+    /// The user submitted answers.
+    Answer,
+    /// The user closed the card to speak instead.
+    Dismiss,
+    /// The card was cancelled (the turn died / the delivery withdrew).
+    Cancel,
+}
+
 /// How to create one session.
 #[derive(Debug, Clone, Default)]
 pub struct SessionIntent {
@@ -271,11 +285,13 @@ pub trait SessionRuntime: Send + Sync + 'static {
         approved: bool,
     ) -> Result<(), RuntimeError>;
 
-    /// Settle a question card with the answers the client submitted.
+    /// Settle a question card: the client's submitted answers, or a
+    /// non-answer close (dismissed to speak, or cancelled with the turn).
     fn answer_question(
         &self,
         session_id: &str,
         request_id: &str,
+        response: QuestionResponse,
         answers: Vec<manox_agent::permission::AskAnswer>,
     ) -> Result<(), RuntimeError>;
 

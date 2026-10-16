@@ -289,9 +289,36 @@ where
     (result, abort_requested)
 }
 
+/// A run's parked settlement: the run ended cleanly on a delivered ask, so
+/// its turn-finish waits for the answers (see `settle_run`'s hold). A held
+/// close is always a clean one — the hold requires a non-aborted,
+/// non-failed run — so the close journals `failed: false` and no stranded
+/// steers by construction; only the steered list varies.
+pub(super) struct HeldSettle {
+    pub(super) steered: Vec<String>,
+}
+
+/// Whether any open ask card was delivered by a run of THIS process (a
+/// stale card re-parked at restore never holds a turn: its turn predates
+/// the process, so no settle of ours may close or seed it).
+pub(super) fn live_ask_pending(state: &Arc<EngineState>) -> bool {
+    let stale = state.stale_questions.lock().unwrap();
+    state
+        .question_gate
+        .pending_entries()
+        .iter()
+        .any(|(id, _)| !stale.contains(id))
+}
+
 /// Post-run settlement shared by user prompts and idle-wakeups:
 /// error notice, running flag, history/usage/session-list mirrors, steer
 /// accounting, title eligibility, and the `Settled` notice.
+///
+/// A run that ended cleanly on a delivered `AskUserQuestion` HOLDS instead:
+/// its turn stays open on the wire until the answer settles (the ahp
+/// reducer settles input parts on the ACTIVE turn only, so a `turn_finish`
+/// here would cancel the just-delivered card at its own boundary). The
+/// deferred tail lands in [`finish_held_settle`].
 #[allow(clippy::too_many_arguments)] // settlement plumbing: each input is a distinct sink
 pub(super) async fn settle_run(
     result: &anyhow::Result<Vec<AgentMessage>>,
@@ -314,7 +341,21 @@ pub(super) async fn settle_run(
             "error notice",
         );
     }
-    state.running.store(false, Ordering::Relaxed);
+    // The hold: a clean run that still has an open ask keeps its turn (and
+    // the engine's running flag) until the answer settles. A dying run's
+    // open cards cancel here — no turn will ever hold for them, and a card
+    // whose turn is gone is unanswerable by construction (the journal
+    // decision row keeps the replay fold honest). Only cards this process
+    // delivered hold; restore-reparked cards are settled as journal-only
+    // rows (their turn predates the process).
+    let hold = !abort_requested && !failed && live_ask_pending(state);
+    state.running.store(hold, Ordering::Relaxed);
+    if !hold && !state.question_gate.pending_entries().is_empty() {
+        let appender = session.journal_appender();
+        for (id, meta) in state.question_gate.withdraw_all() {
+            journal_ask_decision(&appender, &id, &meta, "cancelled", state, notice_tx).await;
+        }
+    }
     // The sticky cwd may have moved during the run (a tool call with an
     // explicit `cwd`, or a `cd` inside a command): report one `CwdChanged`
     // per durable move so the facade mirror and the UI track the session
@@ -391,6 +432,13 @@ pub(super) async fn settle_run(
     } else {
         (std::mem::take(run_steers), Vec::new())
     };
+    if hold {
+        // Park the settlement tail: the turn stays open until a settling
+        // answer (or a dismiss/abort) closes it through `finish_held_settle`.
+        *state.held_settle.lock().unwrap() = Some(HeldSettle { steered });
+        state.awaiting_answers.store(true, Ordering::Relaxed);
+        return;
+    }
     // §C.2 `turn_finish`: the settle verdict must ride the journal, not
     // just the notice plane — v2 clients fold lifecycle facts from durable
     // rows (the `ThreadEvent::TurnFinished` notice is `Skip`ped by
@@ -437,6 +485,97 @@ pub(super) async fn settle_run(
         serde_json::json!({
             "cancelled": abort_requested,
             "failed": failed,
+        }),
+    );
+}
+
+/// Journal one settled ask's decision row at the caller's append point
+/// (the actor's idle path — journal order ahead of the boundary the settle
+/// implies). K4 fail-loud on permanent append failure: a durable loss
+/// record plus one facade notice — a decision row that vanished silently
+/// would keep a replayed card alive that no client can settle.
+pub(super) async fn journal_ask_decision(
+    appender: &Arc<JournalAppender>,
+    id: &str,
+    meta: &crate::permission::PendingAuthMeta,
+    verdict: &str,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    let payload = serde_json::json!({
+        "kind": "decision",
+        "authId": id,
+        "payload": { "toolName": meta.tool_name, "verdict": verdict },
+    });
+    if let Err(err) = append_typed_resilient(appender, "question", payload).await {
+        if let Some(row) = record_journal_loss(appender, "question", &err).await {
+            state.pending_journal.lock().unwrap().push(row);
+        }
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
+                "journal append permanently failed for `question`: {err:#}; the entry was dropped"
+            )))),
+            "error notice",
+        );
+    }
+}
+
+/// Close a held turn: the answers settled (or the user dismissed/aborted
+/// out), so the settlement `settle_run` parked lands now — the deferred
+/// `turn_finish` row, the `Settled` notice, and the Stop hook. `cancelled`
+/// is the close verdict: a normal answer settles complete; an abort while
+/// answers were pending settles cancelled.
+pub(super) async fn finish_held_settle(
+    held: HeldSettle,
+    cancelled: bool,
+    session: &AgentSession,
+    state: &Arc<EngineState>,
+    cwd: &Path,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    state.awaiting_answers.store(false, Ordering::Relaxed);
+    state.awaiting_abort.store(false, Ordering::Relaxed);
+    state.running.store(false, Ordering::Relaxed);
+    // A held close is always clean (see `HeldSettle`): `failed` is false
+    // and no steer stranded, by the hold's own precondition.
+    let turn_finish = serde_json::json!({
+        "cancelled": cancelled,
+        "failed": false,
+        "strandedSteerIds": Vec::<String>::new(),
+    });
+    let appender = session.journal_appender();
+    if let Err(err) = append_typed_resilient(&appender, "turn_finish", turn_finish).await {
+        // K4 fail-loud, same as `settle_run`'s own `turn_finish`: the row
+        // is the durable close every replay folds — losing it silently
+        // would leave a turn that never ends.
+        if let Some(row) = record_journal_loss(&appender, "turn_finish", &err).await {
+            state.pending_journal.lock().unwrap().push(row);
+        }
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
+                "journal append permanently failed for `turn_finish` at settle: {err:#}; the entry was dropped"
+            )))),
+            "error notice",
+        );
+    }
+    send_notice(
+        notice_tx,
+        BackendNotice::Settled {
+            cancelled,
+            failed: false,
+            steered: held.steered,
+            stranded: Vec::new(),
+        },
+        "held run settled",
+    );
+    crate::plugin_hooks::fire(
+        crate::plugin_hooks::HookEvent::Stop,
+        cwd.to_str(),
+        serde_json::json!({
+            "cancelled": cancelled,
+            "failed": false,
         }),
     );
 }
@@ -490,6 +629,11 @@ pub(super) async fn chain_goal_rounds(
     cwd: &Path,
     session_path: &Path,
 ) {
+    // A held turn (open ask awaiting answers) never chains: the next run
+    // would stack onto a turn that is still open on the wire.
+    if state.awaiting_answers.load(Ordering::Relaxed) {
+        return;
+    }
     loop {
         let queued = match &state.goal_bridge {
             Some(bridge) => {
@@ -538,6 +682,11 @@ pub(super) async fn chain_goal_rounds(
             return;
         }
         goal_housekeeping(&result, abort_requested, session, state).await;
+        // A round that ended on a delivered ask holds its turn — chaining
+        // another round would stack onto the still-open turn.
+        if state.awaiting_answers.load(Ordering::Relaxed) {
+            return;
+        }
     }
 }
 
@@ -577,6 +726,11 @@ pub(super) async fn resume_steering_queue(
     sessions_dir: &Path,
     cwd: &Path,
 ) {
+    // A held turn (open ask awaiting answers) never resumes into a run:
+    // the queued steer drains in the seeded (or next) run.
+    if state.awaiting_answers.load(Ordering::Relaxed) {
+        return;
+    }
     while !session.steering_messages().is_empty() {
         let handle = session.handle();
         let active_session_path = session.path().clone();
@@ -627,6 +781,11 @@ pub(super) async fn resume_steering_queue(
         // not-yet-drained steers (S4) and reported them stranded; an aborted
         // run must not auto-resume.
         if abort_requested || result.is_err() {
+            return;
+        }
+        // A round that ended on a delivered ask holds its turn — resuming
+        // another round would stack onto the still-open turn.
+        if state.awaiting_answers.load(Ordering::Relaxed) {
             return;
         }
         chain_goal_rounds(

@@ -1030,17 +1030,22 @@ impl RuntimeBackend {
     /// AHP's elicitation plane answers by request id, which is the same
     /// `authId` the translator surfaced the card under, so the two protocols
     /// name one identity. The client's answers ride the completed card and are
-    /// mapped here onto the kernel's `AskAnswer` list.
+    /// mapped here onto the kernel's `AskAnswer` list; the response kind
+    /// carries the non-answer closes (an empty answer is not a cancel).
     fn answer_question(
         &self,
         channel: &str,
         request_id: &str,
+        response: crate::runtime_trait::QuestionResponse,
         answers: Vec<manox_agent::permission::AskAnswer>,
     ) -> DispatchOutcome {
         let Some(session_id) = chat::id(channel) else {
             return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
         };
-        match self.server.answer_question(session_id, request_id, answers) {
+        match self
+            .server
+            .answer_question(session_id, request_id, response, answers)
+        {
             Ok(()) => DispatchOutcome::Accepted,
             Err(error) => DispatchOutcome::Rejected(error.message),
         }
@@ -1856,12 +1861,19 @@ impl Backend for RuntimeBackend {
                 outcome
             }
             StateAction::ChatInputCompleted(completed) => {
+                use crate::runtime_trait::QuestionResponse;
+                let response = match completed.response {
+                    ahp_types::state::ChatInputResponseKind::Accept => QuestionResponse::Answer,
+                    ahp_types::state::ChatInputResponseKind::Decline => QuestionResponse::Dismiss,
+                    ahp_types::state::ChatInputResponseKind::Cancel => QuestionResponse::Cancel,
+                };
                 let outcome = if completed.request_id.starts_with("plan-review:") {
                     self.resolve_plan_review(channel, completed)
                 } else {
                     self.answer_question(
                         channel,
                         &completed.request_id,
+                        response,
                         map_answers(&completed.answers),
                     )
                 };
@@ -2955,6 +2967,7 @@ mod mcp_dispatch_tests {
             &self,
             _session_id: &str,
             _request_id: &str,
+            _response: crate::runtime_trait::QuestionResponse,
             _answers: Vec<manox_agent::permission::AskAnswer>,
         ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))

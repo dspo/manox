@@ -422,11 +422,13 @@ impl SessionRuntime for GatewayRuntime {
         &self,
         session_id: &str,
         request_id: &str,
+        response: manox_ahp_runtime::runtime_trait::QuestionResponse,
         answers: Vec<manox_agent::permission::AskAnswer>,
     ) -> Result<(), RuntimeError> {
         tracing::debug!(
             session = %session_id,
             request_id = %request_id,
+            ?response,
             answers = answers.len(),
             "gateway: answering question"
         );
@@ -436,12 +438,13 @@ impl SessionRuntime for GatewayRuntime {
         let thread = block_on(crate::agent_server::ensure_opened_for_settle(
             &inner, session_id,
         ))?;
-        thread.with_mut(|t| {
-            t.respond_question(
-                request_id,
-                manox_agent::questions::AskOutcome::Answered(answers),
-            )
-        });
+        use manox_ahp_runtime::runtime_trait::QuestionResponse;
+        let outcome = match response {
+            QuestionResponse::Answer => manox_agent::questions::AskOutcome::Answered(answers),
+            QuestionResponse::Dismiss => manox_agent::questions::AskOutcome::Dismissed,
+            QuestionResponse::Cancel => manox_agent::questions::AskOutcome::Cancelled,
+        };
+        thread.with_mut(|t| t.respond_question(request_id, outcome));
         Ok(())
     }
 
