@@ -3,13 +3,14 @@
 
 use super::*;
 
-/// Bind the orchestrators to a freshly built session: the monitor steerer
-/// lands events in the session's steering queue and the background manager
-/// subscribes to the session's lifecycle.
-pub(super) fn attach_orchestrators(session: &mut AgentSession, orch: &SessionOrchestrators) {
-    let handle = session.handle();
-    orch.monitor.attach(&handle);
-    orch.background.attach(session);
+/// Bind the orchestrator to a freshly built session: the background
+/// manager subscribes to the session's lifecycle (completion steers land
+/// in the session's steering queue).
+pub(super) fn attach_orchestrators(
+    session: &mut AgentSession,
+    background: &Arc<BackgroundManager>,
+) {
+    background.attach(session);
 }
 pub(super) fn steer_message(id: String, text: String, images: Vec<ContentBlock>) -> AgentMessage {
     let mut content = vec![ContentBlock::Text {
@@ -197,7 +198,7 @@ pub(super) fn prompt_user_message(text: &str, images: &[ContentBlock]) -> AgentM
 /// the normal path. The pin and any drain-time append carry the
 /// POST-expansion text (the K5 edge: the run announces the expanded
 /// shape); the acceptance-side persistence expands identically. An origin-less prompt (an internally-driven `run()`
-/// turn, a goal/monitor seed) keeps the legacy flow: the middleware
+/// turn, a goal seed) keeps the legacy flow: the middleware
 /// persists its user message at announce time.
 pub(super) async fn persist_prompt_user_entry(
     session: &AgentSession,
@@ -324,10 +325,10 @@ pub(super) fn session_builder(
     bus: &Arc<crate::steer_bus::AgentBus>,
 ) -> (
     manox_harness::coding_agent::AgentSessionBuilder,
-    SessionOrchestrators,
+    Arc<BackgroundManager>,
     crate::plan_mode::ReadOnlySubagentResolver,
 ) {
-    let (tools, orchestrators, read_only_subagent) = build_tools(
+    let (tools, background, read_only_subagent) = build_tools(
         cwd,
         runtime,
         model,
@@ -340,12 +341,11 @@ pub(super) fn session_builder(
         granted_roots,
         bus,
     );
-    // One observer wiring per orchestrator pair: the host task center sees
+    // One observer wiring per session: the host task center sees
     // every producer lifecycle from this session (card snapshots + stop
     // routing), no per-open re-attach.
     crate::background_task::attach(
-        Arc::clone(&orchestrators.monitor),
-        Arc::clone(&orchestrators.background),
+        Arc::clone(&background),
         notice_tx.clone(),
         thread_id.to_string(),
     );
@@ -404,7 +404,7 @@ pub(super) fn session_builder(
     if let Some(model) = model {
         builder = builder.with_model(model.clone());
     }
-    (builder, orchestrators, read_only_subagent)
+    (builder, background, read_only_subagent)
 }
 /// Adopt the session's own model after a restore: the reopened session
 /// projects its persisted model onto the harness, and the actor's working
@@ -542,7 +542,7 @@ pub(super) async fn rebuild_session(
     // Like the startup restore, a session swap passes no model override so
     // the opened session's own persisted model wins; the actor adopts it
     // right after the open.
-    let (builder, orchestrators, read_only_subagent) = session_builder(
+    let (builder, background, read_only_subagent) = session_builder(
         &cwd,
         sessions_dir,
         runtime,
@@ -559,7 +559,7 @@ pub(super) async fn rebuild_session(
     );
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
-            attach_orchestrators(&mut s, &orchestrators);
+            attach_orchestrators(&mut s, &background);
             attach_plan_hooks(&mut s, plan, &cwd, read_only_subagent);
             // Session swaps (Open) must carry the
             // same plugin lifecycle hooks as fresh builds, or the swapped

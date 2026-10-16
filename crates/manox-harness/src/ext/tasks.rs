@@ -1,6 +1,6 @@
 //! Unified task lifecycle vocabulary and the observer seam.
 //!
-//! The kernel-path producers — command/WebSocket monitors and background bash —
+//! The kernel-path producers — background bash —
 //! report through one [`TaskLifecycle`] stream to one [`TaskObserver`]. A
 //! settlement pairs the outcome ([`SettlementKind`]) with an explicit
 //! [`SettlementCause`], so consumers no longer infer "stopped by whom" from
@@ -18,8 +18,6 @@ use std::sync::Arc;
 /// Which family of background work a task belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TaskFamily {
-    MonitorCommand,
-    MonitorWebSocket,
     BackgroundBash,
     Subagent,
 }

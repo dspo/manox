@@ -18,7 +18,6 @@ use manox_harness::bash::orchestration::BackgroundManager;
 use manox_harness::bash::persistent::PersistentShellOperations;
 use manox_harness::coding_agent::{AgentSession, ModelRuntime, create_agent_session};
 use manox_harness::ext_point_agent::AgentRegistry;
-use manox_harness::monitor::{MonitorManager, MonitorTool};
 use manox_harness::subagent::spawn::register_defaults;
 use manox_harness::subagent::{DelegationToolConfig, SpawnProvider, SubagentRuntime};
 use manox_harness::tool::AgentTool as HarnessAgentTool;
@@ -1047,7 +1046,7 @@ async fn run_actor(
         // projects the session's own model only when the builder carries
         // none, and the actor adopts
         // it right after the open below.
-        let (builder, orchestrators, read_only_subagent) = session_builder(
+        let (builder, background, read_only_subagent) = session_builder(
             &tool_cwd,
             &sessions_dir,
             &runtime,
@@ -1064,7 +1063,7 @@ async fn run_actor(
         );
         match builder.open(session_path).await {
             Ok(mut s) => {
-                attach_orchestrators(&mut s, &orchestrators);
+                attach_orchestrators(&mut s, &background);
                 attach_plan_hooks(&mut s, &state.plan, &tool_cwd, read_only_subagent);
                 attach_plugin_hooks(&mut s, &tool_cwd);
                 attach_prefix_gate(&mut s, &notice_tx, &thread_id);
@@ -1082,7 +1081,7 @@ async fn run_actor(
     let mut session = match session {
         Some(s) => s,
         None => {
-            let (builder, orchestrators, read_only_subagent) = session_builder(
+            let (builder, background, read_only_subagent) = session_builder(
                 &cwd,
                 &sessions_dir,
                 &runtime,
@@ -1102,7 +1101,7 @@ async fn run_actor(
             // share one identity.
             match builder.with_session_id(thread_id.clone()).build().await {
                 Ok(mut s) => {
-                    attach_orchestrators(&mut s, &orchestrators);
+                    attach_orchestrators(&mut s, &background);
                     attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
                     attach_plugin_hooks(&mut s, &cwd);
                     attach_prefix_gate(&mut s, &notice_tx, &thread_id);
@@ -1151,7 +1150,8 @@ async fn run_actor(
     }
     spawn_session_list_refresh(&sessions_dir, &state);
 
-    // Idle-wakeup channel: the harness listener signals when monitor events
+    // Idle-wakeup channel: the harness listener signals when steered events
+    // (a background task's completion summary, a subagent's finish note)
     // land in the steering queue; the actor resumes an idle session below.
     let (wakeup_tx, mut wakeup_rx) = mpsc::unbounded_channel::<()>();
 
@@ -1343,18 +1343,18 @@ async fn run_actor(
         for cmd in parked_cmds {
             let _ = cmd_tx.send(cmd);
         }
-        // Between runs the actor wakes on either a facade command or a
-        // monitor idle-wakeup (steered events queued while the session was
-        // idle). Mid-run wakeups simply accumulate and are re-checked after
-        // settlement.
+        // Between runs the actor wakes on either a facade command or an
+        // idle-wakeup (steered events queued while the session was idle —
+        // a background task completion, a subagent finish). Mid-run
+        // wakeups simply accumulate and are re-checked after settlement.
         let cmd = tokio::select! {
             // None = facade dropped: shut down.
             cmd = cmd_rx.recv() => cmd,
             _ = wakeup_rx.recv() => {
                 // Collapse wakeups queued while the actor was busy; the
                 // steering-queue check inside the helper decides whether a
-                // run is owed. A monitor steered events while the session was
-                // idle — resume now (S1 via the shared helper).
+                // run is owed. A producer steered events while the session
+                // was idle — resume now (S1 via the shared helper).
                 while wakeup_rx.try_recv().is_ok() {}
                 resume_steering_queue(
                     &mut session,

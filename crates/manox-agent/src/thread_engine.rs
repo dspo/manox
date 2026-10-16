@@ -109,7 +109,8 @@ pub trait ThreadEngine: Send + Sync {
     /// durable identity end-to-end — the injected `user` journal row lands
     /// under this id and the returned id equals it, so the client that minted
     /// the id can correlate the injection and, on an aborted run, retract
-    /// exactly this steer. `None` (internal steers such as the monitor bridge)
+    /// exactly this steer. `None` (internal steers such as the background
+    /// completion bridge)
     /// self-mints a fresh id as before.
     fn steer(
         &self,

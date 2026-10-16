@@ -1,7 +1,7 @@
 // Background task registry — the interface behind long-running shell
-// commands (`Bash run_in_background`), command monitors, and web socket
-// monitors. The harness defines the seam; implementations live in extension
-// crates so the core stays free of process-management policy.
+// commands (`Bash run_in_background`). The harness defines the seam;
+// implementations live in extension crates so the core stays free of
+// process-management policy.
 
 use std::path::Path;
 
@@ -44,8 +44,10 @@ pub enum TaskError {
 ///
 /// `spawn` returns immediately with an id; output accumulates in a ring
 /// buffer and `poll` returns only the increment since the previous poll, so
-/// a consumer (a poll-style tool or a monitor) can follow progress without
-/// re-reading history. `kill` terminates the process group.
+/// a consumer (a poll-style tool) can follow progress without re-reading
+/// history. `collect_exit` blocks a model-facing read until the task's exit
+/// is recorded, so a consumer can wait for completion instead of polling.
+/// `kill` terminates the process group.
 #[async_trait::async_trait]
 pub trait BackgroundTaskRegistry: Send + Sync {
     /// Start a command in the background and return its id immediately.
@@ -56,4 +58,11 @@ pub trait BackgroundTaskRegistry: Send + Sync {
 
     /// Terminate the task's process group.
     async fn kill(&self, id: &TaskId) -> Result<(), TaskError>;
+
+    /// Resolve when the task's exit code has been recorded; an
+    /// already-exited task resolves immediately. Unlike `poll`, this does
+    /// not advance the read cursor. An exit that lands while this call is
+    /// blocked is collected by it: the caller's result carries the terminal
+    /// state, so no completion notice repeats it.
+    async fn collect_exit(&self, id: &TaskId) -> Result<(), TaskError>;
 }

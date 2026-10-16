@@ -593,8 +593,9 @@ fn nudge_sleep_loop(command: &str, ctx: &dyn ToolContext) -> String {
         if secs >= 10
             && !crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::SLEEP_BACKGROUND)
         {
-            return "\n\n[tip: long wait detected — use `run_in_background: true` and the completion \
-                    summary will wake you automatically when done]".to_string();
+            return "\n\n[tip: long wait detected — use `run_in_background: true`; the completion \
+                    summary wakes you automatically, or block on it with `BashOutput` (`wait: true`)]"
+                .to_string();
         }
     }
 
@@ -605,8 +606,8 @@ fn nudge_sleep_loop(command: &str, ctx: &dyn ToolContext) -> String {
         && trimmed.contains("sleep")
         && !crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::POLL_LOOP)
     {
-        return "\n\n[tip: poll loop detected — use `run_in_background: true` with completion \
-                wake-up, or `Monitor` for streaming observation]"
+        return "\n\n[tip: poll loop detected — use `run_in_background: true` and `BashOutput` \
+                (`wait: true`) to block on it, or let the completion wake-up fire]"
             .to_string();
     }
 
@@ -614,8 +615,8 @@ fn nudge_sleep_loop(command: &str, ctx: &dyn ToolContext) -> String {
     if (trimmed.contains("gh run watch") || trimmed.contains("gh pr checks --watch"))
         && !crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::GH_WATCH)
     {
-        return "\n\n[tip: CI wait detected — use `run_in_background: true` and the completion \
-                summary will wake you when the CI finishes]"
+        return "\n\n[tip: CI wait detected — use `run_in_background: true` and `BashOutput` \
+                (`wait: true`) to block until the CI finishes, or let the completion wake-up fire]"
             .to_string();
     }
 
@@ -696,6 +697,12 @@ mod tests {
             })
         }
         async fn kill(&self, _id: &crate::core::TaskId) -> Result<(), crate::core::TaskError> {
+            Ok(())
+        }
+        async fn collect_exit(
+            &self,
+            _id: &crate::core::TaskId,
+        ) -> Result<(), crate::core::TaskError> {
             Ok(())
         }
     }

@@ -248,7 +248,6 @@ fn tool_id_from_spec(spec: &str) -> Option<String> {
         "ls" | "list" | "list_directory" => "Ls".to_string(),
         "askuserquestion" | "ask_user" => crate::tools::ASK_USER_QUESTION.to_string(),
         "skill" => crate::tools::SKILL.to_string(),
-        "monitor" => crate::tools::MONITOR.to_string(),
         other => other.to_string(),
     })
 }

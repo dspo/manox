@@ -10,9 +10,6 @@ async-channel.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["fs", "process", "time", "sync", "io-util", "macros", "rt-multi-thread"] }
 tokio-util.workspace = true
-tokio-tungstenite.workspace = true
-tokio-native-tls = "0.3"
-native-tls = "0.2"
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml.workspace = true
