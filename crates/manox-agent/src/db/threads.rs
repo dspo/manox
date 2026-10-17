@@ -37,10 +37,6 @@ pub struct ThreadSummary {
     /// User-assigned tag shown as a chip on the sidebar row. Persisted in
     /// the session sidecar (the sidebar's source of truth), not in SQL.
     pub tag: Option<String>,
-    /// The bind successor that superseded this session (sidecar truth).
-    /// Superseded rows resolve to their successor on load and never lead a
-    /// list partition. `None` = live identity.
-    pub superseded_by: Option<String>,
     /// Unread flag: the thread finished a turn the user has not yet viewed.
     /// Set on a background thread's terminal `Stop`/`Error`, cleared when the
     /// user switches into the thread. `upsert` never touches this column — only
@@ -175,9 +171,7 @@ pub fn create_table(conn: &Connection) -> Result<()> {
 }
 
 impl ThreadsDatabase {
-    /// Delete one thread's durable rows (`threads` + `thread_data`). Used by
-    /// the superseded-predecessor purge: such an id's only artifacts are its
-    /// sidecar marker and, at most, rows a create-time upsert left behind.
+    /// Delete one thread's durable rows (`threads` + `thread_data`).
     pub fn delete_thread(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute("DELETE FROM thread_data WHERE thread_id = ?1", params![id])
@@ -437,7 +431,6 @@ impl ThreadsDatabase {
         let rows = stmt.query_map([], |row| {
             Ok(ThreadSummary {
                 // Sidecar truth; the store's meta merge fills this in.
-                superseded_by: None,
                 id: row.get(0)?,
                 summary: row.get(1)?,
                 title: row.get(2)?,

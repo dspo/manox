@@ -3494,7 +3494,6 @@ fn session_info_to_summary(
     info: &manox_harness::session::repository::SessionInfo,
 ) -> ThreadSummary {
     ThreadSummary {
-        superseded_by: None,
         id: info.id.clone(),
         summary: info.first_message.clone(),
         title: None,

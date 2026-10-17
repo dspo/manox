@@ -334,12 +334,6 @@ pub struct Thread {
     messages: Vec<Message>,
     reasoning_effort: ReasoningEffort,
     pinned: bool,
-    /// This entity is a redirect stub for a bind successor: it shares the
-    /// successor's engine `Arc` without owning it, so `Drop` must not shut
-    /// that engine down (review #809 [sugg] 6 — the real engine's
-    /// `shutdown` asks the live actor to close, which would kill the
-    /// successor).
-    redirect_stub: bool,
     archived: bool,
     running: bool,
     restored: bool,
@@ -812,7 +806,6 @@ impl Thread {
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
             archived: false,
-            redirect_stub: false,
             running: false,
             restored: false,
             display: Vec::new(),
@@ -917,7 +910,6 @@ impl Thread {
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
             archived: false,
-            redirect_stub: false,
             running: false,
             restored: false,
             display: Vec::new(),
@@ -1883,7 +1875,6 @@ impl Thread {
             reasoning_effort,
             pinned: false,
             archived: false,
-            redirect_stub: false,
             running: false,
             restored: false,
             display: Vec::new(),
@@ -2064,21 +2055,26 @@ impl Thread {
     }
 
     /// Move the session's working directory at any interaction state —
-    /// the host-driven `SetCwd` path. Unlike a bind (which mints a
-    /// initial-only project binding, guarded by `has_interacted`), this
-    /// follows the per-call cwd machinery: the sticky cwd advances and the
-    /// move is durable as a `cwd_change` entry, never touching the header
-    /// cwd or the project binding.
-    pub fn set_cwd(&self, path: PathBuf) {
+    /// the host-driven `SetCwd` path. Identity never follows the
+    /// directory. A session nobody has interacted with yet relocates in
+    /// place: its project binding moves with it (the sidebar groups it
+    /// where the user is about to start) and the move rides the same
+    /// durable `cwd_change` entry, which lands as the first row when the
+    /// session materializes. An interacted session keeps its binding and
+    /// only advances the sticky cwd through that entry.
+    pub fn set_cwd(&mut self, path: PathBuf) {
+        if !self.has_interacted() {
+            self.cwd = path.clone();
+            self.project = Some(path.clone());
+        }
         if let Some(engine) = &self.engine {
             engine.set_cwd(path);
         }
     }
 
-    /// Creation-time project binding (the `new_in_project` path): the only
-    /// place a project binds — a live session never re-binds (identity
-    /// follows the log; a bind on a live thread mints a successor session
-    /// instead, see `AgentServerInner::bind_successor`).
+    /// Creation-time project binding (the `new_in_project` path). A session
+    /// nobody has interacted with yet may still relocate through `set_cwd`;
+    /// an interacted one never re-binds.
     pub fn bind_at_creation(&mut self, dir: PathBuf) {
         self.cwd = dir.clone();
         self.project = Some(dir.clone());
@@ -2087,26 +2083,6 @@ impl Thread {
             // one step (no orphaned pre-project session file).
             self.ensure_engine(Some(dir));
         }
-    }
-
-    /// Identity-follows-log hand-off: this predecessor entity becomes a
-    /// redirect stub for its bind successor — the successor's engine (its
-    /// journal feed and read seam) plus mirrored header fields — so live
-    /// streams and ops still addressed to the predecessor id converge on
-    /// the successor log (the seq regression resyncs them loudly).
-    pub fn adopt_successor(&mut self, engine: Arc<dyn ThreadEngine>, dir: PathBuf) {
-        self.cwd = dir.clone();
-        self.project = Some(dir);
-        self.engine = Some(engine);
-        // The stub shares the successor's engine without owning it: `Drop`
-        // must not ask that engine to shut down (review #809 [sugg] 6).
-        self.redirect_stub = true;
-    }
-
-    /// The engine behind this thread (the successor-stub hand-off shares it
-    /// between the predecessor stub and the canonical successor entity).
-    pub fn engine_clone(&self) -> Option<Arc<dyn ThreadEngine>> {
-        self.engine.clone()
     }
 
     /// Manual compaction (`/compact`): no-op while a turn is in flight (the
@@ -2712,12 +2688,7 @@ impl Drop for Thread {
     fn drop(&mut self) {
         // The engine owns the actor; ask it to close gracefully. If the
         // channel is already gone the actor exited on its own. A landing
-        // thread has no engine to shut down, and a redirect stub shares the
-        // successor's engine — shutting it down here would kill a live
-        // session (review #809 [sugg] 6).
-        if self.redirect_stub {
-            return;
-        }
+        // thread has no engine to shut down.
         if let Some(engine) = &self.engine {
             engine.shutdown();
         }
@@ -2860,7 +2831,6 @@ pub(crate) mod tests {
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
             archived: false,
-            redirect_stub: false,
             running: false,
             restored: false,
             display: Vec::new(),

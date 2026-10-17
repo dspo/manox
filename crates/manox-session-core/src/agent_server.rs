@@ -13,7 +13,7 @@
 //! to be reported rather than swallowed — a silent no-op would leave every
 //! client converged on a session state that never took effect.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -143,30 +143,8 @@ struct QueuedSubmit {
 /// The single gateway. Cloning shares the inner state.
 pub struct AgentServer(Arc<AgentServerInner>);
 
-/// Releases one transient session owner when its scope ends — success,
-/// failure or panic — so an internal open can never leave a ghost owner
-/// that defeats the orphaned-session reap (review r3 [sugg] 3).
-struct OwnerLease {
-    inner: Arc<AgentServerInner>,
-    owner: &'static str,
-    id: String,
-}
-
-impl Drop for OwnerLease {
-    fn drop(&mut self) {
-        self.inner.remove_owner(self.owner, &self.id);
-    }
-}
-
 pub(crate) struct AgentServerInner {
     cwd: PathBuf,
-    /// Bind redirect map (predecessor → successor session id): the live
-    /// half of the supersede contract; the sidecar marker is the
-    /// restart-surviving half (`ThreadStore::superseded_by`).
-    superseded: Mutex<HashMap<String, String>>,
-    /// Bind hand-offs in flight per predecessor: two quick `SetCwd` notes
-    /// must not mint two successors (review #805 [sugg] 6).
-    binding: Mutex<HashSet<String>>,
     sessions: Mutex<HashMap<String, ServerSession>>,
     /// session_id → client_ids that own (view) it. A session may have several
     /// owners; each receives its streamed notes.
@@ -601,8 +579,6 @@ impl AgentServer {
         manox_terminal::runtime::set_runtime(manox_agent::runtime::handle().clone());
         let inner = Arc::new(AgentServerInner {
             cwd,
-            superseded: Mutex::new(HashMap::new()),
-            binding: Mutex::new(HashSet::new()),
             sessions: Mutex::new(HashMap::new()),
             session_owners: Mutex::new(HashMap::new()),
             #[cfg(feature = "terminal")]
@@ -726,33 +702,11 @@ impl AgentServer {
 
 impl AgentServerInner {
     // ── Pure state accessors (no spawning). ─────────────────────────────────
-    /// Resolve the bind redirect chain: the live map first, the sidecar
-    /// `superseded_by` marker as the restart-surviving half (cached into
-    /// the live map on first hit). The superseded guard drops before the
-    /// store read (lock order), and the bounded walk caps cycles.
-    fn resolve_redirect(&self, session_id: &str) -> String {
-        let mut id = session_id.to_string();
-        for _ in 0..8 {
-            let next = { self.superseded.lock().get(&id).cloned() };
-            let next = next.or_else(|| {
-                let from_store = manox_agent::thread_store::try_global()
-                    .and_then(|store| store.read(|s| s.superseded_by(&id)));
-                if let Some(succ) = &from_store {
-                    self.superseded.lock().insert(id.clone(), succ.clone());
-                }
-                from_store
-            });
-            match next {
-                Some(next) if next != id => id = next,
-                _ => break,
-            }
-        }
-        id
-    }
-
     pub(crate) fn session_thread(&self, session_id: &str) -> Option<ThreadHandle> {
-        let id = self.resolve_redirect(session_id);
-        self.sessions.lock().get(&id).map(|s| s.thread.clone())
+        self.sessions
+            .lock()
+            .get(session_id)
+            .map(|s| s.thread.clone())
     }
 
     fn owners(&self, session_id: &str) -> Vec<String> {
@@ -868,7 +822,7 @@ pub(crate) async fn ensure_opened_for_settle(
     let thread = if let Some(thread) = inner.session_thread(session_id) {
         thread
     } else {
-        let id = inner.resolve_redirect(session_id);
+        let id = session_id.to_string();
         let owner = inner
             .owners(&id)
             .into_iter()
@@ -1578,16 +1532,6 @@ impl AgentServerInner {
         client_id: Option<String>,
         origin_rpc: Option<String>,
     ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
-        // Bind redirect + restart window: submissions addressed to a
-        // superseded predecessor land on the successor, opened under its
-        // own id with this connection as owner. Only a real redirect
-        // auto-opens — a cold id keeps not-found semantics (review #805
-        // r2 [issue] B).
-        let effective = self.resolve_redirect(session_id);
-        if effective != session_id && !self.sessions.lock().contains_key(&effective) {
-            let _ = open_session(self, owner, &effective).await;
-        }
-        let session_id = effective.as_str();
         let receipt = |accepted: bool, message_id: Option<String>| {
             Ok(json!({ "accepted": accepted, "message_id": message_id }))
         };
@@ -1820,8 +1764,7 @@ impl AgentServerInner {
     }
 
     pub(crate) fn drop_queued(&self, session_id: &str, client_id: String) {
-        let resolved = self.resolve_redirect(session_id);
-        if let Some(session) = self.sessions.lock().get(&resolved) {
+        if let Some(session) = self.sessions.lock().get(session_id) {
             let pending = session.pending_submits.clone();
             pending.lock().retain(|q| q.client_id != client_id);
         }
@@ -1952,236 +1895,22 @@ impl AgentServerInner {
         Ok(())
     }
 
+    /// Move a session's working directory. Identity never follows the
+    /// directory: a not-yet-interacted session relocates in place (its
+    /// project binding moves with it, and the move lands as its first
+    /// durable row when it materializes), while an interacted session
+    /// records a `cwd_change` entry — one id, one log, at every
+    /// interaction state. A cold id keeps not-found semantics.
     pub(crate) async fn set_cwd(
         self: &Arc<Self>,
         session_id: &str,
         cwd: &str,
     ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
-        // Restart-window opens from a note carry no connection identity:
-        // use a transient owner and release it right after so it never
-        // defeats the orphaned-session reap (review #805 [sugg] 11).
-        const NOTE_OWNER: &str = "note-setcwd";
-        let effective = self.resolve_redirect(session_id);
-        // Only a real redirect auto-opens here (a cold id keeps not-found
-        // semantics, review #805 r2 [issue] B); the transient owner stays
-        // until the hand-off releases it so the session is never ownerless
-        // (r2 [sugg] G).
-        if effective != session_id && !self.sessions.lock().contains_key(&effective) {
-            let _ = open_session(self, NOTE_OWNER, &effective).await;
-        }
-        // The transient owner rides the OPENED id (never the id a bind
-        // may mint later), and every exit path releases it (review r3
-        // [problem] 2).
-        let opened_id = (effective != session_id && self.sessions.lock().contains_key(&effective))
-            .then(|| effective.clone());
-        let Some(thread) = self.session_thread(&effective) else {
-            if let Some(id) = &opened_id {
-                self.remove_owner(NOTE_OWNER, id);
-            }
+        let Some(thread) = self.session_thread(session_id) else {
             return Err(unknown_session(session_id));
         };
-        if thread.read(|t| t.has_interacted()) {
-            // The working-directory switch applies at ANY interaction
-            // state, through the same per-call cwd machinery the model's
-            // tools use: sticky advance + a durable `cwd_change` entry —
-            // never the header cwd, never a re-bind.
-            thread.with_mut(|t| t.set_cwd(cwd.into()));
-            if let Some(id) = &opened_id {
-                self.remove_owner(NOTE_OWNER, id);
-            }
-            return Ok(());
-        }
-        // Bind on a not-yet-interacted thread: identity follows the log —
-        // the directory becomes a SUCCESSOR session (fresh chain bound at
-        // creation), and this predecessor degrades into a redirect stub
-        // sharing the successor's engine (#802: no chain swap under a
-        // live identity, ever).
-        let inner = Arc::clone(self);
-        let session_id = session_id.to_string();
-        let cwd = cwd.to_string();
-        manox_agent::runtime::handle().spawn(async move {
-            if let Err(error) = inner.bind_successor(&session_id, &cwd).await {
-                tracing::warn!(session = %session_id, %error, "bind successor failed");
-            }
-            // Released AFTER the hand-off, on the id the owner was added
-            // to (review r3 [problem] 2).
-            if let Some(id) = opened_id {
-                inner.remove_owner(NOTE_OWNER, &id);
-            }
-        });
+        thread.with_mut(|t| t.set_cwd(cwd.into()));
         Ok(())
-    }
-
-    /// The bind hand-off (#802 / identity-follows-log): mint the successor
-    /// session bound to `cwd`, mark the predecessor superseded (sidecar +
-    /// live map), stub the predecessor entity onto the successor's engine
-    /// so live streams/ops addressed to it converge on the new log, and
-    /// publish the control-face hand-off (`SessionDisposed { successor }`).
-    async fn bind_successor(self: &Arc<Self>, pred_id: &str, cwd: &str) -> Result<(), String> {
-        // Dedupe keys on the RESOLVED id: a note may arrive on any
-        // predecessor of the same redirect chain, and inserting one id
-        // while removing another wedges the set forever (review #805 r2
-        // [issue] A).
-        let key = self.resolve_redirect(pred_id);
-        if !self.binding.lock().insert(key.clone()) {
-            return Err("bind already in flight".into());
-        }
-        let outcome = self.bind_successor_impl(pred_id, cwd).await;
-        self.binding.lock().remove(&key);
-        outcome
-    }
-
-    async fn bind_successor_impl(self: &Arc<Self>, pred_id: &str, cwd: &str) -> Result<(), String> {
-        // The lease is armed as soon as the successor exists and releases
-        // the internal owner on EVERY exit — including the narrow failure
-        // window after `create` (review r3 [sugg] 3).
-        let pred = self.session_thread(pred_id).ok_or("unknown session")?;
-        let (model, approval, effort) = pred.read(|t| {
-            (
-                t.model().map(|m| format!("{}/{}", m.provider, m.id)),
-                t.permission_mode().wire().to_string(),
-                match t.reasoning_effort() {
-                    manox_agent::language_model::ReasoningEffort::High => "high",
-                    manox_agent::language_model::ReasoningEffort::Max => "max",
-                }
-                .to_string(),
-            )
-        });
-        let created = Self::create_session_request(
-            self,
-            "server-bind",
-            SessionIntent {
-                session_id: None,
-                cwd: Some(cwd.to_string()),
-                project: Some(cwd.to_string()),
-                initial_model: model,
-                approval_mode: Some(approval),
-                reasoning_effort: Some(effort),
-                seed: None,
-                working_directories: Vec::new(),
-            },
-        )
-        .await
-        .map_err(|e| e.message)?;
-        let succ_id = created["session_id"]
-            .as_str()
-            .ok_or("create answered without a session id")?
-            .to_string();
-        let _bind_lease = OwnerLease {
-            inner: Arc::clone(self),
-            owner: "server-bind",
-            id: succ_id.clone(),
-        };
-        // Every fail-able step runs BEFORE the durable hand-off: past
-        // `mark_superseded` there is no rollback, so a failure below this
-        // line would strand a superseded predecessor with no alias (review
-        // #805 r2 [sugg] F).
-        let succ = self
-            .session_thread(&succ_id)
-            .ok_or("successor session missing after create")?;
-        let engine = succ
-            .read(|t| t.engine_clone())
-            .ok_or("successor engine not materialized")?;
-        // The hand-off audience: every client owning the id the note
-        // arrived on OR the id it resolved to — they differ once a
-        // predecessor has already handed off, whose own owner set is
-        // cleared by that earlier hand-off (plan §3.1 B-iv).
-        let effective = self.resolve_redirect(pred_id);
-        let mut audience: Vec<String> = self.owners(pred_id);
-        for owner in self.owners(&effective) {
-            if !audience.contains(&owner) {
-                audience.push(owner);
-            }
-        }
-        // Owner inheritance: the successor takes the predecessor's audience,
-        // so a client watching the predecessor keeps watching the session
-        // across the hand-off.
-        for owner in &audience {
-            // `add_owner(session_id, client_id)`: the successor takes the
-            // audience, not the other way around.
-            self.add_owner(&succ_id, owner);
-        }
-        // Stub the predecessor onto the successor's engine + mirrored header
-        // fields: its journal seam answers the successor's log from here on.
-        pred.with_mut(|t| t.adopt_successor(engine, PathBuf::from(cwd)));
-        // Both ids mark the successor: the id clients still address, and the
-        // id it resolved to.
-        manox_agent::thread_store::global().with_mut(|s| {
-            s.mark_superseded(pred_id, &succ_id);
-            if effective != pred_id {
-                s.mark_superseded(&effective, &succ_id);
-            }
-        });
-        self.superseded
-            .lock()
-            .insert(pred_id.to_string(), succ_id.clone());
-        self.superseded
-            .lock()
-            .insert(effective.clone(), succ_id.clone());
-        // The bound directory becomes (or joins) a workspace row, and the
-        // successor leads its account. A workspace-store failure is logged,
-        // not fatal: the session hand-off is the user's intent and the
-        // bookkeeping row is not worth failing it over.
-        match manox_workspace::WorkspaceStore::open() {
-            Ok(store) => match store.create(std::path::Path::new(cwd)) {
-                Ok((view, _)) => {
-                    if let Err(error) = store.attach_session(&view.workspace_id, &succ_id) {
-                        tracing::debug!(%error, "workspace attach after bind skipped");
-                    }
-                }
-                Err(error) => tracing::debug!(%error, "workspace create after bind skipped"),
-            },
-            Err(error) => tracing::debug!(%error, "workspace store unavailable after bind"),
-        }
-        // The hand-off is complete: the audience is inherited by the
-        // successor, so both predecessor ids drop their ownership here.
-        // Without this an entry could never satisfy the reap predicate while
-        // the client stays connected.
-        for owner in &audience {
-            self.remove_owner(owner, pred_id);
-            if effective != pred_id {
-                self.remove_owner(owner, &effective);
-            }
-        }
-        self.reap_superseded_if_idle(pred_id);
-        if effective != pred_id {
-            self.reap_superseded_if_idle(&effective);
-        }
-        // No explicit owner release here: `OwnerLease` covers the bind
-        // owner on every exit path, and the note-open owner belongs to
-        // `set_cwd`'s own scope (review r3 [problem] 2, [sugg] 3).
-        Ok(())
-    }
-
-    /// Drop a superseded predecessor's entry once nothing consumes it: without
-    /// this it stays resident for the process lifetime. A running turn keeps
-    /// its entry — there is still a settle path to reach.
-    fn reap_superseded_if_idle(&self, session_id: &str) {
-        if !self.superseded.lock().contains_key(session_id) {
-            return;
-        }
-        if !self.owners(session_id).is_empty() {
-            return;
-        }
-        // Check-and-remove under ONE hold: a turn turning active between two
-        // holds would otherwise be reaped mid-flight with nobody left to
-        // settle it.
-        let removed = {
-            let mut sessions = self.sessions.lock();
-            let running = sessions
-                .get(session_id)
-                .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
-            if running {
-                return;
-            }
-            sessions.remove(session_id)
-        };
-        if removed.is_some() {
-            // The registrations die with the entry, like every other removal
-            // path.
-            self.clear_embedder_tools(session_id);
-            tracing::debug!(session = %session_id, "reaped superseded predecessor");
-        }
     }
 
     pub(crate) fn compact(
