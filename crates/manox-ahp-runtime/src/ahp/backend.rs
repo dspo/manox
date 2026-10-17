@@ -1392,9 +1392,6 @@ impl Backend for RuntimeBackend {
             state
                 .summaries()
                 .iter()
-                // A superseded predecessor is not the conversation's identity;
-                // its successor row is (the v2 list rules the same way).
-                .filter(|row| row.superseded_by.is_none())
                 .map(|row| summary_from_row(row, state, self.seeded_status(&row.id)))
                 .collect()
         })

@@ -1973,20 +1973,16 @@ mod dispatch {
     /// is silent *and* dangerous: every later tool call would be fenced against
     /// the wrong root.
     ///
-    /// Two branches exist, and the difference is load-bearing: an *interacted*
-    /// session moves its cwd in place (synchronous, asserted here), while a
-    /// not-yet-interacted one binds a successor session on a spawned task
-    /// (`bind_successor`) and has no synchronous cwd to observe. The session is
-    /// therefore marked interacted first, so this pins the in-place leg rather
-    /// than racing a spawn.
+    /// Identity never follows the directory: both interaction states move the
+    /// cwd in place and synchronously under the same session id. The
+    /// not-yet-interacted leg is asserted first (the previous model handed
+    /// that one to a successor session on a spawned task), then the
+    /// interacted leg.
     #[tokio::test(flavor = "multi_thread")]
     async fn working_directory_set_reaches_the_engine_cwd() {
         let _guards = install();
         let (server, backend) = fixture().await;
         let engine = attach_engine(&server);
-        if let Some(thread) = server.ahp_inner().session_thread("s-dispatch") {
-            thread.with_mut(|t| t.insert_user_message_with_ui_metadata("first".into(), None));
-        }
 
         let action = StateAction::SessionWorkingDirectorySet(
             ahp_types::actions::SessionWorkingDirectorySetAction {
@@ -2000,7 +1996,32 @@ mod dispatch {
         assert_eq!(
             engine.cwds.lock().clone(),
             vec![std::path::PathBuf::from("/work/granted")],
-            "the new root reaches the engine's fence"
+            "a blank session relocates in place: the new root reaches the engine's fence"
+        );
+        assert!(
+            server.ahp_inner().session_thread("s-dispatch").is_some(),
+            "the session keeps its id — no successor is minted"
+        );
+
+        if let Some(thread) = server.ahp_inner().session_thread("s-dispatch") {
+            thread.with_mut(|t| t.insert_user_message_with_ui_metadata("first".into(), None));
+        }
+        let again = StateAction::SessionWorkingDirectorySet(
+            ahp_types::actions::SessionWorkingDirectorySetAction {
+                directory: "file:///work/granted-later".to_string(),
+            },
+        );
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &again, &origin()),
+            DispatchOutcome::Accepted
+        );
+        assert_eq!(
+            engine.cwds.lock().clone(),
+            vec![
+                std::path::PathBuf::from("/work/granted"),
+                std::path::PathBuf::from("/work/granted-later"),
+            ],
+            "an interacted session advances its sticky cwd in place"
         );
 
         // A non-file URI cannot name a grant, and must not be accepted as one.
@@ -2013,7 +2034,7 @@ mod dispatch {
             backend.dispatch(&session::uri("s-dispatch"), &bogus, &origin()),
             DispatchOutcome::Rejected(_)
         ));
-        assert_eq!(engine.cwds.lock().len(), 1, "the bogus grant never landed");
+        assert_eq!(engine.cwds.lock().len(), 2, "the bogus grant never landed");
         uninstall();
     }
 
