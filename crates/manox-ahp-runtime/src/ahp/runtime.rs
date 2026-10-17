@@ -119,14 +119,8 @@ impl AhpRuntime {
         let Some(store) = manox_agent::thread_store::try_global() else {
             return;
         };
-        let rows: Vec<String> = store.read(|state| {
-            state
-                .summaries()
-                .iter()
-                .filter(|row| row.superseded_by.is_none())
-                .map(|row| row.id.clone())
-                .collect()
-        });
+        let rows: Vec<String> =
+            store.read(|state| state.summaries().iter().map(|row| row.id.clone()).collect());
         for session_id in rows {
             let Some(summary) = self.host.backend().session_summary(&session_id) else {
                 continue;
