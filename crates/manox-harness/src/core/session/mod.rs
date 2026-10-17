@@ -4,9 +4,19 @@
 // parentId, forming a DAG walked leafward to reconstruct the conversation
 // context. Variant `type` tags are snake_case and field names are camelCase,
 // matching the on-disk schema exactly so real session files load.
+//
+// The `identity`/`event`/`store`/`claim` modules are the Session Core (the
+// v1.0.0 model): an immutable header per session, one append-only event log
+// as the whole durable schema, lazy materialization, and a claim decision
+// for `createSession`. They run beside the tree engine above until the
+// engine's writers are re-homed onto `event::Event`.
 
+pub mod claim;
+pub mod event;
+pub mod identity;
 pub mod jsonl;
 pub mod repository;
+pub mod store;
 
 use crate::types::{AgentMessage, Usage};
 use chrono::{DateTime, Utc};
