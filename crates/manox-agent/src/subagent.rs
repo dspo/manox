@@ -907,29 +907,6 @@ impl SubagentRunObserver {
             .unwrap_or_else(|e| e.into_inner())
             .remove(run_id);
     }
-
-    fn emit_progress(
-        &self,
-        run_id: &str,
-        subagent_type: &str,
-        activity: Option<String>,
-        status: crate::thread::ToolCallStatus,
-        health: Option<String>,
-    ) {
-        send_notice(
-            &self.notice_tx,
-            BackendNotice::Event(Box::new(ThreadEvent::SubagentProgress {
-                id: run_id.to_string(),
-                subagent_type: subagent_type.to_string(),
-                tool_uses: 0,
-                token_usage: crate::language_model::TokenUsage::default(),
-                latest_activity: activity,
-                status,
-                health,
-            })),
-            "subagent progress tick",
-        );
-    }
 }
 
 impl RunObserver for SubagentRunObserver {
@@ -945,23 +922,10 @@ impl RunObserver for SubagentRunObserver {
                 ))),
             },
         );
-        if let Some(model) = &info.model {
-            let _ =
-                self.notice_tx
-                    .send(BackendNotice::Event(Box::new(ThreadEvent::SubagentChild {
-                        id: info.run_id.clone(),
-                        child: crate::thread::SubagentChildEvent::Model(
-                            crate::provider_glue::display_name(model),
-                        ),
-                    })));
-        }
-        self.emit_progress(
-            &info.run_id,
-            &subagent_type,
-            Some(info.label.clone()),
-            crate::thread::ToolCallStatus::Running,
-            Some("starting".into()),
-        );
+        // The run's durable record is the `run/started` row (journaled at
+        // dispatch); the live roster is the registry (`ListAgents`) and the
+        // chat's `background_work`. Nothing per-tick is forwarded anymore.
+        let _ = &subagent_type;
     }
 
     fn on_child_event(&self, run_id: &str, event: &manox_harness::types::AgentEvent) {
@@ -978,28 +942,9 @@ impl RunObserver for SubagentRunObserver {
                 None => None,
             }
         };
-        if let Some(line) = health_change {
-            let subagent_type = {
-                let runs = self.locked();
-                runs.get(run_id)
-                    .map(|w| w.subagent_type.clone())
-                    .unwrap_or_default()
-            };
-            self.emit_progress(
-                run_id,
-                &subagent_type,
-                None,
-                crate::thread::ToolCallStatus::Running,
-                Some(line),
-            );
-        }
-        for ev in crate::engine::adapt::child_events_of(run_id, event) {
-            send_notice(
-                &self.notice_tx,
-                BackendNotice::Event(Box::new(ev)),
-                "subagent child event",
-            );
-        }
+        // Health changes surface through the registry (`ListAgents` reads
+        // the watchdog directly); no per-tick forwarding exists anymore.
+        let _ = health_change;
     }
 
     fn on_tick(&self, run_id: &str) -> bool {
@@ -1014,26 +959,9 @@ impl RunObserver for SubagentRunObserver {
         match outcome {
             crate::subagent_watchdog::TickOutcome::Idle => false,
             crate::subagent_watchdog::TickOutcome::ReportStall => {
-                let (subagent_type, line) = {
-                    let runs = self.locked();
-                    match runs.get(run_id) {
-                        Some(watch) => {
-                            let wd = watch.watchdog.lock().unwrap_or_else(|e| e.into_inner());
-                            (
-                                watch.subagent_type.clone(),
-                                wd.health_line(std::time::Instant::now()),
-                            )
-                        }
-                        None => return false,
-                    }
-                };
-                self.emit_progress(
-                    run_id,
-                    &subagent_type,
-                    None,
-                    crate::thread::ToolCallStatus::Running,
-                    Some(line),
-                );
+                // The stall line reads from the registry (`ListAgents`
+                // serves the watchdog's health directly); the enforcement
+                // below stays the tick's only side effect.
                 false
             }
             crate::subagent_watchdog::TickOutcome::EnforceStall => true,
@@ -1080,21 +1008,9 @@ impl RunObserver for SubagentRunObserver {
                 "toolCalls": tool_calls,
             }),
         );
-        let (status, activity) = match end.stop_reason {
-            StopReason::Completed => (
-                crate::thread::ToolCallStatus::Success,
-                Some(end.output.clone()),
-            ),
-            StopReason::Aborted => (
-                crate::thread::ToolCallStatus::Cancelled,
-                Some("aborted".into()),
-            ),
-            ref reason => (
-                crate::thread::ToolCallStatus::Error,
-                Some(format!("failed: {reason}")),
-            ),
-        };
-        self.emit_progress(&end.run_id, &subagent_type, activity, status, None);
+        // The settled state rides the `run/settled` row and the
+        // background-work close; no per-run notice emission remains.
+        let _ = &subagent_type;
     }
 }
 

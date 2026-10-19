@@ -995,7 +995,7 @@ fn adapt_strips_proposed_plan_blocks_from_assistant_text() {
 /// mapping and the vocabulary never drift apart.
 #[test]
 fn durable_journal_mapping_round_trips_every_journaled_event() {
-    use crate::thread::{SubagentChildEvent, ThreadEvent, ToolCallStatus};
+    use crate::thread::{ThreadEvent, ToolCallStatus};
     let events: Vec<ThreadEvent> = vec![
         ThreadEvent::TurnStarted,
         ThreadEvent::TurnFinished {
@@ -1029,25 +1029,6 @@ fn durable_journal_mapping_round_trips_every_journaled_event() {
         ThreadEvent::ToolOutput {
             id: "tc-1".into(),
             chunk: "a".into(),
-        },
-        ThreadEvent::SubagentStarted {
-            id: "sub-1".into(),
-            subagent_type: "explore".into(),
-            description: "scout".into(),
-            child: crate::thread::ThreadId("child-1".into()),
-        },
-        ThreadEvent::SubagentProgress {
-            id: "sub-1".into(),
-            subagent_type: "explore".into(),
-            tool_uses: 4,
-            token_usage: Default::default(),
-            latest_activity: Some("reading".into()),
-            status: ToolCallStatus::Running,
-            health: None,
-        },
-        ThreadEvent::SubagentChild {
-            id: "sub-1".into(),
-            child: SubagentChildEvent::Text("hi".into()),
         },
         ThreadEvent::PermissionModeChanged {
             mode: manox_harness::sandbox::PermissionMode::default(),
