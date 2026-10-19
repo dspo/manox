@@ -1115,7 +1115,12 @@ pub(crate) async fn fork_session(
     // Materialize the fork file immediately (never deferred — a non-empty
     // prefix must be visible to `list` and loadable cold).
     let session_id = target_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let Some(target_path) = manox_ahp_runtime::paths::persisted_session_file(&session_id) else {
+    let target_cwd = cwd
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| inner.cwd.clone());
+    let Some(target_path) = manox_ahp_runtime::paths::session_file_under(&session_id, &target_cwd)
+    else {
         return Err(manox_ahp_runtime::error::RuntimeError::new(
             "minted fork id failed the path gate",
         )
@@ -1345,18 +1350,18 @@ impl AgentServerInner {
         // create keeps the deferred-fresh flow untouched.
         if !seed_blocks.is_empty() {
             let session_id = uuid::Uuid::new_v4().to_string();
-            let Some(path) = manox_ahp_runtime::paths::persisted_session_file(&session_id) else {
-                return Err(manox_ahp_runtime::error::RuntimeError::new(
-                    "minted session id failed the path gate",
-                )
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
-            };
             let cwd = intent
                 .cwd
                 .clone()
                 .map(PathBuf::from)
                 .or_else(|| intent.project.clone().map(PathBuf::from))
                 .unwrap_or_else(|| inner.cwd.clone());
+            let Some(path) = manox_ahp_runtime::paths::session_file_under(&session_id, &cwd) else {
+                return Err(manox_ahp_runtime::error::RuntimeError::new(
+                    "minted session id failed the path gate",
+                )
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+            };
             let storage = JsonlSessionStorage::create(
                 &path,
                 JsonlSessionMetadata {
@@ -1459,7 +1464,7 @@ impl AgentServerInner {
             .unwrap_or_else(|| project.clone().unwrap_or_else(|| inner.cwd.clone()));
         let thread = match &project {
             Some(p) => Thread::new_in_project(ThreadId(session_id.clone()), p.clone()),
-            None => Thread::new_fresh(ThreadId(session_id.clone()), cwd),
+            None => Thread::new_fresh(ThreadId(session_id.clone()), cwd.clone()),
         };
         // Multi-root: grant the extra working directories before the engine
         // materializes, so the gate's granted-root set admits them from the
@@ -1472,7 +1477,7 @@ impl AgentServerInner {
         // (the journal materializes lazily at the first turn) so the
         // sidecar write is addressable.
         if !intent.working_directories.is_empty()
-            && let Some(path) = manox_ahp_runtime::paths::persisted_session_file(&session_id)
+            && let Some(path) = manox_ahp_runtime::paths::session_file_under(&session_id, &cwd)
         {
             let dirs = intent.working_directories.clone();
             manox_agent::thread_store::global().with_mut(|s| {

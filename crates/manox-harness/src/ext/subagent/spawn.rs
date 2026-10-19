@@ -228,19 +228,30 @@ impl SubagentProvider for SpawnProvider {
             .as_ref()
             .map(|w| w.path.clone())
             .unwrap_or_else(|| req.cwd.clone());
-        let (session_dir, temp_guard): (PathBuf, Option<tempfile::TempDir>) = match &self
-            .session_dir
-        {
-            Some(dir) => (dir.clone(), None),
+        let (session_dir, session_file, temp_guard): (
+            PathBuf,
+            Option<PathBuf>,
+            Option<tempfile::TempDir>,
+        ) = match &self.session_dir {
+            // An explicit dir (tests) keeps the legacy flat layout.
+            Some(dir) => (dir.clone(), None, None),
+            // Production: the v1.0.0 core layout — one directory per
+            // child under its project bucket, `log.v1.jsonl` inside.
             None => {
-                let guard = tempfile::tempdir()
-                    .map_err(|e| SubagentError::Provider(self.name().to_string(), e.to_string()))?;
-                (guard.path().to_path_buf(), Some(guard))
+                let dir = crate::session::identity::core_session_dir_for(
+                    &child_cwd.to_string_lossy(),
+                    &run_id,
+                );
+                let file = dir.join("log.v1.jsonl");
+                (dir, Some(file), None)
             }
         };
         let mut builder = create_agent_session()
             .with_cwd(child_cwd.clone())
             .with_session_dir(session_dir.clone())
+            .with_session_file(session_file.clone().unwrap_or_else(|| {
+                session_dir.join(crate::session::repository::session_file_name(&run_id))
+            }))
             // The child session id IS the run id: every parent-side row
             // keyed by run id (progress ticks, tool-call correlation) then
             // names the child's own chat channel (`ahp-chat:/<run_id>`)
@@ -280,10 +291,11 @@ impl SubagentProvider for SpawnProvider {
         // creating a fresh session: the file carries its own header
         // (lineage, persona binding) and the follow-up prompt rides the
         // same drive loop, budgets, and salvage as a first dispatch.
-        let continuation_path = req
-            .continuation_of
-            .as_ref()
-            .map(|_| session_dir.join(crate::session::repository::session_file_name(&run_id)));
+        let continuation_path = req.continuation_of.as_ref().map(|_| {
+            session_file.clone().unwrap_or_else(|| {
+                session_dir.join(crate::session::repository::session_file_name(&run_id))
+            })
+        });
         if let Some(path) = &continuation_path
             && !path.exists()
         {

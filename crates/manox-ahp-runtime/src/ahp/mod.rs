@@ -349,21 +349,36 @@ fn thread_sessions(thread_id: &str, active: &str) -> Vec<String> {
     let Some(dir) = sessions_dir() else {
         return members.into_iter().collect();
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return members.into_iter().collect();
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(stem) = session_stem(&path) else {
-            continue;
+    // The core layout is two-deep (buckets over per-session directories,
+    // `log.v1.jsonl` inside); a session's directory name is its id. The
+    // walk stays bounded to that shape.
+    fn collect(dir: &Path, depth: u8, thread_id: &str, members: &mut BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
         };
-        if members.contains(stem) {
-            continue;
-        }
-        if header_thread_id(&path).is_some_and(|thread| thread == thread_id) {
-            members.insert(stem.to_string());
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                if depth > 0 {
+                    collect(&path, depth - 1, thread_id, members);
+                }
+                continue;
+            }
+            let Some(stem) = session_stem_of(&path) else {
+                continue;
+            };
+            if members.contains(stem.as_str()) {
+                continue;
+            }
+            if header_thread_id(&path).is_some_and(|thread| thread == thread_id) {
+                members.insert(stem.to_string());
+            }
         }
     }
+    collect(&dir, 2, thread_id, &mut members);
     members.into_iter().collect()
 }
 
@@ -475,10 +490,15 @@ async fn fold_extension_state(
     state
 }
 
-/// The `<id>.jsonl` stem of a sessions-dir entry (non-journals yield `None`).
-fn session_stem(path: &Path) -> Option<&str> {
+fn session_stem_of(path: &Path) -> Option<String> {
+    // The core layout names the journal `log.v1.jsonl`; a session's id is
+    // its PARENT directory's name. A legacy flat `<id>.jsonl` keeps the
+    // file stem.
+    if path.file_name().and_then(|n| n.to_str()) == Some("log.v1.jsonl") {
+        return path.parent()?.file_name()?.to_str().map(str::to_string);
+    }
     (path.extension()? == "jsonl")
-        .then(|| path.file_stem()?.to_str())
+        .then(|| path.file_stem()?.to_str().map(str::to_string))
         .flatten()
 }
 
@@ -510,9 +530,13 @@ fn read_header(path: &Path) -> Option<manox_harness::session::jsonl::JsonlSessio
 /// [`crate::paths::persisted_session_file`] uses, so enumeration and
 /// cold read can never disagree.
 fn sessions_dir() -> Option<PathBuf> {
+    // The v1.0.0 core root, bucketed: test fixtures sit inside one project
+    // bucket so the two-deep walk (`<core>/<slug>/<id>/log.v1.jsonl`)
+    // resolves them exactly as production sessions resolve.
     manox_agent::thread_store::try_global()
         .map(|_| manox_agent::thread_store::global_sessions_dir())
-        .or_else(|| manox_agent::paths::sessions_dir().ok())
+        .or_else(|| manox_agent::paths::core_root().ok())
+        .map(|root| root.join("t"))
 }
 
 /// The seeded granted set: the session's creation cwd plus the sidecar's
@@ -732,6 +756,10 @@ pub fn session_uri_of_terminal(session_id: &str) -> String {
 
 #[cfg(test)]
 mod baseline_tests {
+
+    fn journal(sessions: &std::path::Path, id: &str) -> std::path::PathBuf {
+        sessions.join(id).join("log.v1.jsonl")
+    }
     use super::*;
     use manox_harness::session::SessionStorage;
 
@@ -755,7 +783,7 @@ mod baseline_tests {
                 ("a_mid", chrono::Duration::hours(1), "newerTime"),
             ];
             for (id, ago, label) in members {
-                let path = sessions.join(format!("{id}.jsonl"));
+                let path = journal(&sessions, id);
                 let _ = std::fs::remove_file(&path);
                 let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
                     &path,
@@ -782,7 +810,7 @@ mod baseline_tests {
                 drop(storage);
             }
             // The active session: newest journal, no label row of its own.
-            let active_path = sessions.join("m_act.jsonl");
+            let active_path = journal(&sessions, "m_act");
             let _ = std::fs::remove_file(&active_path);
             let active_storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
                 &active_path,
@@ -828,7 +856,7 @@ mod baseline_tests {
             );
 
             for id in ["z_old", "a_mid", "m_act"] {
-                let _ = std::fs::remove_file(sessions.join(format!("{id}.jsonl")));
+                let _ = std::fs::remove_file(journal(&sessions, id));
             }
             let _ = std::fs::remove_file(&registry);
         })
@@ -842,7 +870,7 @@ mod baseline_tests {
         at: chrono::DateTime<chrono::Utc>,
         label: &str,
     ) {
-        let path = sessions.join(format!("{id}.jsonl"));
+        let path = journal(sessions, id);
         let _ = std::fs::remove_file(&path);
         let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
             &path,
@@ -877,7 +905,7 @@ mod baseline_tests {
         owner: Option<u32>,
         finish: bool,
     ) {
-        let path = sessions.join(format!("{id}.jsonl"));
+        let path = journal(sessions, id);
         let _ = std::fs::remove_file(&path);
         let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
             &path,
@@ -987,8 +1015,8 @@ mod baseline_tests {
                 "the active session's own row must be in — and win — the baseline: {baseline}"
             );
 
-            let _ = std::fs::remove_file(sessions.join("o_shelf.jsonl"));
-            let _ = std::fs::remove_file(sessions.join("act_s.jsonl"));
+            let _ = std::fs::remove_file(journal(&sessions, "o_shelf"));
+            let _ = std::fs::remove_file(journal(&sessions, "act_s"));
             let _ = std::fs::remove_file(&registry);
         })
     }
@@ -1017,9 +1045,9 @@ mod baseline_tests {
             assert_eq!(first["label"], "v1");
 
             // Append after the first baseline was served.
-            let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(
-                &sessions.join("fresh_s.jsonl"),
-            )
+            let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(&journal(
+                &sessions, "fresh_s",
+            ))
             .await
             .unwrap();
             storage
@@ -1040,7 +1068,7 @@ mod baseline_tests {
                 "the next baseline must see rows written after the previous one: {second}"
             );
 
-            let _ = std::fs::remove_file(sessions.join("fresh_s.jsonl"));
+            let _ = std::fs::remove_file(journal(&sessions, "fresh_s"));
             let _ = std::fs::remove_file(&registry);
         })
     }
@@ -1057,7 +1085,7 @@ mod baseline_tests {
         manox_agent::runtime::handle().block_on(async {
             let sessions = sessions_dir().expect("sessions dir under the hermetic home");
             std::fs::create_dir_all(&sessions).unwrap();
-            let path = sessions.join("open_turn_s.jsonl");
+            let path = journal(&sessions, "open_turn_s");
             let _ = std::fs::remove_file(&path);
             let at = chrono::Utc::now();
             let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
@@ -1154,9 +1182,9 @@ mod baseline_tests {
             assert_eq!(hits, hits_before + 1, "the second request hit the cache");
 
             // An append moves the stamp: the cache must miss and refold.
-            let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(
-                &sessions.join("cache_s.jsonl"),
-            )
+            let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(&journal(
+                &sessions, "cache_s",
+            ))
             .await
             .unwrap();
             storage
@@ -1179,7 +1207,7 @@ mod baseline_tests {
             let (_, folds_after) = baseline_cache::probe();
             assert_eq!(folds_after, folds + 1, "the append forced a refold");
 
-            let _ = std::fs::remove_file(sessions.join("cache_s.jsonl"));
+            let _ = std::fs::remove_file(journal(&sessions, "cache_s"));
             let _ = std::fs::remove_file(&registry);
         })
     }
@@ -1217,8 +1245,8 @@ mod baseline_tests {
                 "the active flip must invalidate the cached fold even with unchanged journals: {after}"
             );
 
-            let _ = std::fs::remove_file(sessions.join("flip_a.jsonl"));
-            let _ = std::fs::remove_file(sessions.join("flip_b.jsonl"));
+            let _ = std::fs::remove_file(journal(&sessions, "flip_a"));
+            let _ = std::fs::remove_file(journal(&sessions, "flip_b"));
             let _ = std::fs::remove_file(&registry);
         })
     }

@@ -150,6 +150,18 @@ impl SessionHeader {
 
 /// Mint a fresh session id (the claim driver's `Mint` arm and the swarm's
 /// child-id mint share this).
+/// A session's directory under the v1.0.0 core root
+/// (`~/.manox/core/<project-slug>/<id>`). The state home follows the same
+/// resolution the provider config uses (`$HOME/.manox`).
+pub fn core_session_dir_for(cwd: &str, id: &str) -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
+    home.join(".manox")
+        .join("core")
+        .join(project_slug(cwd))
+        .join(id)
+}
+
 pub fn mint_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }

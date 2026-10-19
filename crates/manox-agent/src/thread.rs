@@ -843,9 +843,15 @@ impl Thread {
         // gate input and render the streaming preview.
         let loading = initial_path.is_some();
         let model = crate::provider_glue::default_model();
-        let sessions_dir = crate::paths::manox_config_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("sessions");
+        let (sessions_dir, session_file) = crate::paths::core_session_parts(&cwd, &id.0)
+            .unwrap_or_else(|_| {
+                (
+                    crate::paths::manox_config_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join("sessions"),
+                    None,
+                )
+            });
         // The goal bridge is shared with the engine's goal tools; its
         // restore seed rides the Ready chain (seed_from_journal — the
         // journal is the goal authority; stage ③ retired the db leg and
@@ -859,6 +865,7 @@ impl Thread {
             cwd.clone(),
             model.clone(),
             sessions_dir,
+            session_file,
             initial_path,
             fresh,
             project.clone(),
@@ -931,9 +938,18 @@ impl Thread {
         }
         let cwd = project.clone().unwrap_or_else(|| self.cwd.clone());
         let model = self.model.clone();
-        let sessions_dir = crate::paths::manox_config_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("sessions");
+        // The v1.0.0 core layout: one directory per session under its
+        // project bucket, the journal (`log.v1.jsonl`) inside. The legacy
+        // flat `sessions/` tree is never written again.
+        let (sessions_dir, session_file) = crate::paths::core_session_parts(&cwd, &self.id.0)
+            .unwrap_or_else(|_| {
+                (
+                    crate::paths::manox_config_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join("sessions"),
+                    None,
+                )
+            });
         // A fresh spawn has nothing to restore: the default (already
         // ready) watch is the honest value, so the receiver is dropped.
         let SpawnedEngine {
@@ -944,6 +960,7 @@ impl Thread {
             cwd.clone(),
             model,
             sessions_dir,
+            session_file,
             None,
             true,
             project,
@@ -1808,9 +1825,15 @@ impl Thread {
         let model = self.model.clone();
         let permission_mode = self.permission_mode;
         let reasoning_effort = self.reasoning_effort;
-        let sessions_dir = crate::paths::manox_config_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("sessions");
+        let (sessions_dir, session_file) = crate::paths::core_session_parts(&cwd, &id.0)
+            .unwrap_or_else(|_| {
+                (
+                    crate::paths::manox_config_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join("sessions"),
+                    None,
+                )
+            });
         let SpawnedEngine {
             engine,
             events,
@@ -1819,6 +1842,7 @@ impl Thread {
             cwd.clone(),
             model.clone(),
             sessions_dir,
+            session_file,
             None,
             true,
             None,

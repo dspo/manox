@@ -83,6 +83,24 @@ impl SessionRepository {
         Ok(Session::new(storage))
     }
 
+    /// Create a session at an exact file path (the v1.0.0 core layout:
+    /// `<core>/<slug>/<id>/log.v1.jsonl`). Same deferred-materialization
+    /// contract as [`Self::create`]: nothing touches disk until the first
+    /// append.
+    pub async fn create_at(
+        &self,
+        path: &Path,
+        metadata: JsonlSessionMetadata,
+    ) -> Result<Session<JsonlSessionStorage>, anyhow::Error> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let storage = JsonlSessionStorage::create_deferred(path, metadata).await?;
+        Ok(Session::new(storage))
+    }
+
     /// Open a session file by path.
     pub async fn open(&self, path: &Path) -> Result<Session<JsonlSessionStorage>, anyhow::Error> {
         let storage = JsonlSessionStorage::open(path).await?;
