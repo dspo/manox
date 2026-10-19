@@ -57,7 +57,9 @@ pub struct ThreadStore {
     order_dirty: bool,
     /// Host db handle persisting `known_projects` (shared threads.db,
     /// `projects` table only — thread rows remain the manox store's domain).
-    db: std::sync::Arc<crate::db::ThreadsDatabase>,
+    /// The project-registry file under the state root (the db table's
+    /// successor): one project path per line, rewritten on change.
+    projects_path: PathBuf,
     running: HashSet<String>,
     /// Threads with an interaction pending a user answer (a parked
     /// thread's question card is not visible, so the sidebar badge is the
@@ -315,12 +317,11 @@ impl StoreHandle {
     /// order replaces the scanned order before the rows are published.
     pub async fn refresh_now(&self) {
         let dir = self.read(|s| s.sessions_dir.clone());
-        let db = self.read(|s| std::sync::Arc::clone(&s.db));
         let registry = crate::thread_registry::load().await;
         let order = crate::sidebar_order::load().await;
         let rows = {
             let mut index = self.0.index.lock().await;
-            reconcile_summaries(&dir, Some(&db), &mut index).await
+            reconcile_summaries(&dir, &mut index).await
         };
         self.with_mut(|s| {
             let (session_paths, summaries, archived) = group_by_thread(rows, &registry);
@@ -367,6 +368,43 @@ static GLOBAL: std::sync::Mutex<Option<StoreHandle>> = std::sync::Mutex::new(Non
 static TEST_OVERRIDE: std::sync::Mutex<Option<StoreHandle>> = std::sync::Mutex::new(None);
 
 /// Resolve the session directory under the manox config dir.
+/// The project registry: one path per line under the state root. The
+/// sqlite `projects` table's successor — derived at first read, rewritten
+/// on change.
+fn read_project_registry(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|raw| {
+            let mut lines: Vec<String> = raw
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect();
+            lines.sort();
+            lines.dedup();
+            lines
+        })
+        .unwrap_or_default()
+}
+
+fn write_project_registry(path: &std::path::Path, projects: &[String]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut lines = projects.to_vec();
+    lines.sort();
+    lines.dedup();
+    std::fs::write(
+        path,
+        lines
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+}
+
 pub(crate) fn sessions_dir() -> PathBuf {
     // The v1.0.0 core root: per-session directories under project buckets.
     // Computed DIRECTLY (never through `paths::core_root`, which resolves
@@ -381,12 +419,8 @@ pub(crate) fn sessions_dir() -> PathBuf {
 /// process-global handle. Call at App startup.
 pub fn init() {
     let dir = sessions_dir();
-    let db_path = crate::db::default_db_path().expect("Failed to resolve threads.db path");
-    let db = Arc::new(
-        crate::db::ThreadsDatabase::open(&db_path)
-            .unwrap_or_else(|e| panic!("Failed to open threads db ({}): {e}", db_path.display())),
-    );
-    let known_projects = db.list_projects().unwrap_or_default();
+    let projects_path = dir.join("projects.registry");
+    let known_projects = read_project_registry(&projects_path);
     let handle = StoreHandle::new(ThreadStore {
         summaries: Vec::new(),
         archived_summaries: Vec::new(),
@@ -399,7 +433,7 @@ pub fn init() {
         pending_plan: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
-        db,
+        projects_path,
         decision_overlay: HashMap::new(),
         pending_events: Vec::new(),
         pending_meta_writes: Vec::new(),
@@ -474,12 +508,6 @@ pub enum RenameOutcome {
 impl ThreadStore {
     pub fn summaries(&self) -> &[ThreadSummary] {
         &self.summaries
-    }
-
-    /// The shared threads.db handle, for UI-layer per-thread state that
-    /// piggybacks on the store's single connection (right-pane snapshots).
-    pub fn db(&self) -> &std::sync::Arc<crate::db::ThreadsDatabase> {
-        &self.db
     }
 
     /// Archived rows, partitioned out of `summaries` so the sidebar list
@@ -672,7 +700,7 @@ impl ThreadStore {
             return;
         }
         self.known_projects.push(path.clone());
-        if let Err(e) = self.db.register_project(&path) {
+        if let Err(e) = write_project_registry(&self.projects_path, &self.known_projects) {
             tracing::warn!(error = %e, "failed to persist project registration");
         }
         // The folder account claims a committed tail position for the new
@@ -690,7 +718,7 @@ impl ThreadStore {
             return;
         }
         self.known_projects.retain(|p| p != path);
-        if let Err(e) = self.db.remove_project(path) {
+        if let Err(e) = write_project_registry(&self.projects_path, &self.known_projects) {
             tracing::warn!(error = %e, "failed to persist project removal");
         }
         // The folder leaves the account; its rows re-partition as loose.
@@ -1308,16 +1336,6 @@ impl ThreadStore {
     /// itself; nothing to do here.
     pub fn record_model_change(&self, _thread_id: &str, _from: Option<&str>, _to: &str) {}
 
-    /// Append a typed event to the thread's timeline. The manox SQLite
-    /// timeline is not produced by the harness backend.
-    pub fn record_event(
-        &self,
-        _thread_id: &str,
-        _event_type: crate::db::ThreadEventType,
-        _data: &serde_json::Value,
-    ) {
-    }
-
     /// Queue a sidecar change for a session. The caller's in-memory update
     /// is the render source of truth, so `SummariesUpdated` fires up front;
     /// the write itself is queued for [`StoreHandle::with_mut`] to dispatch
@@ -1411,29 +1429,12 @@ struct Stat {
 /// shrunk files, refresh sidecars whose fingerprint moved, and persist the
 /// index wholesale (best-effort). Returns the rows the sidebar renders —
 /// identical CONTENT to a full scan, at O(files) steady-state cost.
-async fn reconcile_summaries(
-    dir: &std::path::Path,
-    db: Option<&std::sync::Arc<crate::db::ThreadsDatabase>>,
-    index: &mut SessionIndex,
-) -> Vec<SessionRow> {
-    if !index.seeded {
-        if let Some(db) = db {
-            match db.load_session_index() {
-                Ok(rows) => {
-                    index.rows = rows
-                        .into_iter()
-                        .filter_map(IndexedSession::from_db)
-                        .collect();
-                }
-                Err(error) => {
-                    // A missing/corrupt table degrades to bounded scans —
-                    // the list's content never depends on the cache.
-                    tracing::warn!(%error, "session index unreadable; cold-scanning instead");
-                }
-            }
-        }
-        index.seeded = true;
-    }
+async fn reconcile_summaries(dir: &std::path::Path, index: &mut SessionIndex) -> Vec<SessionRow> {
+    // The cold-cache layer retired with the db: the in-memory index still
+    // accelerates a live process's repeat scans, but every restart starts
+    // from a bounded header scan — the list's content never depended on the
+    // cache anyway.
+    index.seeded = true;
     let stats = stat_session_files(dir).await;
     let live: std::collections::HashSet<PathBuf> = stats.iter().map(|s| s.path.clone()).collect();
     let mut rows = Vec::with_capacity(stats.len());
@@ -1601,24 +1602,7 @@ async fn reconcile_summaries(
     }
     // Vanished files leave the cache; the persist below drops their rows
     // from the cold layer with them.
-    let pruned = index.rows.len() != live.len();
     index.rows.retain(|path, _| live.contains(path));
-    // Persist only when something moved (a new or rescanned file, a
-    // refreshed fingerprint, a reloaded sidecar, a prune): a pure-stat pass
-    // over an idle store writes nothing. Failed verdicts persist too — a
-    // restart must not re-attempt every legacy zombie the store carries.
-    if (pruned || index.dirty)
-        && let Some(db) = db
-    {
-        let persisted: Vec<crate::db::SessionIndexRow> = index
-            .rows
-            .iter()
-            .map(|(path, entry)| entry.to_db(path))
-            .collect();
-        if let Err(error) = db.replace_session_index(&persisted) {
-            tracing::warn!(%error, "failed to persist the session index");
-        }
-    }
     index.dirty = false;
     rows
 }
@@ -1740,122 +1724,6 @@ fn metadata_mtime_ns(metadata: &std::fs::Metadata) -> i64 {
 
 fn nanos_to_datetime(nanos: i64) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::from_timestamp(nanos / 1_000_000_000, (nanos % 1_000_000_000) as u32)
-}
-
-impl IndexedSession {
-    fn from_db(row: crate::db::SessionIndexRow) -> Option<(PathBuf, IndexedSession)> {
-        let metadata = row.metadata_json.as_deref().and_then(|json| {
-            serde_json::from_str::<serde_json::Value>(json)
-                .map_err(|error| {
-                    tracing::warn!(
-                        path = %row.path.display(),
-                        %error,
-                        "cached session metadata corrupt; rescanning the file"
-                    );
-                    error
-                })
-                .ok()
-        });
-        // A FAILED row carries no facts by design — its fingerprint IS
-        // the content. A fact row whose identity columns cannot be trusted
-        // cannot rebuild a summary without the file; drop it and let the
-        // bounded scan re-establish the facts.
-        if row.failed {
-            return Some((
-                row.path,
-                IndexedSession {
-                    size: row.size,
-                    mtime_ns: row.mtime_ns,
-                    failed: true,
-                    id: String::new(),
-                    cwd: String::new(),
-                    created_at: chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
-                        .unwrap()
-                        .with_timezone(&chrono::Utc),
-                    parent_session_path: None,
-                    metadata: None,
-                    first_user_text: String::new(),
-                    has_messages: false,
-                    sidecar_size: 0,
-                    sidecar_mtime_ns: 0,
-                    sidecar: None,
-                },
-            ));
-        }
-        if row.session_id.is_empty() || row.cwd.is_empty() {
-            return None;
-        }
-        let sidecar = row.sidecar_json.as_deref().and_then(|json| {
-            serde_json::from_str::<manox_harness::session_meta::SessionMeta>(json)
-                .map_err(|error| {
-                    tracing::warn!(
-                        path = %row.path.display(),
-                        %error,
-                        "cached sidecar corrupt; reloading it"
-                    );
-                    error
-                })
-                .ok()
-        });
-        Some((
-            row.path,
-            IndexedSession {
-                size: row.size,
-                mtime_ns: row.mtime_ns,
-                failed: false,
-                id: row.session_id,
-                cwd: row.cwd,
-                created_at: nanos_to_datetime(row.created_at_ns)?,
-                parent_session_path: row.parent_session,
-                metadata,
-                first_user_text: row.first_user_text,
-                has_messages: row.has_messages,
-                sidecar_size: row.sidecar_size,
-                sidecar_mtime_ns: row.sidecar_mtime_ns,
-                sidecar,
-            },
-        ))
-    }
-
-    fn to_db(&self, path: &std::path::Path) -> crate::db::SessionIndexRow {
-        if self.failed {
-            return crate::db::SessionIndexRow {
-                path: path.to_path_buf(),
-                size: self.size,
-                mtime_ns: self.mtime_ns,
-                session_id: String::new(),
-                cwd: String::new(),
-                created_at_ns: 0,
-                parent_session: None,
-                metadata_json: None,
-                first_user_text: String::new(),
-                has_messages: false,
-                failed: true,
-                sidecar_size: 0,
-                sidecar_mtime_ns: 0,
-                sidecar_json: None,
-            };
-        }
-        crate::db::SessionIndexRow {
-            path: path.to_path_buf(),
-            size: self.size,
-            mtime_ns: self.mtime_ns,
-            session_id: self.id.clone(),
-            cwd: self.cwd.clone(),
-            created_at_ns: self.created_at.timestamp_nanos_opt().unwrap_or_default(),
-            parent_session: self.parent_session_path.clone(),
-            metadata_json: self.metadata.as_ref().map(|value| value.to_string()),
-            first_user_text: self.first_user_text.clone(),
-            has_messages: self.has_messages,
-            failed: false,
-            sidecar_size: self.sidecar_size,
-            sidecar_mtime_ns: self.sidecar_mtime_ns,
-            sidecar_json: self
-                .sidecar
-                .as_ref()
-                .map(|meta| serde_json::to_string(meta).unwrap_or_default()),
-        }
-    }
 }
 
 /// Materialize a missing interaction stamp. Fire-and-forget and rescan-free
@@ -2033,8 +1901,8 @@ pub(crate) fn team_parent_id(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn init_for_test(db: Arc<crate::db::ThreadsDatabase>) {
-    let handle = standalone_for_test(db);
+pub fn init_for_test() {
+    let handle = standalone_for_test();
     *TEST_OVERRIDE.lock().unwrap() = Some(handle);
 }
 
@@ -2043,8 +1911,9 @@ pub fn init_for_test(db: Arc<crate::db::ThreadsDatabase>) {
 /// routing) use this to stay immune to cross-test TEST_OVERRIDE churn —
 /// the agent suite runs its store tests in parallel.
 #[cfg(any(test, feature = "test-support"))]
-pub fn standalone_for_test(db: Arc<crate::db::ThreadsDatabase>) -> StoreHandle {
+pub fn standalone_for_test() -> StoreHandle {
     let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+    let projects_path = dir.join("projects.registry");
     StoreHandle::new(ThreadStore {
         summaries: Vec::new(),
         archived_summaries: Vec::new(),
@@ -2052,12 +1921,12 @@ pub fn standalone_for_test(db: Arc<crate::db::ThreadsDatabase>) -> StoreHandle {
         known_projects: Vec::new(),
         order: crate::sidebar_order::SidebarOrder::default(),
         order_dirty: false,
-        db,
         running: HashSet::new(),
         pending_auth: HashSet::new(),
         pending_plan: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
+        projects_path,
         decision_overlay: HashMap::new(),
         pending_events: Vec::new(),
         pending_meta_writes: Vec::new(),
@@ -2094,15 +1963,8 @@ pub fn store_test_lock() -> &'static std::sync::Mutex<()> {
 mod tests {
     use super::*;
 
-    fn temp_db() -> (
-        std::sync::Arc<crate::db::ThreadsDatabase>,
-        std::path::PathBuf,
-    ) {
-        let path = std::env::temp_dir().join(format!("store-test-{}.db", uuid::Uuid::new_v4()));
-        let db = std::sync::Arc::new(
-            crate::db::ThreadsDatabase::open(&path).expect("open temp threads db"),
-        );
-        (db, path)
+    fn temp_db() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("store-test-{}", uuid::Uuid::new_v4()))
     }
 
     /// A rename must land a durable `title` **journal** row, not only the
@@ -2116,7 +1978,7 @@ mod tests {
     /// divergence the store-level journal append exists to prevent.
     #[test]
     fn rename_thread_appends_the_durable_title_row() {
-        let (db, db_path) = temp_db();
+        let db_path = temp_db();
         crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("t-title.jsonl");
@@ -2130,7 +1992,7 @@ mod tests {
              \"metadata\":{\"host\":\"manox\"}}\n",
         )
         .unwrap();
-        let store = store_handle(db.clone());
+        let store = store_handle();
         store.with_mut(|s| {
             s.insert_summary_for_test("t-title", None);
             s.session_paths
@@ -2190,11 +2052,11 @@ mod tests {
     /// process.
     #[test]
     fn rename_thread_reports_whether_it_could_persist() {
-        let (db, _path) = temp_db();
+        let _path = temp_db();
         // A rename journals as well as writing the sidecar, so the store needs
         // the process runtime the journal append dispatches onto.
         crate::runtime::init_hermetic_for_test();
-        let store = store_handle(db);
+        let store = store_handle();
         store.with_mut(|s| s.insert_summary_for_test("t-rename", None));
         store.with_mut(|s| {
             let row = s.summary_mut("t-rename").expect("seeded");
@@ -2239,21 +2101,22 @@ mod tests {
         });
     }
 
-    fn store_handle(db: Arc<crate::db::ThreadsDatabase>) -> StoreHandle {
-        let known_projects = db.list_projects().unwrap_or_default();
+    fn store_handle() -> StoreHandle {
+        let dir = std::env::temp_dir().join(format!("store-dir-{}", uuid::Uuid::new_v4()));
+        let projects_path = dir.join("projects.registry");
         StoreHandle::new(ThreadStore {
             summaries: Vec::new(),
             archived_summaries: Vec::new(),
             session_paths: HashMap::new(),
-            known_projects,
+            known_projects: Vec::new(),
             order: crate::sidebar_order::SidebarOrder::default(),
             order_dirty: false,
-            db,
             running: HashSet::new(),
             pending_auth: HashSet::new(),
             pending_plan: HashSet::new(),
             live_threads: HashMap::new(),
-            sessions_dir: std::env::temp_dir(),
+            sessions_dir: dir,
+            projects_path,
             decision_overlay: HashMap::new(),
             pending_events: Vec::new(),
             pending_meta_writes: Vec::new(),
@@ -2264,10 +2127,10 @@ mod tests {
     #[test]
     fn working_directories_wait_for_the_journal_to_materialize() {
         crate::runtime::init();
-        let (db, _db_path) = temp_db();
+        let _db_path = temp_db();
         let dir = std::env::temp_dir().join(format!("store-wd-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let handle = store_handle(db);
+        let handle = store_handle();
         handle.with_mut(|s| s.sessions_dir = dir.clone());
 
         // A create on a not-yet-materialized session leaves no sidecar: a
@@ -2331,8 +2194,8 @@ mod tests {
     /// a SHRINK always rescans.
     #[tokio::test]
     async fn reconcile_reuses_facts_on_growth_and_rescans_on_shrink() {
-        let (db, _db_path) = temp_db();
-        let store = standalone_for_test(db.clone());
+        let _db_path = temp_db();
+        let store = standalone_for_test();
         let dir = store.read(|s| s.sessions_dir.clone());
         write_session_fixture(&dir, "rule", "original");
 
@@ -2358,8 +2221,8 @@ mod tests {
     /// instead of spawning — the burst is served by the runner's loop tail.
     #[tokio::test]
     async fn refresh_marks_pending_while_a_runner_is_in_flight() {
-        let (db, _db_path) = temp_db();
-        let store = standalone_for_test(db);
+        let _db_path = temp_db();
+        let store = standalone_for_test();
         store
             .0
             .refresh_running
@@ -2382,8 +2245,8 @@ mod tests {
     /// mid-write wording forever.
     #[tokio::test]
     async fn reconcile_does_not_cache_torn_tail_facts() {
-        let (db, _db_path) = temp_db();
-        let store = standalone_for_test(db.clone());
+        let _db_path = temp_db();
+        let store = standalone_for_test();
         let dir = store.read(|s| s.sessions_dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         let header = r#"{"type":"session","version":4,"id":"torn","timestamp":"2026-09-13T00:00:00Z","cwd":"/proj","metadata":{"host":"manox","thread":"torn"}}"#;
@@ -2411,8 +2274,8 @@ mod tests {
     /// fingerprint) comes back. The failure never swallows the recovery.
     #[tokio::test]
     async fn reconcile_negative_cache_skips_zombies_until_they_heal() {
-        let (db, _db_path) = temp_db();
-        let store = standalone_for_test(db.clone());
+        let _db_path = temp_db();
+        let store = standalone_for_test();
         let dir = store.read(|s| s.sessions_dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         // A headerless zombie (the shape a pre-fix bug left on real stores).
@@ -2437,64 +2300,79 @@ mod tests {
         );
     }
 
-    /// The cold layer: a refresh persists the index to the db, and a fresh
-    /// store over the same directory + db rebuilds identical rows from the
-    /// seeded cache — a restart costs the stat sweep, not the scans.
+    /// A restart rebuilds identical rows from the bounded scan alone — the
+    /// cold-cache layer retired with the db, and the list's content never
+    /// depended on it.
     #[tokio::test]
-    async fn reconcile_persists_the_index_and_seeds_a_restart() {
-        let (db, _db_path) = temp_db();
-        let store = standalone_for_test(db.clone());
+    async fn reconcile_rebuilds_identical_rows_after_a_restart() {
+        let store = standalone_for_test();
         let dir = store.read(|s| s.sessions_dir.clone());
         write_session_fixture(&dir, "persist", "cold start prompt");
 
         store.refresh_now().await;
-        let rows = db.load_session_index().unwrap();
-        assert!(
-            rows.iter().any(|row| row.session_id == "persist"),
-            "the index row landed in the db: {rows:?}"
-        );
+        assert_eq!(first_summary_of(&store, "persist"), "cold start prompt");
 
-        // A "restarted" store: fresh handle, same sessions dir + db.
+        let sessions_dir = dir.clone();
+        let projects_path = sessions_dir.join("projects.registry");
         let restarted = StoreHandle::new(ThreadStore {
             summaries: Vec::new(),
             archived_summaries: Vec::new(),
             session_paths: HashMap::new(),
-            known_projects: db.list_projects().unwrap_or_default(),
+            known_projects: Vec::new(),
             order: crate::sidebar_order::SidebarOrder::default(),
             order_dirty: false,
-            db,
             running: HashSet::new(),
             pending_auth: HashSet::new(),
             pending_plan: HashSet::new(),
             live_threads: HashMap::new(),
-            sessions_dir: dir,
+            sessions_dir,
+            projects_path,
             decision_overlay: HashMap::new(),
             pending_events: Vec::new(),
             pending_meta_writes: Vec::new(),
             pending_working_dirs: HashMap::new(),
         });
         restarted.refresh_now().await;
-        assert_eq!(first_summary_of(&restarted, "persist"), "cold start prompt");
+        assert_eq!(
+            first_summary_of(&restarted, "persist"),
+            "cold start prompt",
+            "a restarted store rebuilds identical rows from the scan"
+        );
     }
 
     #[test]
     fn register_project_persists_and_survives_reopen() {
-        let (db, path) = temp_db();
-        let store = store_handle(db.clone());
+        let store = store_handle();
+        let path = store.read(|s| s.projects_path.clone());
         store.with_mut(|s| s.register_project("/p/a".into()));
-        // Persisted to the db...
-        assert!(db.list_projects().unwrap().contains(&"/p/a".to_string()));
-        // ...and a freshly initialized store (simulated restart) sees it.
-        let reopened = store_handle(db.clone());
-        let known = reopened.read(|s| s.known_projects().to_vec());
-        assert_eq!(known, vec!["/p/a".to_string()]);
-        std::fs::remove_file(path).ok();
+        // Persisted to the registry file...
+        assert!(std::fs::read_to_string(&path).unwrap().contains("/p/a"));
+        // ...and a fresh store over the same root seeds from it.
+        let reopened = StoreHandle::new(ThreadStore {
+            summaries: Vec::new(),
+            archived_summaries: Vec::new(),
+            session_paths: HashMap::new(),
+            known_projects: read_project_registry(&path),
+            order: crate::sidebar_order::SidebarOrder::default(),
+            order_dirty: false,
+            running: HashSet::new(),
+            pending_auth: HashSet::new(),
+            pending_plan: HashSet::new(),
+            live_threads: HashMap::new(),
+            sessions_dir: store.read(|s| s.sessions_dir.clone()),
+            projects_path: path,
+            decision_overlay: HashMap::new(),
+            pending_events: Vec::new(),
+            pending_meta_writes: Vec::new(),
+            pending_working_dirs: HashMap::new(),
+        });
+        assert!(reopened.read(|s| s.known_projects.contains(&"/p/a".to_string())));
     }
 
     #[test]
     fn register_project_dedupes() {
-        let (db, path) = temp_db();
-        let store = store_handle(db.clone());
+        let _path = temp_db();
+        let store = store_handle();
         store.with_mut(|s| {
             s.register_project("/p/a".into());
             s.register_project("/p/a".into());
@@ -2502,14 +2380,17 @@ mod tests {
         });
         let known = store.read(|s| s.known_projects().to_vec());
         assert_eq!(known, vec!["/p/a".to_string()]);
-        assert_eq!(db.list_projects().unwrap().len(), 1);
-        std::fs::remove_file(path).ok();
+        let registry = store.read(|s| s.projects_path.clone());
+        assert_eq!(
+            std::fs::read_to_string(&registry).unwrap().lines().count(),
+            1
+        );
     }
 
     #[test]
     fn remove_project_persists_and_survives_reopen() {
-        let (db, path) = temp_db();
-        let store = store_handle(db.clone());
+        let _path = temp_db();
+        let store = store_handle();
         store.with_mut(|s| {
             s.register_project("/p/a".into());
             s.register_project("/p/b".into());
@@ -2517,23 +2398,24 @@ mod tests {
             // Removing an unknown path is a no-op.
             s.remove_project("/p/missing");
         });
-        // Persisted to the db...
-        assert_eq!(db.list_projects().unwrap(), vec!["/p/b".to_string()]);
+        let registry = store.read(|s| s.projects_path.clone());
+        assert_eq!(
+            std::fs::read_to_string(&registry)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["/p/b"]
+        );
         let known = store.read(|s| s.known_projects().to_vec());
         assert_eq!(known, vec!["/p/b".to_string()]);
-        // ...and a freshly initialized store (simulated restart) sees it.
-        let reopened = store_handle(db.clone());
-        let known = reopened.read(|s| s.known_projects().to_vec());
-        assert_eq!(known, vec!["/p/b".to_string()]);
-        std::fs::remove_file(path).ok();
     }
 
     /// The pending-auth badge marker toggles per thread id and only emits
     /// `SummariesUpdated` on an actual state change.
     #[test]
     fn mark_pending_auth_toggles_marker() {
-        let (db, path) = temp_db();
-        let store = store_handle(db.clone());
+        let _path = temp_db();
+        let store = store_handle();
         let events = store.subscribe();
         store.with_mut(|s| s.mark_pending_auth("t1", true));
         assert!(store.read(|s| s.pending_auth_contains("t1")));
@@ -2544,7 +2426,6 @@ mod tests {
         store.with_mut(|s| s.mark_pending_auth("t1", false));
         assert!(!store.read(|s| s.pending_auth_contains("t1")));
         assert_eq!(events.len(), 2);
-        std::fs::remove_file(path).ok();
     }
 
     /// The running-set marker (the sidebar spinner source) toggles per thread
@@ -2553,8 +2434,8 @@ mod tests {
     /// subscription (foreground, parked, actor) relies on.
     #[test]
     fn mark_running_toggles_marker() {
-        let (db, path) = temp_db();
-        let store = store_handle(db.clone());
+        let _path = temp_db();
+        let store = store_handle();
         let events = store.subscribe();
         store.with_mut(|s| s.mark_running("t1"));
         assert!(store.read(|s| s.is_running("t1")));
@@ -2570,15 +2451,14 @@ mod tests {
         assert!(!store.read(|s| s.is_running("t1")));
         assert!(store.read(|s| s.is_running("t2")));
         assert_eq!(events.len(), 3);
-        std::fs::remove_file(path).ok();
     }
 
     /// The plan-review marker (the blue-static vs spinner distinction)
     /// toggles per thread id and is idempotent under repeated marks.
     #[test]
     fn plan_marker_toggles() {
-        let (db, path) = temp_db();
-        let store = store_handle(db.clone());
+        let _path = temp_db();
+        let store = store_handle();
         let events = store.subscribe();
         store.with_mut(|s| s.mark_pending_plan("t1", true));
         assert!(store.read(|s| s.pending_plan_contains("t1")));
@@ -2593,7 +2473,6 @@ mod tests {
         assert!(!store.read(|s| s.pending_plan_contains("t1")));
         assert!(store.read(|s| s.pending_plan_contains("t2")));
         assert_eq!(events.len(), 3);
-        std::fs::remove_file(path).ok();
     }
 
     fn sample_summary(id: &str, archived: bool) -> ThreadSummary {
@@ -2764,7 +2643,7 @@ mod tests {
         .unwrap();
 
         let mut index = SessionIndex::default();
-        let rows = reconcile_summaries(sessions, None, &mut index).await;
+        let rows = reconcile_summaries(sessions, &mut index).await;
         assert_eq!(rows.len(), 2);
 
         // Pointer on the fork (inside the worktree): one row, thread-keyed,
@@ -2910,11 +2789,11 @@ mod tests {
     /// archived conversations).
     #[test]
     fn archive_survives_concurrent_pinned_write() {
-        let (db, db_path) = temp_db();
+        let db_path = temp_db();
         crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("t1.jsonl");
-        let store = store_handle(db.clone());
+        let store = store_handle();
         store.with_mut(|s| {
             s.session_paths.insert("t1".to_string(), session.clone());
             s.sessions_dir = dir.path().to_path_buf();
@@ -2949,7 +2828,7 @@ mod tests {
     /// sidecar follows; clearing lands `None`.
     #[test]
     fn set_thread_tag_persists_to_sidecar() {
-        let (db, db_path) = temp_db();
+        let db_path = temp_db();
         crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("t1.jsonl");
@@ -2960,7 +2839,7 @@ mod tests {
             "{\"type\":\"session\",\"version\":3,\"id\":\"t1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{\"host\":\"manox\"}}\n",
         )
         .unwrap();
-        let store = store_handle(db.clone());
+        let store = store_handle();
         store.with_mut(|s| {
             s.session_paths.insert("t1".to_string(), session.clone());
             s.sessions_dir = dir.path().to_path_buf();
@@ -3022,8 +2901,8 @@ mod tests {
     /// members and fork children share the one `parent_id` hierarchy rule).
     #[test]
     fn archive_cascades_to_descendants() {
-        let (db, db_path) = temp_db();
-        let store = store_handle(db);
+        let db_path = temp_db();
+        let store = store_handle();
         store.with_mut(|s| {
             s.summaries.push(cascade_summary("lead", None));
             s.summaries.push(cascade_summary("member", Some("lead")));
@@ -3047,8 +2926,8 @@ mod tests {
     /// Unarchiving moves only the requested row; descendants stay archived.
     #[test]
     fn unarchive_does_not_cascade() {
-        let (db, db_path) = temp_db();
-        let store = store_handle(db);
+        let db_path = temp_db();
+        let store = store_handle();
         store.with_mut(|s| {
             s.summaries.push(cascade_summary("lead", None));
             s.summaries.push(cascade_summary("member", Some("lead")));
@@ -3074,7 +2953,7 @@ mod tests {
     /// for every descendant row that actually moves.
     #[test]
     fn pin_and_archive_decisions_cold_append_pinned_archived_entries() {
-        let (db, db_path) = temp_db();
+        let db_path = temp_db();
         crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         // Real session files (v3 headers: the cold append rides the lazy
@@ -3095,7 +2974,7 @@ mod tests {
             "k3-child",
             "{\"host\":\"manox\",\"team\":{\"parent\":\"k3-lead\"}}",
         );
-        let store = store_handle(db.clone());
+        let store = store_handle();
         store.with_mut(|s| {
             s.sessions_dir = dir.path().to_path_buf();
             s.session_paths.insert("k3-lead".to_string(), lead.clone());
@@ -3192,7 +3071,7 @@ mod tests {
     /// makes every round converge.
     #[test]
     fn concurrent_cold_appends_land_a_linear_chain() {
-        let (db, db_path) = temp_db();
+        let db_path = temp_db();
         crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         let entries_for = |path: &std::path::Path| -> Vec<(bool, bool)> {
@@ -3228,7 +3107,7 @@ mod tests {
                 entries_for(path)
             );
         };
-        let store = store_handle(db.clone());
+        let store = store_handle();
         for round in 0..3u32 {
             let id = format!("k3-race-{round}");
             let path = dir.path().join(format!("{id}.jsonl"));
@@ -3272,8 +3151,8 @@ mod tests {
     /// mutation closure: without a runtime the drain cannot spawn a save, so no
     /// test ever touches the real `~/.manox/sidebar.order.json`.
     fn ordered_store(rows: &[(&str, &str, i64, bool)]) -> (StoreHandle, std::path::PathBuf) {
-        let (db, db_path) = temp_db();
-        let store = store_handle(db);
+        let db_path = temp_db();
+        let store = store_handle();
         store.with_mut(|s| {
             for (id, project, at, pinned) in rows {
                 s.insert_summary_with_times_for_test(
@@ -3310,7 +3189,7 @@ mod tests {
 
     #[test]
     fn a_later_rescan_with_moved_timestamps_cannot_reorder_the_list() {
-        let (store, path) = ordered_store(&[
+        let (store, _path) = ordered_store(&[
             ("t1", "/p/a", 100, false),
             ("t2", "/p/a", 200, false),
             ("t3", "", 300, false),
@@ -3336,12 +3215,11 @@ mod tests {
             seeded,
             "the account churned"
         );
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn a_thread_move_reorders_the_list_and_dirties_the_account() {
-        let (store, path) = ordered_store(&[
+        let (store, _path) = ordered_store(&[
             ("t1", "/p/a", 100, false),
             ("t2", "/p/a", 200, false),
             ("t3", "/p/a", 300, false),
@@ -3357,12 +3235,11 @@ mod tests {
             vec!["t1".to_string(), "t3".to_string(), "t2".to_string()],
             "the account must record the move"
         );
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn a_move_is_rejected_when_the_anchor_lives_elsewhere() {
-        let (store, path) =
+        let (store, _path) =
             ordered_store(&[("t1", "/p/a", 100, false), ("t2", "/p/b", 200, false)]);
         let before = ids(&store);
         store.with_mut(|s| {
@@ -3374,7 +3251,6 @@ mod tests {
             );
             assert!(!s.order_dirty, "a rejected move persists nothing");
         });
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -3384,7 +3260,7 @@ mod tests {
         crate::runtime::init_hermetic_for_test();
         let scratch = std::env::temp_dir().join(format!("order-{}.json", uuid::Uuid::new_v4()));
         crate::sidebar_order::set_order_path_for_test(Some(scratch.clone()));
-        let (store, path) = ordered_store(&[
+        let (store, _path) = ordered_store(&[
             ("t1", "/p/a", 300, false),
             ("t2", "/p/a", 200, false),
             ("t3", "/p/a", 100, true),
@@ -3401,14 +3277,13 @@ mod tests {
         // Unpinning drops the row back to its stored rank.
         store.with_mut(|s| s.pin_thread("t2", false));
         assert_eq!(ids(&store), vec!["t3", "t2", "t1"]);
-        std::fs::remove_file(path).ok();
         std::fs::remove_file(&scratch).ok();
         crate::sidebar_order::set_order_path_for_test(None);
     }
 
     #[test]
     fn a_new_row_surfaces_at_the_head_of_its_partition() {
-        let (store, path) = ordered_store(&[("t1", "/p/a", 100, false)]);
+        let (store, _path) = ordered_store(&[("t1", "/p/a", 100, false)]);
         store.with_mut(|s| {
             s.insert_summary_with_times_for_test(
                 "t9",
@@ -3422,12 +3297,11 @@ mod tests {
             s.rerank();
         });
         assert_eq!(ids(&store), vec!["t9", "t1"]);
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
     fn folders_follow_the_committed_order_and_the_registry_projects_it() {
-        let (store, path) = ordered_store(&[
+        let (store, _path) = ordered_store(&[
             ("t1", "/p/a", 100, false),
             ("t2", "/p/b", 200, false),
             ("t3", "", 300, false),
@@ -3443,7 +3317,6 @@ mod tests {
         );
         // Loose rows stay last regardless of folder order.
         assert_eq!(ids(&store), vec!["t2", "t1", "t3"]);
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -3453,7 +3326,7 @@ mod tests {
         crate::runtime::init_hermetic_for_test();
         let scratch = std::env::temp_dir().join(format!("order-{}.json", uuid::Uuid::new_v4()));
         crate::sidebar_order::set_order_path_for_test(Some(scratch.clone()));
-        let (store, path) =
+        let (store, _path) =
             ordered_store(&[("t1", "/p/a", 100, false), ("t2", "/p/a", 200, false)]);
         store.with_mut(|s| s.archive_thread("t1", true));
         assert_eq!(ids(&store), vec!["t2"]);
@@ -3464,7 +3337,6 @@ mod tests {
         store.with_mut(|s| s.archive_thread("t1", false));
         // A row that returns has no stored rank, so it surfaces at the head.
         assert_eq!(ids(&store), vec!["t1", "t2"]);
-        std::fs::remove_file(path).ok();
         std::fs::remove_file(&scratch).ok();
         crate::sidebar_order::set_order_path_for_test(None);
     }

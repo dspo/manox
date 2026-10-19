@@ -44,8 +44,7 @@ pub(super) fn install() -> (
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&tmp).unwrap();
-    let db = Arc::new(manox_agent::db::ThreadsDatabase::open(&tmp.join("threads.db")).unwrap());
-    manox_agent::thread_store::init_for_test(db);
+    manox_agent::thread_store::init_for_test();
     manox_agent::thread_registry::set_registry_path_for_test(Some(
         tmp.join("threads.registry.json"),
     ));
@@ -3232,11 +3231,7 @@ mod transport_parity {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&scratch).expect("scratch dir");
-        let db = Arc::new(
-            manox_agent::db::ThreadsDatabase::open(&scratch.join("threads.db"))
-                .expect("threads db"),
-        );
-        manox_agent::thread_store::init_for_test(db);
+        manox_agent::thread_store::init_for_test();
         manox_agent::thread_registry::set_registry_path_for_test(Some(
             scratch.join("threads.registry.json"),
         ));
