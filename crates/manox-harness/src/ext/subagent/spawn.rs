@@ -207,6 +207,15 @@ impl SubagentProvider for SpawnProvider {
             ));
         }
         let mut selected = self.select_child_tools(req.tool_filter.as_ref());
+        // The child's channel to the parent's user: one clarifying
+        // question, delivered once, ending the child's turn — the answer
+        // returns as a continuation of the same run.
+        if let Some(observer) = &self.observer {
+            selected.push(Arc::new(crate::ext::subagent::ask::AskParentTool::new(
+                run_id.clone(),
+                Arc::clone(observer),
+            )));
+        }
         let mut worktree = match req.isolation.as_deref() {
             Some("worktree") => Some(
                 Worktree::prepare(req.env.as_ref(), &req.cwd)

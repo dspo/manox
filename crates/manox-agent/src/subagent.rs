@@ -931,6 +931,21 @@ impl SubagentRunObserver {
 }
 
 impl RunObserver for SubagentRunObserver {
+    /// A child's `AskParent` delivery: the escalation row is the durable
+    /// record; the fold surfaces the question on the parent chat as an
+    /// attributed note coaching the continuation.
+    fn on_escalate(&self, run_id: &str, question: &str) {
+        let auth_id = uuid::Uuid::new_v4().to_string();
+        self.journal_swarm_row(
+            "run/escalated",
+            serde_json::json!({
+                "runId": run_id,
+                "question": question,
+                "authId": auth_id,
+            }),
+        );
+    }
+
     fn on_start(&self, info: &RunInfo) {
         let subagent_type = info.kind.clone();
         self.locked().insert(
