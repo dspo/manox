@@ -994,5 +994,4 @@ mod tests {
         let title = tool_title("mcp_long", &json!({"text": long}));
         assert_eq!(title, format!("mcp_long {}…", "y".repeat(40)));
     }
-
 }

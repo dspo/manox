@@ -379,11 +379,14 @@ impl RuntimeBackend {
         if let Some(host) = self.host() {
             host.seed_session(&seeded.thread_id, seeded.session.clone());
             host.seed_chat(&seeded.thread_id, session_id, seeded.chat.clone());
-            // A subagent child chat has a foldable journal but no thread of
-            // its own — no live feed to bridge. It is served snapshot-only:
-            // the fold above is the whole truth, and a re-subscribe refreshes
-            // it (a child's journal ends when its run ends).
-            if own_thread.is_some() {
+            // A live engine bridges through its thread feed; a running
+            // sub-agent child bridges through its registry feed (the run
+            // registers the child journal's broadcast at dispatch). A
+            // settled child has neither — it serves snapshot-only from its
+            // durable journal, and a re-subscribe refreshes it.
+            if own_thread.is_some()
+                || manox_harness::subagent::feeds::child_journal_feed(session_id).is_some()
+            {
                 self.ensure_bridge(session_id);
             }
         }
@@ -414,14 +417,25 @@ impl RuntimeBackend {
                 None => self.first_bridge_resume(session_id),
             },
         };
-        let Some(thread) = self.server.journal_feed(session_id) else {
-            // A cold session (no live engine) has no feed to bridge; its state
-            // still answers from the journal, and a submit materializes the
-            // engine, which re-runs this path. The entry (and the watermark it
-            // carries) stays, so that later start still resumes where this one
-            // meant to.
-            tracing::debug!(session = %session_id, "bridge: no live feed yet (cold session)");
-            return;
+        enum Feed {
+            Thread(manox_agent::thread::ThreadHandle),
+            Child(tokio::sync::broadcast::Receiver<manox_harness::session::jsonl::JournalEvent>),
+        }
+        let feed = match self.server.journal_feed(session_id) {
+            Some(thread) => Feed::Thread(thread),
+            None => match manox_harness::subagent::feeds::child_journal_feed(session_id) {
+                Some(child) => Feed::Child(child),
+                // A cold session (no live engine, no running child) has no
+                // feed to bridge; its state still answers from the journal,
+                // and a submit (or a dispatch) materializes one, which
+                // re-runs this path. The entry (and the watermark it
+                // carries) stays, so that later start still resumes where
+                // this one meant to.
+                None => {
+                    tracing::debug!(session = %session_id, "bridge: no live feed yet (cold session)");
+                    return;
+                }
+            },
         };
         let Some(host) = self.host() else {
             return;
@@ -434,9 +448,18 @@ impl RuntimeBackend {
         let watermark = Arc::new(AtomicU64::new(resume_from.saturating_sub(1)));
         let task_watermark = Arc::clone(&watermark);
         let task = manox_agent::runtime::handle().spawn(async move {
-            backend
-                .bridge(host, thread, id, resume_from, task_watermark)
-                .await;
+            match feed {
+                Feed::Thread(thread) => {
+                    backend
+                        .bridge(host, thread, id, resume_from, task_watermark)
+                        .await;
+                }
+                Feed::Child(child) => {
+                    backend
+                        .bridge_child(host, child, id, resume_from, task_watermark)
+                        .await;
+                }
+            }
         });
         // Whatever held the slot is superseded: a finished task is already
         // dead, and a live one can only be a concurrent restart's — two bridges
@@ -459,6 +482,85 @@ impl RuntimeBackend {
             .get(session_id)
             .map(|seeded| seeded.tail + 1)
             .unwrap_or_default()
+    }
+
+    /// The child-session bridge: the same replay-and-forward shape as
+    /// [`Self::bridge`], over a running sub-agent's journal broadcast
+    /// instead of a thread feed. The channel closes when the child session
+    /// drops at the run's settle — the bridge exits on `Closed`, and the
+    /// chat serves from its durable journal from then on, exactly as a
+    /// re-subscribe always did.
+    async fn bridge_child(
+        &self,
+        host: Arc<manox_ahp::Host>,
+        mut feed: tokio::sync::broadcast::Receiver<manox_harness::session::jsonl::JournalEvent>,
+        session_id: String,
+        resume_from: u64,
+        watermark: Arc<AtomicU64>,
+    ) {
+        let mut translator = Translator::new();
+        let mut cursor = Cursor {
+            tail: resume_from.saturating_sub(1),
+            watermark,
+        };
+        tracing::info!(session = %session_id, resume_from, "bridge: subscribed to the child journal feed");
+        self.replay_journal(
+            &session_id,
+            &host,
+            &mut translator,
+            &mut cursor,
+            resume_from,
+            false,
+        )
+        .await;
+        loop {
+            match feed.recv().await {
+                Ok(event) => {
+                    if event.seq <= cursor.tail {
+                        continue;
+                    }
+                    self.forward_entry(
+                        &host,
+                        &session_id,
+                        &mut translator,
+                        event.seq,
+                        &event.entry,
+                    )
+                    .await;
+                    cursor.accounted(event.seq);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Same resync discipline as the thread bridge: reset the
+                    // translator, replay the durable rows above the cursor,
+                    // keep going — a child flood must not hollow the chat.
+                    tracing::warn!(
+                        session = %session_id,
+                        "bridge: child feed lagged, resyncing over the gap"
+                    );
+                    translator = Translator::new();
+                    let replay_from = cursor.tail + 1;
+                    self.replay_journal(
+                        &session_id,
+                        &host,
+                        &mut translator,
+                        &mut cursor,
+                        replay_from,
+                        true,
+                    )
+                    .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    // The child session dropped: the run settled. Everything
+                    // above the cursor is in the durable journal a
+                    // re-subscribe folds.
+                    tracing::info!(
+                        session = %session_id,
+                        "bridge: child feed closed with the run, exiting"
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     /// Abort and restart the bridge unconditionally: the engine
