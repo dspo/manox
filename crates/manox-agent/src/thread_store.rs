@@ -857,6 +857,18 @@ impl ThreadStore {
 
     /// Persist the session's granted extra working directories (multi-
     /// root) so a cold restore re-widens the fence (multi-working-dirs).
+    /// Drop every in-memory trace of one session (summary row, path map,
+    /// live handle) — the true deletion for a session that never
+    /// materialized. Durable artifacts are the caller's business: this
+    /// store only ever held the row.
+    pub fn drop_session_row(&mut self, id: &str) {
+        self.summaries.retain(|row| row.id != id);
+        self.session_paths.remove(id);
+        self.live_threads.remove(id);
+        self.pending_working_dirs.remove(id);
+        self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
+    }
+
     /// The journal file path the store has for a session, when it has one.
     pub fn journal_path(&self, id: &str) -> Option<std::path::PathBuf> {
         self.session_paths.get(id).cloned()
