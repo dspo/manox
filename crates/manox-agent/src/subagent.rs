@@ -307,6 +307,10 @@ impl AgentTool for DelegationTool {
             .get("run_in_background")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Continue a settled run: the child session the id names reopens and
+        // `prompt` is the follow-up. The dispatch otherwise behaves exactly
+        // like a first run — same budgets, promotion, settlement, delivery.
+        let continue_run_id = string_param(&params, "continue_run_id");
         let budgets = Budgets {
             timeout_ms: params.get("timeout_ms").and_then(|v| v.as_u64()),
             idle_timeout_ms: params.get("idle_timeout_ms").and_then(|v| v.as_u64()),
@@ -376,7 +380,7 @@ impl AgentTool for DelegationTool {
         let request = manox_harness::subagent::StartRequest {
             label: description,
             kind: self.config.name.clone(),
-            prompt,
+            prompt: prompt.clone(),
             agent_options,
             max_depth: Some(self.config.max_depth),
             tool_filter,
@@ -384,6 +388,7 @@ impl AgentTool for DelegationTool {
             parent_depth: self.parent_depth,
             parent_session: self.parent_session.clone(),
             tool_call_id: Some(_tool_call_id.to_string()),
+            continuation_of: continue_run_id.clone(),
             budgets: if run_in_background {
                 budgets
             } else {
@@ -405,30 +410,46 @@ impl AgentTool for DelegationTool {
                 signal.clone()
             },
         };
-        let run = self
-            .runtime
-            .start(&self.config.provider, request)
-            .await
-            .map_err(tool_error_of)?;
+        let run = match &continue_run_id {
+            Some(run_id) => self
+                .runtime
+                .continue_run(&self.config.provider, run_id, request)
+                .await
+                .map_err(tool_error_of)?,
+            None => self
+                .runtime
+                .start(&self.config.provider, request)
+                .await
+                .map_err(tool_error_of)?,
+        };
         let run_id = run.id.clone();
         let run_id_for_result = run_id.clone();
         // The run.s lifecycle row is the durable record — two rows per run,
         // written once each; progress never rides the parent journal.
-        self.observer.journal_swarm_row(
-            "run/started",
-            serde_json::json!({
-                "runId": run_id.clone(),
-                "kind": self.config.name,
-                "label": card_title.clone(), // the delivery keeps the label
-                "childSession": run_id.clone(), // the invariant: the run id names the child session
-                "toolCallId": _tool_call_id,
-                "budgets": {
-                    "timeoutMs": budgets.timeout_ms,
-                    "idleTimeoutMs": budgets.idle_timeout_ms,
-                },
-                "depth": self.parent_depth + 1,
-            }),
-        );
+        match &continue_run_id {
+            Some(_) => self.observer.journal_swarm_row(
+                "run/continued",
+                serde_json::json!({
+                    "runId": run_id.clone(),
+                    "followUp": prompt,
+                }),
+            ),
+            None => self.observer.journal_swarm_row(
+                "run/started",
+                serde_json::json!({
+                    "runId": run_id.clone(),
+                    "kind": self.config.name,
+                    "label": card_title.clone(), // the delivery keeps the label
+                    "childSession": run_id.clone(), // the invariant: the run id names the child session
+                    "toolCallId": _tool_call_id,
+                    "budgets": {
+                        "timeoutMs": budgets.timeout_ms,
+                        "idleTimeoutMs": budgets.idle_timeout_ms,
+                    },
+                    "depth": self.parent_depth + 1,
+                }),
+            ),
+        }
         if !run_in_background {
             let settled = match promote_after {
                 None => run.result().await,

@@ -135,6 +135,33 @@ impl SubagentRuntime {
         provider: &str,
         request: StartRequest,
     ) -> Result<SubagentRun, SubagentError> {
+        self.start_gated(provider, request, None).await
+    }
+
+    /// Continue a settled run: reopen the child session the run id names
+    /// and inject the follow-up prompt as a new turn. Every gate of
+    /// [`Self::start`] applies; the run keeps its id — the child session
+    /// id IS the run id, so cards, rows, and drill-downs stay pointed at
+    /// the same chat.
+    pub async fn continue_run(
+        self: &Arc<Self>,
+        provider: &str,
+        run_id: &str,
+        mut request: StartRequest,
+    ) -> Result<SubagentRun, SubagentError> {
+        request.continuation_of = Some(run_id.to_string());
+        self.start_gated(provider, request, Some(run_id.to_string()))
+            .await
+    }
+
+    /// The one start path: gates, id (minted or continued), provider
+    /// dispatch, run-table registration, settle watcher.
+    async fn start_gated(
+        self: &Arc<Self>,
+        provider: &str,
+        request: StartRequest,
+        explicit_id: Option<String>,
+    ) -> Result<SubagentRun, SubagentError> {
         let provider_impl = self.get_provider(provider)?;
         request.budgets.validate()?;
         assert_capabilities(provider, &provider_impl.capabilities(), &request)?;
@@ -162,11 +189,13 @@ impl SubagentRuntime {
         descriptor.persona = request.persona.clone();
         descriptor.tool_filter = request.tool_filter.clone();
 
-        let run_id = format!(
-            "sub-{}-{}",
-            self.namespace,
-            self.run_seq.fetch_add(1, Ordering::SeqCst)
-        );
+        let run_id = explicit_id.unwrap_or_else(|| {
+            format!(
+                "sub-{}-{}",
+                self.namespace,
+                self.run_seq.fetch_add(1, Ordering::SeqCst)
+            )
+        });
         let label = request.label.clone();
         let kind = request.kind.clone();
         let request_kind = request.kind.clone();
