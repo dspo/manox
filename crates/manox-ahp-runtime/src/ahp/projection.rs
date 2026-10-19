@@ -981,7 +981,13 @@ impl Translator {
                 // transcript with a card per spawn/exit the moment the bridge
                 // streamed again.
             }
-            SessionTreeEntry::RunStarted { run_id, label, .. } => {
+            SessionTreeEntry::RunStarted {
+                run_id,
+                kind,
+                label,
+                tool_call_id,
+                ..
+            } => {
                 // The durable lifecycle rows are the whole background-work
                 // truth: one open at start, one close at settle — and the
                 // child's own state lives in its chat (`ahp-chat:/<run_id>`;
@@ -1003,6 +1009,33 @@ impl Translator {
                                         chat: format!("ahp-chat:/{run_id}"),
                                     },
                                 ),
+                            },
+                        ),
+                    ));
+                }
+                // The spawning tool call's forward pointer — the same edge
+                // the child chat records in reverse through its ChatOrigin
+                // (the spec's MUST-keep-consistent pair). The tool call id
+                // is the join key the row has carried since it rode the
+                // start request.
+                if !tool_call_id.is_empty() {
+                    self.ensure_turn(&row, &chat, &mut out);
+                    let turn_id = self.turn_id();
+                    out.push(Emitted::new(
+                        &chat,
+                        StateAction::ChatToolCallContentChanged(
+                            ahp_types::actions::ChatToolCallContentChangedAction {
+                                turn_id,
+                                tool_call_id: tool_call_id.clone(),
+                                meta: None,
+                                content: vec![ahp_types::state::ToolResultContent::Subagent(
+                                    ahp_types::state::ToolResultSubagentContent {
+                                        resource: format!("ahp-chat:/{run_id}"),
+                                        title: label.clone(),
+                                        agent_name: Some(kind.clone()),
+                                        description: Some(label.clone()),
+                                    },
+                                )],
                             },
                         ),
                     ));
@@ -4216,6 +4249,59 @@ mod annotations_tests {
         assert_eq!(state.annotations.len(), 1);
         assert_eq!(state.annotations[0].id, "note-1");
         assert_eq!(state.annotations[0].entries.len(), 2);
+    }
+
+    /// A run/started row with a tool call id opens the background-work
+    /// pointer AND attaches the spawning tool call's forward pointer — a
+    /// `ToolResultSubagentContent` naming the child chat — so the card, the
+    /// row, and the drill-down correlate by spec vocabulary, with no
+    /// private payload riding either.
+    #[test]
+    fn run_started_attaches_the_subagent_pointer_to_the_owning_tool_call() {
+        let mut t = Translator::new();
+        let out = t.on_entry(
+            "c-1",
+            "s-1",
+            0,
+            &kernel(json!({
+                "type": "run/started",
+                "id": "e-1",
+                "parentId": null,
+                "timestamp": "1970-01-01T00:00:00Z",
+                "runId": "sub-9",
+                "kind": "Explore",
+                "label": "survey the fold",
+                "childSession": "sub-9",
+                "toolCallId": "tu_1",
+                "budgets": {},
+                "depth": 1,
+            })),
+        );
+        let chat = manox_ahp::channels::chat::uri("c-1");
+        let mut work = 0;
+        let mut pointer = None;
+        for emitted in &out {
+            if emitted.channel != chat {
+                continue;
+            }
+            match &emitted.action {
+                StateAction::ChatBackgroundWorkSet(_) => work += 1,
+                StateAction::ChatToolCallContentChanged(action) => pointer = Some(action.clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(work, 1, "the run opens exactly one background-work entry");
+        let pointer = pointer.expect("the spawning tool call gets its forward pointer");
+        assert_eq!(pointer.tool_call_id, "tu_1");
+        assert_eq!(pointer.content.len(), 1);
+        match &pointer.content[0] {
+            ahp_types::state::ToolResultContent::Subagent(sub) => {
+                assert_eq!(sub.resource, "ahp-chat:/sub-9");
+                assert_eq!(sub.title, "survey the fold");
+                assert_eq!(sub.agent_name.as_deref(), Some("Explore"));
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
     }
 
     /// A UI note card (an annotation carrying the `x-manox` note payload)
