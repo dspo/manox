@@ -28,6 +28,11 @@ struct ActiveRun {
     started_at: Instant,
 }
 
+/// How many child runs may be active at once. The limit keeps a model from
+/// fanning out unbounded while any single run can still run to completion;
+/// hitting it is a routing decision the error text coaches, not a failure.
+pub const DEFAULT_ACTIVE_CAPACITY: usize = 4;
+
 /// The subagent service: registry + capability-checked starts + live-run
 /// table + the `start`/`end` observation broadcast. One per thread assembly.
 pub struct SubagentRuntime {
@@ -138,6 +143,14 @@ impl SubagentRuntime {
             return Err(SubagentError::InvalidRequest(format!(
                 "delegation depth budget exhausted: child would run at depth {child_depth} \
                  but the cap is {max}"
+            )));
+        }
+        let active = mutex(&self.runs).len();
+        if active >= DEFAULT_ACTIVE_CAPACITY {
+            return Err(SubagentError::InvalidRequest(format!(
+                "subagent limit reached (active child limit: {DEFAULT_ACTIVE_CAPACITY}); \
+                 wait for an existing child to finish or complete this work \
+                 with the current agents"
             )));
         }
         let mut descriptor = Descriptor::one_shot(
@@ -531,5 +544,72 @@ mod tests {
         let names = runtime.delegation_tool_names();
         assert_eq!(names.len(), 2);
         assert!(names.contains("Explore") && names.contains("ListAgents"));
+    }
+
+    /// A provider whose runs never settle — the capacity gate's fixture:
+    /// active runs occupy slots for their whole life.
+    struct HoldingProvider;
+
+    #[async_trait::async_trait]
+    impl SubagentProvider for HoldingProvider {
+        fn name(&self) -> &str {
+            "holding"
+        }
+        fn capabilities(&self) -> Capabilities {
+            full_caps()
+        }
+        async fn start(&self, request: ResolvedStartRequest) -> Result<SubagentRun, SubagentError> {
+            let cancel = request.inner.cancel.clone();
+            Ok(SubagentRun::new(
+                request.run_id,
+                cancel.clone(),
+                Box::pin(async move {
+                    // Hold until the dispose token fires, then settle as
+                    // aborted — the cancellation the real drive loop takes.
+                    cancel.cancelled().await;
+                    RunResult {
+                        output: String::new(),
+                        structured: None,
+                        diagnostic: None,
+                        stop_reason: StopReason::Aborted,
+                    }
+                }),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_active_capacity_gate_coaches_instead_of_failing_silently() {
+        let runtime = SubagentRuntime::new();
+        let _guard = runtime.register_provider(Arc::new(HoldingProvider));
+        for _ in 0..DEFAULT_ACTIVE_CAPACITY {
+            runtime
+                .start("holding", test_request("l", "p"))
+                .await
+                .unwrap();
+        }
+        let err = runtime
+            .start("holding", test_request("one too many", "p"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("wait for an existing child"),
+            "{err}"
+        );
+        // Interrupting one run settles it, its watcher frees the slot, and
+        // the next start is admitted.
+        let live = runtime.list_runs();
+        let victim = live.first().expect("held runs").id.clone();
+        assert!(runtime.interrupt(&victim));
+        for _ in 0..50 {
+            if runtime.list_runs().len() < DEFAULT_ACTIVE_CAPACITY {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        runtime
+            .start("holding", test_request("after free", "p"))
+            .await
+            .expect("the freed slot admits a new run");
     }
 }
