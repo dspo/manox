@@ -146,6 +146,10 @@ pub struct StartRequest {
     pub parent_depth: u32,
     /// Lineage: the parent's session id, written into the child header.
     pub parent_session: Option<String>,
+    /// The parent-side tool call id that dispatched this run — the join key
+    /// the `run/started` row carries so a card, a row, and a settled report
+    /// correlate without guessing.
+    pub tool_call_id: Option<String>,
     /// Arming wall-clock/idle budgets.
     pub budgets: Budgets,
     /// `Some("worktree")` isolates the child in a throwaway git worktree
@@ -292,6 +296,8 @@ pub struct RunInfo {
     /// The dispatch's armed budgets — the host watchdog reads the idle
     /// budget from here.
     pub budgets: Budgets,
+    /// The parent-side tool call id that dispatched this run.
+    pub tool_call_id: Option<String>,
 }
 
 /// The static per-definition configuration one model-facing delegation tool
@@ -404,6 +410,7 @@ pub fn test_request(label: &str, prompt: &str) -> StartRequest {
         persona: None,
         parent_depth: 0,
         parent_session: None,
+        tool_call_id: None,
         budgets: Budgets::default(),
         isolation: None,
         env: Arc::new(crate::core::env::TokioExecutionEnv::new(cwd.clone())),
