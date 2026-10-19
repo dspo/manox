@@ -171,6 +171,7 @@ impl SubagentRuntime {
         let kind = request.kind.clone();
         let request_kind = request.kind.clone();
         let request_model = request.agent_options.as_ref().and_then(|o| o.model.clone());
+        let resolved_tool_call_id = request.tool_call_id.clone();
         let resolved_budgets = request.budgets;
         let resolved = ResolvedStartRequest {
             run_id: run_id.clone(),
@@ -204,6 +205,7 @@ impl SubagentRuntime {
                 model: request_model,
                 local: true,
                 budgets: resolved_budgets,
+                tool_call_id: resolved_tool_call_id,
             }))
             .is_err()
         {
