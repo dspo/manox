@@ -18,7 +18,7 @@ use crate::core::coding_agent::{AgentSession, ModelRuntime, create_agent_session
 use crate::core::env::ExecutionEnv;
 use crate::core::ext_point_agent::{AgentDef, AgentRegistry};
 use crate::core::tool::{AgentTool, ToolError};
-use crate::core::types::{AgentEvent, AgentMessage, ContentBlock};
+use crate::core::types::{AgentEvent, AgentMessage};
 use crate::ext::prompt::base_prompt_builder;
 use crate::ext::subagent::SubagentRun;
 use crate::ext::subagent::provider::{RunObserver, SubagentProvider};
@@ -462,13 +462,17 @@ async fn drive_run(run: DrivenRun) -> RunResult {
     tokio::pin!(deadline);
     let mut watchdog_tick = tokio::time::interval(SUBAGENT_TICK);
     watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Partial-output salvage, read inside the killing arms right after the
+    // Partial-output salvage: the fold accumulates across the whole run
+    // (streamed text always, completed messages as the candidate), and the
+    // killing arms refresh it from the final message list right after the
     // prompt future is dropped (the borrow must provably end first).
+    let mut fold = super::salvage::OutputFold::new();
     let mut partial = String::new();
     let ending = loop {
         tokio::select! {
             r = prompt_fut.as_mut() => break Ending::Done(r),
             Some(event) = ev_rx.recv() => {
+                fold.observe(&event);
                 if let Some(observer) = &observer {
                     observer.on_child_event(&run_id, &event);
                 }
@@ -486,7 +490,8 @@ async fn drive_run(run: DrivenRun) -> RunResult {
                     break Ending::Done(r);
                 }
                 drop(prompt_fut);
-                partial = truncate_final(&extract_final_text(session.harness_messages()));
+                fold.observe_messages(session.harness_messages());
+                partial = fold.collect().map(|text| truncate_final(&text)).unwrap_or_default();
                 handle.abort();
                 break Ending::TimedOut;
             }
@@ -494,7 +499,8 @@ async fn drive_run(run: DrivenRun) -> RunResult {
                 let enforce = observer.as_ref().is_some_and(|o| o.on_tick(&run_id));
                 if enforce {
                     drop(prompt_fut);
-                    partial = truncate_final(&extract_final_text(session.harness_messages()));
+                    fold.observe_messages(session.harness_messages());
+                    partial = fold.collect().map(|text| truncate_final(&text)).unwrap_or_default();
                     handle.abort();
                     break Ending::Stalled;
                 }
@@ -515,16 +521,20 @@ async fn drive_run(run: DrivenRun) -> RunResult {
     // from the returned messages instead.
     let result = match ending {
         Ending::Done(Ok(messages)) => RunResult {
-            output: format!(
-                "{}{kept_note}",
-                truncate_final(&extract_final_text(&messages))
-            ),
+            output: format!("{}{kept_note}", {
+                fold.observe_messages(&messages);
+                fold.collect()
+                    .map(|text| truncate_final(&text))
+                    .unwrap_or_default()
+            }),
             structured: None,
             diagnostic: None,
             stop_reason: StopReason::Completed,
         },
         Ending::Done(Err(e)) if e.to_string().contains("aborted") => RunResult {
-            output: String::new(),
+            // The work the child finished before the abort is real: the
+            // fold carries it, and the settlement delivers it.
+            output: partial,
             structured: None,
             diagnostic: Some(cap_diagnostic("aborted")),
             stop_reason: StopReason::Aborted,
@@ -536,7 +546,7 @@ async fn drive_run(run: DrivenRun) -> RunResult {
             stop_reason: StopReason::Error,
         },
         Ending::Aborted => RunResult {
-            output: String::new(),
+            output: partial,
             structured: None,
             diagnostic: Some(cap_diagnostic(&format!("aborted{kept_note}"))),
             stop_reason: StopReason::Aborted,
@@ -571,27 +581,6 @@ async fn drive_run(run: DrivenRun) -> RunResult {
         });
     }
     result
-}
-
-/// Extract the final assistant text: the text blocks of the last assistant
-/// message that carried content, skipping empty/usage-only messages.
-pub fn extract_final_text(messages: &[AgentMessage]) -> String {
-    for msg in messages.iter().rev() {
-        if let AgentMessage::Assistant { content, .. } = msg {
-            let text: String = content
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text, .. } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text.is_empty() {
-                return text;
-            }
-        }
-    }
-    String::new()
 }
 
 fn truncate_final(text: &str) -> String {
@@ -1201,56 +1190,6 @@ mod tests {
             .arg(repo)
             .args(["branch", "-D", &branch])
             .output();
-    }
-
-    /// Output extraction: the last non-empty assistant message wins; an
-    /// empty transcript yields nothing.
-    #[test]
-    fn extract_final_text_prefers_last_non_empty_assistant() {
-        use crate::core::types::{AgentMessage, ContentBlock};
-        let text_block = |t: &str| {
-            vec![ContentBlock::Text {
-                text: t.to_string(),
-                signature: None,
-            }]
-        };
-        let messages = vec![
-            AgentMessage::Assistant {
-                content: text_block("intermediate narration"),
-                model: "m".into(),
-                provider: "p".into(),
-                api: "a".into(),
-                response_model: None,
-                response_id: None,
-                diagnostics: None,
-                raw_stop_reason: None,
-                stop_reason: None,
-                usage: Box::new(crate::core::types::Usage::default()),
-                error_message: None,
-                timestamp: chrono::Utc::now(),
-            },
-            AgentMessage::User {
-                content: Vec::new(),
-                timestamp: chrono::Utc::now(),
-                id: None,
-            },
-            AgentMessage::Assistant {
-                content: text_block("the final answer"),
-                model: "m".into(),
-                provider: "p".into(),
-                api: "a".into(),
-                response_model: None,
-                response_id: None,
-                diagnostics: None,
-                raw_stop_reason: None,
-                stop_reason: None,
-                usage: Box::new(crate::core::types::Usage::default()),
-                error_message: None,
-                timestamp: chrono::Utc::now(),
-            },
-        ];
-        assert_eq!(extract_final_text(&messages), "the final answer");
-        assert_eq!(extract_final_text(&[]), "");
     }
 
     /// Budget validation: below-minimum arms are input errors.

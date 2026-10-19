@@ -18,6 +18,8 @@
 pub mod descriptor;
 pub mod provider;
 pub mod runtime;
+pub mod salvage;
+pub mod settlement;
 pub mod spawn;
 pub mod types;
 
@@ -26,9 +28,10 @@ pub use provider::{
     ContinuableCreateRequest, ContinuableCreateSpec, RunObserver, SubagentProvider, SubagentRun,
 };
 pub use runtime::{ProviderGuard, SubagentRuntime};
+pub use settlement::{NO_CLOSING_MESSAGE, kind_of, verdict};
 pub use spawn::{
-    SpawnProvider, Worktree, auto_deny_gated, explore_agent_def, extract_final_text,
-    register_defaults, sailor_agent_def,
+    SpawnProvider, Worktree, auto_deny_gated, explore_agent_def, register_defaults,
+    sailor_agent_def,
 };
 pub use types::{
     AgentOptions, Budgets, Capabilities, DelegationToolConfig, Event, HUMAN_INTERACTION_TOOLS,

@@ -183,8 +183,16 @@ pub enum StopReason {
     Aborted,
     /// Model, transport, budget, or stall failure.
     Error,
-    /// Reserved: the child hit its token ceiling before finishing.
+    /// The child hit its token ceiling before finishing.
     MaxTokens,
+    /// The wall-clock budget expired and the run was stopped mid-flight.
+    TimedOut,
+    /// The idle budget expired with no child activity.
+    Stalled,
+    /// The foreground wait ended by promotion: the run continues in the
+    /// background and settles later through its own continued run. This
+    /// reason appears only on the promotion receipt, never on a settlement.
+    Promoted,
     /// Reserved: the child declined the task.
     Refusal,
     /// A backend-added variant this build does not know.
@@ -203,7 +211,10 @@ impl Serialize for StopReason {
 impl StopReason {
     /// Whether the run's `output` may be partial (anything non-completed).
     pub fn is_terminal_failure(&self) -> bool {
-        matches!(self, StopReason::Error | StopReason::Unknown(_))
+        matches!(
+            self,
+            StopReason::Error | StopReason::Unknown(_) | StopReason::TimedOut | StopReason::Stalled
+        )
     }
 }
 
@@ -219,6 +230,9 @@ impl<'de> serde::Deserialize<'de> for StopReason {
             "error" => StopReason::Error,
             "max-tokens" => StopReason::MaxTokens,
             "refusal" => StopReason::Refusal,
+            "timed-out" => StopReason::TimedOut,
+            "stalled" => StopReason::Stalled,
+            "promoted" => StopReason::Promoted,
             other => StopReason::Unknown(other.to_string()),
         })
     }
@@ -232,6 +246,9 @@ impl std::fmt::Display for StopReason {
             StopReason::Error => write!(f, "error"),
             StopReason::MaxTokens => write!(f, "max-tokens"),
             StopReason::Refusal => write!(f, "refusal"),
+            StopReason::TimedOut => write!(f, "timed-out"),
+            StopReason::Stalled => write!(f, "stalled"),
+            StopReason::Promoted => write!(f, "promoted"),
             StopReason::Unknown(s) => write!(f, "{s}"),
         }
     }

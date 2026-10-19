@@ -981,14 +981,80 @@ impl Translator {
                 // transcript with a card per spawn/exit the moment the bridge
                 // streamed again.
             }
-            SessionTreeEntry::RunStarted { .. }
-            | SessionTreeEntry::RunSettled { .. }
-            | SessionTreeEntry::RunEscalated { .. }
+            SessionTreeEntry::RunStarted { run_id, label, .. } => {
+                // The durable lifecycle rows are the whole background-work
+                // truth: one open at start, one close at settle — and the
+                // child's own state lives in its chat (`ahp-chat:/<run_id>`;
+                // the run id names the child session). No progress rides
+                // this pointer.
+                let listed = self.subagents.contains_key(run_id);
+                if !listed {
+                    self.subagents.insert(run_id.clone(), ());
+                    out.push(Emitted::new(
+                        &chat,
+                        StateAction::ChatBackgroundWorkSet(
+                            ahp_types::actions::ChatBackgroundWorkSetAction {
+                                work: ahp_types::state::BackgroundWork::Subagent(
+                                    ahp_types::state::BackgroundSubagentWork {
+                                        id: run_id.clone(),
+                                        label: label.clone(),
+                                        started_at: row.timestamp.clone(),
+                                        meta: None,
+                                        chat: format!("ahp-chat:/{run_id}"),
+                                    },
+                                ),
+                            },
+                        ),
+                    ));
+                }
+            }
+            SessionTreeEntry::RunSettled {
+                run_id,
+                verdict,
+                salvage,
+                turns,
+                tool_calls,
+                ..
+            } => {
+                let listed = self.subagents.contains_key(run_id);
+                if listed {
+                    self.subagents.remove(run_id);
+                    out.push(Emitted::new(
+                        &chat,
+                        StateAction::ChatBackgroundWorkRemoved(
+                            ahp_types::actions::ChatBackgroundWorkRemovedAction {
+                                id: run_id.clone(),
+                            },
+                        ),
+                    ));
+                }
+                // The settlement notice rides the standard face: the host's
+                // verdict, the salvaged output or the explicit line that
+                // there is none, and the counters. Visible to the agent and
+                // the user alike — a settlement is never silent.
+                let mut text = verdict.clone();
+                match salvage {
+                    Some(salvage) if !salvage.trim().is_empty() => {
+                        text.push_str("\n\n");
+                        text.push_str(salvage);
+                    }
+                    _ => text.push_str(" It left no closing message."),
+                }
+                text.push_str(&format!("\n\n({turns} turns, {tool_calls} tool calls)"));
+                self.push_note(
+                    &chat,
+                    &row,
+                    text,
+                    serde_json::json!({ "runSettled": { "runId": run_id } }),
+                    &mut out,
+                );
+            }
+            SessionTreeEntry::RunEscalated { .. }
             | SessionTreeEntry::RunContinued { .. }
             | SessionTreeEntry::Disposed { .. } => {
-                // Wired with the swarm projection: background work on the
-                // parent chat, settlement notices, and session removal ride
-                // these rows (W2/W3). Until then they fold to nothing.
+                // Escalation, continuation, and disposal fold with their
+                // dedicated faces (the ask channel, the child chat, the
+                // session list) — not with this pass.
             }
             SessionTreeEntry::SubagentProgress {
                 agent_id,
