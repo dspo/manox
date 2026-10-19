@@ -231,7 +231,7 @@ impl SubagentProvider for SpawnProvider {
         };
         let mut builder = create_agent_session()
             .with_cwd(child_cwd.clone())
-            .with_session_dir(session_dir)
+            .with_session_dir(session_dir.clone())
             // The child session id IS the run id: every parent-side row
             // keyed by run id (progress ticks, tool-call correlation) then
             // names the child's own chat channel (`ahp-chat:/<run_id>`)
@@ -267,8 +267,27 @@ impl SubagentProvider for SpawnProvider {
         // Bounded assembly: a wedged child build fails the dispatch
         // stage-named (and never leaks the prepared worktree) instead of
         // hanging the parent turn forever.
+        // A continuation reopens the settled child's journal instead of
+        // creating a fresh session: the file carries its own header
+        // (lineage, persona binding) and the follow-up prompt rides the
+        // same drive loop, budgets, and salvage as a first dispatch.
+        let continuation_path = req
+            .continuation_of
+            .as_ref()
+            .map(|_| session_dir.join(crate::session::repository::session_file_name(&run_id)));
+        if let Some(path) = &continuation_path
+            && !path.exists()
+        {
+            return Err(SubagentError::InvalidRequest(format!(
+                "no settled run named `{run_id}` to continue"
+            )));
+        }
         let built = tokio::time::timeout(START_TIMEOUT, async {
-            let mut session = builder.build().await.map_err(|e| {
+            let built_session = match &continuation_path {
+                Some(path) => builder.open(path.clone()).await,
+                None => builder.build().await,
+            };
+            let mut session = built_session.map_err(|e| {
                 SubagentError::Provider(
                     self.name().to_string(),
                     format!("failed to start subagent: {e}"),

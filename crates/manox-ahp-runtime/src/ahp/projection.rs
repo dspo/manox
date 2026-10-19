@@ -1082,12 +1082,37 @@ impl Translator {
                     &mut out,
                 );
             }
-            SessionTreeEntry::RunEscalated { .. }
-            | SessionTreeEntry::RunContinued { .. }
-            | SessionTreeEntry::Disposed { .. } => {
-                // Escalation, continuation, and disposal fold with their
-                // dedicated faces (the ask channel, the child chat, the
-                // session list) — not with this pass.
+            SessionTreeEntry::RunContinued {
+                run_id, follow_up, ..
+            } => {
+                // A continuation re-opens the run's roster entry: the same
+                // child chat, a fresh start line, every pointer intact.
+                let listed = self.subagents.contains_key(run_id);
+                if !listed {
+                    self.subagents.insert(run_id.clone(), ());
+                    out.push(Emitted::new(
+                        &chat,
+                        StateAction::ChatBackgroundWorkSet(
+                            ahp_types::actions::ChatBackgroundWorkSetAction {
+                                work: ahp_types::state::BackgroundWork::Subagent(
+                                    ahp_types::state::BackgroundSubagentWork {
+                                        id: run_id.clone(),
+                                        // The follow-up is the live topic
+                                        // of the reopened run.
+                                        label: follow_up.clone(),
+                                        started_at: row.timestamp.clone(),
+                                        meta: None,
+                                        chat: format!("ahp-chat:/{run_id}"),
+                                    },
+                                ),
+                            },
+                        ),
+                    ));
+                }
+            }
+            SessionTreeEntry::RunEscalated { .. } | SessionTreeEntry::Disposed { .. } => {
+                // Escalation and disposal fold with their dedicated faces
+                // (the ask channel, the session list) — not with this pass.
             }
             SessionTreeEntry::SubagentProgress { .. } => {
                 // Retired forwarding rows: run/* rows are the only
