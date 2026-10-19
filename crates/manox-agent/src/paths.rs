@@ -60,6 +60,47 @@ pub fn sessions_dir() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("sessions"))
 }
 
+/// The v1.0.0 state root: every session lives in its own directory under a
+/// project bucket (`<root>/<project-slug>/<session-id>/log.v1.jsonl`), the
+/// immutable identity beside it (`header.json`). The legacy `sessions/`
+/// flat tree is never read again — no import, no fallback.
+pub fn core_root() -> Result<PathBuf> {
+    // The store owns the sessions root (a test store points at its own
+    // temp tree; the production store builds from this same function).
+    if let Some(store_root) =
+        crate::thread_store::try_global().map(|_| crate::thread_store::global_sessions_dir())
+    {
+        return Ok(store_root);
+    }
+    Ok(manox_config_dir()?.join("core"))
+}
+
+/// One session's directory under the core root (created lazily by the
+/// engine's first append — a session that never runs leaves nothing).
+pub fn core_session_dir(cwd: &std::path::Path, id: &str) -> Result<PathBuf> {
+    Ok(core_root()?
+        .join(manox_harness::session::identity::project_slug(
+            &cwd.to_string_lossy(),
+        ))
+        .join(id))
+}
+
+/// The engine journal file inside a session's core directory.
+pub fn core_session_file(cwd: &std::path::Path, id: &str) -> Result<PathBuf> {
+    Ok(core_session_dir(cwd, id)?.join("log.v1.jsonl"))
+}
+
+/// `(dir, exact-file)` for a session's core location: the per-session
+/// directory the engine passes on (snapshots, notes checks) plus the
+/// journal file the builder pins. `Err` only when the config dir is
+/// unresolvable — callers fall back to the legacy flat shape rather than
+/// refusing to spawn.
+pub fn core_session_parts(cwd: &std::path::Path, id: &str) -> Result<(PathBuf, Option<PathBuf>)> {
+    let dir = core_session_dir(cwd, id)?;
+    let file = dir.join("log.v1.jsonl");
+    Ok((dir, Some(file)))
+}
+
 /// `$HOME/.claude/skills` — user-authored skills (`<name>/SKILL.md`).
 /// Plugin skills live under each plugin's `skills/` subdir instead.
 pub fn skills_dir() -> Result<PathBuf> {

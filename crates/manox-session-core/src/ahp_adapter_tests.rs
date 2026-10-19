@@ -155,10 +155,19 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
     e
 }
 
-/// Write one session journal (`<id>.jsonl` under the store's sessions dir,
+/// A session journal's path in the core layout (bucket over per-session
+/// directories, `log.v1.jsonl` inside) under the store's root.
+fn core_journal(id: &str) -> std::path::PathBuf {
+    manox_agent::thread_store::global_sessions_dir()
+        .join("t")
+        .join(id)
+        .join("log.v1.jsonl")
+}
+
+/// Write one session journal (the core layout under the store's root,
 /// header stamped with its thread) with a linear entry chain.
 async fn seed_session(id: &str, thread: &str, cwd: &str, events: Vec<(&str, E)>) {
-    let path = manox_agent::thread_store::global_sessions_dir().join(format!("{id}.jsonl"));
+    let path = core_journal(id);
     let mut entries = Vec::with_capacity(events.len());
     let mut parent: Option<String> = None;
     for (eid, event) in events {
@@ -441,12 +450,9 @@ fn probe_real_journal_fold() {
     let dst = manox_agent::thread_store::global_sessions_dir().join(src.file_name().unwrap());
     std::fs::copy(&src, &dst).unwrap();
     manox_agent::runtime::handle().block_on(async {
-        let session_id = src
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .trim_end_matches(".jsonl");
+        // The core layout: `log.v1.jsonl` inside a directory named by the
+        // session's id.
+        let session_id = src.parent().unwrap().file_name().unwrap().to_str().unwrap();
         match chat_state(session_id).await {
             Some(state) => {
                 assert!(
@@ -670,6 +676,7 @@ fn folds_answer_none_for_absent_inputs() {
 // matches and the test would assert about the fallback instead of the mapping.
 
 mod dispatch {
+    use super::core_journal;
     use super::install;
     use super::uninstall;
     use super::{
@@ -719,7 +726,7 @@ mod dispatch {
     /// live engine's own writes do, without the broadcast. The bridge's
     /// cold read is the reader these tests exercise.
     async fn append_session(id: &str, events: Vec<(&str, Option<&str>, E)>) {
-        let path = manox_agent::thread_store::global_sessions_dir().join(format!("{id}.jsonl"));
+        let path = core_journal(id);
         let storage = JsonlSessionStorage::open(&path)
             .await
             .expect("the seeded journal opens");
@@ -763,9 +770,7 @@ mod dispatch {
         crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
             .await
             .expect("session opens");
-        let _ = std::fs::remove_file(
-            manox_agent::thread_store::global_sessions_dir().join(format!("{session_id}.jsonl")),
-        );
+        let _ = std::fs::remove_file(core_journal(session_id));
         seed_session(session_id, thread_id, "/", events).await;
 
         let transport = runtime.inproc();
@@ -1743,8 +1748,7 @@ mod dispatch {
         let (_server, backend) = fixture().await;
         // A rename is only durable against a session that has a journal, so the
         // happy path needs one (the refusal case is its own test below).
-        let session_file =
-            manox_agent::thread_store::global_sessions_dir().join("s-dispatch.jsonl");
+        let session_file = core_journal("s-dispatch");
         std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
         std::fs::write(
             &session_file,
@@ -2204,8 +2208,7 @@ mod dispatch {
     async fn title_changed_appends_the_journal_row() {
         let _guards = install();
         let session_id = format!("s-title-{}", uuid::Uuid::new_v4().simple());
-        let session_file =
-            manox_agent::thread_store::global_sessions_dir().join(format!("{session_id}.jsonl"));
+        let session_file = core_journal(&session_id);
         std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
         // The store's cold append (no live engine drives this session) writes to
         // an existing journal, opened through its header row.
@@ -2425,9 +2428,7 @@ mod dispatch {
                 // route alone is not that (a queued append to an engine that
                 // never opened a file is dropped without a trace).
                 assert!(
-                    manox_agent::thread_store::global_sessions_dir()
-                        .join(format!("{id}.jsonl"))
-                        .exists(),
+                    core_journal(&id).exists(),
                     "an accepted rename must have a journal behind it"
                 );
             }

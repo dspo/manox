@@ -784,7 +784,6 @@ pub(super) fn build_tools(
         // Subagent transcripts persist under the host session root (a
         // subdirectory the sidebar's non-recursive listing never surfaces)
         // so their usage stays accountable.
-        .with_session_dir(crate::thread_store::sessions_dir().join("subagents"))
         .with_observer(
             Arc::clone(&subagent_observer) as Arc<dyn manox_harness::subagent::RunObserver>
         );

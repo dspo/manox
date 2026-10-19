@@ -312,6 +312,7 @@ pub(super) async fn record_journal_loss(
 pub(super) fn session_builder(
     cwd: &Path,
     sessions_dir: &Path,
+    session_file: Option<&Path>,
     runtime: &ModelRuntime,
     model: Option<&HarnessModel>,
     gate: &Arc<ApprovalGate>,
@@ -351,7 +352,11 @@ pub(super) fn session_builder(
     let default_active = default_active_tool_names(&tools);
     let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
-        .with_session_dir(sessions_dir.to_path_buf())
+        .with_session_dir(sessions_dir.to_path_buf());
+    if let Some(file) = session_file {
+        builder = builder.with_session_file(file.to_path_buf());
+    }
+    let mut builder = builder
         .with_model_runtime(runtime.clone())
         .with_system_prompt_builder(manox_harness::prompt::captain_prompt_builder(
             manox_harness::prompt::CaptainConfig {
@@ -372,13 +377,12 @@ pub(super) fn session_builder(
                 // reach the first request, then keep it live via the append
                 // seam.
                 user_notes: {
+                    let journal = session_file
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| sessions_dir.join(format!("{thread_id}.jsonl")));
                     crate::engine::refresh_notes_cell(
                         thread_id,
-                        sessions_dir
-                            .join(format!("{thread_id}.jsonl"))
-                            .exists()
-                            .then(|| sessions_dir.join(format!("{thread_id}.jsonl")))
-                            .as_deref(),
+                        journal.exists().then_some(journal.as_path()),
                     );
                     Some(crate::engine::notes_cell(thread_id))
                 },
@@ -538,6 +542,7 @@ pub(super) async fn rebuild_session(
     let (builder, background) = session_builder(
         &cwd,
         sessions_dir,
+        None,
         runtime,
         None,
         gate,

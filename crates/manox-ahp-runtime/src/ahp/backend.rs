@@ -3437,14 +3437,16 @@ mod turn_cancel_ask_settlement_tests {
         crate::test_support::hermetic_home();
         crate::test_support::init_globals();
         manox_agent::runtime::handle().block_on(async {
-            // The sessions dir the cold seed resolves through.
-            let sessions = manox_agent::paths::sessions_dir().unwrap();
+            // The sessions dir the cold seed resolves through (the core
+            // layout: bucket over per-session directories).
+            let sessions = manox_agent::paths::core_root().unwrap().join("t");
             std::fs::create_dir_all(&sessions).unwrap();
+            let journal = |root: &std::path::Path, id: &str| root.join(id).join("log.v1.jsonl");
 
             // A journal whose turn sits parked on an unanswered question — no
             // decision row, the shape the live cancel leaves mid-flight.
             let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
-                &sessions.join("s-1.jsonl"),
+                &journal(&sessions, "s-1"),
                 manox_harness::session::jsonl::JsonlSessionMetadata {
                     id: "s-1".to_string(),
                     cwd: "/".to_string(),
