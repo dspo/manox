@@ -133,6 +133,14 @@ impl AhpRuntime {
         }
     }
 
+    /// Broadcast one session's removal: subscribers drop the row (the
+    /// faithful-mirror counterpart of `catalogue_changed`). A session that
+    /// never materialized leaves no journal — its disappearance is a fact
+    /// the client must see, not infer from a restart.
+    pub fn catalogue_removed(&self, session_id: &str) {
+        self.host().session_removed(session_id);
+    }
+
     /// The session runtime behind the host.
     pub fn server(&self) -> &Arc<dyn SessionRuntime> {
         &self.server

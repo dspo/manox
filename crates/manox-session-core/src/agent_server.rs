@@ -1546,6 +1546,19 @@ impl AgentServerInner {
                 manox_agent::thread_store::global().with_mut(|s| s.mark_idle(session_id));
             }
         }
+        // A session that never materialized (no journal file) has no
+        // durable existence: dropping the last owner truly deletes it —
+        // the store row goes and the removal is broadcast, so the client's
+        // row book is a faithful mirror, not an append-only log.
+        let never_materialized = manox_agent::thread_store::try_global()
+            .and_then(|store| store.read(|s| s.journal_path(session_id)))
+            .is_none_or(|path| !path.exists());
+        if never_materialized {
+            manox_agent::thread_store::global().with_mut(|s| s.drop_session_row(session_id));
+            if let Some(runtime) = manox_ahp_runtime::ahp::runtime::try_runtime() {
+                runtime.catalogue_removed(session_id);
+            }
+        }
     }
 
     pub(crate) async fn submit(
