@@ -861,6 +861,7 @@ fn model_resolver(
 pub struct AgentSessionBuilder {
     cwd: Option<PathBuf>,
     session_dir: Option<PathBuf>,
+    session_file: Option<PathBuf>,
     model_runtime: Option<ModelRuntime>,
     resources: Option<HarnessResources>,
     tools: Vec<Arc<dyn AgentTool>>,
@@ -895,6 +896,15 @@ impl AgentSessionBuilder {
 
     pub fn with_session_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.session_dir = Some(dir.into());
+        self
+    }
+
+    /// Pin the exact journal file (the v1.0.0 core layout writes
+    /// `<core>/<slug>/<id>/log.v1.jsonl`; the per-session directory is the
+    /// parent). When set, `build()` creates at this path and `open()` is
+    /// the caller's path resolution.
+    pub fn with_session_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.session_file = Some(file.into());
         self
     }
 
@@ -1244,18 +1254,20 @@ impl AgentSessionBuilder {
         })?;
         tokio::fs::create_dir_all(&session_dir).await?;
         let repo = SessionRepository::new(&session_dir);
-        let session = repo
-            .create(JsonlSessionMetadata {
-                id: self
-                    .session_id
-                    .clone()
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                cwd: cwd.to_string_lossy().into_owned(),
-                created_at: chrono::Utc::now(),
-                parent_session_path: None,
-                metadata: self.metadata.clone(),
-            })
-            .await?;
+        let metadata = JsonlSessionMetadata {
+            id: self
+                .session_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            cwd: cwd.to_string_lossy().into_owned(),
+            created_at: chrono::Utc::now(),
+            parent_session_path: None,
+            metadata: self.metadata.clone(),
+        };
+        let session = match &self.session_file {
+            Some(file) => repo.create_at(file, metadata).await?,
+            None => repo.create(metadata).await?,
+        };
         self.assemble_common(session, cwd, session_dir, false).await
     }
 

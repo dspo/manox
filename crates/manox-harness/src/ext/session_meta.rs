@@ -100,11 +100,30 @@ pub struct UserAttributionMeta {
 
 /// The sidecar path for a session file: `<dir>/<id>.meta.json`.
 pub fn meta_path(session_dir: &Path, session_path: &Path) -> PathBuf {
+    // The core layout's journal is `log.v1.jsonl` inside a directory named
+    // by the session's id — the sidecar sits beside it as
+    // `<dir>/<id>.meta.json`. A legacy flat `<id>.jsonl` keeps the old
+    // derivation.
+    if session_path.file_name().and_then(|n| n.to_str()) == Some("log.v1.jsonl")
+        && let Some(id) = session_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+    {
+        return session_path
+            .parent()
+            .unwrap()
+            .join(format!("{id}.meta.json"));
+    }
+    let _ = session_dir;
     let id = session_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
-    session_dir.join(format!("{id}.meta.json"))
+    session_path
+        .parent()
+        .unwrap_or(session_dir)
+        .join(format!("{id}.meta.json"))
 }
 
 /// Read the sidecar; a missing file yields the default (fresh session).

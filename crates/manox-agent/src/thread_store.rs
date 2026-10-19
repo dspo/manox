@@ -110,6 +110,11 @@ pub struct StoreHandle(Arc<StoreCore>);
 
 pub struct StoreCore {
     state: parking_lot::RwLock<ThreadStore>,
+    /// The sessions dir this store scans, frozen at construction — read
+    /// WITHOUT the state lock (`core_root` resolves through this and is
+    /// called from inside `with_mut` closures; a locked read would
+    /// re-enter on the same thread).
+    dir: PathBuf,
     /// Event subscribers. Carries `Arc<ThreadStoreEvent>` for parity with
     /// the `ThreadHandle` channel shape; the event is `Clone`, so the `Arc`
     /// can come off once the consumers settle.
@@ -135,8 +140,10 @@ pub struct StoreCore {
 impl StoreHandle {
     /// Wrap a freshly built [`ThreadStore`].
     pub fn new(thread_store: ThreadStore) -> Self {
+        let dir = thread_store.sessions_dir.clone();
         Self(Arc::new(StoreCore {
             state: parking_lot::RwLock::new(thread_store),
+            dir,
             subscribers: parking_lot::Mutex::new(Vec::new()),
             index: tokio::sync::Mutex::new(SessionIndex::default()),
             meta_queue: parking_lot::Mutex::new(Vec::new()),
@@ -361,9 +368,13 @@ static TEST_OVERRIDE: std::sync::Mutex<Option<StoreHandle>> = std::sync::Mutex::
 
 /// Resolve the session directory under the manox config dir.
 pub(crate) fn sessions_dir() -> PathBuf {
+    // The v1.0.0 core root: per-session directories under project buckets.
+    // Computed DIRECTLY (never through `paths::core_root`, which resolves
+    // through this store — re-entering the global during store construction
+    // deadlocks).
     crate::paths::manox_config_dir()
+        .map(|dir| dir.join("core"))
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join("sessions")
 }
 
 /// Open the session directory, seed the summary list, and register the
@@ -1263,10 +1274,16 @@ impl ThreadStore {
     /// sessions whose journal never materialized — the header-validation
     /// source the workspace domain relies on (review #805 follow-up).
     pub fn sidecar_project(&self, id: &str) -> Option<String> {
-        // The canonical sidecar path is derived from the id alone — a
-        // synthetic `session_paths` entry (bind-time predecessor) is not
-        // required, and a reconcile pass cannot invalidate the lookup.
-        let meta_path = self.sessions_dir.join(format!("{id}.meta.json"));
+        // Resolve the journal first (the core layout nests it under the
+        // session's own directory); the sidecar sits beside it. A
+        // registered path wins — a reconcile pass cannot invalidate it —
+        // and an unknown id falls back to the per-session directory guess.
+        let journal = self
+            .session_paths
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| self.sessions_dir.join(id).join("log.v1.jsonl"));
+        let meta_path = manox_harness::session_meta::meta_path(&self.sessions_dir, &journal);
         let raw = std::fs::read_to_string(meta_path).ok()?;
         let meta: manox_harness::session_meta::SessionMeta = serde_json::from_str(&raw).ok()?;
         meta.project
@@ -1670,31 +1687,41 @@ fn summary_from_cached(
 async fn stat_session_files(dir: &std::path::Path) -> Vec<Stat> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|e| e != "jsonl") {
-                continue;
-            }
-            let Ok(file_meta) = std::fs::metadata(&path) else {
-                continue;
+        // The core root is two-deep: project buckets over per-session
+        // directories, the journal (`log.v1.jsonl`) inside each. A flat
+        // `*.jsonl` beside the buckets (the pre-core layout a test store
+        // still uses) stays visible — both shapes scan.
+        fn walk(dir: &std::path::Path, depth: u8, out: &mut Vec<Stat>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
             };
-            if !file_meta.is_file() {
-                continue;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_meta) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                if file_meta.is_dir() {
+                    if depth > 0 {
+                        walk(&path, depth - 1, out);
+                    }
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "jsonl") {
+                    continue;
+                }
+                let sidecar =
+                    std::fs::metadata(manox_harness::session_meta::meta_path(dir, &path)).ok();
+                out.push(Stat {
+                    path,
+                    size: file_meta.len(),
+                    mtime_ns: metadata_mtime_ns(&file_meta),
+                    sidecar_size: sidecar.as_ref().map_or(0, |m| m.len()),
+                    sidecar_mtime_ns: sidecar.as_ref().map_or(0, metadata_mtime_ns),
+                });
             }
-            let sidecar =
-                std::fs::metadata(manox_harness::session_meta::meta_path(&dir, &path)).ok();
-            out.push(Stat {
-                path,
-                size: file_meta.len(),
-                mtime_ns: metadata_mtime_ns(&file_meta),
-                sidecar_size: sidecar.as_ref().map_or(0, |m| m.len()),
-                sidecar_mtime_ns: sidecar.as_ref().map_or(0, metadata_mtime_ns),
-            });
         }
+        let mut out = Vec::new();
+        walk(&dir, 2, &mut out);
         out
     })
     .await
@@ -2050,7 +2077,8 @@ pub fn drop_for_test() {
 /// calls [`StoreHandle::refresh`], and switches threads to assert a cold
 /// restore loads the persisted transcript (the #765 regression lock).
 pub fn global_sessions_dir() -> PathBuf {
-    global().read(|s| s.sessions_dir.clone())
+    // The frozen per-handle dir: no state lock (see `StoreCore::dir`).
+    global().0.dir.clone()
 }
 
 /// Serializes tests that install the process-global store override

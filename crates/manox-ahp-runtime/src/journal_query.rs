@@ -267,9 +267,9 @@ mod cold_write_read_probe {
         crate::test_support::hermetic_home();
         crate::test_support::init_globals();
         manox_agent::runtime::handle().block_on(async {
-            let sessions = manox_agent::paths::sessions_dir().unwrap();
+            let sessions = manox_agent::paths::core_root().unwrap().join("t");
             std::fs::create_dir_all(&sessions).unwrap();
-            let path = sessions.join("probe-seed-1.jsonl");
+            let path = sessions.join("probe-seed-1").join("log.v1.jsonl");
             let _ = std::fs::remove_file(&path);
             let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
                 &path,
