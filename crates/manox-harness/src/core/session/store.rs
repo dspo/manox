@@ -398,10 +398,22 @@ mod tests {
     fn events() -> Vec<Event> {
         vec![
             Event::CwdChange {
-                to: "/work/other".into(),
+                id: "e-0".into(),
+                parent_id: None,
+                timestamp: Utc.with_ymd_and_hms(2026, 10, 16, 12, 0, 0).unwrap(),
+                cwd: "/work/other".into(),
             },
-            Event::Pinned { on: true },
+            Event::PinnedArchived {
+                id: "e-1".into(),
+                parent_id: None,
+                timestamp: Utc.with_ymd_and_hms(2026, 10, 16, 12, 0, 0).unwrap(),
+                pinned: true,
+                archived: false,
+            },
             Event::RunSettled {
+                id: "e-2".into(),
+                parent_id: None,
+                timestamp: Utc.with_ymd_and_hms(2026, 10, 16, 12, 0, 0).unwrap(),
                 run_id: "sub-1".into(),
                 settlement: SettlementKind::Aborted,
                 verdict: "stopped before it finished".into(),
