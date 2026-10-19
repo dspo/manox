@@ -76,468 +76,11 @@ pub fn plan_review_request_id(entry_id: &str) -> String {
     format!("plan-review:{entry_id}")
 }
 
-/// (the cursor is `targetId`, not the leaf entry's own id).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum SessionTreeEntry {
-    #[serde(rename = "message", rename_all = "camelCase")]
-    Message {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        message: AgentMessage,
-        /// The RPC id this message was submitted under (§C.2 `originRpc`,
-        /// source RPC id). The server pins the client's Submit
-        /// `origin_rpc` on the user message's journal entry so the client can
-        /// retire its optimistic echo (echo/retire protocol, §F.2). Absent on
-        /// every other entry and on older session files.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        origin: Option<String>,
-    },
-    #[serde(rename = "compaction", rename_all = "camelCase")]
-    Compaction {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        summary: String,
-        first_kept_entry_id: Option<String>,
-        tokens_before: u64,
-        /// Materialized messages kept after the boundary — a self-contained
-        /// checkpoint: a context rebuild reads them straight from the entry
-        /// instead of walking the tree from `first_kept_entry_id`. Absent on
-        /// older session files, where the tree walk remains the fallback.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        retained_tail: Option<Vec<AgentMessage>>,
-        /// Token usage reported by the summarization call, when recorded.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<Usage>,
-        /// Structured payload a summarization hook may attach.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        details: Option<JsonValue>,
-        /// Whether the boundary was written by a hook rather than the
-        /// harness's own compaction.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        from_hook: Option<bool>,
-    },
-    /// A change of model for the following turns.
-    #[serde(rename = "model_change", rename_all = "camelCase")]
-    ModelChange {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        provider: String,
-        model_id: String,
-    },
-    /// A change in reasoning depth for the following turns.
-    #[serde(rename = "thinking_level_change", rename_all = "camelCase")]
-    ThinkingLevelChange {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        /// The reasoning tier for following turns, or `"off"` to disable it.
-        /// Always a string — `null` would drop the field on the wire.
-        thinking_level: String,
-    },
-    /// A change of the working directory the following tool calls run in.
-    ///
-    /// The header cwd is immutable (append-only file), so this entry is the
-    /// durable witness of the per-call sticky cwd advancing — resolution chain
-    /// `explicit cwd argument → sticky → header cwd`. Restore projects the
-    /// latest one; tools do not project it into the transcript.
-    #[serde(rename = "cwd_change", rename_all = "camelCase")]
-    CwdChange {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        cwd: String,
-    },
-    /// A change in the set of tools mounted for the following turns.
-    #[serde(rename = "active_tools_change", rename_all = "camelCase")]
-    ActiveToolsChange {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        active_tool_names: Vec<String>,
-    },
-    /// A conversation- or branch-level summary produced by branch summarization.
-    /// Flat (not nested): `summary` is the prose string, `details` carries any
-    /// structured payload (e.g. files changed).
-    #[serde(rename = "branch_summary", rename_all = "camelCase")]
-    BranchSummary {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        from_id: String,
-        summary: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        details: Option<JsonValue>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage: Option<Usage>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        from_hook: Option<bool>,
-    },
-    /// Extension entry whose payload the harness does not interpret.
-    #[serde(rename = "custom", rename_all = "camelCase")]
-    Custom {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        custom_type: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        data: Option<JsonValue>,
-    },
-    /// An extension message whose payload the harness does not interpret.
-    /// `content` is a plain string or an array of text/image blocks, matching
-    /// the v3 schema.
-    #[serde(rename = "custom_message", rename_all = "camelCase")]
-    CustomMessage {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        custom_type: String,
-        #[serde(default, deserialize_with = "crate::types::deserialize_content_blocks")]
-        content: Vec<crate::types::ContentBlock>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        details: Option<JsonValue>,
-        #[serde(default)]
-        display: bool,
-    },
-    /// A short human-readable label attached to a point in the tree.
-    #[serde(rename = "label", rename_all = "camelCase")]
-    Label {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        target_id: String,
-        // `label` is optional on the wire and omitted when unset;
-        // skip-on-None keeps Rust output byte-identical to external writers.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        label: Option<String>,
-    },
-    /// Free-form session metadata (agent identity, environment, config snapshot).
-    #[serde(rename = "session_info", rename_all = "camelCase")]
-    SessionInfo {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-    },
-    /// A cursor move: the leaf points at `targetId` (an older entry) for
-    /// branching. Appended by `set_leaf_id`; never the walk start.
-    #[serde(rename = "leaf", rename_all = "camelCase")]
-    Leaf {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        target_id: Option<String>,
-    },
-    // ── v4 journal vocabulary (architecture doc §C.2) ─────────────────────
-    //
-    // Everything below extends the durable session log to the full
-    // "every observable state change is an entry" surface (L3). The envelope
-    // keys (`seq`/`id`/`parentId`/`timestamp`/`type`) are exclusive: payload
-    // fields never reuse them, so tool handles are `callId` and subagent
-    // handles `agentId` (§C.1 exclusivity rule).
-    /// A plan-review lifecycle edge (the C4 vocabulary augmentation):
-    /// `state` is `"proposed"` (a review card is due — the pending
-    /// projection raises) or `"resolved"` (a verdict landed — it clears;
-    /// the verdict discriminant rides the notice plane). The fold source
-    /// for the pending projection; the sidecar `plan_review_pending` flag
-    /// demotes to the pre-vocabulary hole-fill.
-    #[serde(rename = "plan_review", rename_all = "camelCase")]
-    PlanReview {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        state: String,
-        plan_file: Option<String>,
-        #[serde(default)]
-        title: Option<String>,
-        #[serde(default)]
-        content: Option<String>,
-        /// The settled edge's back-reference to its proposal — the request id
-        /// (`plan-review:<proposal entry id>`) the proposal edge minted. A
-        /// review outlives its turn and routinely spans a host restart, so
-        /// the resolution must be self-describing: a fold that never saw the
-        /// proposal (a bridge resuming above it) can still emit the verdict.
-        /// Absent on rows written before the field existed.
-        #[serde(default)]
-        request_id: Option<String>,
-    },
-    /// A persisted UI note card (was the fire-and-forget AppendUiNote).
-    #[serde(rename = "ui_note", rename_all = "camelCase")]
-    UiNote {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        note: JsonValue,
-    },
-    /// A model turn started.
-    #[serde(rename = "turn_start", rename_all = "camelCase")]
-    TurnStart {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        /// The process that started the turn (wire mirror of the journal's
-        /// `TurnOwner`): readers of the shared journal use its liveness to
-        /// settle a dead owner's turn without touching a live one. Absent on
-        /// rows written before the stamp.
-        #[serde(default)]
-        owner: Option<TurnOwner>,
-    },
-    /// A model turn finished.
-    #[serde(rename = "turn_finish", rename_all = "camelCase")]
-    TurnFinish {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        cancelled: bool,
-        failed: bool,
-        stranded_steer_ids: Vec<String>,
-    },
-    /// The loop stopped advancing.
-    #[serde(rename = "stop", rename_all = "camelCase")]
-    Stop {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        reason: Option<String>,
-    },
-    /// A provider retry was scheduled.
-    #[serde(rename = "retry", rename_all = "camelCase")]
-    Retry {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        attempt: u32,
-        max_attempts: u32,
-        delay_secs: u64,
-        reason: String,
-        detail: Option<String>,
-    },
-    /// A terminal error, flattened to its message (`anyhow` is not
-    /// serializable).
-    #[serde(rename = "error", rename_all = "camelCase")]
-    ErrorEvent {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        message: String,
-    },
-    /// An assistant text delta (durable streaming chunk).
-    #[serde(rename = "agent_text_delta", rename_all = "camelCase")]
-    AgentTextDelta {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        delta: String,
-    },
-    /// An assistant thinking delta.
-    #[serde(rename = "agent_thinking_delta", rename_all = "camelCase")]
-    AgentThinkingDelta {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        delta: String,
-    },
-    /// A tool call announced / updated (`callId` per §C.1).
-    #[serde(rename = "tool_call", rename_all = "camelCase")]
-    ToolCall {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        call_id: String,
-        name: String,
-        title: String,
-        status: String,
-        input: Option<JsonValue>,
-    },
-    /// A tool result settled (`callId` per §C.1).
-    #[serde(rename = "tool_result", rename_all = "camelCase")]
-    ToolResult {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        call_id: String,
-        output: String,
-        is_error: bool,
-    },
-    /// A streaming chunk of a tool's output (`callId` per §C.1).
-    #[serde(rename = "tool_output_chunk", rename_all = "camelCase")]
-    ToolOutputChunk {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        call_id: String,
-        chunk: String,
-    },
-    /// An event surfaced by a subagent child session (`agentId` per §C.1).
-    #[serde(rename = "subagent_child", rename_all = "camelCase")]
-    SubagentChild {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        agent_id: String,
-        event: JsonValue,
-    },
-    /// A subagent progress tick (`agentId` per §C.1).
-    #[serde(rename = "subagent_progress", rename_all = "camelCase")]
-    SubagentProgress {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        agent_id: String,
-        agent_type: String,
-        tool_uses: u32,
-        latest_activity: Option<String>,
-        status: String,
-    },
-    /// The project binding changed (`None` unbinds).
-    #[serde(rename = "project_change", rename_all = "camelCase")]
-    ProjectChange {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        path: Option<String>,
-    },
-    /// The approval mode changed.
-    #[serde(rename = "permission_mode_change", rename_all = "camelCase")]
-    PermissionModeChange {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        mode: String,
-    },
-    /// Plan mode toggled.
-    #[serde(rename = "plan_mode_change", rename_all = "camelCase")]
-    PlanModeChange {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        enabled: bool,
-    },
-    /// A plan-mode selection the user made, awaiting the next turn
-    /// boundary to commit as `plan_mode_change`. Log-only whole value.
-    #[serde(rename = "plan_mode_request", rename_all = "camelCase")]
-    PlanModeRequest {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        enabled: bool,
-    },
-    /// The persisted plan snapshot changed.
-    #[serde(rename = "plan_update", rename_all = "camelCase")]
-    PlanUpdate {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        snapshot: JsonValue,
-    },
-    /// The session goal changed.
-    #[serde(rename = "goal", rename_all = "camelCase")]
-    Goal {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        goal: Option<JsonValue>,
-    },
-    /// The display title changed.
-    #[serde(rename = "title", rename_all = "camelCase")]
-    Title {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        title: String,
-    },
-    /// The browser-suite set changed.
-    #[serde(rename = "browser_suites", rename_all = "camelCase")]
-    BrowserSuites {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        suites: Vec<String>,
-    },
-    /// A background-task snapshot changed.
-    #[serde(rename = "background_task", rename_all = "camelCase")]
-    BackgroundTask {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        snapshot: JsonValue,
-    },
-    /// An approval request or decision (the `pending_auth` projection's fold
-    /// source; `kind` is `"request" | "decision"`).
-    #[serde(rename = "approval", rename_all = "camelCase")]
-    Approval {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        kind: String,
-        auth_id: String,
-        payload: JsonValue,
-    },
-    /// A user-question request or decision (the question seam's own
-    /// vocabulary; `kind` is `"request" | "decision"`). Folds the same
-    /// pending-card badge as an approval, kept distinct so the approval
-    /// audit never carries an interactive ask.
-    #[serde(rename = "question", rename_all = "camelCase")]
-    Question {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        kind: String,
-        auth_id: String,
-        payload: JsonValue,
-    },
-    /// A durable user annotation upserted through the annotations channel
-    /// (`ahp-session:/<id>/annotations`): the AHP `Annotation` JSON rides the
-    /// row verbatim — the kernel persists it without interpreting it, and the
-    /// prompt builder injects the unresolved entries' texts into the model
-    /// context (latest-wins per annotation id).
-    #[serde(rename = "annotation_set", rename_all = "camelCase")]
-    AnnotationSet {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        annotation: serde_json::Value,
-    },
-    /// A durable user annotation removal — the fold collapses the named id.
-    #[serde(rename = "annotation_removed", rename_all = "camelCase")]
-    AnnotationRemoved {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        annotation_id: String,
-    },
-    /// Pin / archive flags changed.
-    #[serde(rename = "pinned_archived", rename_all = "camelCase")]
-    PinnedArchived {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        pinned: bool,
-        archived: bool,
-    },
-    /// A compaction began (spinner state ahead of the `compaction` boundary).
-    #[serde(rename = "compaction_started", rename_all = "camelCase")]
-    CompactionStarted {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        tokens_before: u64,
-    },
-    /// A diagnostics/metrics tick (prefix stability, cache invalidation,
-    /// call metrics, token usage) — logged, low wire priority.
-    #[serde(rename = "metrics", rename_all = "camelCase")]
-    Metrics {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        metric_type: String,
-        data: JsonValue,
-    },
-}
+/// The durable event vocabulary lives in [`event`]: one serde enum is the
+/// whole schema, absorbed from the former `SessionTreeEntry`. The tree
+/// name stays as an alias while call sites migrate.
+pub use event::Event;
+pub type SessionTreeEntry = Event;
 
 /// Borrowed envelope fields shared by every [`SessionTreeEntry`] variant.
 pub(crate) struct EntryEnvelope<'a> {
@@ -609,6 +152,11 @@ impl SessionTreeEntry {
             PinnedArchived,
             CompactionStarted,
             Metrics,
+            Disposed,
+            RunStarted,
+            RunSettled,
+            RunEscalated,
+            RunContinued,
         )
     }
 
@@ -1999,6 +1547,11 @@ pub enum EntryType {
     PinnedArchived,
     CompactionStarted,
     Metrics,
+    Disposed,
+    RunStarted,
+    RunSettled,
+    RunEscalated,
+    RunContinued,
 }
 
 impl EntryType {
@@ -2047,6 +1600,11 @@ impl EntryType {
             EntryType::PinnedArchived => "pinned_archived",
             EntryType::CompactionStarted => "compaction_started",
             EntryType::Metrics => "metrics",
+            EntryType::Disposed => "session/disposed",
+            EntryType::RunStarted => "run/started",
+            EntryType::RunSettled => "run/settled",
+            EntryType::RunEscalated => "run/escalated",
+            EntryType::RunContinued => "run/continued",
         }
     }
 }
@@ -2252,6 +1810,11 @@ pub fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
         SessionTreeEntry::PinnedArchived { .. } => EntryType::PinnedArchived,
         SessionTreeEntry::CompactionStarted { .. } => EntryType::CompactionStarted,
         SessionTreeEntry::Metrics { .. } => EntryType::Metrics,
+        SessionTreeEntry::Disposed { .. } => EntryType::Disposed,
+        SessionTreeEntry::RunStarted { .. } => EntryType::RunStarted,
+        SessionTreeEntry::RunSettled { .. } => EntryType::RunSettled,
+        SessionTreeEntry::RunEscalated { .. } => EntryType::RunEscalated,
+        SessionTreeEntry::RunContinued { .. } => EntryType::RunContinued,
     }
 }
 

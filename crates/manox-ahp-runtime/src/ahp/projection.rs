@@ -213,6 +213,13 @@ pub(crate) fn target_of(entry: &SessionTreeEntry) -> Target {
         | E::ToolOutputChunk { .. }
         | E::SubagentChild { .. } => Target::Chat,
         E::SubagentProgress { .. } => Target::Work,
+        // Swarm lifecycle and disposal are chat-level facts (background work
+        // plus settlement notices); disposal itself is a session-level fact.
+        E::RunStarted { .. }
+        | E::RunSettled { .. }
+        | E::RunEscalated { .. }
+        | E::RunContinued { .. } => Target::Chat,
+        E::Disposed { .. } => Target::Session,
         // ── session state ────────────────────────────────────────────
         E::ModelChange { .. }
         | E::CwdChange { .. }
@@ -973,6 +980,15 @@ impl Translator {
                 // below maintain it), and a notice per event flooded the
                 // transcript with a card per spawn/exit the moment the bridge
                 // streamed again.
+            }
+            SessionTreeEntry::RunStarted { .. }
+            | SessionTreeEntry::RunSettled { .. }
+            | SessionTreeEntry::RunEscalated { .. }
+            | SessionTreeEntry::RunContinued { .. }
+            | SessionTreeEntry::Disposed { .. } => {
+                // Wired with the swarm projection: background work on the
+                // parent chat, settlement notices, and session removal ride
+                // these rows (W2/W3). Until then they fold to nothing.
             }
             SessionTreeEntry::SubagentProgress {
                 agent_id,
