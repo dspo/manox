@@ -1211,7 +1211,20 @@ impl AgentServerInner {
     /// resolves through the single convergence point
     /// `resolve_model_ref` (L8) *before* anything is created — an
     /// unresolvable canonical ref answers `model/unresolvable` without a
-    /// side effect. Re-opening a live session id is idempotent: the
+    /// side effect.
+    ///
+    /// The origin cwd recorded in a session journal's header line, for the
+    /// create-time directory-conflict guard. `None` when the header cannot be
+    /// read — an unreadable header is the restore path's problem to report.
+    fn journal_header_cwd(path: &std::path::Path) -> Option<String> {
+        let bytes = std::fs::read(path).ok()?;
+        let line_end = bytes.iter().position(|b| *b == b'\n')?;
+        let (meta, _) =
+            manox_harness::session::jsonl::parse_header_line(&bytes[..line_end]).ok()?;
+        Some(meta.cwd)
+    }
+
+    /// Create a session from a client intent. Idempotent by design: an
     /// existing id answers and the live session is left untouched. An id
     /// whose journal file already exists on disk is an existing COLD
     /// session: it restores through the `OpenSession` path (§D.2
@@ -1307,6 +1320,18 @@ impl AgentServerInner {
             && let Some(path) = manox_ahp_runtime::paths::persisted_session_file(existing)
             && path.exists()
         {
+            // Claim discipline: a cold session lives where it was created.
+            // A create that names another directory is an explicit conflict
+            // — never a silent redirect, never a fresh session over the id.
+            if let Some(requested) = intent.cwd.as_deref()
+                && let Some(existing_cwd) = Self::journal_header_cwd(&path)
+                && existing_cwd != requested
+            {
+                return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                    "session {existing} lives in {existing_cwd}; the create named {requested}"
+                ))
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+            }
             manox_agent::thread_store::global().with_mut(|s| s.note_session_path(existing, &path));
             open_session(inner, owner, existing).await?;
             return Ok(json!({ "session_id": existing }));
