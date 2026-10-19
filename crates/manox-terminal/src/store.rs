@@ -10,9 +10,19 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use manox_agent::db::{TerminalSession, ThreadsDatabase, default_db_path};
-
 use crate::TerminalHandle;
+
+/// One terminal session's volatile metadata. `env` is the override list
+/// (empty when the terminal inherited the parent process environment).
+#[derive(Debug, Clone)]
+pub struct TerminalSession {
+    pub id: String,
+    pub cwd: String,
+    pub env: Vec<(String, String)>,
+    pub title: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
 
 /// Events emitted by `TerminalStore` to subscribers (sidebar in stage 9).
 #[derive(Debug, Clone)]
@@ -22,7 +32,9 @@ pub enum TerminalStoreEvent {
 }
 
 pub struct TerminalStore {
-    db: Arc<ThreadsDatabase>,
+    /// Terminal tab state is volatile presentation state (the plan's
+    /// client-registry home): sessions live in memory for the process
+    /// lifetime — the sqlite table's restore duty retired with the db.
     summaries: Vec<TerminalSession>,
     /// Events buffered under the state lock; [`TerminalStoreHandle::with_mut`]
     /// drains and broadcasts them once the mutation closure returns.
@@ -98,21 +110,10 @@ impl TerminalStoreHandle {
         }
     }
 
-    /// Re-read the db and refresh the summary list. Runs on the registered
-    /// runtime so a busy SQLite lock cannot stall the caller;
-    /// `SummariesUpdated` broadcasts when the scan lands.
+    /// Refresh the summary list: an in-memory rebroadcast (the volatile
+    /// registry has nothing to re-read — the list IS the state).
     pub fn refresh(&self) {
-        let db = self.read(|s| s.db.clone());
-        let this = self.clone();
-        crate::runtime::handle().spawn(async move {
-            match db.list_terminal_sessions() {
-                Ok(list) => this.with_mut(|s| {
-                    s.summaries = list;
-                    s.pending_events.push(TerminalStoreEvent::SummariesUpdated);
-                }),
-                Err(e) => tracing::warn!(error = %e, "refresh terminal sessions failed"),
-            }
-        });
+        self.with_mut(|s| s.pending_events.push(TerminalStoreEvent::SummariesUpdated));
     }
 
     /// Persist a terminal's session metadata (id/cwd/title) on the runtime,
@@ -126,16 +127,14 @@ impl TerminalStoreHandle {
                 t.title.clone(),
             )
         });
-        let db = self.read(|s| s.db.clone());
         let now = Utc::now().timestamp();
-        let this = self.clone();
-        crate::runtime::handle().spawn(async move {
+        self.with_mut(|s| {
             // Preserve the original created_at if this session already exists.
-            let created_at = db
-                .load_terminal_session(&id)
-                .ok()
-                .flatten()
-                .map(|s| s.created_at)
+            let created_at = s
+                .summaries
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| row.created_at)
                 .unwrap_or(now);
             let session = TerminalSession {
                 id,
@@ -145,23 +144,17 @@ impl TerminalStoreHandle {
                 created_at,
                 updated_at: now,
             };
-            if let Err(e) = db.upsert_terminal_session(&session) {
-                tracing::warn!(error = %e, "save terminal session failed");
-            }
-            this.refresh();
+            s.summaries.retain(|row| row.id != session.id);
+            s.summaries.push(session);
+            s.pending_events.push(TerminalStoreEvent::SummariesUpdated);
         });
     }
 
     /// Delete a session row and refresh.
     pub fn delete_session(&self, id: &str) {
-        let db = self.read(|s| s.db.clone());
-        let id = id.to_string();
-        let this = self.clone();
-        crate::runtime::handle().spawn(async move {
-            if let Err(e) = db.delete_terminal_session(&id) {
-                tracing::warn!(error = %e, "delete terminal session failed");
-            }
-            this.refresh();
+        self.with_mut(|s| {
+            s.summaries.retain(|row| row.id != id);
+            s.pending_events.push(TerminalStoreEvent::SummariesUpdated);
         });
     }
 }
@@ -170,30 +163,17 @@ impl TerminalStoreHandle {
 /// global between tests.
 static GLOBAL: std::sync::Mutex<Option<TerminalStoreHandle>> = std::sync::Mutex::new(None);
 
-/// Test-only override of the process-global `TerminalStore`. `init_for_test`
-/// stores an in-memory-db-backed handle here so persistence-bearing tests
-/// don't touch the real `~/.manox/threads.db`; `drop_for_test` clears it.
+/// Test-only override of the process-global `TerminalStore`.
 /// Mirrors `thread_store`'s override slot.
 #[cfg(any(test, feature = "test-support"))]
 static TEST_OVERRIDE: std::sync::Mutex<Option<TerminalStoreHandle>> = std::sync::Mutex::new(None);
 
-/// Open the db, load the session list, and register the process-global
-/// handle. Call at App startup, after `manox_manox_terminal::runtime::set_runtime`.
+/// Register the process-global handle with an empty volatile session
+/// list. Call at App startup, after `manox_manox_terminal::runtime::set_runtime`.
 pub fn init() {
-    let path = default_db_path().expect("resolve threads.db path");
-    let db = ThreadsDatabase::open(&path)
-        .unwrap_or_else(|e| panic!("open threads db failed ({}): {e}", path.display()));
-    let summaries = db.list_terminal_sessions().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "load terminal sessions failed, starting empty");
-        Vec::new()
-    });
-    tracing::info!(
-        count = summaries.len(),
-        "TerminalStore initialized, loaded terminal sessions"
-    );
+    tracing::info!("TerminalStore initialized (volatile session registry)");
     let handle = TerminalStoreHandle::new(TerminalStore {
-        db: Arc::new(db),
-        summaries,
+        summaries: Vec::new(),
         pending_events: Vec::new(),
     });
     *GLOBAL.lock().unwrap() = Some(handle);
@@ -214,19 +194,12 @@ pub fn try_global() -> Option<TerminalStoreHandle> {
     GLOBAL.lock().unwrap().clone()
 }
 
-/// Test-only initializer that primes the process-global `TerminalStore` with
-/// a caller-provided db (typically `:memory:`) so persistence-bearing tests
-/// don't touch the real `~/.manox/threads.db`. Pair every call with
+/// Test-only initializer: an empty volatile handle. Pair with
 /// `drop_for_test`.
 #[cfg(any(test, feature = "test-support"))]
-pub fn init_for_test(db: Arc<ThreadsDatabase>) {
-    let summaries = db.list_terminal_sessions().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "load terminal sessions failed, starting empty");
-        Vec::new()
-    });
+pub fn init_for_test() {
     let handle = TerminalStoreHandle::new(TerminalStore {
-        db,
-        summaries,
+        summaries: Vec::new(),
         pending_events: Vec::new(),
     });
     *TEST_OVERRIDE.lock().unwrap() = Some(handle);
@@ -245,8 +218,8 @@ impl TerminalStore {
         &self.summaries
     }
 
-    /// Direct db lookup (synchronous) — used when reopening a specific tab.
+    /// Lookup (synchronous) — used when reopening a specific tab.
     pub fn load_session(&self, id: &str) -> Option<TerminalSession> {
-        self.db.load_terminal_session(id).ok().flatten()
+        self.summaries.iter().find(|row| row.id == id).cloned()
     }
 }
