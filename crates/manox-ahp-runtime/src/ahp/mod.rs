@@ -238,6 +238,26 @@ pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<Journ
         }
     };
     let mut state = chat::initial(chat_id);
+    // A child chat declares its lineage on the state itself — the spec's
+    // reverse edge, kept consistent with the parent tool call's
+    // `ToolResultSubagentContent` (MUST). The header metadata the spawn
+    // wrote carries the parent and the dispatching tool call id; a worker
+    // chat is read-only to the user.
+    if let Some(meta) = crate::journal_query::header_metadata(chat_id).await
+        && let Some(subagent) = meta.get("subagent")
+        && let Some(parent) = subagent.get("parent").and_then(|v| v.as_str())
+    {
+        let tool_call_id = subagent
+            .get("toolCallId")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        state.origin = Some(ahp_types::state::ChatOrigin::Tool {
+            chat: format!("ahp-chat:/{parent}"),
+            tool_call_id,
+        });
+        state.interactivity = Some(ahp_types::state::ChatInteractivity::ReadOnly);
+    }
     let mut translator = Translator::new();
     let mut session_actions = Vec::new();
     let mut extension_actions: Vec<(String, StateAction)> = Vec::new();
