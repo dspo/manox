@@ -1110,9 +1110,29 @@ impl Translator {
                     ));
                 }
             }
-            SessionTreeEntry::RunEscalated { .. } | SessionTreeEntry::Disposed { .. } => {
-                // Escalation and disposal fold with their dedicated faces
-                // (the ask channel, the session list) — not with this pass.
+            SessionTreeEntry::RunEscalated {
+                run_id, question, ..
+            } => {
+                // The child's clarifying question, attributed and visible to
+                // the agent and the user alike: the note names the run and
+                // coaches the continuation contract (the answer re-dispatches
+                // with `continue_run_id`; the child session keeps its
+                // context).
+                let text = format!(
+                    "Sub-agent `{run_id}` asks: {question}\n\nAnswer the user, then \
+                     continue the run with `continue_run_id = \"{run_id}\"` carrying the \
+                     answer as the prompt."
+                );
+                self.push_note(
+                    &chat,
+                    &row,
+                    text,
+                    serde_json::json!({ "runEscalated": { "runId": run_id } }),
+                    &mut out,
+                );
+            }
+            SessionTreeEntry::Disposed { .. } => {
+                // Disposal folds with the session list — not this pass.
             }
             SessionTreeEntry::SubagentProgress { .. } => {
                 // Retired forwarding rows: run/* rows are the only

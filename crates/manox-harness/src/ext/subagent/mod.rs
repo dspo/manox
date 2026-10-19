@@ -15,6 +15,7 @@
 //! `start_continuable` exist and reject — so the future manager lands
 //! without reshaping this surface.
 
+pub mod ask;
 pub mod descriptor;
 pub mod feeds;
 pub mod provider;
