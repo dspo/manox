@@ -105,6 +105,13 @@ pub trait RunObserver: Send + Sync {
         let _ = (run_id, event);
     }
 
+    /// A child asked the parent's user a question (the `AskParent`
+    /// delivery). The observation side journals the escalation row; the
+    /// child's turn ends at the delivery either way.
+    fn on_escalate(&self, run_id: &str, question: &str) {
+        let _ = (run_id, question);
+    }
+
     /// Fixed-cadence health tick. Returns `true` to enforce a stall — the
     /// run loop terminates the child and settles it as an error with the
     /// salvaged partial output. Reporting (state flips, health lines) is the
