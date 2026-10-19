@@ -121,9 +121,9 @@ fn spawn_settle_watcher(
 #[cfg(feature = "terminal")]
 struct TerminalEntry {
     handle: manox_terminal::TerminalHandle,
-    /// The session this terminal was attached for: the cwd source and the db
-    /// row's owner.
+    /// The session this terminal was attached for: the cwd source.
     session_id: String,
+    #[allow(dead_code)] // kept for the terminal panel's future restore face
     cwd: String,
     exited: StdMutex<Option<i32>>,
 }
@@ -469,24 +469,12 @@ impl AgentServerInner {
 
     #[cfg(feature = "terminal")]
     fn upsert_terminal_db(&self, entry: &TerminalEntry, exit: Option<i32>) {
-        let Ok(path) = manox_agent::db::default_db_path() else {
-            return;
-        };
-        let Ok(db) = manox_agent::db::ThreadsDatabase::open(&path) else {
-            return;
-        };
-        let id = entry.handle.read(|t| t.id.clone());
-        let title = entry.handle.read(|t| t.title.clone());
-        let now = chrono::Utc::now().timestamp_millis();
+        let store = manox_terminal::store::try_global();
         let _ = exit; // exit code rides the summary, not the row
-        let _ = db.upsert_terminal_session(&manox_agent::db::TerminalSession {
-            id,
-            cwd: entry.cwd.clone(),
-            env: Vec::new(),
-            title,
-            created_at: now,
-            updated_at: now,
-        });
+        let Some(store) = store else {
+            return;
+        };
+        store.save_terminal(&entry.handle);
     }
 }
 
@@ -2036,7 +2024,7 @@ impl AgentServerInner {
             return Err(unknown_session(session_id));
         };
         let objective = objective.unwrap_or_default();
-        let actor = manox_agent::db::GoalActor::User;
+        let actor = manox_agent::goal::GoalActor::User;
         let result = thread.with_mut(|t| match action {
             "create" => t.set_goal(objective),
             "edit" => t.edit_goal(objective, budget, max_rounds, actor),

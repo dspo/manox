@@ -751,7 +751,6 @@ impl AgentTool for UpdateGoalTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::ThreadsDatabase;
     use crate::goal::GoalEventKind;
 
     /// Goal authority migration, stage ②: the journal seed is the restore
@@ -761,8 +760,7 @@ mod tests {
     /// `None` leaves the db fold standing (the migration-window fallback).
     #[test]
     fn journal_seed_is_the_restore_authority() {
-        let dir = tempfile::tempdir().unwrap();
-        let (bridge, _rx) = bridge_in(&dir);
+        let (bridge, _rx) = bridge_in(&tempfile::tempdir().unwrap());
         // A db-folded goal exists (the pre-migration shape).
         bridge
             .create_goal("db goal".into(), None, None, GoalActor::User)
@@ -791,13 +789,10 @@ mod tests {
     /// routes the explicit null snapshot.
     #[tokio::test]
     async fn goal_batches_route_journal_snapshot_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let db =
-            Arc::new(ThreadsDatabase::open(&dir.path().join("threads.db")).expect("open temp db"));
         // A STANDALONE store (no process global): the agent suite runs its
         // store tests in parallel, and a global-based route would race the
         // cross-test TEST_OVERRIDE churn.
-        let store = crate::thread_store::standalone_for_test(db.clone());
+        let store = crate::thread_store::standalone_for_test();
         let thread_id = format!("goal-route-{}", uuid::Uuid::new_v4());
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         crate::engine::register_engine_route(&thread_id, &cmd_tx);

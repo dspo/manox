@@ -3324,12 +3324,7 @@ mod mcp_dispatch_tests {
     fn summaries_carry_the_pin_in_the_meta_slot() {
         // pin_thread's drained sidecar writes spawn on the process runtime.
         crate::test_support::init_globals();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = std::sync::Arc::new(
-            manox_agent::db::ThreadsDatabase::open(&dir.path().join("threads.db"))
-                .expect("open temp threads db"),
-        );
-        let store = manox_agent::thread_store::standalone_for_test(db);
+        let store = manox_agent::thread_store::standalone_for_test();
         store.with_mut(|st| {
             st.insert_summary_for_test("s-pinned", None);
             st.insert_summary_for_test("s-plain", None);
@@ -3359,12 +3354,7 @@ mod mcp_dispatch_tests {
     #[test]
     fn a_row_summary_carries_the_one_chat_catalogue() {
         crate::test_support::init_globals();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = std::sync::Arc::new(
-            manox_agent::db::ThreadsDatabase::open(&dir.path().join("threads.db"))
-                .expect("open temp threads db"),
-        );
-        let store = manox_agent::thread_store::standalone_for_test(db);
+        let store = manox_agent::thread_store::standalone_for_test();
         store.with_mut(|st| {
             st.insert_summary_for_test("s-cat", None);
         });
