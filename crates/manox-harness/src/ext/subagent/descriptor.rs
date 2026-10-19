@@ -60,7 +60,11 @@ impl Descriptor {
     /// keeps the pre-descriptor lineage shape (definition name + parent) so
     /// the sidebar's session filter and usage accounting keep working
     /// unchanged.
-    pub fn metadata(&self, parent_session: Option<&str>) -> serde_json::Value {
+    pub fn metadata(
+        &self,
+        parent_session: Option<&str>,
+        tool_call_id: Option<&str>,
+    ) -> serde_json::Value {
         let mut meta = serde_json::json!({
             "type": self.kind,
             "label": self.label,
@@ -71,6 +75,9 @@ impl Descriptor {
         });
         if let Some(parent) = parent_session {
             meta["parent"] = serde_json::json!(parent);
+        }
+        if let Some(tool_call_id) = tool_call_id {
+            meta["toolCallId"] = serde_json::json!(tool_call_id);
         }
         if let Some(persona) = &self.persona {
             meta["persona"] = serde_json::json!(persona);
@@ -96,7 +103,7 @@ mod tests {
     fn one_shot_metadata_keeps_lineage_shape() {
         let mut descriptor = Descriptor::one_shot("spawn", "survey auth", "Explore", 1);
         descriptor.persona = Some("read-only".into());
-        let meta = descriptor.metadata(Some("thread-9"));
+        let meta = descriptor.metadata(Some("thread-9"), Some("tu_9"));
         assert_eq!(meta["type"], "Explore");
         assert_eq!(meta["parent"], "thread-9");
         assert_eq!(meta["provider"], "spawn");
@@ -111,7 +118,7 @@ mod tests {
     #[test]
     fn without_parent_the_lineage_key_is_absent() {
         let descriptor = Descriptor::one_shot("spawn", "l", "Sailor", 1);
-        let meta = descriptor.metadata(None);
+        let meta = descriptor.metadata(None, None);
         assert!(meta.get("parent").is_none());
     }
 }

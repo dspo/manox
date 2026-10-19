@@ -152,6 +152,12 @@ pub struct JsonlSessionStorage {
 
 impl JsonlSessionStorage {
     /// The session file path.
+    /// The session's header metadata (the immutable line-0 facts: id, cwd,
+    /// parentage, free-form metadata such as the subagent lineage).
+    pub fn session_metadata(&self) -> &JsonlSessionMetadata {
+        &self.metadata
+    }
+
     pub fn path(&self) -> &Path {
         &self.jsonl_path
     }

@@ -244,9 +244,10 @@ impl SubagentProvider for SpawnProvider {
             .with_tools(std::mem::take(&mut selected))
             // The lineage rides `metadata.subagent` (the sidebar filter and
             // usage accounting key off that object).
-            .with_metadata(
-                serde_json::json!({ "subagent": descriptor.metadata(req.parent_session.as_deref()) }),
-            );
+            .with_metadata(serde_json::json!({ "subagent": descriptor.metadata(
+                    req.parent_session.as_deref(),
+                    req.tool_call_id.as_deref(),
+                ) }));
         if let Some(runtime) = &self.model_runtime {
             builder = builder.with_model_runtime(runtime.clone());
         }
