@@ -45,7 +45,7 @@ pub const META_KEY: &str = "x-manox";
 /// had a host producer (the stop signal already reaches clients through
 /// `backgroundTasksChanged`'s `status: "Stopped"`), so a client caching
 /// version 4 kept only a name that was rejected either way.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// State-bearing extension channel prefixes, in declaration order.
 pub mod channels {

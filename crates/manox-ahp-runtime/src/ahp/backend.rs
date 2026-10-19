@@ -144,7 +144,7 @@ impl Cursor {
 /// lag-resync: asks, tool calls/results, plan reviews, lifecycle and config
 /// facts. Delta rows (streamed text/thinking/output chunks) are consciously
 /// dropped from a gap — replaying them at flood rate re-lags the bridge.
-/// `BackgroundTask` and `SubagentProgress` are NOT droppable: they are the
+/// `BackgroundTask` and `run/*` rows are NOT droppable: they are the
 /// sole state carriers of the work channel's registry views (upsert-by-key,
 /// no other repair path), and both are lifecycle/state-transition rows, not
 /// per-chunk floods — dropping one leaves the task or agent frozen at its

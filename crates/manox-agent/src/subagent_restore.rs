@@ -1,6 +1,6 @@
 //! Subagent observation rows recovered from a restored transcript.
 //!
-//! Live rows are fed by `SubagentProgress` events, which die with the
+//! Live rows were fed by `SubagentProgress` events, which died with the
 //! process. Everything needed to rebuild them survives in the parent
 //! transcript: the delegation tool call (definition name + prompt), its tool
 //! result (the run id the row correlates on, plus the foreground envelope's
