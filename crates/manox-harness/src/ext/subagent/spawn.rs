@@ -314,6 +314,11 @@ impl SubagentProvider for SpawnProvider {
         };
         let handle = session.handle();
         let model = session.model().clone();
+        // The live feed for the child's own chat: registered for the run's
+        // whole life (the drive loop removes it on every exit below), so a
+        // bridge attaching at any moment during the run finds it.
+        let _feed_guard = ChildFeedGuard(run_id.clone());
+        super::feeds::register_child_feed(&run_id, &session.subscribe_journal_sender());
 
         let info = crate::ext::subagent::types::RunInfo {
             run_id: run_id.clone(),
@@ -425,6 +430,16 @@ enum Ending {
     TimedOut,
     /// The observer enforced a stall (armed idle budget).
     Stalled,
+}
+
+/// Removes the run's child feed entry when the drive loop exits, on every
+/// ending — the guard lives to the function's return, not just its tail.
+struct ChildFeedGuard(String);
+
+impl Drop for ChildFeedGuard {
+    fn drop(&mut self) {
+        super::feeds::remove_child_feed(&self.0);
+    }
 }
 
 async fn drive_run(run: DrivenRun) -> RunResult {

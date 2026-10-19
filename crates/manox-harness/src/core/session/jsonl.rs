@@ -672,6 +672,12 @@ impl JsonlSessionStorage {
     /// Subscribe to ordered journal appends. A lagging receiver sees
     /// [`broadcast::error::RecvError::Lagged`] and must resynchronize via a
     /// fresh chain read (L5 companion rule).
+    /// The journal broadcast's sender — for registries that hand out fresh
+    /// receivers on demand (`subscribe()` is always current-cursor-free).
+    pub fn journal_sender(&self) -> tokio::sync::broadcast::Sender<JournalEvent> {
+        self.journal_tx.clone()
+    }
+
     pub fn subscribe_journal(&self) -> broadcast::Receiver<JournalEvent> {
         self.journal_tx.subscribe()
     }
