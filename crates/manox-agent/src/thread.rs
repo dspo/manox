@@ -148,37 +148,6 @@ pub enum ThreadEvent {
         id: String,
         chunk: String,
     },
-    /// A sub-agent's child thread was constructed. Not produced by the
-    /// backend in this stage (sub-agent observation panels are not wired).
-    /// Carries the child's [`ThreadId`] (value type) — the event crosses the
-    /// kernel boundary, so no handle/entity rides it.
-    SubagentStarted {
-        id: String,
-        subagent_type: String,
-        description: String,
-        child: ThreadId,
-    },
-    /// A spawned sub-agent's aggregated progress.
-    SubagentProgress {
-        id: String,
-        subagent_type: String,
-        tool_uses: u32,
-        token_usage: TokenUsage,
-        latest_activity: Option<String>,
-        status: ToolCallStatus,
-        /// The watchdog's one-line health verdict (`working`, `tool: Bash
-        /// 3m12s`, `stalled 2m0s`, `looping: Read src/a.rs`) when the event
-        /// carries one; `None` for lifecycle-only progress events.
-        health: Option<String>,
-    },
-    /// A streamed child-session event from a running sub-agent (the
-    /// bridge of the child's text/thinking deltas and tool lifecycle). The
-    /// conversation attaches these to the Agent tool call's drill-down
-    /// output; the rail uses them for live activity.
-    SubagentChild {
-        id: String,
-        child: SubagentChildEvent,
-    },
     /// Interactive question round trip: `AskUserQuestion` (and bubbled team
     /// member authorizations) parks here. The workspace renders the question
     /// card and answers through [`Thread::respond_authorization`]. Permission
