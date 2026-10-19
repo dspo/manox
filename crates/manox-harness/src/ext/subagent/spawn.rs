@@ -322,6 +322,7 @@ impl SubagentProvider for SpawnProvider {
             model: Some(model),
             local: true,
             budgets: req.budgets,
+            tool_call_id: req.tool_call_id.clone(),
         };
         if let Some(observer) = &self.observer {
             observer.on_start(&info);

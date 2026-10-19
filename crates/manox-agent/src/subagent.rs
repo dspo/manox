@@ -383,6 +383,7 @@ impl AgentTool for DelegationTool {
             persona: Some(self.config.persona.clone()),
             parent_depth: self.parent_depth,
             parent_session: self.parent_session.clone(),
+            tool_call_id: Some(_tool_call_id.to_string()),
             budgets: if run_in_background {
                 budgets
             } else {
@@ -420,7 +421,7 @@ impl AgentTool for DelegationTool {
                 "kind": self.config.name,
                 "label": card_title.clone(), // the delivery keeps the label
                 "childSession": run_id.clone(), // the invariant: the run id names the child session
-                "toolCallId": "",
+                "toolCallId": _tool_call_id,
                 "budgets": {
                     "timeoutMs": budgets.timeout_ms,
                     "idleTimeoutMs": budgets.idle_timeout_ms,
