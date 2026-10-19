@@ -86,6 +86,11 @@ pub struct ThreadStore {
     /// drains and dispatches them on the agent runtime once the mutation
     /// closure returns.
     pending_meta_writes: Vec<MetaWrite>,
+    /// Working-directory grants held in memory until the session's journal
+    /// materializes: writing a sidecar for a session with no journal orphans
+    /// a meta with no log (the v1 black-hole class). Flushed the moment the
+    /// journal file appears.
+    pending_working_dirs: HashMap<String, Vec<String>>,
 }
 
 /// One queued sidecar write, drained by [`StoreHandle::with_mut`] once the
@@ -315,6 +320,7 @@ impl StoreHandle {
             let mut summaries = summaries;
             resolve_depths(&mut summaries);
             s.session_paths = session_paths;
+            s.flush_materialized_working_dirs();
             s.summaries = summaries;
             s.archived_summaries = archived;
             // The persisted account is the authority over the row order; the
@@ -386,6 +392,7 @@ pub fn init() {
         decision_overlay: HashMap::new(),
         pending_events: Vec::new(),
         pending_meta_writes: Vec::new(),
+        pending_working_dirs: HashMap::new(),
     });
     handle.refresh();
     *GLOBAL.lock().unwrap() = Some(handle);
@@ -851,7 +858,34 @@ impl ThreadStore {
     /// Persist the session's granted extra working directories (multi-
     /// root) so a cold restore re-widens the fence (multi-working-dirs).
     pub fn set_working_directories(&mut self, id: &str, dirs: Vec<String>) {
-        self.write_meta(id, move |meta| meta.working_directories = dirs);
+        // The grants wait for the journal: a session that never materializes
+        // leaves no disk trace at all, and one that does takes the sidecar
+        // the moment the file exists (refresh and load both re-check).
+        self.pending_working_dirs.insert(id.to_string(), dirs);
+        self.flush_working_dirs_if_materialized(id);
+    }
+
+    /// Flush the pending grants for one session when its journal exists.
+    fn flush_working_dirs_if_materialized(&mut self, id: &str) {
+        if self.session_paths.get(id).is_some_and(|path| path.exists())
+            && let Some(dirs) = self.pending_working_dirs.remove(id)
+        {
+            self.write_meta(id, move |meta| meta.working_directories = dirs);
+        }
+    }
+
+    /// Flush every pending grant whose journal has appeared since the last
+    /// pass (the scan refresh and session loads call this).
+    fn flush_materialized_working_dirs(&mut self) {
+        let ready: Vec<String> = self
+            .pending_working_dirs
+            .keys()
+            .filter(|id| self.session_paths.get(*id).is_some_and(|p| p.exists()))
+            .cloned()
+            .collect();
+        for id in ready {
+            self.flush_working_dirs_if_materialized(&id);
+        }
     }
 
     /// Whether a thread has a tool authorization pending a user verdict.
@@ -937,6 +971,7 @@ impl ThreadStore {
         // Multi-root restore (multi-working-dirs): the sidecar's granted
         // directories re-widen the restored engine's fence — `open`
         // spawned it cwd-only.
+        self.flush_working_dirs_if_materialized(id);
         for dir in self.persisted_working_directories(&path) {
             handle.with_mut(|t| t.grant_working_directory(dir));
         }
@@ -1982,6 +2017,7 @@ pub fn standalone_for_test(db: Arc<crate::db::ThreadsDatabase>) -> StoreHandle {
         decision_overlay: HashMap::new(),
         pending_events: Vec::new(),
         pending_meta_writes: Vec::new(),
+        pending_working_dirs: HashMap::new(),
     })
 }
 
@@ -2176,7 +2212,44 @@ mod tests {
             decision_overlay: HashMap::new(),
             pending_events: Vec::new(),
             pending_meta_writes: Vec::new(),
+            pending_working_dirs: HashMap::new(),
         })
+    }
+
+    #[test]
+    fn working_directories_wait_for_the_journal_to_materialize() {
+        crate::runtime::init();
+        let (db, _db_path) = temp_db();
+        let dir = std::env::temp_dir().join(format!("store-wd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = store_handle(db);
+        handle.with_mut(|s| s.sessions_dir = dir.clone());
+
+        // A create on a not-yet-materialized session leaves no sidecar: a
+        // session that never materializes leaves no disk trace at all.
+        handle.with_mut(|s| {
+            s.note_session_path("s-blank", &dir.join("s-blank.jsonl"));
+            s.set_working_directories("s-blank", vec!["/w/extra".into()]);
+        });
+        assert!(!dir.join("s-blank.meta.json").exists());
+
+        // The journal materializes; the next store pass flushes the grants.
+        // The sidecar write lands on the store's async refresh pump, so the
+        // test waits for it rather than racing the spawn.
+        write_session_fixture(&dir, "s-blank", "first");
+        handle.with_mut(|s| s.flush_materialized_working_dirs());
+        let meta_path = dir.join("s-blank.meta.json");
+        let mut landed = false;
+        for _ in 0..500 {
+            if meta_path.exists() {
+                landed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(landed, "the flushed grants never reached the sidecar");
+        let meta = std::fs::read_to_string(&meta_path).unwrap();
+        assert!(meta.contains("/w/extra"), "{meta}");
     }
 
     /// A v4 session fixture: a host+thread-stamped header plus one user
@@ -2353,6 +2426,7 @@ mod tests {
             decision_overlay: HashMap::new(),
             pending_events: Vec::new(),
             pending_meta_writes: Vec::new(),
+            pending_working_dirs: HashMap::new(),
         });
         restarted.refresh_now().await;
         assert_eq!(first_summary_of(&restarted, "persist"), "cold start prompt");
