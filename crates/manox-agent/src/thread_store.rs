@@ -857,6 +857,11 @@ impl ThreadStore {
 
     /// Persist the session's granted extra working directories (multi-
     /// root) so a cold restore re-widens the fence (multi-working-dirs).
+    /// The journal file path the store has for a session, when it has one.
+    pub fn journal_path(&self, id: &str) -> Option<std::path::PathBuf> {
+        self.session_paths.get(id).cloned()
+    }
+
     pub fn set_working_directories(&mut self, id: &str, dirs: Vec<String>) {
         // The grants wait for the journal: a session that never materializes
         // leaves no disk trace at all, and one that does takes the sidecar
