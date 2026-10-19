@@ -150,6 +150,11 @@ pub struct StartRequest {
     /// the `run/started` row carries so a card, a row, and a settled report
     /// correlate without guessing.
     pub tool_call_id: Option<String>,
+    /// `Some(run_id)` marks a CONTINUATION: the settled child session named
+    /// by the run id reopens and `prompt` is the follow-up. The run id IS
+    /// the child session id, so the continuation keeps every pointer
+    /// (`run/started`'s childSession, cards, drill-downs) intact.
+    pub continuation_of: Option<String>,
     /// Arming wall-clock/idle budgets.
     pub budgets: Budgets,
     /// `Some("worktree")` isolates the child in a throwaway git worktree
@@ -411,6 +416,7 @@ pub fn test_request(label: &str, prompt: &str) -> StartRequest {
         parent_depth: 0,
         parent_session: None,
         tool_call_id: None,
+        continuation_of: None,
         budgets: Budgets::default(),
         isolation: None,
         env: Arc::new(crate::core::env::TokioExecutionEnv::new(cwd.clone())),
