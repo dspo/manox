@@ -106,15 +106,15 @@ pub fn rebuild_from_messages(messages: &[Message]) -> Vec<RestoredSubagent> {
                 .display_text
                 .clone()
                 .unwrap_or_else(|| unwrap_peer_text(from, &text_of(m)));
-            // A failed or timed-out run also delivers (unlike an abort): the
-            // delivery prefixes the cause, and the live rail showed an Error
-            // row.
-            row.status = if final_text.starts_with(crate::subagent::SUBAGENT_FAILED_DELIVERY_PREFIX)
-                || final_text.starts_with(crate::subagent::SUBAGENT_TIMED_OUT_DELIVERY_PREFIX)
-            {
-                ToolCallStatus::Error
-            } else {
+            // Every ending delivers, verdict-first: the opening line is
+            // the host's judgment, and it names the outcome class.
+            let first_line = final_text.lines().next().unwrap_or("");
+            row.status = if first_line.contains("completed.") {
                 ToolCallStatus::Success
+            } else if first_line.contains("was stopped before it finished") {
+                ToolCallStatus::Cancelled
+            } else {
+                ToolCallStatus::Error
             };
             row.final_text = Some(final_text);
         }

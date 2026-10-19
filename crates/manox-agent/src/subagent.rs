@@ -32,18 +32,6 @@ use crate::subagent_watchdog::SubagentWatchdog;
 use crate::thread::ThreadEvent;
 use crate::thread_engine::{BackendNotice, send_notice};
 
-/// Prefix of the peer delivery a failed subagent run emits to the parent.
-/// Shared with `subagent_restore`, which keys the restored row's status off
-/// it: a failed run delivers (unlike an abort), and its row must read as
-/// `Error`, not the `Success` a plain delivery implies.
-pub const SUBAGENT_FAILED_DELIVERY_PREFIX: &str = "subagent failed: ";
-
-/// Prefix of the peer delivery a timed-out subagent run emits to the parent.
-/// Shared with `subagent_restore`, which keys the restored row's status off
-/// it: a timed-out run delivers (unlike an abort), and its row must read as
-/// `Error`, not the `Success` a plain delivery implies.
-pub const SUBAGENT_TIMED_OUT_DELIVERY_PREFIX: &str = "subagent timed out: ";
-
 /// Sanitize a definition's registry name into a model-facing tool name.
 /// Provider wire APIs constrain tool names to `[A-Za-z0-9_-]{1,64}` (a name
 /// like the plugin namespacing's `remora:remora-task` would make every
@@ -375,6 +363,16 @@ impl AgentTool for DelegationTool {
             None
         };
         let card_title = description.clone();
+        // Foreground waiting is a choice with an exit: the wall-clock budget
+        // promotes the wait instead of killing the run. A foreground run is
+        // therefore started WITHOUT the wall-clock budget (the idle watchdog
+        // stays armed) and the caller enforces promotion itself — the run
+        // never races a kill it could have survived.
+        let promote_after = if run_in_background {
+            None
+        } else {
+            budgets.timeout_ms
+        };
         let request = manox_harness::subagent::StartRequest {
             label: description,
             kind: self.config.name.clone(),
@@ -385,7 +383,14 @@ impl AgentTool for DelegationTool {
             persona: Some(self.config.persona.clone()),
             parent_depth: self.parent_depth,
             parent_session: self.parent_session.clone(),
-            budgets,
+            budgets: if run_in_background {
+                budgets
+            } else {
+                manox_harness::subagent::Budgets {
+                    timeout_ms: None,
+                    idle_timeout_ms: budgets.idle_timeout_ms,
+                }
+            },
             isolation: isolation.map(String::from),
             env: Arc::clone(&self.env),
             cwd: self.cwd.clone(),
@@ -406,19 +411,78 @@ impl AgentTool for DelegationTool {
             .map_err(tool_error_of)?;
         let run_id = run.id.clone();
         let run_id_for_result = run_id.clone();
+        // The run.s lifecycle row is the durable record — two rows per run,
+        // written once each; progress never rides the parent journal.
+        self.observer.journal_swarm_row(
+            "run/started",
+            serde_json::json!({
+                "runId": run_id.clone(),
+                "kind": self.config.name,
+                "label": card_title.clone(), // the delivery keeps the label
+                "childSession": run_id.clone(), // the invariant: the run id names the child session
+                "toolCallId": "",
+                "budgets": {
+                    "timeoutMs": budgets.timeout_ms,
+                    "idleTimeoutMs": budgets.idle_timeout_ms,
+                },
+                "depth": self.parent_depth + 1,
+            }),
+        );
         if !run_in_background {
-            let result = run.result().await;
+            let settled = match promote_after {
+                None => run.result().await,
+                Some(ms) => tokio::select! {
+                    r = run.result() => r,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {
+                        // Promotion: the tool call answers now, the run keeps
+                        // going under its idle watchdog, and the report
+                        // arrives through the same settlement delivery as a
+                        // dispatched background run.
+                        let cancel = run.dispose_token().clone();
+                        let (task_id, task) =
+                            background_task::register(self.owner_thread_id(), card_title.clone(), cancel);
+                        send_notice(
+                            &self.notice_tx(),
+                            BackendNotice::Event(Box::new(ThreadEvent::BackgroundTaskUpdated {
+                                snapshot: task.snapshot(&task_id),
+                            })),
+                            "promoted subagent task card",
+                        );
+                        spawn_settlement_delivery(
+                            Arc::clone(&self.runtime),
+                            Arc::clone(&self.observer),
+                            run,
+                            run_id_for_result.clone(),
+                            card_title,
+                            task,
+                            task_id,
+                        );
+                        return Ok(AgentToolResult::text(
+                            serde_json::json!({
+                                "kind": "foreground",
+                                "run_id": run_id_for_result,
+                                "stop_reason": "promoted",
+                                "output": format!(
+                                    "promoted to background after {ms}ms; the report will arrive as a notification"
+                                ),
+                            })
+                            .to_string(),
+                        ));
+                    }
+                },
+            };
             self.observer.retire(&run_id);
-            if result.stop_reason == StopReason::Aborted && signal.is_cancelled() {
+            if settled.stop_reason == StopReason::Aborted && signal.is_cancelled() {
                 return Err(ToolError::ExecutionFailed("canceled".into()));
             }
-            return Ok(foreground_result(&run_id_for_result, result));
+            return Ok(foreground_result(&run_id_for_result, settled));
         }
-        // Background: card + peer delivery of the settled report. The card
-        // title is the dispatch's `description` (the run label), not a
-        // watchdog activity line.
+        // Background: card + settlement delivery of the settled report.
+        // The card title is the dispatch's `description` (the run label),
+        // not a watchdog activity line.
         let cancel = run.dispose_token().clone();
-        let (task_id, task) = background_task::register(self.owner_thread_id(), card_title, cancel);
+        let (task_id, task) =
+            background_task::register(self.owner_thread_id(), card_title.clone(), cancel);
         send_notice(
             &self.notice_tx(),
             BackendNotice::Event(Box::new(ThreadEvent::BackgroundTaskUpdated {
@@ -426,60 +490,16 @@ impl AgentTool for DelegationTool {
             })),
             "subagent task card snapshot",
         );
-        let runtime = Arc::clone(&self.runtime);
-        let observer = Arc::clone(&self.observer);
-        let notice_tx = self.notice_tx();
-        let run_id_for_delivery = run_id.clone();
-        tokio::spawn(async move {
-            let _keep_runtime = runtime; // the run table outlives the tool call
-            let result = run.result().await;
-            let stats = observer.stats_of(&run_id_for_delivery);
-            let delivery = background_delivery(&result, stats);
-            observer.retire(&run_id_for_delivery);
-            // One settlement vocabulary for every producer: map the run's
-            // stop reason onto it, and let the shared mapper write the
-            // wire-stable terminal status.
-            let settlement = match result.stop_reason {
-                StopReason::Aborted => manox_harness::tasks::Settlement::new(
-                    manox_harness::tasks::SettlementKind::Stopped,
-                    manox_harness::tasks::SettlementCause::UserStop,
-                ),
-                StopReason::Completed => manox_harness::tasks::Settlement::new(
-                    manox_harness::tasks::SettlementKind::Completed,
-                    manox_harness::tasks::SettlementCause::Natural,
-                ),
-                _ => manox_harness::tasks::Settlement::new(
-                    manox_harness::tasks::SettlementKind::Failed,
-                    manox_harness::tasks::SettlementCause::Natural,
-                )
-                .with_failure_summary(Some(
-                    result
-                        .diagnostic
-                        .clone()
-                        .unwrap_or_else(|| "failed".to_string()),
-                )),
-            };
-            background_task::apply_settlement(&task, &task_id, &settlement);
-            send_notice(
-                &notice_tx,
-                BackendNotice::Event(Box::new(ThreadEvent::BackgroundTaskUpdated {
-                    snapshot: task.snapshot(&task_id),
-                })),
-                "subagent task terminal snapshot",
-            );
-            if let Some(text) = delivery {
-                send_notice(
-                    &notice_tx,
-                    BackendNotice::SteerDelivered {
-                        from: manox_harness::steer_bus::AgentId::Subagent(run_id_for_delivery),
-                        reason: manox_harness::steer_bus::SteerReason::Complete,
-                        payload: manox_harness::steer_bus::SteerPayload { text },
-                    },
-                    "subagent report delivery",
-                );
-            }
-            let _ = observer; // rail settlement already happened via on_settled
-        });
+        spawn_settlement_delivery(
+            Arc::clone(&self.runtime),
+            Arc::clone(&self.observer),
+            run,
+            run_id.clone(),
+            card_title,
+            task,
+            task_id,
+        );
+
         Ok(AgentToolResult::text(
             serde_json::json!({
                 "kind": "background",
@@ -540,40 +560,86 @@ fn foreground_result(run_id: &str, result: RunResult) -> AgentToolResult {
     tool_result
 }
 
-/// The background peer-delivery text: the final report on completion; on a
-/// delivering failure the diagnostic (already carrying the shared
-/// failure/timed-out prefixes restore keys on) plus the watchdog's run
-/// counters and whatever partial output the child had produced; `None` on
-/// an explicit abort (the parent asked for it — no report revives the
-/// turn).
-fn background_delivery(result: &RunResult, stats: Option<(u64, u64)>) -> Option<String> {
-    let footer = stats
-        .map(|(turns, tool_calls)| format!(" ({turns} turns, {tool_calls} tool calls)"))
-        .unwrap_or_default();
-    match result.stop_reason {
-        StopReason::Completed => {
-            if result.output.is_empty() {
-                Some(format!("completed with no output{footer}"))
-            } else {
-                Some(result.output.clone())
-            }
-        }
-        StopReason::Aborted => None,
-        _ => {
-            let diagnostic = result
-                .diagnostic
-                .clone()
-                .unwrap_or_else(|| "subagent failed".to_string());
-            if result.output.is_empty() {
-                Some(format!("{diagnostic}{footer}"))
-            } else {
-                Some(format!(
-                    "{diagnostic}{footer}\n\nPartial result:\n{}",
-                    result.output
-                ))
-            }
-        }
+/// The one settlement delivery. Every terminal — completion, error,
+/// timeout, stall, abort — lands the card settlement and delivers text
+/// composed the same way: the host's verdict line, the salvaged output (or
+/// the explicit no-closing-message line), the run counters, and any
+/// diagnostic. Silence is never a delivery.
+fn spawn_settlement_delivery(
+    runtime: Arc<manox_harness::subagent::SubagentRuntime>,
+    observer: Arc<SubagentRunObserver>,
+    run: manox_harness::subagent::SubagentRun,
+    run_id: String,
+    label: String,
+    task: Arc<background_task::BackgroundTask>,
+    task_id: background_task::TaskId,
+) {
+    tokio::spawn(async move {
+        let _keep_runtime = runtime; // the run table outlives the tool call
+        let result = run.result().await;
+        let stats = observer.stats_of(&run_id);
+        let delivery = background_delivery(&label, &result, stats);
+        observer.retire(&run_id);
+        // One settlement vocabulary for every producer: the run's stop
+        // reason maps onto it, and the shared mapper writes the
+        // wire-stable terminal status.
+        let settlement = match result.stop_reason {
+            StopReason::Aborted => manox_harness::tasks::Settlement::new(
+                manox_harness::tasks::SettlementKind::Stopped,
+                manox_harness::tasks::SettlementCause::UserStop,
+            ),
+            StopReason::Completed => manox_harness::tasks::Settlement::new(
+                manox_harness::tasks::SettlementKind::Completed,
+                manox_harness::tasks::SettlementCause::Natural,
+            ),
+            ref reason => manox_harness::tasks::Settlement::new(
+                manox_harness::tasks::SettlementKind::Failed,
+                manox_harness::tasks::SettlementCause::Natural,
+            )
+            .with_failure_summary(Some(manox_harness::subagent::verdict(
+                &label,
+                manox_harness::subagent::kind_of(reason),
+            ))),
+        };
+        background_task::apply_settlement(&task, &task_id, &settlement);
+        send_notice(
+            &observer.notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::BackgroundTaskUpdated {
+                snapshot: task.snapshot(&task_id),
+            })),
+            "subagent task terminal snapshot",
+        );
+        send_notice(
+            &observer.notice_tx,
+            BackendNotice::SteerDelivered {
+                from: manox_harness::steer_bus::AgentId::Subagent(run_id),
+                reason: manox_harness::steer_bus::SteerReason::Complete,
+                payload: manox_harness::steer_bus::SteerPayload { text: delivery },
+            },
+            "subagent report delivery",
+        );
+    });
+}
+
+/// The delivery text: verdict line, salvage (or the explicit line that
+/// there is none), counters, diagnostic.
+fn background_delivery(label: &str, result: &RunResult, stats: Option<(u64, u64)>) -> String {
+    let kind = manox_harness::subagent::kind_of(&result.stop_reason);
+    let mut text = manox_harness::subagent::verdict(label, kind);
+    if result.output.trim().is_empty() {
+        text.push(' ');
+        text.push_str(manox_harness::subagent::NO_CLOSING_MESSAGE);
+    } else {
+        text.push_str("\n\n");
+        text.push_str(&result.output);
     }
+    if let Some((turns, tool_calls)) = stats {
+        text.push_str(&format!("\n\n({turns} turns, {tool_calls} tool calls)"));
+    }
+    if let Some(diagnostic) = &result.diagnostic {
+        text.push_str(&format!("\n\n{diagnostic}"));
+    }
+    text
 }
 
 // ── Control tools ────────────────────────────────────────────────────────
@@ -809,6 +875,27 @@ impl SubagentRunObserver {
             .map(|s| (s.turns, s.tool_calls))
     }
 
+    /// Land one swarm lifecycle row in the owning thread's journal (the
+    /// store's typed route; the engine synthesizes the envelope fields).
+    /// Two rows per run — `run/started` at dispatch, `run/settled` at the
+    /// end — are the whole durable record: progress never rides the
+    /// parent journal.
+    fn journal_swarm_row(&self, kind: &str, payload: serde_json::Value) {
+        let path = crate::thread_store::try_global()
+            .and_then(|store| store.read(|s| s.journal_path(&self.owner_thread_id)));
+        if !crate::engine::dispatch_store_journal_row(
+            self.owner_thread_id.clone(),
+            path,
+            kind.to_string(),
+            payload,
+        ) {
+            tracing::debug!(
+                kind,
+                "swarm row has no journal route yet; on_settled still delivers"
+            );
+        }
+    }
+
     /// Drop one run's observation state (live row and settled entry). The
     /// tool calls this after reading what it needs from the settled run
     /// (health → delivery footers).
@@ -976,6 +1063,22 @@ impl RunObserver for SubagentRunObserver {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(end.run_id.clone(), SettledStats { turns, tool_calls });
         }
+        // The durable settlement row: kind, verdict, salvage, counters —
+        // the same vocabulary every consumer reads.
+        let kind = manox_harness::subagent::kind_of(&end.stop_reason);
+        let verdict = manox_harness::subagent::verdict(&end.label, kind);
+        let (turns, tool_calls) = stats.unwrap_or((0, 0));
+        self.journal_swarm_row(
+            "run/settled",
+            serde_json::json!({
+                "runId": end.run_id,
+                "settlement": kind,
+                "verdict": verdict,
+                "salvage": (!end.output.trim().is_empty()).then(|| end.output.clone()),
+                "turns": turns,
+                "toolCalls": tool_calls,
+            }),
+        );
         let (status, activity) = match end.stop_reason {
             StopReason::Completed => (
                 crate::thread::ToolCallStatus::Success,
@@ -1033,7 +1136,7 @@ mod tests {
             result(
                 StopReason::Error,
                 "partial work",
-                Some("subagent timed out: budget 1000ms exceeded"),
+                Some("exceeded its 1000ms budget"),
             ),
         );
         assert!(tool_result.is_error);
@@ -1041,50 +1144,61 @@ mod tests {
         assert_eq!(envelope["stop_reason"], "error");
         assert_eq!(envelope["output"], "partial work");
         assert!(
+            envelope["error"].as_str().unwrap().contains("budget"),
+            "{}",
             envelope["error"]
-                .as_str()
-                .unwrap()
-                .starts_with("subagent timed out")
         );
     }
 
-    /// Completed background runs deliver the final report; failures deliver
-    /// the diagnostic (already carrying the shared prefixes restore keys
-    /// on); an explicit abort delivers nothing (the parent asked for it).
+    /// Every ending delivers: the verdict line, the salvage (or the
+    /// explicit line that there is none), the counters, the diagnostic.
     #[test]
     fn background_delivery_mapping() {
-        let completed =
-            background_delivery(&result(StopReason::Completed, "final report", None), None);
-        assert_eq!(completed.as_deref(), Some("final report"));
+        let completed = background_delivery(
+            "scout",
+            &result(StopReason::Completed, "final report", None),
+            None,
+        );
+        assert!(completed.starts_with("`scout` completed."), "{completed}");
+        assert!(completed.ends_with("final report"), "{completed}");
 
         let failed = background_delivery(
-            &result(StopReason::Error, "partial", Some("subagent failed: boom")),
+            "scout",
+            &result(StopReason::Error, "partial", Some("boom")),
             Some((2, 5)),
         );
-        let failed = failed.unwrap();
         assert!(
-            failed.starts_with(SUBAGENT_FAILED_DELIVERY_PREFIX),
+            failed.starts_with("`scout` failed before it finished."),
             "{failed}"
         );
         assert!(failed.contains("(2 turns, 5 tool calls)"), "{failed}");
-        assert!(failed.contains("Partial result:\npartial"), "{failed}");
+        assert!(failed.ends_with("boom"), "{failed}");
 
         let timed_out = background_delivery(
-            &result(
-                StopReason::Error,
-                "",
-                Some("subagent timed out: budget 1000ms exceeded"),
-            ),
+            "scout",
+            &result(StopReason::TimedOut, "", Some("exceeded its budget")),
             None,
         );
-        let timed_out = timed_out.unwrap();
-        assert!(timed_out.starts_with(SUBAGENT_TIMED_OUT_DELIVERY_PREFIX));
-        assert!(!timed_out.contains("Partial result"), "{timed_out}");
-
-        assert_eq!(
-            background_delivery(&result(StopReason::Aborted, "", None), None),
-            None
+        assert!(
+            timed_out.starts_with("`scout` exceeded its time budget"),
+            "{timed_out}"
         );
+        assert!(
+            timed_out.contains(manox_harness::subagent::NO_CLOSING_MESSAGE),
+            "{timed_out}"
+        );
+
+        // An abort delivers its receipt: the work before the stop is real.
+        let aborted = background_delivery(
+            "scout",
+            &result(StopReason::Aborted, "partial before the stop", None),
+            Some((1, 3)),
+        );
+        assert!(
+            aborted.starts_with("`scout` was stopped before it finished."),
+            "{aborted}"
+        );
+        assert!(aborted.contains("partial before the stop"), "{aborted}");
     }
 
     /// Assembly-level resolution: a plugin-namespaced def sanitizes into a
@@ -1153,11 +1267,5 @@ mod tests {
                 .count(),
             64
         );
-    }
-
-    #[test]
-    fn failed_delivery_prefix_constant_is_shared_with_restore() {
-        assert_eq!(SUBAGENT_FAILED_DELIVERY_PREFIX, "subagent failed: ");
-        assert_eq!(SUBAGENT_TIMED_OUT_DELIVERY_PREFIX, "subagent timed out: ");
     }
 }
