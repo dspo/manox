@@ -4007,7 +4007,6 @@ mod preview_edits_tests {
     }
 }
 
-
 #[cfg(test)]
 mod annotations_tests {
     use super::*;

@@ -16,6 +16,7 @@
 //! without reshaping this surface.
 
 pub mod descriptor;
+pub mod feeds;
 pub mod provider;
 pub mod runtime;
 pub mod salvage;

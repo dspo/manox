@@ -703,6 +703,13 @@ impl AgentSession {
         self.harness.session().storage().subscribe_journal()
     }
 
+    /// The journal broadcast's sender (see the storage accessor).
+    pub fn subscribe_journal_sender(
+        &self,
+    ) -> tokio::sync::broadcast::Sender<crate::session::jsonl::JournalEvent> {
+        self.harness.session().storage().journal_sender()
+    }
+
     /// The journal cursor (seq of the active leaf).
     pub async fn journal_cursor(&self) -> u64 {
         self.harness.session().storage().journal_cursor().await
