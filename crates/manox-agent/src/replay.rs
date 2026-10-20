@@ -261,7 +261,6 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             | SessionTreeEntry::Label { .. }
             | SessionTreeEntry::SessionInfo { .. }
             | SessionTreeEntry::Leaf { .. }
-            | SessionTreeEntry::Disposed { .. }
             | SessionTreeEntry::RunStarted { .. }
             | SessionTreeEntry::RunSettled { .. }
             | SessionTreeEntry::RunEscalated { .. }
