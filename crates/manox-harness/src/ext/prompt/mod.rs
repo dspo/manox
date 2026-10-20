@@ -193,7 +193,9 @@ pub fn captain_prompt_builder(config: CaptainConfig) -> crate::core::harness::Sy
     let cwd = config.cwd;
     let notes = config.user_notes;
     std::sync::Arc::new(
-        move |active_tools: &[String], resources: &crate::core::harness::HarnessResources| {
+        move |active_tools: &[String],
+              resources: &crate::core::harness::HarnessResources,
+              _session_cwd: &std::path::Path| {
             let mut assembly = render_assembly(&base, &cwd, active_tools, resources);
             // The notes section is a read-time fact: the cell holds the
             // journal's current annotations, so every render sees the notes
@@ -218,7 +220,9 @@ pub fn base_prompt_builder(
     cwd: PathBuf,
 ) -> crate::core::harness::SystemPromptBuilder {
     std::sync::Arc::new(
-        move |active_tools: &[String], resources: &crate::core::harness::HarnessResources| {
+        move |active_tools: &[String],
+              resources: &crate::core::harness::HarnessResources,
+              _session_cwd: &std::path::Path| {
             render_assembly(&base, &cwd, active_tools, resources)
         },
     )
@@ -267,7 +271,8 @@ pub fn render_golden_fixture() -> String {
         "Edit".to_string(),
         "Write".to_string(),
     ];
-    builder(&active_tools, &resources)
+    let cwd = std::path::Path::new("/private/tmp/golden-proj");
+    builder(&active_tools, &resources, cwd)
 }
 
 #[cfg(test)]
@@ -295,7 +300,11 @@ mod tests {
         let resources = crate::core::harness::HarnessResources::default();
         let active_tools = vec!["Read".into(), "Grep".into(), "Glob".into(), "Ls".into()];
         assert_eq!(
-            builder(&active_tools, &resources),
+            builder(
+                &active_tools,
+                &resources,
+                std::path::Path::new("/private/tmp/golden-proj")
+            ),
             include_str!("../../../testdata/fold_prompt.golden.txt"),
         );
     }

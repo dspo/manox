@@ -8,7 +8,7 @@
 // `fork` replaces the session with a root→leaf path fork; `close` settles the
 // harness before returning the path.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -770,6 +770,12 @@ impl AgentSession {
             .unwrap_or_else(|| self.cwd.clone())
     }
 
+    /// The currently rendered system prompt — the cwd line inside it follows
+    /// [`Self::set_session_cwd`] (the model's belief, not just the tools').
+    pub fn system_prompt(&self) -> &str {
+        self.harness.system_prompt()
+    }
+
     /// Move the session's working directory (host-driven `SetCwd`): sticky
     /// advance + an immediately durable `cwd_change` entry. See
     /// [`AgentHarness::set_session_cwd`].
@@ -1054,7 +1060,7 @@ impl AgentSessionBuilder {
             .unwrap_or_else(|| crate::system_prompt::DEFAULT_BASE_PROMPT.into());
         let custom_prompt = self.system_prompt.is_some();
         let system_prompt = match &self.system_prompt_builder {
-            Some(builder) => builder(&active_tools, &resources),
+            Some(builder) => builder(&active_tools, &resources, &cwd),
             None => crate::system_prompt::build_harness_prompt(
                 &base_prompt,
                 &cwd,
@@ -1156,24 +1162,27 @@ impl AgentSessionBuilder {
         // Install the prompt builder: the harness rebuilds the system prompt
         // whenever the effective tool selection or resources change, so the
         // model never sees tools/skills that are not actually available.
+        // The builder renders from the harness's LIVE session cwd (seeded
+        // here, advanced by `set_session_cwd`): a directory picked after
+        // creation must reach the model's context, not just the tools.
+        harness.set_prompt_cwd(cwd.clone());
         match &self.system_prompt_builder {
             Some(builder) => {
                 let builder = builder.clone();
                 harness.set_system_prompt_builder(
-                    move |active_tools: &[String], resources: &HarnessResources| {
-                        builder(active_tools, resources)
+                    move |active_tools: &[String], resources: &HarnessResources, cwd: &Path| {
+                        builder(active_tools, resources, cwd)
                     },
                 );
             }
             None => {
                 let base_prompt_for_builder = base_prompt.clone();
-                let cwd_for_builder = cwd.clone();
                 let custom_for_builder = custom_prompt;
                 harness.set_system_prompt_builder(
-                    move |active_tools: &[String], resources: &HarnessResources| {
+                    move |active_tools: &[String], resources: &HarnessResources, cwd: &Path| {
                         crate::system_prompt::build_harness_prompt(
                             &base_prompt_for_builder,
-                            &cwd_for_builder,
+                            cwd,
                             active_tools,
                             &resources.context_files,
                             &resources.skills,
@@ -1869,6 +1878,44 @@ mod tests {
         assert!(!result.is_error, "sticky cwd follows the switch");
     }
 
+    /// The system prompt's working-directory line follows a host-driven
+    /// `SetCwd`: the sticky cwd alone moves the tools, and a prompt still
+    /// naming the claim-time directory leaves the model answering from a
+    /// stale belief (the "current cwd" question answered wrong).
+    #[tokio::test]
+    async fn set_session_cwd_rerenders_the_system_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("cwd-origin-dir");
+        let moved = dir.path().join("cwd-moved-dir");
+        tokio::fs::create_dir_all(&origin).await.unwrap();
+        tokio::fs::create_dir_all(&moved).await.unwrap();
+
+        let mut session = create_agent_session()
+            .with_cwd(&origin)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        assert!(
+            session.system_prompt().contains("cwd-origin-dir"),
+            "the initial prompt names the assembly cwd"
+        );
+
+        session.set_session_cwd(moved.clone()).await.unwrap();
+        let rendered = session.system_prompt();
+        assert!(
+            rendered.contains("cwd-moved-dir"),
+            "the prompt's cwd line follows the move"
+        );
+        assert!(
+            !rendered.contains("cwd-origin-dir"),
+            "the claim-time directory is gone from the prompt"
+        );
+    }
+
     /// A durable `cwd_change` tail projects onto a reopen: tools resolve in
     /// the moved-to directory even when the reopen's own cwd is wrong.
     #[tokio::test]
@@ -2212,10 +2259,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        let builder: crate::harness::SystemPromptBuilder =
-            Arc::new(|tools: &[String], _resources: &HarnessResources| {
+        let builder: crate::harness::SystemPromptBuilder = Arc::new(
+            |tools: &[String], _resources: &HarnessResources, _cwd: &Path| {
                 format!("CUSTOM[{}]", tools.join(","))
-            });
+            },
+        );
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))

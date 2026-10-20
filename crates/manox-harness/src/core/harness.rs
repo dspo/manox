@@ -699,7 +699,8 @@ pub struct BranchSummaryHookOverride {
 
 /// Rebuilds the harness system prompt from the effective tool selection and
 /// resources.
-pub type SystemPromptBuilder = Arc<dyn Fn(&[String], &HarnessResources) -> String + Send + Sync>;
+pub type SystemPromptBuilder =
+    Arc<dyn Fn(&[String], &HarnessResources, &std::path::Path) -> String + Send + Sync>;
 
 /// The typed `session_before_tree` hook event: the navigation preparation a
 /// handler can cancel or use to override the summarization instructions and
@@ -996,6 +997,11 @@ pub struct AgentHarness<S: SessionStorage> {
     /// effective active-tool selection or resources change, so the prompt
     /// never advertises tools/skills that are not actually available.
     system_prompt_builder: Option<SystemPromptBuilder>,
+    /// The live session cwd the system-prompt builder renders from. Frozen
+    /// at builder registration, advanced by [`Self::set_session_cwd`] so a
+    /// host-driven directory move re-renders the prompt's working-directory
+    /// line instead of leaving the model's context on the claim-time cwd.
+    prompt_cwd: std::path::PathBuf,
     /// Skills and prompt templates the harness can expand into prompts.
     resources: HarnessResources,
     /// The cwd last made durable through a `cwd_change` entry. The assembly
@@ -1121,6 +1127,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             show_cache_miss_notices: false,
             branch_summary_reserve: crate::compaction::branch_summarization::RESERVE_TOKENS,
             system_prompt_builder: None,
+            prompt_cwd: std::path::PathBuf::new(),
             restore_active_tool_default: None,
         }
     }
@@ -1165,7 +1172,12 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.session
             .append_cwd_change(&cwd.to_string_lossy())
             .await?;
-        self.persisted_cwd = Some(cwd);
+        self.persisted_cwd = Some(cwd.clone());
+        // The prompt's working-directory line follows the move: the sticky
+        // cwd already moved the tools, and a prompt still naming the old
+        // directory leaves the model answering from a stale belief.
+        self.prompt_cwd = cwd;
+        self.rebuild_system_prompt();
         Ok(())
     }
 
@@ -1491,9 +1503,25 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// the effective tool selection or resources change.
     pub fn set_system_prompt_builder(
         &mut self,
-        builder: impl Fn(&[String], &HarnessResources) -> String + Send + Sync + 'static,
+        builder: impl Fn(&[String], &HarnessResources, &std::path::Path) -> String
+        + Send
+        + Sync
+        + 'static,
     ) {
         self.system_prompt_builder = Some(Arc::new(builder));
+    }
+
+    /// Seed the live cwd the system-prompt builder renders from; call at
+    /// builder registration so the first rebuild already names the session's
+    /// working directory.
+    pub fn set_prompt_cwd(&mut self, cwd: std::path::PathBuf) {
+        self.prompt_cwd = cwd;
+    }
+
+    /// The currently rendered system prompt (the next turn's context
+    /// snapshot source).
+    pub fn system_prompt(&self) -> &str {
+        self.agent.system_prompt()
     }
 
     /// Rebuild the system prompt from the builder over the EFFECTIVE tool
@@ -1511,7 +1539,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 .map(|t| t.name().to_string())
                 .collect(),
         };
-        let prompt = builder(&names, &self.resources);
+        let prompt = builder(&names, &self.resources, &self.prompt_cwd);
         self.agent.set_system_prompt(prompt);
     }
 
