@@ -27,6 +27,7 @@ use manox_agent::language_model::{MessageContent, ReasoningEffort};
 use manox_agent::thread::{PermissionMode, ThreadHandle};
 use manox_agent::thread_engine::BackendNotice;
 use manox_agent::{MessageUiMetadata, Thread, ThreadEvent, ThreadId};
+use manox_harness::session::claim::{self, ClaimOutcome, ClaimRequest, SessionFacts};
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 
 /// One live session: the strong `ThreadHandle` (the retention owner) and the
@@ -1206,22 +1207,99 @@ impl AgentServerInner {
     /// unresolvable canonical ref answers `model/unresolvable` without a
     /// side effect.
     ///
-    /// The origin cwd recorded in a session journal's header line, for the
-    /// create-time directory-conflict guard. `None` when the header cannot be
-    /// read — an unreadable header is the restore path's problem to report.
-    fn journal_header_cwd(path: &std::path::Path) -> Option<String> {
+    /// A session journal's header line: id, origin cwd, and the lineage
+    /// stamp the spawn wrote. `None` when the file is absent or its header is
+    /// unreadable — an unreadable header is the restore path's problem to
+    /// report, not the claim's.
+    fn journal_header(
+        path: &std::path::Path,
+    ) -> Option<manox_harness::session::jsonl::JsonlSessionMetadata> {
         let bytes = std::fs::read(path).ok()?;
         let line_end = bytes.iter().position(|b| *b == b'\n')?;
-        let (meta, _) =
-            manox_harness::session::jsonl::parse_header_line(&bytes[..line_end]).ok()?;
-        Some(meta.cwd)
+        manox_harness::session::jsonl::parse_header_line(&bytes[..line_end])
+            .ok()
+            .map(|(meta, _)| meta)
     }
 
-    /// Create a session from a client intent. Idempotent by design: an
-    /// existing id answers and the live session is left untouched. An id
-    /// whose journal file already exists on disk is an existing COLD
-    /// session: it restores through the `OpenSession` path (§D.2
-    /// idempotency on disk, GW11) and is never re-minted over its file.
+    /// The durable facts one claim decision runs on: the live table, the
+    /// journal's header line and whether any interaction row landed, and the
+    /// archived bit the sidecar carries. Facts fail toward "a real session":
+    /// an unreadable log counts as non-blank, so a claim never re-mints over
+    /// an id whose file exists.
+    async fn gather_claim_facts(inner: &Arc<AgentServerInner>, id: &str) -> SessionFacts {
+        let live = inner.sessions.lock().contains_key(id);
+        let path = manox_ahp_runtime::paths::persisted_session_file(id);
+        let materialized = path.as_deref().is_some_and(std::path::Path::exists);
+        let header = path.as_deref().and_then(Self::journal_header);
+        // Blank = the log carries no interaction-marking row (the same rule
+        // the sidebar hides never-used rows by); a session with no journal is
+        // blank by construction.
+        let blank = match path.as_deref().filter(|_| materialized) {
+            None => true,
+            Some(path) => !manox_harness::session::repository::scan_session(path)
+                .await
+                .map(|scanned| scanned.info.has_messages)
+                .unwrap_or(true),
+        };
+        let subagent = header
+            .as_ref()
+            .and_then(|meta| meta.metadata.as_ref())
+            .is_some_and(|meta| meta.get("subagent").is_some());
+        let archived = match manox_agent::thread_store::try_global()
+            .and_then(|store| store.read(|state| state.summary_by_id(id).map(|row| row.archived)))
+        {
+            Some(archived) => archived,
+            // No store row yet (a claim before the first list scan): the
+            // sidecar is the durable archived bit.
+            None => match path.as_deref() {
+                Some(path) => manox_harness::session_meta::load(
+                    path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+                    path,
+                )
+                .await
+                .map(|meta| meta.archived)
+                .unwrap_or(false),
+                None => false,
+            },
+        };
+        SessionFacts {
+            id: id.to_string(),
+            exists: live || materialized,
+            blank,
+            archived,
+            subagent,
+            origin_cwd: header.map(|meta| meta.cwd),
+        }
+    }
+
+    /// Drive a session the claim reused: a live session only gains an owner;
+    /// a cold one restores through the `OpenSession` path (§D.2 idempotency
+    /// on disk, GW11) with its id→path note seeded first, so the restore's
+    /// `load_thread` resolves the id even when no list refresh has ever run.
+    async fn reuse_claimed_session(
+        inner: &Arc<AgentServerInner>,
+        owner: &str,
+        id: &str,
+    ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
+        if inner.sessions.lock().contains_key(id) {
+            inner.add_owner(id, owner);
+            return Ok(json!({ "session_id": id }));
+        }
+        let Some(path) = manox_ahp_runtime::paths::persisted_session_file(id) else {
+            return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                "session {id} has no journal to restore"
+            ))
+            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+        };
+        manox_agent::thread_store::global().with_mut(|state| state.note_session_path(id, &path));
+        open_session(inner, owner, id).await?;
+        Ok(json!({ "session_id": id }))
+    }
+
+    /// Create a session from a client intent: gather the claim facts, let
+    /// [`claim::decide`] name the id, then build that id. Every arm is
+    /// terminal — the answer carries the id the client will drive, and it
+    /// never changes afterwards (§D.2 idempotency).
     pub(crate) async fn create_session_request(
         inner: &Arc<AgentServerInner>,
         owner: &str,
@@ -1291,44 +1369,52 @@ impl AgentServerInner {
                 parsed
             }
         };
-        // Idempotent re-open of a live session (§D.2).
-        if let Some(existing) = intent.session_id.as_deref()
-            && inner.sessions.lock().contains_key(existing)
-        {
-            inner.add_owner(existing, owner);
-            return Ok(json!({ "session_id": existing }));
-        }
-        // §D.2 idempotency on disk (GW11): an id whose journal file already
-        // exists is an existing COLD session — restore it through the
-        // OpenSession path instead of minting a fresh session over the id.
-        // The pre-fix fall-through reached `new_fresh` ("never restores the
-        // previous session"), whose deferred materialization rewrote the
-        // existing file wholesale on the first assistant message, erasing
-        // the cold session's history. The probe reads the canonical
-        // sessions-dir path directly rather than the store's scan-populated
-        // map, so it holds even when no list refresh has ever run;
-        // `note_session_path` seeds the identity map for the restore's
-        // `load_thread`.
-        if let Some(existing) = intent.session_id.as_deref()
-            && let Some(path) = manox_ahp_runtime::paths::persisted_session_file(existing)
-            && path.exists()
-        {
-            // Claim discipline: a cold session lives where it was created.
-            // A create that names another directory is an explicit conflict
-            // — never a silent redirect, never a fresh session over the id.
-            if let Some(requested) = intent.cwd.as_deref()
-                && let Some(existing_cwd) = Self::journal_header_cwd(&path)
-                && existing_cwd != requested
-            {
-                return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
-                    "session {existing} lives in {existing_cwd}; the create named {requested}"
-                ))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+        // The claim decision is the one creation rule: the answer names the
+        // session the client will drive, and that id never changes afterward.
+        // A live session this process drives owns its id whatever the disk
+        // says; a materialized session in the claimed directory restores
+        // through the `OpenSession` path (§D.2 idempotency on disk, GW11) and
+        // is never re-minted over its file — the pre-fix fall-through reached
+        // `new_fresh` ("never restores the previous session"), whose deferred
+        // materialization rewrote the existing file wholesale on the first
+        // assistant message, erasing the cold session's history. The probe
+        // reads the canonical core-root path directly rather than the store's
+        // scan-populated map, so it holds even when no list refresh has ever
+        // run.
+        let claimed_id = match intent.session_id.as_deref() {
+            Some(existing) => {
+                let facts = Self::gather_claim_facts(inner, existing).await;
+                match claim::decide(
+                    &ClaimRequest {
+                        desired_id: Some(existing.to_string()),
+                        cwd: intent.cwd.clone(),
+                    },
+                    &facts,
+                ) {
+                    ClaimOutcome::Reuse { id } => {
+                        return Self::reuse_claimed_session(inner, owner, &id).await;
+                    }
+                    ClaimOutcome::Mint { id } => id,
+                    ClaimOutcome::Conflict {
+                        id,
+                        requested_cwd,
+                        existing_cwd,
+                    } => {
+                        return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                            "session {id} lives in {existing_cwd}; the create named {requested_cwd}"
+                        ))
+                        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                    }
+                    ClaimOutcome::SubagentOwned { id } => {
+                        return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                            "session {id} belongs to its parent's run and cannot be claimed"
+                        ))
+                        .with_code(manox_ahp_runtime::error::codes::SESSION_ALREADY_OWNED));
+                    }
+                }
             }
-            manox_agent::thread_store::global().with_mut(|s| s.note_session_path(existing, &path));
-            open_session(inner, owner, existing).await?;
-            return Ok(json!({ "session_id": existing }));
-        }
+            None => None,
+        };
         // Hidden-context seeding (`CreateSession.seed`): a seeded create
         // materializes the journal synchronously — header plus one
         // non-displaying `embedder_seed` custom row per block — and then
@@ -1337,7 +1423,9 @@ impl AgentServerInner {
         // the engine actor, and independent of its boot). An unseeded
         // create keeps the deferred-fresh flow untouched.
         if !seed_blocks.is_empty() {
-            let session_id = uuid::Uuid::new_v4().to_string();
+            let session_id = claimed_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let cwd = intent
                 .cwd
                 .clone()
@@ -1440,10 +1528,7 @@ impl AgentServerInner {
             return Ok(json!({ "session_id": session_id }));
         }
 
-        let session_id = intent
-            .session_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let session_id = claimed_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let project = intent.project.as_ref().map(PathBuf::from);
         let cwd = intent
             .cwd
