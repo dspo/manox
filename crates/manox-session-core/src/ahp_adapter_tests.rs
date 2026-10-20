@@ -679,7 +679,8 @@ mod dispatch {
     use super::install;
     use super::uninstall;
     use super::{
-        JsonlSessionStorage, assistant, delta, seed_session, stamp, tool_call, user, with_chain,
+        JsonlSessionStorage, assistant, delta, seed_session, stamp, tool_call, turn_finish,
+        turn_start, user, with_chain,
     };
     use crate::agent_server::AgentServer;
     use ahp_types::actions::{
@@ -688,6 +689,7 @@ mod dispatch {
     };
     use ahp_types::common::JsonObject;
     use ahp_types::state::{Message, MessageKind, MessageOrigin, PendingMessageKind, ResponsePart};
+    use ahp_types::state::{SessionStatus, TurnState};
     use ahp_types::version::PROTOCOL_VERSION;
     use manox_ahp::backend::{Backend, DispatchOutcome};
     use manox_ahp::channels::{chat, session};
@@ -2495,6 +2497,97 @@ mod dispatch {
         assert!(
             result.snapshot.is_some(),
             "the empty chat answers a snapshot, not `not found`"
+        );
+        uninstall();
+    }
+
+    /// A turn the journal shows as started but never settled is dead by
+    /// construction on a cold read: the engine that owed the settlement
+    /// died with its process, and nothing will ever complete it. The cold
+    /// seed must fold the settlement itself (cancelled, "host exited") —
+    /// restoring the turn as running left a phantom spinner no stop could
+    /// clear (real-device round, 2026-10-20: a killed host's session
+    /// re-opened showing InProgress forever).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_hosts_open_turn_folds_settled_on_the_cold_seed() {
+        let _guards = install();
+        seed_session(
+            "s-deadturn",
+            "thread-dead",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", turn_start()),
+                ("e3", delta("partial")),
+                // No turn_finish: the process died mid-run.
+            ],
+        )
+        .await;
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let state = backend
+            .chat_state("s-deadturn")
+            .expect("the cold seed answers");
+        assert!(
+            state.active_turn.is_none(),
+            "a dead host's turn must not fold as running"
+        );
+        assert_eq!(state.turns.len(), 1, "the turn itself stays visible");
+        assert_eq!(
+            state.turns[0].state,
+            TurnState::Cancelled,
+            "the synthetic settlement reads as cancelled"
+        );
+        assert_eq!(
+            state.status & SessionStatus::InProgress.bits(),
+            0,
+            "the chat status no longer claims InProgress"
+        );
+        uninstall();
+    }
+
+    /// Cancelling a cold session (journal on disk, no live engine in this
+    /// process) must open it and answer Ok — the cancel is a no-op settle
+    /// on the loaded thread. Refusing "unknown session" left a restored
+    /// dead turn unstoppable (the client's stop surfaced the rejection).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_cold_restored_session_opens_it_instead_of_refusing() {
+        let _guards = install();
+        seed_session(
+            "s-coldcancel",
+            "thread-cold",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", turn_start()),
+                ("e3", turn_finish()),
+            ],
+        )
+        .await;
+        // The scan is what teaches the store the id→path map on the real
+        // device (verified live: a refreshed store resolves the cold id);
+        // the test store's reconcile doesn't index direct file writes, so
+        // the note lands the same mapping the established idiom uses.
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.note_session_path("s-coldcancel", &core_journal("s-coldcancel")));
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let action = StateAction::ChatTurnCancelled(ahp_types::actions::ChatTurnCancelledAction {
+            turn_id: "t-irrelevant".to_string(),
+            duration: 0,
+            meta: None,
+        });
+        match backend.dispatch(&chat::uri("s-coldcancel"), &action, &origin()) {
+            DispatchOutcome::Accepted => {}
+            other => panic!("a cold session's cancel must open and settle, got {other:?}"),
+        }
+        assert!(
+            server.ahp_inner().session_thread("s-coldcancel").is_some(),
+            "the cancel's cold open loaded the session"
         );
         uninstall();
     }

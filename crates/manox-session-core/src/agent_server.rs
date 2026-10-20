@@ -854,7 +854,7 @@ pub(crate) async fn ensure_opened_for_settle(
 /// any IO, and two racing opens of a cold id converge on one entry (the loser
 /// adopts the winner's `ThreadHandle` through the store's weak upgrade, so
 /// nothing is loaded twice).
-async fn open_session(
+pub(crate) async fn open_session(
     inner: &Arc<AgentServerInner>,
     owner: &str,
     session_id: &str,
