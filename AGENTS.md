@@ -75,23 +75,34 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 
 持久化分两个根：**运行时状态统一位于 `~/.manox/`**（不再使用 `~/.config/cx/`）；**扩展生态资产位于 `~/.claude/`**（与 Claude Code CLI 物理共享，装一次两边可用；`MANOX_CLAUDE_HOME` 整体重定向，测试隔离用）。路径清单：
 
-- 单一状态根：`~/.manox/`（`manox_agent::paths::manox_config_dir()` 与 `manox_providers::cx_state_dir()` 均指向它）。**多进程共享**：runtime 允许多实例共用同一状态根，跨进程协调在资源粒度——per-session 写租约（`manox_agent::session_lease`，`sessions/<id>.jsonl.lock`，驱动即独占、进程死自动释放、冲突报 `session/already-owned`）、threads.db 走 SQLite WAL、共享状态文件（registry/sidebar/sidecar）走 per-file flock、网关单例走 `~/.manox/gateway.lock`。无全 store 级单实例锁。
+- 单一状态根：`~/.manox/`（`manox_agent::paths::manox_config_dir()` 与 `manox_providers::cx_state_dir()` 均指向它）。**多进程共享**：runtime 允许多实例共用同一状态根，跨进程协调在资源粒度——per-session 写租约（`manox_agent::session_lease`，锁文件是 journal 的同级 `<journal>.lock`，驱动即独占、进程死自动释放、冲突报 `session/already-owned`）、共享状态文件（registry/sidebar/sidecar）走 per-file flock、网关单例走 `~/.manox/gateway.lock`。无全 store 级单实例锁。
 - 生态根：`~/.claude/`（`manox_agent::paths::claude_home()`）。用户技能 `~/.claude/skills/`、斜杠命令 `~/.claude/commands/`、子 agent 定义 `~/.claude/agents/`、规则 `~/.claude/rules/`（与 CLAUDE.md 层级一同由 `claude_md.rs` 装载）；插件与市场存储亦在此根下（见 `plugin.rs`）。
 - LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/manox-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；首启时会从旧根 `~/.config/cx/` 自动复制一次（旧文件保留）
-- SQLite：`~/.manox/threads.db`（WAL 模式；`threads.db-shm` / `threads.db-wal` 随行）
-- 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`manox_agent::thread_registry`；跨进程 RMW 经 per-file flock 串行化）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork；多工作目录会话经 `CreateSession.workingDirectories` seed granted-root 围栏。
-- 会话（.jsonl）：`~/.manox/sessions/`
-- 子代理会话：`~/.manox/sessions/subagents/`（持久化、不进侧栏）
+- SQLite（v1.0.0 已退役）：`threads.db` 及其 WAL 文件不再读写；六类状态各归其家——UI 注释卡 = journal `custom` 行（`manox_ui_note`）、右侧页签注册表 = 客户端内存（manox-app 侧）、终端注册表 = 内存易失（`manox_terminal::store`）、列表扫描 = header/首条消息的有界读取、token 用量 = 事件派生（`metrics` 行 → `x-manox-metrics`）、项目注册表 = `~/.manox/core/projects.registry` 单行文件。
+- 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；v1.0.0 起新建会话 thread id == session id，指针仍服务于既有 journal 的打开/恢复；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`manox_agent::thread_registry`；跨进程 RMW 经 per-file flock 串行化）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork；多工作目录会话经 `CreateSession.workingDirectories` seed granted-root 围栏。
+- 会话（v1.0.0 core 布局）：`~/.manox/core/<project-slug>/<session-id>/` —— `header.json`（不可变身份：`formatVersion`/`id`/`createdAt`/`originCwd`/`lineage`/`agentPreset`）、`log.v1.jsonl`（唯一 durable 事件日志）、`<id>.meta.json`（UI sidecar：pin/archive/unread/title/tag/工作目录授权）、`state.json`（可重建缓存）。`<project-slug>` 是 `originCwd` 的扁平化渲染，决定侧栏分组；`~/.manox/core/projects.registry` 是项目注册表。旧 `~/.manox/sessions/` 平铺树**永不再读**（无迁移、无兼容读）。
+- 子代理会话：`~/.manox/core/<project-slug>/<run-id>/`（run id == 子会话 id == 子 chat id；持久化、不进侧栏）
 - 外部会话：`~/.manox/external-sessions/`（外部 CLI 会话由 manox-app 侧的 cx 驱动，目录约定在本仓库文档维护）
 - 设置：`~/.manox/settings.toml`；主题：`~/.manox/themes/`
 - 子 agent：`~/.claude/agents/*.md`（frontmatter name/description/tools/model + 正文；每个定义装配为一个独立委派工具：`ext/subagent/` 的 SubagentRuntime/SubagentProvider/能力协商/descriptor）；MCP：`~/.manox/mcp.json`（Claude Code `mcpServers` schema，stdio 或 HTTP；项目级 `.mcp.json` 与插件 `.mcp.json` 同 schema，合并序 plugin < global < project）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
 - Plan 文件：`~/.manox/plans/`
 - WS 网关端点（`cx web`，CLI 在 manox-app）：`~/.manox/gateway-ws.json`（0600；启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ws?token=…`；每次启动覆盖，进程退出后过期）。网关每机单例：`ws::start` 以非阻塞 flock 持 `~/.manox/gateway.lock`，他进程已持锁时本次 start 不绑定不发布（loud no-op）。
 - ChromeUse profile：`~/.manox/chrome-profile/`（内置 Chrome 自动化引擎 `chrome_use` 的缺省 user-data-dir，登录态跨会话持久；可经 `settings.toml` 的 `[chrome]` 表改 executable / headless / user_data_dir / cdp_endpoint）
-- cx CLI 状态：`~/.manox/cx.db`、IPC socket `~/.manox/sessions/`、codex 注入目录 `~/.manox/.codex/`、`~/.manox/.patch_source`（CLI 本体在 manox-app，状态目录与本仓库共享）
+- cx CLI 状态：`~/.manox/cx.db`、IPC socket `~/.manox/sessions/`（该目录自 v1.0.0 起只承载 cx 的 socket 与注册 JSON，不再是会话 journal 目录）、codex 注入目录 `~/.manox/.codex/`、`~/.manox/.patch_source`（CLI 本体在 manox-app，状态目录与本仓库共享）
 - API key 源：macOS Keychain（`keychain:SERVICE`）/ env（`env:VAR`）/ 字面量（`literal:...`）/ shell（`$(shell ...)`）
 - **百炼 anthropic 兼容端点**（`*.aliyuncs.com/apps/anthropic`）：不报 `cache_creation_input_tokens`（恒 0），只报 `cache_read_input_tokens`。故 manox 的 `cache_creation` 记账对该端点恒 0 属预期，非解析/累加/持久化 bug（三链路均正确，记的就是端点报的 0）。`LastBreakpointOnly` 与 `Full` policy 对该端点均有效。
 
+### Session Core（v1.0.0）事实契约
+
+会话模型是「不可变身份 + append-only 事实 + 派生视图」。判违规按此表：
+
+- **身份面**：`header.json` 随首次 append 原子发布（O_EXCL），此后永不改写；血缘（parent/toolCallId/runId/depth）是 header 字段，不是可变旁册指针。身份只出现一次，永不迁移。
+- **事件面**：`log.v1.jsonl` 是唯一 durable 权威与唯一 schema（`session::event::Event`，行名 = serde tag）。铁律：**用户可见且需持久的事实必为事件；身份字段永不出现在事件 payload**（事件只带 id 引用）。退役的行名按未知行拒收，没有兼容读。
+- **派生面**：列表、状态位、谱系全是投影；侧栏扫描只读 header 与首条用户消息（有界），`state.json` 只是缓存。
+- **创建**：`createSession` = claim，唯一决策点是 `session::claim::decide`：未占用的 id → 驱动客户端铸的 id；同目录已物化 → 幂等复用（restore，绝不重铸）；活空白 → 复用；归档 → 铸新；目录不符 → 显式冲突（`gateway/bad-request`）；`lineage=subagent` → 拒绝（`session/already-owned`）。**应答携带最终 id，此后不变**。
+- **处置**：未物化会话的 dispose = 内存删行 + `root/sessionRemoved`；已物化会话的 dispose 不写任何 durable 标记（会话仍在列表里）。日志里没有「已处置」行。
+- **Swarm**：每个 run 落父日志恰两行（`run/started` + `run/settled`），进度不上父日志；run id == 子会话 id == 子 chat id。结算 kind 全枚举（completed/timed-out/stalled/aborted/error/refusal/max-tokens）由生产者给出，下游不得按字符串前缀判词（唯一例外：`manox-agent` 的 transcript 重建按 verdict 行**结尾**判状态，见 `ext/subagent/settlement.rs` 顶部）。子会话 chat 只读（`ChatOrigin{tool}` + `ChatInteractivity::ReadOnly`）；`AskParent` 的答案经 `continue_run_id` 续跑同一子会话（不是 AHP InputRequest）。
+- **Engine 阶段**：`session::{identity,event,store,claim}` 是 v1.0.0 引擎；当前写入仍走 `jsonl` 树引擎（共用同一 `Event` 词汇与同一 `log.v1.jsonl`），`CoreStore` 的物化/租约/header-only 扫描**尚未接线**（staged，勿当成现役写入路径读）。
 ## crates/manox-harness 接线开发纪律（harness 分层）
 
 manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`；老 manox harness 已退役并完全删除，代码存于 git 历史与 `origin/Manox` 备份分支）。接线开发遵循以下纪律：
