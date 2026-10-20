@@ -903,17 +903,25 @@ impl SubagentRunObserver {
     /// end — are the whole durable record: progress never rides the
     /// parent journal.
     fn journal_swarm_row(&self, kind: &str, payload: serde_json::Value) {
+        // The path is resolved against the disk, not only the store's scan
+        // map: the two rows per run are the durable record, and a session
+        // whose journal materialized since the last scan (the common case for
+        // a fresh session's first turn) must still find its route.
         let path = crate::thread_store::try_global()
-            .and_then(|store| store.read(|s| s.journal_path(&self.owner_thread_id)));
+            .and_then(|store| store.read(|s| s.journal_path_on_disk(&self.owner_thread_id)));
         if !crate::engine::dispatch_store_journal_row(
             self.owner_thread_id.clone(),
             path,
             kind.to_string(),
             payload,
         ) {
-            tracing::debug!(
+            // A dropped swarm row is a hole in the durable record, not a
+            // debug detail: the live delivery still happens, but the log no
+            // longer shows the run at all.
+            tracing::warn!(
                 kind,
-                "swarm row has no journal route yet; on_settled still delivers"
+                session = %self.owner_thread_id,
+                "swarm row has nowhere to land: no live engine route and no journal on disk"
             );
         }
     }

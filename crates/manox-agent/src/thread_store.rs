@@ -913,6 +913,40 @@ impl ThreadStore {
         self.session_paths.get(id).cloned()
     }
 
+    /// The journal file for one session id as it exists ON DISK: the
+    /// registered path first (a scan or a create-time note), then a bounded
+    /// walk of the core root's buckets. The registered map is populated by
+    /// scans and creates, so a session whose journal materialized since the
+    /// last scan — a turn just run in a fresh session — would otherwise
+    /// answer `None` to a caller that must append a durable row NOW.
+    ///
+    /// The walk admits only the minters' id charset (ASCII alphanumeric,
+    /// `-`, `_`): the id is a session id, never a path, and a separator or
+    /// dot must never reach the join.
+    pub fn journal_path_on_disk(&self, id: &str) -> Option<std::path::PathBuf> {
+        if let Some(path) = self.session_paths.get(id) {
+            return Some(path.clone());
+        }
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return None;
+        }
+        let buckets = std::fs::read_dir(&self.sessions_dir).ok()?;
+        for bucket in buckets.flatten() {
+            if !bucket.file_type().ok().is_some_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let candidate = bucket.path().join(id).join("log.v1.jsonl");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     pub fn set_working_directories(&mut self, id: &str, dirs: Vec<String>) {
         // The grants wait for the journal: a session that never materializes
         // leaves no disk trace at all, and one that does takes the sidecar
@@ -1961,6 +1995,48 @@ pub fn store_test_lock() -> &'static std::sync::Mutex<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The on-disk journal lookup falls back to a bounded walk of the core
+    /// root, and refuses anything but the minters' id charset.
+    #[test]
+    fn journal_path_on_disk_walks_the_core_root_buckets() {
+        let store = standalone_for_test();
+        let root = store.0.dir.clone();
+        let bucket = root.join("users-x-work-manox");
+        let journal = bucket.join("s-walked").join("log.v1.jsonl");
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        std::fs::write(&journal, b"").unwrap();
+        assert_eq!(
+            store
+                .read(|s| s.journal_path_on_disk("s-walked"))
+                .as_deref(),
+            Some(journal.as_path()),
+            "a journal the store has not scanned still resolves"
+        );
+
+        let registered = root.join("registered.jsonl");
+        store.with_mut(|s| s.note_session_path("s-walked", &registered));
+        assert_eq!(
+            store
+                .read(|s| s.journal_path_on_disk("s-walked"))
+                .as_deref(),
+            Some(registered.as_path()),
+            "the registered path wins over the walk"
+        );
+
+        assert!(
+            store
+                .read(|s| s.journal_path_on_disk("../../etc/passwd"))
+                .is_none(),
+            "an id is not a path"
+        );
+        assert!(store.read(|s| s.journal_path_on_disk("")).is_none());
+        assert!(
+            store.read(|s| s.journal_path_on_disk("s-absent")).is_none(),
+            "no journal anywhere answers None"
+        );
+    }
+
     use super::*;
 
     fn temp_db() -> std::path::PathBuf {
