@@ -126,13 +126,23 @@ impl SidebarOrder {
     /// [`Self::groups`] recomputed against live membership, so a folder that
     /// vanished between scans leaves no residue.
     pub fn reconcile_groups(&mut self, registered: &[String]) -> Vec<String> {
-        self.groups
-            .retain(|path| registered.iter().any(|r| r == path));
-        for path in registered {
-            if !self.groups.iter().any(|g| g == path) {
-                self.groups.push(path.clone());
-            }
-        }
+        // Committed (manually ordered) folders keep their relative order;
+        // uncommitted newcomers render ABOVE them, newest first — the
+        // registered list itself is newest-first (registration inserts at
+        // the head), so the newcomer block preserves its given order.
+        let committed: Vec<String> = self
+            .groups
+            .iter()
+            .filter(|path| registered.iter().any(|r| r == *path))
+            .cloned()
+            .collect();
+        let mut next: Vec<String> = registered
+            .iter()
+            .filter(|path| !committed.iter().any(|c| c == *path))
+            .cloned()
+            .collect();
+        next.extend(committed);
+        self.groups = next;
         self.groups.clone()
     }
 }
@@ -428,14 +438,14 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_groups_keeps_registered_order_and_appends_newcomers() {
+    fn reconcile_groups_keeps_committed_order_and_heads_newcomers() {
         let mut order = order_with_groups(&["/p/b", "/p/gone", "/p/a"]);
-        let registered = ids(&["/p/a", "/p/b", "/p/c"]);
+        let registered = ids(&["/p/c", "/p/a", "/p/b"]);
         assert_eq!(
             order.reconcile_groups(&registered),
-            ids(&["/p/b", "/p/a", "/p/c"])
+            ids(&["/p/c", "/p/b", "/p/a"])
         );
-        assert_eq!(order.groups, ids(&["/p/b", "/p/a", "/p/c"]));
+        assert_eq!(order.groups, ids(&["/p/c", "/p/b", "/p/a"]));
     }
 
     #[test]

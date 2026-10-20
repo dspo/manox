@@ -125,6 +125,9 @@ pub mod actions {
     pub const ORDER_CHANGED: &str = "x-manox/orderChanged";
     /// Thread pinned flag changed (client-dispatchable; AHP has no pin bit).
     pub const PINNED_CHANGED: &str = "x-manox/pinnedChanged";
+    /// A project's display alias changed (client-dispatchable on the
+    /// workspaces channel; the durable authority is the projects file).
+    pub const ALIAS_CHANGED: &str = "x-manox/aliasChanged";
     /// A label row attached to an entry (host-emitted; the durable row carries
     /// no target id, so it is announced as session state, not per-entry state).
     pub const LABEL_CHANGED: &str = "x-manox/labelChanged";
@@ -151,6 +154,7 @@ pub mod actions {
         WORKSPACES_REMOVED,
         ORDER_CHANGED,
         PINNED_CHANGED,
+        ALIAS_CHANGED,
         LABEL_CHANGED,
         SESSION_INFO_CHANGED,
         LEAF_CHANGED,

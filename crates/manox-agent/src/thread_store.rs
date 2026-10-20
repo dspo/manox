@@ -48,6 +48,10 @@ pub struct ThreadStore {
     /// Session file path per summary id, for sidecar writes and reopen.
     session_paths: HashMap<String, PathBuf>,
     known_projects: Vec<String>,
+    /// The alias half of each project object, keyed by path
+    /// (`known_projects` holds the ordered set; this holds the display
+    /// name).
+    project_aliases: HashMap<String, String>,
     /// The durable sidebar order: folder sequence plus one thread account per
     /// partition. Authoritative over `summaries`' order — see
     /// [`crate::sidebar_order`].
@@ -368,41 +372,33 @@ static GLOBAL: std::sync::Mutex<Option<StoreHandle>> = std::sync::Mutex::new(Non
 static TEST_OVERRIDE: std::sync::Mutex<Option<StoreHandle>> = std::sync::Mutex::new(None);
 
 /// Resolve the session directory under the manox config dir.
-/// The project registry: one path per line under the state root. The
-/// sqlite `projects` table's successor — derived at first read, rewritten
-/// on change.
-fn read_project_registry(path: &std::path::Path) -> Vec<String> {
+/// One durable project object: the directory plus the user's display
+/// alias. The list IS the object — a project with every conversation
+/// archived stays right here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProjectEntry {
+    pub path: String,
+    /// User-facing display name; `None` renders the directory segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+}
+
+/// The projects file under the state root: a JSON array of
+/// [`ProjectEntry`], written in committed order (newest first; manual
+/// moves rewrite the order). The order is meaningful and preserved — the
+/// successor of the sqlite `projects` table and the sorted registry lines.
+fn read_projects_file(path: &std::path::Path) -> Vec<ProjectEntry> {
     std::fs::read_to_string(path)
-        .map(|raw| {
-            let mut lines: Vec<String> = raw
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string)
-                .collect();
-            lines.sort();
-            lines.dedup();
-            lines
-        })
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
 }
 
-fn write_project_registry(path: &std::path::Path, projects: &[String]) -> std::io::Result<()> {
+fn write_projects_file(path: &std::path::Path, projects: &[ProjectEntry]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut lines = projects.to_vec();
-    lines.sort();
-    lines.dedup();
-    std::fs::write(
-        path,
-        lines
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n",
-    )
+    std::fs::write(path, serde_json::to_string_pretty(projects)?)
 }
 
 pub(crate) fn sessions_dir() -> PathBuf {
@@ -419,13 +415,19 @@ pub(crate) fn sessions_dir() -> PathBuf {
 /// process-global handle. Call at App startup.
 pub fn init() {
     let dir = sessions_dir();
-    let projects_path = dir.join("projects.registry");
-    let known_projects = read_project_registry(&projects_path);
+    let projects_path = dir.join("projects.json");
+    let projects = read_projects_file(&projects_path);
+    let known_projects = projects.iter().map(|p| p.path.clone()).collect();
+    let project_aliases = projects
+        .into_iter()
+        .filter_map(|p| p.alias.map(|alias| (p.path, alias)))
+        .collect();
     let handle = StoreHandle::new(ThreadStore {
         summaries: Vec::new(),
         archived_summaries: Vec::new(),
         session_paths: HashMap::new(),
         known_projects,
+        project_aliases,
         order: crate::sidebar_order::SidebarOrder::default(),
         order_dirty: false,
         running: HashSet::new(),
@@ -683,6 +685,48 @@ impl ThreadStore {
         &self.known_projects
     }
 
+    /// A project's display alias, when the user set one.
+    pub fn project_alias(&self, path: &str) -> Option<&str> {
+        self.project_aliases.get(path).map(String::as_str)
+    }
+
+    /// Set (or clear, on `None`) a project's display alias. The project
+    /// object is durable whether or not it holds live conversations; an
+    /// unknown path is refused — aliasing an unregistered directory would
+    /// mint an object nobody registered.
+    pub fn set_project_alias(&mut self, path: &str, alias: Option<String>) -> bool {
+        if !self.known_projects.iter().any(|p| p == path) {
+            return false;
+        }
+        match alias {
+            Some(alias) if !alias.trim().is_empty() => {
+                self.project_aliases.insert(path.to_string(), alias);
+            }
+            _ => {
+                self.project_aliases.remove(path);
+            }
+        }
+        self.persist_projects();
+        self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
+        true
+    }
+
+    /// Persist the project objects — the ordered path list plus the alias
+    /// map — as one array write.
+    fn persist_projects(&self) {
+        let projects: Vec<ProjectEntry> = self
+            .known_projects
+            .iter()
+            .map(|path| ProjectEntry {
+                path: path.clone(),
+                alias: self.project_aliases.get(path).cloned(),
+            })
+            .collect();
+        if let Err(e) = write_projects_file(&self.projects_path, &projects) {
+            tracing::warn!(error = %e, "failed to persist the projects file");
+        }
+    }
+
     /// The committed sidebar order: folder order plus each partition's ordered
     /// thread ids.
     ///
@@ -700,10 +744,10 @@ impl ThreadStore {
         if path.is_empty() || self.known_projects.contains(&path) {
             return;
         }
-        self.known_projects.push(path.clone());
-        if let Err(e) = write_project_registry(&self.projects_path, &self.known_projects) {
-            tracing::warn!(error = %e, "failed to persist project registration");
-        }
+        // Newest project first: an uncommitted folder order renders the
+        // most recently added directory at the top of the section.
+        self.known_projects.insert(0, path.clone());
+        self.persist_projects();
         // The folder account claims a committed tail position for the new
         // folder, and the registry list is re-projected from it.
         self.rerank();
@@ -719,9 +763,8 @@ impl ThreadStore {
             return;
         }
         self.known_projects.retain(|p| p != path);
-        if let Err(e) = write_project_registry(&self.projects_path, &self.known_projects) {
-            tracing::warn!(error = %e, "failed to persist project removal");
-        }
+        self.project_aliases.remove(path);
+        self.persist_projects();
         // The folder leaves the account; its rows re-partition as loose.
         self.rerank();
         self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
@@ -1951,8 +1994,9 @@ pub fn init_for_test() {
 #[cfg(any(test, feature = "test-support"))]
 pub fn standalone_for_test() -> StoreHandle {
     let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-    let projects_path = dir.join("projects.registry");
+    let projects_path = dir.join("projects.json");
     StoreHandle::new(ThreadStore {
+        project_aliases: HashMap::new(),
         summaries: Vec::new(),
         archived_summaries: Vec::new(),
         session_paths: HashMap::new(),
@@ -2185,8 +2229,9 @@ mod tests {
 
     fn store_handle() -> StoreHandle {
         let dir = std::env::temp_dir().join(format!("store-dir-{}", uuid::Uuid::new_v4()));
-        let projects_path = dir.join("projects.registry");
+        let projects_path = dir.join("projects.json");
         StoreHandle::new(ThreadStore {
+            project_aliases: HashMap::new(),
             summaries: Vec::new(),
             archived_summaries: Vec::new(),
             session_paths: HashMap::new(),
@@ -2395,8 +2440,9 @@ mod tests {
         assert_eq!(first_summary_of(&store, "persist"), "cold start prompt");
 
         let sessions_dir = dir.clone();
-        let projects_path = sessions_dir.join("projects.registry");
+        let projects_path = sessions_dir.join("projects.json");
         let restarted = StoreHandle::new(ThreadStore {
+            project_aliases: HashMap::new(),
             summaries: Vec::new(),
             archived_summaries: Vec::new(),
             session_paths: HashMap::new(),
@@ -2431,10 +2477,14 @@ mod tests {
         assert!(std::fs::read_to_string(&path).unwrap().contains("/p/a"));
         // ...and a fresh store over the same root seeds from it.
         let reopened = StoreHandle::new(ThreadStore {
+            project_aliases: HashMap::new(),
             summaries: Vec::new(),
             archived_summaries: Vec::new(),
             session_paths: HashMap::new(),
-            known_projects: read_project_registry(&path),
+            known_projects: read_projects_file(&path)
+                .iter()
+                .map(|p| p.path.clone())
+                .collect(),
             order: crate::sidebar_order::SidebarOrder::default(),
             order_dirty: false,
             running: HashSet::new(),
@@ -2463,9 +2513,14 @@ mod tests {
         let known = store.read(|s| s.known_projects().to_vec());
         assert_eq!(known, vec!["/p/a".to_string()]);
         let registry = store.read(|s| s.projects_path.clone());
+        let persisted: Vec<ProjectEntry> =
+            serde_json::from_str(&std::fs::read_to_string(&registry).unwrap()).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&registry).unwrap().lines().count(),
-            1
+            persisted,
+            vec![ProjectEntry {
+                path: "/p/a".into(),
+                alias: None
+            }]
         );
     }
 
@@ -2481,12 +2536,14 @@ mod tests {
             s.remove_project("/p/missing");
         });
         let registry = store.read(|s| s.projects_path.clone());
+        let persisted: Vec<ProjectEntry> =
+            serde_json::from_str(&std::fs::read_to_string(&registry).unwrap()).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&registry)
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
-            vec!["/p/b"]
+            persisted,
+            vec![ProjectEntry {
+                path: "/p/b".into(),
+                alias: None
+            }]
         );
         let known = store.read(|s| s.known_projects().to_vec());
         assert_eq!(known, vec!["/p/b".to_string()]);

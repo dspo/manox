@@ -358,6 +358,10 @@ impl SessionRuntime for GatewayRuntime {
         self.server.ahp_inner().order_session(session_id, before)
     }
 
+    fn set_project_alias(&self, path: &str, alias: Option<&str>) -> bool {
+        self.server.ahp_inner().set_project_alias(path, alias)
+    }
+
     fn compact(&self, session_id: &str, instructions: Option<String>) -> Result<(), RuntimeError> {
         self.server.ahp_inner().compact(session_id, instructions)
     }

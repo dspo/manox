@@ -4398,6 +4398,7 @@ mod extension_gate_tests {
                 label: Some("x".to_string()),
                 session_info: Some(json!({"name": "agent"})),
                 leaf: Some("e-9".to_string()),
+                alias: None,
                 active_tools: Some(vec!["bash".to_string()]),
                 order: Some(json!({"s-1": 1})),
             },

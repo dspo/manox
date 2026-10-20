@@ -336,6 +336,9 @@ mod accept_without_a_reactor_tests {
         fn order_session(&self, _: &str, _: Option<&str>) -> bool {
             false
         }
+        fn set_project_alias(&self, _: &str, _: Option<&str>) -> bool {
+            false
+        }
         fn compact(&self, _: &str, _: Option<String>) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }

@@ -1099,8 +1099,17 @@ impl RuntimeBackend {
             let (workspaces, order) = manox_agent::thread_store::try_global()
                 .map(|store| {
                     store.read(|state| {
-                        let (groups, accounts) = state.sidebar_order();
-                        (groups.to_vec(), accounts.clone())
+                        let groups: Vec<serde_json::Value> = state
+                            .known_projects()
+                            .iter()
+                            .map(|path| {
+                                serde_json::json!({
+                                    "path": path,
+                                    "alias": state.project_alias(path),
+                                })
+                            })
+                            .collect();
+                        (groups, state.sidebar_order().1.clone())
                     })
                 })
                 .unwrap_or_default();
@@ -1530,7 +1539,12 @@ fn summary_from_row(
         origin: None,
         project: (!row.project.is_empty()).then(|| ahp_types::state::ProjectInfo {
             uri: row.project.clone(),
-            display_name: row.project.clone(),
+            // The user's alias is the project's display name; the raw path is
+            // the fallback.
+            display_name: store
+                .project_alias(&row.project)
+                .map(str::to_string)
+                .unwrap_or_else(|| row.project.clone()),
         }),
         working_directories: directories,
         annotations: None,
@@ -2331,6 +2345,32 @@ impl Backend for RuntimeBackend {
                     DispatchOutcome::Rejected(format!("unknown session: {session_id}"))
                 }
             }
+            StateAction::Unknown(tag)
+                if tag.get("type").and_then(Value::as_str)
+                    == Some(manox_ahp::ext::actions::ALIAS_CHANGED) =>
+            {
+                // The workspaces channel is the alias action's home: the
+                // project object is host state, not any one session's.
+                let Some(path) = tag.get("path").and_then(Value::as_str) else {
+                    return DispatchOutcome::Rejected(
+                        "x-manox/aliasChanged needs the project `path`".to_string(),
+                    );
+                };
+                let alias = match tag.get("alias") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(alias)) => Some(alias.as_str()),
+                    Some(_) => {
+                        return DispatchOutcome::Rejected(
+                            "x-manox/aliasChanged `alias` must be a string or null".to_string(),
+                        );
+                    }
+                };
+                if self.server.set_project_alias(path, alias) {
+                    DispatchOutcome::Accepted
+                } else {
+                    DispatchOutcome::Rejected(format!("unknown project: {path}"))
+                }
+            }
             StateAction::SessionIsArchivedChanged(changed) => {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
@@ -3025,6 +3065,10 @@ mod mcp_dispatch_tests {
     }
 
     impl SessionRuntime for McpOnlyRuntime {
+        fn set_project_alias(&self, _: &str, _: Option<&str>) -> bool {
+            false
+        }
+
         fn preflight_config(
             &self,
             _session_id: &str,

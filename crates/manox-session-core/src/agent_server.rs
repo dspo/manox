@@ -2188,6 +2188,14 @@ impl AgentServerInner {
         true
     }
 
+    /// Set (or clear) a project's display alias — the durable project
+    /// object's name half. Refused for an unregistered path: aliasing a
+    /// directory nobody registered would mint an object with no home.
+    pub(crate) fn set_project_alias(&self, path: &str, alias: Option<&str>) -> bool {
+        manox_agent::thread_store::global()
+            .with_mut(|store| store.set_project_alias(path, alias.map(str::to_string)))
+    }
+
     /// Rename a session to a user-supplied title.
     ///
     /// Two calls, and the split matters:
