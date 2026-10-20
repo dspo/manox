@@ -342,6 +342,48 @@ impl RuntimeBackend {
             Some(fold) => (fold.chat, fold.tail),
             None => (chat::initial(session_id), 0),
         };
+        // A turn the journal shows as started but never settled is dead by
+        // construction when no live leg exists AND nothing user-answerable
+        // is parked on it: the engine that owed the settlement died with
+        // its process, and nothing will ever complete it. Fold the
+        // settlement here (cancelled, "host exited") so a restored chat
+        // never carries a phantom running turn — the journal itself is
+        // never rewritten, and every cold fold synthesizes the same
+        // settlement deterministically. Two exemptions keep a turn open: a
+        // live leg (the session table or a running child's feed — the
+        // engine or the child bridge may still settle it), and an
+        // unanswered input request parked on the turn (the ask survives
+        // host death by design: the user's answer is still journalable,
+        // and a cancel settles the park explicitly).
+        let live_leg = self.server.has_session(session_id)
+            || manox_harness::subagent::feeds::child_journal_feed(session_id).is_some();
+        let parked_ask = chat.active_turn.as_ref().is_some_and(|active| {
+            active
+                .response_parts
+                .iter()
+                .any(|part| matches!(part, ahp_types::state::ResponsePart::InputRequest(input) if input.response.is_none()))
+        });
+        if !live_leg
+            && !parked_ask
+            && let Some(active) = chat.active_turn.clone()
+        {
+            let mut reason = serde_json::Map::new();
+            reason.insert("outcome".to_string(), serde_json::json!("aborted"));
+            reason.insert("reason".to_string(), serde_json::json!("host exited"));
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                manox_ahp::ext::META_KEY.to_string(),
+                serde_json::Value::Object(reason),
+            );
+            let _ = ahp::reducers::apply_action_to_chat(
+                &mut chat,
+                &StateAction::ChatTurnCancelled(ahp_types::actions::ChatTurnCancelledAction {
+                    turn_id: active.id,
+                    duration: 0,
+                    meta: Some(meta),
+                }),
+            );
+        }
         // The session half needs the same tolerance as the chat half, for the
         // same reason: a brand-new session has no store row until a list
         // refresh scans its file, and `createSession` seeds it immediately —
