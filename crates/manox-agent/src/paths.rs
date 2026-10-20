@@ -3,9 +3,10 @@
 //!
 //! manox splits its on-disk footprint in two:
 //!
-//! - `~/.manox/` — runtime state manox owns outright: the SQLite database,
-//!   session journals, provider config (`cx.providers.config.yaml`), settings,
-//!   and the cx CLI state (`cx.db`, `sessions/`).
+//! - `~/.manox/` — runtime state manox owns outright: the session core tree
+//!   (`core/<project-slug>/<session-id>/`), provider config
+//!   (`cx.providers.config.yaml`), settings, and the cx CLI state (`cx.db`,
+//!   whose `sessions/` holds that CLI's IPC sockets and registry JSON).
 //! - `~/.claude/` — the Claude Code ecosystem home, shared in place with the
 //!   Claude Code CLI: user-authored skills, commands, agents, rules, and the
 //!   plugin/marketplace store. manox consumes and (via the plugin manager)
@@ -19,8 +20,8 @@ use anyhow::{Context as _, Result};
 /// `$HOME/.manox` — the single root for all manox (and cx-family) runtime state.
 ///
 /// `MANOX_HOME` overrides the root wholesale (env wins over `$HOME`). Used by
-/// embedders and tests wanting an isolated store (provider config lookup,
-/// threads.db, session journals all live under the root).
+/// embedders and tests wanting an isolated store (provider config lookup and
+/// the session core tree both live under the root).
 pub fn manox_home() -> Result<PathBuf> {
     if let Some(root) = std::env::var_os("MANOX_HOME").filter(|r| !r.is_empty()) {
         return Ok(PathBuf::from(root));
@@ -50,14 +51,6 @@ pub fn claude_home() -> Result<PathBuf> {
 /// `$HOME/.claude/agents` — user-authored subagent definition markdown files.
 pub fn agents_dir() -> Result<PathBuf> {
     Ok(claude_home()?.join("agents"))
-}
-
-/// `$HOME/.manox/sessions` — session journal transcripts: the repository
-/// scan root and the canonical creation/materialization target, so an
-/// on-disk identity probe and the eventual file can never disagree about
-/// the path.
-pub fn sessions_dir() -> Result<PathBuf> {
-    Ok(manox_config_dir()?.join("sessions"))
 }
 
 /// The v1.0.0 state root: every session lives in its own directory under a
@@ -245,7 +238,7 @@ pub(crate) mod tests {
         assert_eq!(agents_dir().unwrap(), claude.join("agents"));
         // The runtime root stays under MANOX_HOME/HOME — the two roots must
         // never collapse into one.
-        assert_ne!(sessions_dir().unwrap(), claude.join("sessions"));
+        assert_ne!(core_root().unwrap(), claude.join("sessions"));
     }
 
     /// `MANOX_CLAUDE_HOME` redirects the ecosystem root wholesale.
