@@ -1,6 +1,13 @@
 // The Session Core storage engine: lazy identity publication over an
 // append-only event log.
 //
+// STAGED — not yet the writer. Live engines append through the `jsonl` tree
+// storage (`session::jsonl`) at the same `log.v1.jsonl` path and with the
+// same `Event` vocabulary; this module's materialization, lease, and
+// header-only scan are the re-homing target (`session::mod`'s header says the
+// same). Nothing outside tests calls it yet: do not read it as the
+// production write path.
+//
 // Layout under the state root (one directory per session, bucketed by the
 // origin project slug):
 //   <root>/<project-slug>/<session-id>/header.json   — immutable identity
