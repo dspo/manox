@@ -38,7 +38,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 schemars.workspace = true
 manox-providers.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["gzip", "brotli", "deflate"] }
 rusqlite.workspace = true
 zstd.workspace = true
 uuid.workspace = true
@@ -59,7 +59,10 @@ toml.workspace = true
 http.workspace = true
 tera.workspace = true
 rustwright_core = { workspace = true, optional = true }
-html2text = "0.17.1"
+htmd = "0.5.6"
+markup5ever_rcdom = "0.38"
+encoding_rs = "0.8"
+url = "2"
 tempfile = "3"
 
 [dev-dependencies]
