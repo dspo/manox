@@ -384,6 +384,42 @@ impl RuntimeBackend {
                 }),
             );
         }
+        // An open `run/started` is the same phantom one level down: the
+        // process that owed the run's `run/settled` row died with it, and
+        // nothing can ever close the roster entry. The live path reports a
+        // cancelled turn's in-flight runs as removals (#812) — the cold fold
+        // reports the same, deterministically, and invents no settlement the
+        // journal never recorded. The owner read is the same one the turn
+        // settlement above needs: a parent turn another process is running
+        // means that process's children are live too (children only ever run
+        // inside their parent's driver, so their feed is registered THERE).
+        let owner_running = super::open_turn_owner(session_id)
+            .await
+            .is_some_and(|owner| owner.is_alive());
+        if !live_leg
+            && !owner_running
+            && let Some(work) = chat.background_work.clone()
+        {
+            for entry in work {
+                // Only the run-backed kind: other work entries settle on
+                // their own rows, which this fold already replayed.
+                let ahp_types::state::BackgroundWork::Subagent(sub) = entry else {
+                    continue;
+                };
+                // A child running in THIS process can still settle its own
+                // run: its journal feed is the liveness signal (the same one
+                // the child-chat bridge attaches to).
+                if manox_harness::subagent::feeds::child_journal_feed(&sub.id).is_some() {
+                    continue;
+                }
+                let _ = ahp::reducers::apply_action_to_chat(
+                    &mut chat,
+                    &StateAction::ChatBackgroundWorkRemoved(
+                        ahp_types::actions::ChatBackgroundWorkRemovedAction { id: sub.id },
+                    ),
+                );
+            }
+        }
         // The session half needs the same tolerance as the chat half, for the
         // same reason: a brand-new session has no store row until a list
         // refresh scans its file, and `createSession` seeds it immediately —

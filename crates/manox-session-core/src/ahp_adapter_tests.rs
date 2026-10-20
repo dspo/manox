@@ -81,6 +81,16 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
             parent_id: p,
             ..
         }
+        | E::RunStarted {
+            id: i,
+            parent_id: p,
+            ..
+        }
+        | E::RunSettled {
+            id: i,
+            parent_id: p,
+            ..
+        }
         | E::AgentTextDelta {
             id: i,
             parent_id: p,
@@ -2498,6 +2508,111 @@ mod dispatch {
             result.snapshot.is_some(),
             "the empty chat answers a snapshot, not `not found`"
         );
+        uninstall();
+    }
+
+    /// An open `run/started` whose host died folds settled on the cold seed.
+    ///
+    /// The roster entry is opened by `run/started` and closed by
+    /// `run/settled`; a process that died mid-run leaves the pair unclosed, so
+    /// a cold fold would list a sub-agent that can never finish — the phantom
+    /// the turn-level settlement already clears, one level down. The live path
+    /// reports a cancelled turn's in-flight runs as removals (#812), and the
+    /// cold fold reports the same instead of inventing a settlement kind the
+    /// journal never recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_orphaned_run_folds_settled_on_the_cold_seed() {
+        let _guards = install();
+        seed_session(
+            "s-orphanrun",
+            "thread-orphanrun",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", turn_start()),
+                (
+                    "e3",
+                    E::RunStarted {
+                        id: String::new(),
+                        parent_id: None,
+                        timestamp: stamp(),
+                        run_id: "sub-orphan".into(),
+                        kind: "Explore".into(),
+                        label: "survey the fold".into(),
+                        child_session: "sub-orphan".into(),
+                        tool_call_id: "tu_1".into(),
+                        budgets: Default::default(),
+                        depth: 1,
+                    },
+                ),
+                ("e4", turn_finish()),
+                // No run/settled: the host that owed it died.
+            ],
+        )
+        .await;
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let state = backend
+            .chat_state("s-orphanrun")
+            .expect("the cold seed answers");
+        assert!(
+            state
+                .background_work
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty(),
+            "an orphaned run folds settled: {:?}",
+            state.background_work
+        );
+        uninstall();
+    }
+
+    /// The mirror: while the child's journal feed is registered the run is
+    /// live, so the same fold keeps its roster entry — the synthesis must
+    /// never clear work a running child can still settle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_childs_run_stays_listed_on_the_cold_seed() {
+        let _guards = install();
+        seed_session(
+            "s-liverun",
+            "thread-liverun",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", turn_start()),
+                (
+                    "e3",
+                    E::RunStarted {
+                        id: String::new(),
+                        parent_id: None,
+                        timestamp: stamp(),
+                        run_id: "sub-live".into(),
+                        kind: "Explore".into(),
+                        label: "survey the fold".into(),
+                        child_session: "sub-live".into(),
+                        tool_call_id: "tu_1".into(),
+                        budgets: Default::default(),
+                        depth: 1,
+                    },
+                ),
+                ("e4", turn_finish()),
+            ],
+        )
+        .await;
+        let (feed, _rx) = tokio::sync::broadcast::channel(8);
+        manox_harness::subagent::feeds::register_child_feed("sub-live", &feed);
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let state = backend
+            .chat_state("s-liverun")
+            .expect("the cold seed answers");
+        let listed = state.background_work.as_deref().unwrap_or_default().len();
+        manox_harness::subagent::feeds::remove_child_feed("sub-live");
+        assert_eq!(listed, 1, "a live child keeps its roster entry: {state:?}");
         uninstall();
     }
 
