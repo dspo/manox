@@ -111,27 +111,27 @@ impl TestServer {
 
     /// Number of requests the server actually received for `path`.
     pub(super) fn count(&self, path: &str) -> usize {
-        let key = if path.starts_with('/') {
-            path.to_string()
-        } else {
-            format!("/{path}")
-        };
-        *self.counts.lock().get(&key).unwrap_or(&0)
+        *self.counts.lock().get(&key(path)).unwrap_or(&0)
     }
 
     /// The request head the server received for `path`, when it received one.
     pub(super) fn last_request_head(&self, path: &str) -> Option<String> {
-        let key = if path.starts_with('/') {
-            path.to_string()
-        } else {
-            format!("/{path}")
-        };
-        self.heads.lock().get(&key).cloned()
+        self.heads.lock().get(&key(path)).cloned()
     }
 
     /// A resource on this server, addressed by name (see [`SERVER_HOST`]).
     pub(super) fn host_url(&self, path: &str) -> String {
         format!("http://{SERVER_HOST}:{}/{}", self.addr.port(), path)
+    }
+}
+
+/// Requests are keyed by their target: an origin-form path, or the
+/// absolute-form URL a client sends to a proxy.
+fn key(target: &str) -> String {
+    if target.starts_with('/') || target.contains("://") {
+        target.to_string()
+    } else {
+        format!("/{target}")
     }
 }
 

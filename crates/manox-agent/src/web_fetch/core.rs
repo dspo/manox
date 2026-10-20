@@ -995,6 +995,47 @@ mod tests {
         }
     }
 
+    /// The proxied leg: the proxy receives the absolute-form target URL (so it
+    /// resolves the origin), while a destination that is a private literal is
+    /// still refused before any request is sent.
+    #[tokio::test]
+    async fn proxied_hops_forward_absolute_urls_and_still_refuse_literals() {
+        let server = TestServer::start().await;
+        let target = server.host_url("through-proxy");
+        server.respond(&target, test_server::ok("text/plain", b"proxied"));
+        let proxy = Url::parse(&format!("http://{}", server.addr)).expect("proxy URL parses");
+
+        let res = fetch_with_transport(
+            &target,
+            &limits(),
+            &CancellationToken::new(),
+            &unguarded_transport(),
+            Some(proxy.clone()),
+        )
+        .await
+        .expect("proxied fetch succeeds");
+        assert!(
+            matches!(res.body, BodyKind::Text(ref t) if t == "proxied"),
+            "{res:?}"
+        );
+        assert_eq!(
+            server.count(&target),
+            1,
+            "the proxy received the absolute-form request"
+        );
+
+        let err = fetch_with_transport(
+            "http://169.254.169.254/latest/meta-data/",
+            &limits(),
+            &CancellationToken::new(),
+            &unguarded_transport(),
+            Some(proxy),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, WebFetchError::BlockedUrl(_)), "{err}");
+    }
+
     /// Parameter names are case-insensitive and may be spaced, and the media
     /// type is folded before it is classified.
     #[tokio::test]
