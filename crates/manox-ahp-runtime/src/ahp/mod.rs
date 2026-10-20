@@ -530,13 +530,15 @@ fn read_header(path: &Path) -> Option<manox_harness::session::jsonl::JsonlSessio
 /// [`crate::paths::persisted_session_file`] uses, so enumeration and
 /// cold read can never disagree.
 fn sessions_dir() -> Option<PathBuf> {
-    // The v1.0.0 core root, bucketed: test fixtures sit inside one project
-    // bucket so the two-deep walk (`<core>/<slug>/<id>/log.v1.jsonl`)
-    // resolves them exactly as production sessions resolve.
+    // The v1.0.0 core root ITSELF, never a bucket: production sessions live
+    // under `<core>/<project-slug>/<id>/log.v1.jsonl`, and a test store's
+    // fixtures may sit one level shallower — the bounded walk below reads
+    // both shapes. Naming a bucket here (the fixtures' own `t`, say) would
+    // make the enumeration resolve a directory production never writes, so
+    // no thread's members would ever be found.
     manox_agent::thread_store::try_global()
         .map(|_| manox_agent::thread_store::global_sessions_dir())
         .or_else(|| manox_agent::paths::core_root().ok())
-        .map(|root| root.join("t"))
 }
 
 /// The seeded granted set: the session's creation cwd plus the sidecar's
@@ -762,6 +764,56 @@ mod baseline_tests {
     }
     use super::*;
     use manox_harness::session::SessionStorage;
+
+    /// The member enumeration reads the core root, not one bucket.
+    ///
+    /// Production journals live under `<core>/<project-slug>/<id>/
+    /// log.v1.jsonl`; a scan pointed at a single bucket (the test fixtures'
+    /// own `t`, say) resolves a directory production never writes, so every
+    /// thread's members silently collapse to the active pointer — the
+    /// multi-session catalog and the member fold lose every other journal.
+    /// The fixture here is production-shaped on purpose: it sits under a
+    /// real project bucket, which only a root-wide walk finds.
+    #[test]
+    fn thread_members_are_found_under_a_production_bucket() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::runtime::handle().block_on(async {
+            // The fixture's location comes from the production root (the
+            // path authority `core_root` names), never from the enumeration
+            // under test — otherwise a scan pointed at the wrong bucket
+            // would move the fixture along with it and the guard would
+            // prove nothing.
+            let root = manox_agent::paths::core_root().expect("core root");
+            let bucket = root.join("users-x-work-manox");
+            let path = journal(&bucket, "m-bucketed");
+            let _ = std::fs::remove_file(&path);
+            let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
+                &path,
+                manox_harness::session::jsonl::JsonlSessionMetadata {
+                    id: "m-bucketed".into(),
+                    cwd: "/Users/x/work/manox".into(),
+                    created_at: chrono::Utc::now(),
+                    parent_session_path: None,
+                    metadata: Some(serde_json::json!({"thread": "T-bucketed"})),
+                },
+            )
+            .await
+            .unwrap();
+            drop(storage);
+
+            // The active pointer is a DIFFERENT session: the member can only
+            // arrive through the disk walk, never through the two ids the
+            // enumeration seeds by construction.
+            let members = thread_sessions("T-bucketed", "m-active");
+            assert!(
+                members.contains(&"m-bucketed".to_string()),
+                "a member under a production bucket is enumerated: {members:?}"
+            );
+            let _ = std::fs::remove_file(&path);
+        })
+    }
 
     /// Regression for the dictionary-order fold: member session ids are
     /// uuids, so id order carries no time information, and the scalar rows
