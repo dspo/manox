@@ -242,7 +242,7 @@ impl SubagentProvider for SpawnProvider {
                     &child_cwd.to_string_lossy(),
                     &run_id,
                 );
-                let file = dir.join("log.v1.jsonl");
+                let file = dir.join(crate::session::identity::JOURNAL_FILE);
                 (dir, Some(file), None)
             }
         };

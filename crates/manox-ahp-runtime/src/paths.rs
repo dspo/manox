@@ -18,7 +18,7 @@ pub fn session_file_under(session_id: &str, cwd: &std::path::Path) -> Option<Pat
             manox_agent::paths::core_root()
                 .unwrap_or_default()
                 .join(session_id)
-                .join("log.v1.jsonl")
+                .join(manox_harness::session::identity::JOURNAL_FILE)
         }),
     )
 }
@@ -66,7 +66,7 @@ pub fn persisted_session_file(session_id: &str) -> Option<PathBuf> {
             };
             if meta.is_dir() {
                 if path.file_name().and_then(|n| n.to_str()) == Some(id) {
-                    let log = path.join("log.v1.jsonl");
+                    let log = path.join(manox_harness::session::identity::JOURNAL_FILE);
                     if log.is_file() {
                         return Some(log);
                     }

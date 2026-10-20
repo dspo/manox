@@ -166,31 +166,46 @@ pub fn mint_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// The project bucket name for a working directory: a flattened, lowercase
-/// rendering of the full path. Two directories share a bucket only when
-/// their paths differ in nothing but separators and non-alphanumeric runs.
+/// The project bucket name for a working directory — a byte-for-byte port
+/// of dsh's `projectKey` so both tools shard the same tree shape: path and
+/// drive separators (`/`, `\\`, `:`) fold to `-` (runs fold), `[A-Za-z0-9._-]`
+/// survive as-is (case preserved), every other code point escapes as
+/// `~XXXX` (uppercase hex, at least four digits), the whole slug is wrapped
+/// in `--`…`--`, and `/` alone reads as `root`. The bucket is storage
+/// locality, never identity: two long paths colliding costs co-tenancy in
+/// one bucket, while the journal header's `cwd` stays the durable fact.
 pub fn project_slug(cwd: &str) -> String {
-    let mut slug = String::new();
-    let mut pending_dash = false;
+    let mut readable = String::new();
+    let mut separator_run = false;
     for ch in cwd.chars() {
-        if ch.is_ascii_alphanumeric() {
-            if pending_dash && !slug.is_empty() {
-                slug.push('-');
+        if ch == '/' || ch == '\\' || ch == ':' {
+            if !separator_run {
+                readable.push('-');
             }
-            pending_dash = false;
-            slug.push(ch.to_ascii_lowercase());
+            separator_run = true;
+        } else if ch != '~' && (ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')) {
+            readable.push(ch);
+            separator_run = false;
         } else {
-            pending_dash = true;
+            readable.push('~');
+            readable.push_str(&format!("{:04X}", ch as u32));
+            separator_run = false;
         }
     }
-    if slug.is_empty() {
-        return "default".into();
-    }
-    // Buckets stay readable in a directory listing; a collision between
-    // two long paths costs nothing but co-tenancy in one bucket.
-    slug.truncate(80);
-    slug
+    let trimmed = readable.trim_start_matches('-');
+    let slug = if trimmed.is_empty() { "root" } else { trimmed };
+    let mut bucket = String::with_capacity(slug.len() + 4);
+    bucket.push_str("--");
+    bucket.extend(slug.chars().take(251));
+    bucket.push_str("--");
+    bucket
 }
+
+/// The journal file name inside a core session directory (dsh's current
+/// generation name; the format version lives in the journal's header row,
+/// and a future format bump materializes the previous file as
+/// `session.v<N>.jsonl`, dsh's generation scheme).
+pub const JOURNAL_FILE: &str = "session.jsonl";
 
 #[cfg(test)]
 mod tests {
@@ -249,10 +264,37 @@ mod tests {
     }
 
     #[test]
-    fn project_slug_flattens_paths_stably() {
-        assert_eq!(project_slug("/Users/x/work/manox"), "users-x-work-manox");
-        assert_eq!(project_slug("/Users/x/../work/manox"), "users-x-work-manox");
-        assert_eq!(project_slug("///"), "default");
-        assert_eq!(project_slug("A B/C_D"), "a-b-c-d");
+    fn project_slug_matches_dsh_project_key() {
+        // Separator runs fold; safe characters survive with case preserved.
+        assert_eq!(
+            project_slug("/Users/x/work/manox"),
+            "--Users-x-work-manox--"
+        );
+        assert_eq!(
+            project_slug("/Users/x/../work/manox"),
+            "--Users-x-..-work-manox--"
+        );
+        // Unsafe code points escape as ~XXXX (uppercase hex, ≥4 digits) —
+        // non-ASCII paths stay distinguishable instead of folding away.
+        assert_eq!(
+            project_slug("/Users/x/花束标注"),
+            "--Users-x-~82B1~675F~6807~6CE8--"
+        );
+        assert_eq!(project_slug("A B/C_D"), "--A~0020B-C_D--");
+        // The escape is also how a literal `~` survives unambiguously.
+        assert_eq!(project_slug("/tmp/~root"), "--tmp-~007Eroot--");
+        // Only separators left means the root bucket.
+        assert_eq!(project_slug("///"), "--root--");
+        assert_eq!(project_slug("/"), "--root--");
+    }
+
+    #[test]
+    fn project_slug_bounds_the_bucket_component() {
+        let long_cwd = format!("/{}", "a".repeat(300));
+        let bucket = project_slug(&long_cwd);
+        // `--` + at most 251 inner characters + `--`.
+        assert!(bucket.len() <= 255);
+        assert!(bucket.starts_with("--") && bucket.ends_with("--"));
+        assert!(bucket.trim_matches('-').len() <= 251);
     }
 }

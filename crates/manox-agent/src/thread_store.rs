@@ -939,7 +939,10 @@ impl ThreadStore {
             if !bucket.file_type().ok().is_some_and(|kind| kind.is_dir()) {
                 continue;
             }
-            let candidate = bucket.path().join(id).join("log.v1.jsonl");
+            let candidate = bucket
+                .path()
+                .join(id)
+                .join(manox_harness::session::identity::JOURNAL_FILE);
             if candidate.is_file() {
                 return Some(candidate);
             }
@@ -1340,11 +1343,11 @@ impl ThreadStore {
         // session's own directory); the sidecar sits beside it. A
         // registered path wins — a reconcile pass cannot invalidate it —
         // and an unknown id falls back to the per-session directory guess.
-        let journal = self
-            .session_paths
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| self.sessions_dir.join(id).join("log.v1.jsonl"));
+        let journal = self.session_paths.get(id).cloned().unwrap_or_else(|| {
+            self.sessions_dir
+                .join(id)
+                .join(manox_harness::session::identity::JOURNAL_FILE)
+        });
         let meta_path = manox_harness::session_meta::meta_path(&self.sessions_dir, &journal);
         let raw = std::fs::read_to_string(meta_path).ok()?;
         let meta: manox_harness::session_meta::SessionMeta = serde_json::from_str(&raw).ok()?;
@@ -2003,7 +2006,9 @@ mod tests {
         let store = standalone_for_test();
         let root = store.0.dir.clone();
         let bucket = root.join("users-x-work-manox");
-        let journal = bucket.join("s-walked").join("log.v1.jsonl");
+        let journal = bucket
+            .join("s-walked")
+            .join(manox_harness::session::identity::JOURNAL_FILE);
         std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
         std::fs::write(&journal, b"").unwrap();
         assert_eq!(

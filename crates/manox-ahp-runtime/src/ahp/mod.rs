@@ -491,10 +491,12 @@ async fn fold_extension_state(
 }
 
 fn session_stem_of(path: &Path) -> Option<String> {
-    // The core layout names the journal `log.v1.jsonl`; a session's id is
+    // The core layout names the journal by the shared constant; a session's id is
     // its PARENT directory's name. A legacy flat `<id>.jsonl` keeps the
     // file stem.
-    if path.file_name().and_then(|n| n.to_str()) == Some("log.v1.jsonl") {
+    if path.file_name().and_then(|n| n.to_str())
+        == Some(manox_harness::session::identity::JOURNAL_FILE)
+    {
         return path.parent()?.file_name()?.to_str().map(str::to_string);
     }
     (path.extension()? == "jsonl")
@@ -773,7 +775,9 @@ pub fn session_uri_of_terminal(session_id: &str) -> String {
 mod baseline_tests {
 
     fn journal(sessions: &std::path::Path, id: &str) -> std::path::PathBuf {
-        sessions.join(id).join("log.v1.jsonl")
+        sessions
+            .join(id)
+            .join(manox_harness::session::identity::JOURNAL_FILE)
     }
     use super::*;
     use manox_harness::session::SessionStorage;

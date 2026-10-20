@@ -80,7 +80,7 @@ pub fn core_session_dir(cwd: &std::path::Path, id: &str) -> Result<PathBuf> {
 
 /// The engine journal file inside a session's core directory.
 pub fn core_session_file(cwd: &std::path::Path, id: &str) -> Result<PathBuf> {
-    Ok(core_session_dir(cwd, id)?.join("log.v1.jsonl"))
+    Ok(core_session_dir(cwd, id)?.join(manox_harness::session::identity::JOURNAL_FILE))
 }
 
 /// `(dir, exact-file)` for a session's core location: the per-session
@@ -90,7 +90,7 @@ pub fn core_session_file(cwd: &std::path::Path, id: &str) -> Result<PathBuf> {
 /// refusing to spawn.
 pub fn core_session_parts(cwd: &std::path::Path, id: &str) -> Result<(PathBuf, Option<PathBuf>)> {
     let dir = core_session_dir(cwd, id)?;
-    let file = dir.join("log.v1.jsonl");
+    let file = dir.join(manox_harness::session::identity::JOURNAL_FILE);
     Ok((dir, Some(file)))
 }
 

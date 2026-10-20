@@ -170,7 +170,7 @@ fn core_journal(id: &str) -> std::path::PathBuf {
     manox_agent::thread_store::global_sessions_dir()
         .join("t")
         .join(id)
-        .join("log.v1.jsonl")
+        .join(manox_harness::session::identity::JOURNAL_FILE)
 }
 
 /// Write one session journal (the core layout under the store's root,

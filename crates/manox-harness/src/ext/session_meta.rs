@@ -1,10 +1,13 @@
-//! Per-session UI metadata stored beside the jsonl transcript.
+//! Per-session UI metadata stored outside the session directory.
 //!
-//! The kernel owns the conversation (jsonl session files); sidebar-only
-//! flags — pin, archive, unread, error, display title — have no home in the
-//! transcript schema, so they live in a small sidecar keyed by session id.
-//! Loading tolerates a missing file (a fresh session has no sidecar yet) but
-//! not a corrupt one: a truncated file is a real fault, not an absence.
+//! The kernel owns the conversation (the jsonl journal is a session
+//! directory's only durable content); sidebar-only flags — pin, archive,
+//! unread, error, display title — have no home in the transcript schema,
+//! so they live in a small cache-row sidecar under the core root's
+//! `cache/` directory, keyed by session id (dsh's storages/projcache
+//! concern separation). Loading tolerates a missing file (a fresh session
+//! has no sidecar yet) but not a corrupt one: a truncated file is a real
+//! fault, not an absence.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -98,22 +101,19 @@ pub struct UserAttributionMeta {
     pub display_text: Option<String>,
 }
 
-/// The sidecar path for a session file: `<dir>/<id>.meta.json`.
+/// The sidecar path for a session file.
 pub fn meta_path(session_dir: &Path, session_path: &Path) -> PathBuf {
-    // The core layout's journal is `log.v1.jsonl` inside a directory named
-    // by the session's id — the sidecar sits beside it as
-    // `<dir>/<id>.meta.json`. A legacy flat `<id>.jsonl` keeps the old
-    // derivation.
-    if session_path.file_name().and_then(|n| n.to_str()) == Some("log.v1.jsonl")
-        && let Some(id) = session_path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
+    // Core layout: the session directory holds the journal (and its lease)
+    // alone — dsh's shape — so the sidecar lives one level up as a cache
+    // row under `<core>/cache/<id>.json`. A legacy flat `<id>.jsonl` keeps
+    // the old beside-the-file derivation.
+    if session_path.file_name().and_then(|n| n.to_str())
+        == Some(crate::session::identity::JOURNAL_FILE)
+        && let Some(dir) = session_path.parent()
+        && let Some(core_root) = dir.parent()
+        && let Some(id) = dir.file_name().and_then(|n| n.to_str())
     {
-        return session_path
-            .parent()
-            .unwrap()
-            .join(format!("{id}.meta.json"));
+        return core_root.join("cache").join(format!("{id}.json"));
     }
     let _ = session_dir;
     let id = session_path

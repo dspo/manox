@@ -3531,7 +3531,10 @@ mod turn_cancel_ask_settlement_tests {
             // layout: bucket over per-session directories).
             let sessions = manox_agent::paths::core_root().unwrap().join("t");
             std::fs::create_dir_all(&sessions).unwrap();
-            let journal = |root: &std::path::Path, id: &str| root.join(id).join("log.v1.jsonl");
+            let journal = |root: &std::path::Path, id: &str| {
+                root.join(id)
+                    .join(manox_harness::session::identity::JOURNAL_FILE)
+            };
 
             // A journal whose turn sits parked on an unanswered question — no
             // decision row, the shape the live cancel leaves mid-flight.
