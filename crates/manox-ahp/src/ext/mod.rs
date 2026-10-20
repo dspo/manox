@@ -45,13 +45,24 @@ pub const META_KEY: &str = "x-manox";
 /// had a host producer (the stop signal already reaches clients through
 /// `backgroundTasksChanged`'s `status: "Stopped"`), so a client caching
 /// version 4 kept only a name that was rejected either way.
+///
+/// 6: the sub-agent rows left this surface. `subagent_progress` is retired —
+/// the swarm's `run/started` + `run/settled` rows are the only durable
+/// background-work truth — and both halves of the sub-agent view are standard
+/// AHP state now: the roster rides the parent chat's `ChatBackgroundWorkSet` /
+/// `ChatBackgroundWorkRemoved` (each entry naming the child's channel) and the
+/// child's transcript is that channel, `ahp-chat:/<run-id>`, read-only with a
+/// `ChatOrigin::Tool` naming the spawning call. A client that keyed its
+/// sub-agent view off this channel's rows reads those instead.
 pub const VERSION: u32 = 6;
 
 /// State-bearing extension channel prefixes, in declaration order.
 pub mod channels {
     /// Plan mode, plan document, plan review lifecycle (per chat).
     pub const PLAN: &str = "x-manox-plan:/";
-    /// Goal, background tasks, browser suites, sub-agent tree (per session).
+    /// Goal, background tasks, browser suites (per session). The sub-agent
+    /// roster and the child transcripts are standard AHP state — the parent
+    /// chat's background work and `ahp-chat:/<run-id>` — never this channel.
     pub const WORK: &str = "x-manox-work:/";
     /// Aggregated conversation metrics — the v2 Q face (per chat).
     pub const METRICS: &str = "x-manox-metrics:/";
@@ -99,7 +110,6 @@ pub mod actions {
     pub const WORK_BACKGROUND_TASKS: &str = "x-manox-work/backgroundTasksChanged";
     /// Active browser suites (host-emitted; clients set through `session/configChanged`).
     pub const WORK_BROWSER_SUITES: &str = "x-manox-work/browserSuitesChanged";
-    /// Sub-agent tree / progress (host-emitted).
     /// The engine's active tool set (host-emitted; AHP's `session/serverToolsChanged`
     /// describes *advertised* tools, not the model's currently-visible subset).
     pub const WORK_ACTIVE_TOOLS: &str = "x-manox-work/activeToolsChanged";
