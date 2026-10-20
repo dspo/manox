@@ -557,9 +557,10 @@ impl ThreadStore {
     }
 
     /// Re-emit both partitions from the durable order account: reconcile every
-    /// account against live membership (first-seen ids prepend, dead ids and
-    /// emptied partitions drop), then lay the rows out as folder sequence →
-    /// pinned band → account rank.
+    /// account against live membership (dead ids and emptied partitions
+    /// drop), then lay the rows out as folder sequence → pinned band →
+    /// last-human-interaction rank (the account owns membership and the
+    /// folder order; the interaction stamp ranks rows inside a folder).
     ///
     /// This is the one place the sidebar order is decided: a timestamp never
     /// re-sorts a live row. `order_dirty` rises only when the account itself
@@ -3299,7 +3300,7 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_move_reorders_the_list_and_dirties_the_account() {
+    fn a_thread_move_records_into_the_account_without_reordering_the_list() {
         let (store, _path) = ordered_store(&[
             ("t1", "/p/a", 100, false),
             ("t2", "/p/a", 200, false),
@@ -3310,7 +3311,10 @@ mod tests {
             s.insert_thread_before("t1", Some("t3"));
             assert!(s.order_dirty, "a real move must persist");
         });
-        assert_eq!(ids(&store), vec!["t1", "t3", "t2"]);
+        // The display order is the interaction rank; a stored move never
+        // overrides it — only a pin (the head band) or a newer human
+        // interaction moves a row.
+        assert_eq!(ids(&store), vec!["t3", "t2", "t1"]);
         assert_eq!(
             store.read(|s| s.order.accounts["/p/a"].clone()),
             vec!["t1".to_string(), "t3".to_string(), "t2".to_string()],
@@ -3352,12 +3356,11 @@ mod tests {
             s.pin_thread("t2", true);
             assert!(s.order_dirty, "a pin is an explicit order action");
         });
-        // The most recently pinned row leads: a pin floats, it does not merely
-        // re-band.
+        // The pinned band ranks by interaction too: t2 (200) leads t3 (100).
         assert_eq!(ids(&store), vec!["t2", "t3", "t1"]);
-        // Unpinning drops the row back to its stored rank.
+        // Unpinning drops the row back into the interaction rank.
         store.with_mut(|s| s.pin_thread("t2", false));
-        assert_eq!(ids(&store), vec!["t3", "t2", "t1"]);
+        assert_eq!(ids(&store), vec!["t3", "t1", "t2"]);
         std::fs::remove_file(&scratch).ok();
         crate::sidebar_order::set_order_path_for_test(None);
     }
@@ -3416,8 +3419,9 @@ mod tests {
             "an archived row leaves the account"
         );
         store.with_mut(|s| s.archive_thread("t1", false));
-        // A row that returns has no stored rank, so it surfaces at the head.
-        assert_eq!(ids(&store), vec!["t1", "t2"]);
+        // A row that returns lands by its interaction stamp: t2 (200) is
+        // newer than t1 (100), so t1 surfaces below it.
+        assert_eq!(ids(&store), vec!["t2", "t1"]);
         std::fs::remove_file(&scratch).ok();
         crate::sidebar_order::set_order_path_for_test(None);
     }

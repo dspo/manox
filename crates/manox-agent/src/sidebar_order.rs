@@ -182,19 +182,21 @@ pub struct Row<'a> {
     pub partition: &'a str,
     /// Pinned rows form the head band of their partition.
     pub pinned: bool,
-    /// Unix seconds of the last human interaction; consulted only for rows
-    /// appearing in an account for the first time.
+    /// Unix seconds of the last human interaction — the rank of a row inside
+    /// its partition (newest first).
     pub interacted_at: i64,
 }
 
 /// Reconcile the accounts against the live row set and return each partition's
-/// ids in display order — pinned band first, then account rank. Every `rows` id
-/// appears in exactly one returned list, and every returned id is a live row.
+/// ids in display order — pinned band first, then the last human interaction,
+/// newest first (id as the deterministic tie-break). Every `rows` id appears
+/// in exactly one returned list, and every returned id is a live row.
 ///
-/// Reconciliation is membership-only, never a re-sort: a stored account keeps
-/// its order and drops dead ids, while ids it has never seen are ordered among
-/// themselves (newest interaction first, id as the deterministic tie-break) and
-/// prepended as a block. An account whose partition holds no live row is
+/// The account owns a partition's MEMBERSHIP (and the dead-id prune); the
+/// rows' order inside a partition is the interaction rank — the stamp moves
+/// only when a person speaks to the thread, so a read marker, a title echo,
+/// a harness-authored injection or a subagent's internal prompt never
+/// reshuffles the sidebar. An account whose partition holds no live row is
 /// dropped entirely, so archiving a folder's threads or unregistering the
 /// folder leaves no residue.
 pub fn reconcile<'a>(order: &mut SidebarOrder, rows: &[Row<'a>]) -> HashMap<&'a str, Vec<&'a str>> {
@@ -230,19 +232,20 @@ pub fn reconcile<'a>(order: &mut SidebarOrder, rows: &[Row<'a>]) -> HashMap<&'a 
         // `kept` now holds exactly the live ids of this partition.
         order.accounts.insert(partition.to_string(), kept.clone());
 
-        let rank: HashMap<&str, usize> = kept
-            .iter()
-            .enumerate()
-            .map(|(index, id)| (id.as_str(), index))
-            .collect();
+        let interacted: HashMap<&str, i64> =
+            members.iter().map(|m| (m.id, m.interacted_at)).collect();
         let pinned: HashSet<&'a str> = members.iter().filter(|m| m.pinned).map(|m| m.id).collect();
         let mut display: Vec<&'a str> = members.iter().map(|m| m.id).collect();
-        // Pinned band first; inside a band the account rank decides, so a move
-        // can never cross the band boundary.
+        // Pinned band first; inside a band the last human interaction ranks,
+        // newest first, with the id as the deterministic tie-break — the
+        // stamp advances only when a person speaks to the thread, so every
+        // other durable write (a read marker, a harness-authored injection,
+        // a subagent's internal prompt) leaves the order untouched.
         display.sort_by_key(|id| {
             (
                 !pinned.contains(*id),
-                rank.get(*id).copied().unwrap_or(usize::MAX),
+                std::cmp::Reverse(interacted.get(*id).copied().unwrap_or(0)),
+                *id,
             )
         });
         ordered.insert(partition, display);
@@ -481,9 +484,30 @@ mod tests {
             row("t3", "/p/a", false, 3),
         ];
         let ordered = reconcile(&mut order, &rows);
-        // The account order still holds inside each band: t2 leads the pinned
-        // band, then t1 before t3 by stored rank.
-        assert_eq!(ordered["/p/a"], vec!["t2", "t1", "t3"]);
+        // The pinned band leads; inside each band the interaction rank
+        // decides — t2 is pinned, then t3 (3) before t1 (1).
+        assert_eq!(ordered["/p/a"], vec!["t2", "t3", "t1"]);
+    }
+
+    /// The requirement itself: only a HUMAN interaction re-ranks. The same
+    /// row set with one stamp advanced flips exactly that row; a stored
+    /// account cannot pin an old conversation above a newer interaction.
+    #[test]
+    fn an_interaction_advance_re_ranks_within_the_partition() {
+        let mut order = order_with("/p/a", &["t1", "t2"]);
+        let rows = [row("t1", "/p/a", false, 50), row("t2", "/p/a", false, 20)];
+        let ordered = reconcile(&mut order, &rows);
+        assert_eq!(
+            ordered["/p/a"],
+            vec!["t1", "t2"],
+            "newest interaction first"
+        );
+
+        // A later human prompt on t2 floats it above t1; the account's
+        // stored rank never overrides the stamp.
+        let rows = [row("t1", "/p/a", false, 50), row("t2", "/p/a", false, 80)];
+        let ordered = reconcile(&mut order, &rows);
+        assert_eq!(ordered["/p/a"], vec!["t2", "t1"]);
     }
 
     #[test]
