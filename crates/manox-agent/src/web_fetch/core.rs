@@ -1,8 +1,9 @@
 //! Fetch core of the `web_fetch` tool: URL validation, the transport guard
-//! (public-unicast DNS with connection pinning, same-origin redirects, hop /
-//! byte / char / time caps), charset-aware decoding, and a structured
-//! result/error split where a non-2xx status is data, not failure. Contains
-//! no model-facing vocabulary — the tool face in `mod` renders these types.
+//! (public-unicast DNS with connection pinning and NAT64 translation checks,
+//! same-origin redirects, hop / byte / char / time caps), charset-aware
+//! decoding, and a structured result/error split where a non-2xx status is
+//! data, not failure. Contains no model-facing vocabulary — the tool face in
+//! `mod` renders these types.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -15,10 +16,15 @@ use reqwest::redirect::Policy;
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
+use super::proxy::{self, Route};
 use super::resolver::{PublicUnicastResolver, Slot, SystemResolver, is_public_unicast};
 
+/// `Accept` header sent on every request: a fetched document is text, and a
+/// server able to negotiate formats should answer with one of these.
+const ACCEPT: &str = "text/html,application/xhtml+xml,text/*;q=0.9,application/json;q=0.8";
+
 /// Fixed URL-length cap; long URLs are attack surface without serving any
-/// fetch use case.
+/// fetch use case. Enforced on the request URL and on every redirect target.
 const MAX_URL_LEN: usize = 2048;
 
 /// Deployment-side limits. The model-facing schema exposes none of these —
@@ -102,9 +108,15 @@ pub(crate) enum ContentKind {
 }
 
 pub(crate) fn classify_content_type(content_type: &str) -> ContentKind {
-    // Strip parameters (`text/html; charset=utf-8` → `text/html`).
-    let mime = content_type.split(';').next().unwrap_or("").trim();
-    match mime {
+    // Strip parameters (`text/html; charset=utf-8` → `text/html`). The media
+    // type itself is case-insensitive, so it is folded before it is matched.
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
         "text/html" | "application/xhtml+xml" => ContentKind::Html,
         "" => ContentKind::Missing,
         _ if mime.starts_with("text/") => ContentKind::Text,
@@ -117,11 +129,11 @@ pub(crate) fn classify_content_type(content_type: &str) -> ContentKind {
     }
 }
 
-/// Which resolver stack and pre-flight checks a fetch runs with. Production
-/// degrades to the unguarded system resolver when an environment proxy is
-/// configured: the proxy host (typically a local listener) would fail the
-/// public-unicast policy, and target resolution then belongs to the proxy,
-/// which is user-configured infrastructure.
+/// Which resolver stack and pre-flight checks a fetch runs with. `guarded` is
+/// the DNS-level policy: a proxied hop cannot carry it (the proxy resolves the
+/// origin, and the proxy host itself is usually a local listener the policy
+/// would refuse), while URL validation, the IP-literal check, the redirect
+/// policy, and every cap hold in both modes.
 pub(super) struct Transport {
     inner_resolver: Arc<dyn Resolve>,
     guarded: bool,
@@ -143,49 +155,42 @@ impl Transport {
     }
 }
 
-/// First proxy variable from the environment that parses; same precedence and
-/// validation as the historical inline scan.
-fn env_proxy() -> Option<reqwest::Proxy> {
-    for var in [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ] {
-        if let Ok(value) = std::env::var(var)
-            && let Ok(proxy) = reqwest::Proxy::all(&value)
-        {
-            return Some(proxy);
-        }
-    }
-    None
-}
-
-/// Production entry point: env proxy (if any) plus the full guard otherwise.
+/// Production entry point: the environment's proxy route picks the transport,
+/// then the fetch runs under it.
 pub(crate) async fn fetch(
     url: &str,
     limits: &WebFetchLimits,
     cancel: &CancellationToken,
 ) -> Result<WebFetchResult, WebFetchError> {
-    let proxy = env_proxy();
-    let transport = match proxy {
-        Some(_) => Transport::unguarded(Arc::new(SystemResolver)),
-        None => Transport::guarded(Arc::new(SystemResolver)),
+    let parsed = validate_url(url)?;
+    let (transport, proxy) = match proxy::route_for(&parsed) {
+        Route::Direct => (Transport::guarded(Arc::new(SystemResolver)), None),
+        Route::Proxied(proxy) => (Transport::unguarded(Arc::new(SystemResolver)), Some(proxy)),
     };
-    fetch_with_transport(url, limits, cancel, &transport, proxy).await
+    fetch_parsed(&parsed, limits, cancel, &transport, proxy).await
 }
 
+/// Test entry point: the same fetch under an explicit transport and proxy.
+#[cfg(test)]
 pub(super) async fn fetch_with_transport(
     url: &str,
     limits: &WebFetchLimits,
     cancel: &CancellationToken,
     transport: &Transport,
-    proxy: Option<reqwest::Proxy>,
+    proxy: Option<Url>,
 ) -> Result<WebFetchResult, WebFetchError> {
     let parsed = validate_url(url)?;
-    preflight_ip_literal(&parsed, transport)?;
+    fetch_parsed(&parsed, limits, cancel, transport, proxy).await
+}
+
+async fn fetch_parsed(
+    parsed: &Url,
+    limits: &WebFetchLimits,
+    cancel: &CancellationToken,
+    transport: &Transport,
+    proxy: Option<Url>,
+) -> Result<WebFetchResult, WebFetchError> {
+    preflight_ip_literal(parsed)?;
 
     let slot: Slot = Arc::new(Mutex::new(None));
     let resolver: Arc<dyn Resolve> = if transport.guarded {
@@ -196,11 +201,11 @@ pub(super) async fn fetch_with_transport(
     } else {
         Arc::clone(&transport.inner_resolver)
     };
-    let policy = same_origin_policy(&parsed, limits.max_redirects, Arc::clone(&slot));
+    let policy = same_origin_policy(parsed, limits.max_redirects, Arc::clone(&slot));
     let client = build_client(limits.timeout, resolver, policy, proxy)?;
 
     let response = tokio::select! {
-        r = client.get(parsed).send() => r,
+        r = client.get(parsed.clone()).send() => r,
         _ = cancel.cancelled() => return Err(WebFetchError::Aborted),
     };
     let response = match response {
@@ -217,27 +222,8 @@ pub(super) async fn fetch_with_transport(
         .unwrap_or("")
         .to_string();
 
-    // Hard byte cap: stop reading rather than truncating — the caller cannot
-    // meaningfully use a partial body of unknown usefulness.
-    let cap = limits.max_response_bytes;
-    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-    let mut total: u64 = 0;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk_res) = stream.next().await {
-        if cancel.is_cancelled() {
-            return Err(WebFetchError::Aborted);
-        }
-        let chunk = chunk_res.map_err(|e| map_request_error(e, cancel, &slot, limits.timeout))?;
-        total += chunk.len() as u64;
-        if total > cap as u64 {
-            return Err(WebFetchError::TooLarge {
-                received: total,
-                cap,
-            });
-        }
-        buf.extend_from_slice(&chunk);
-    }
-
+    // The body kind and the decoder are settled before the body is read: a
+    // refused content type or an unknown charset must not cost a full download.
     let kind = classify_content_type(&content_type);
     match kind {
         ContentKind::Binary => {
@@ -252,14 +238,44 @@ pub(super) async fn fetch_with_transport(
         }
         ContentKind::Html | ContentKind::Text => {}
     }
-
     let encoding = charset_encoding(&content_type)?;
+
+    // A declared length over the cap is refused before any read; a stream that
+    // grows past it is cut short and flagged instead, so a server that
+    // under-reports its length still yields a bounded, usable body.
+    let cap = limits.max_response_bytes;
+    if let Some(declared) = response.content_length()
+        && declared > cap as u64
+    {
+        return Err(WebFetchError::TooLarge {
+            received: declared,
+            cap,
+        });
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut truncated_by_bytes = false;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk_res) = stream.next().await {
+        if cancel.is_cancelled() {
+            return Err(WebFetchError::Aborted);
+        }
+        let chunk = chunk_res.map_err(|e| map_request_error(e, cancel, &slot, limits.timeout))?;
+        let remaining = cap - buf.len();
+        if chunk.len() > remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            truncated_by_bytes = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
     let (decoded, _malformed) = encoding.decode_without_bom_handling(&buf);
     let text = decoded.into_owned();
 
     // Soft char cap: truncated content stays useful, so cut and flag.
-    let truncated = text.chars().count() > limits.max_body_chars;
-    let body_text = if truncated {
+    let truncated_by_chars = text.chars().count() > limits.max_body_chars;
+    let body_text = if truncated_by_chars {
         text.chars().take(limits.max_body_chars).collect::<String>()
     } else {
         text
@@ -273,20 +289,27 @@ pub(super) async fn fetch_with_transport(
         final_url,
         status,
         content_type,
-        total_bytes: total,
+        total_bytes: buf.len() as u64,
         body,
-        truncated,
+        truncated: truncated_by_bytes || truncated_by_chars,
     })
 }
 
 fn validate_url(url: &str) -> Result<Url, WebFetchError> {
-    if url.len() > MAX_URL_LEN {
+    let parsed = Url::parse(url)
+        .map_err(|e| WebFetchError::InvalidUrl(format!("unparseable URL ({e}): {url}")))?;
+    validate_url_parts(&parsed)?;
+    Ok(parsed)
+}
+
+/// The transport hygiene every request URL must satisfy, whether it was named
+/// by the model or arrived as a redirect target.
+fn validate_url_parts(parsed: &Url) -> Result<(), WebFetchError> {
+    if parsed.as_str().len() > MAX_URL_LEN {
         return Err(WebFetchError::InvalidUrl(format!(
             "URL exceeds {MAX_URL_LEN} characters"
         )));
     }
-    let parsed = Url::parse(url)
-        .map_err(|e| WebFetchError::InvalidUrl(format!("unparseable URL ({e}): {url}")))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(WebFetchError::InvalidUrl(format!(
             "only supports http/https URLs; got scheme {:?}",
@@ -298,15 +321,16 @@ fn validate_url(url: &str) -> Result<Url, WebFetchError> {
             "embedded credentials are not accepted".to_string(),
         ));
     }
-    Ok(parsed)
+    Ok(())
 }
 
-/// IP-literal hosts never reach the resolver, so the public-unicast policy
-/// must be applied here, before any connection exists.
-fn preflight_ip_literal(parsed: &Url, transport: &Transport) -> Result<(), WebFetchError> {
-    if !transport.guarded {
-        return Ok(());
-    }
+/// IP-literal hosts never reach the resolver, so the public-unicast policy must
+/// be applied here, before any connection exists. This check is unconditional:
+/// a proxied hop skips the DNS guard (the proxy resolves the origin), but a
+/// literal needs no resolution, and handing it to a proxy running on this
+/// machine would reach exactly the service the address policy keeps out of
+/// reach.
+fn preflight_ip_literal(parsed: &Url) -> Result<(), WebFetchError> {
     let host_ip = match parsed.host() {
         Some(Host::Ipv4(ip)) => IpAddr::from(ip),
         Some(Host::Ipv6(ip)) => IpAddr::from(ip),
@@ -336,9 +360,10 @@ fn origin_of(url: &Url) -> Origin {
 }
 
 /// Same-origin redirects only: each hop re-resolves through the (guarding)
-/// resolver because it is a new request through the same client. Hop
-/// accounting matches `Policy::limited`: `previous` includes the original
-/// URL, so the Nth redirect sees N entries.
+/// resolver because it is a new request through the same client, and re-earns
+/// the URL hygiene the original request passed. Hop accounting matches
+/// `Policy::limited`: `previous` includes the original URL, so the Nth redirect
+/// sees N entries.
 fn same_origin_policy(origin: &Url, max_redirects: usize, slot: Slot) -> Policy {
     let origin = origin_of(origin);
     Policy::custom(move |attempt| {
@@ -348,6 +373,10 @@ fn same_origin_policy(origin: &Url, max_redirects: usize, slot: Slot) -> Policy 
                 attempt.url()
             )));
             return attempt.error("too many redirects");
+        }
+        if let Err(error) = validate_url_parts(attempt.url()) {
+            *slot.lock() = Some(error);
+            return attempt.error("redirect target fails URL validation");
         }
         if origin_of(attempt.url()) != origin {
             *slot.lock() = Some(WebFetchError::RedirectBlocked(format!(
@@ -364,17 +393,25 @@ fn build_client(
     timeout: Duration,
     resolver: Arc<dyn Resolve>,
     policy: Policy,
-    proxy: Option<reqwest::Proxy>,
+    proxy: Option<Url>,
 ) -> Result<reqwest::Client, WebFetchError> {
-    // `no_proxy` keeps the client hermetic: env proxies are read exactly once
-    // in `fetch` so the guard decision and the transport stay consistent.
+    // `no_proxy` keeps the client hermetic: the route decision read the
+    // environment once, so reqwest must not read it again per request.
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    default_headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static(ACCEPT),
+    );
     let mut builder = reqwest::Client::builder()
         .timeout(timeout)
         .redirect(policy)
         .no_proxy()
         .user_agent(format!("manox/{}", env!("CARGO_PKG_VERSION")))
+        .default_headers(default_headers)
         .dns_resolver2(resolver);
     if let Some(proxy) = proxy {
+        let proxy = reqwest::Proxy::all(proxy.as_str())
+            .map_err(|e| WebFetchError::Transport(format!("proxy {proxy} is unusable: {e}")))?;
         builder = builder.proxy(proxy);
     }
     builder
@@ -400,43 +437,66 @@ fn map_request_error(
     WebFetchError::Transport(format!("request failed: {e}"))
 }
 
-/// Charset comes only from the Content-Type header; the default is UTF-8 and
-/// an unrecognized label is an error rather than a silent fallback.
+/// Charset comes only from the Content-Type header; the default is UTF-8 and an
+/// unrecognized label is an error rather than a silent fallback.
 fn charset_encoding(content_type: &str) -> Result<&'static encoding_rs::Encoding, WebFetchError> {
-    let Some(params) = content_type.split_once(';') else {
+    let Some(label) = charset_label(content_type) else {
         return Ok(encoding_rs::UTF_8);
     };
-    let charset = params
-        .1
-        .split(';')
-        .map(str::trim)
-        .find_map(|p| p.strip_prefix("charset=").map(str::trim))
-        .map(|v| v.trim_matches('"'));
-    match charset {
-        None => Ok(encoding_rs::UTF_8),
-        Some(label) => encoding_rs::Encoding::for_label(label.as_bytes()).ok_or_else(|| {
-            WebFetchError::UnsupportedContentType(format!(
-                "unknown charset {label:?} in content-type {content_type}"
-            ))
-        }),
-    }
+    encoding_rs::Encoding::for_label(label.as_bytes()).ok_or_else(|| {
+        WebFetchError::UnsupportedContentType(format!(
+            "unknown charset {label:?} in content-type {content_type}"
+        ))
+    })
 }
 
+/// The `charset` parameter of a Content-Type header. Parameter names are
+/// case-insensitive and may be spaced out (`CHARSET = "gbk"`), both of which a
+/// server is entitled to send.
+fn charset_label(content_type: &str) -> Option<String> {
+    content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches('"').to_string())
+    })
+}
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::super::test_server::{self, ScriptedResponse, TestServer};
+    use super::super::test_server::{self, SERVER_HOST, ScriptedResponse, TestServer};
     use super::*;
 
     fn limits() -> WebFetchLimits {
         WebFetchLimits::production()
     }
 
-    fn loopback_transport() -> Transport {
+    /// No DNS guard: for tests whose refusal happens before any connection.
+    fn unguarded_transport() -> Transport {
         Transport::unguarded(Arc::new(SystemResolver))
+    }
+
+    /// Answers every name with one scripted server's socket.
+    #[derive(Clone)]
+    struct LoopbackResolver {
+        addr: SocketAddr,
+    }
+
+    impl Resolve for LoopbackResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let addr = self.addr;
+            Box::pin(async move {
+                let addrs = vec![addr];
+                Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+            })
+        }
+    }
+
+    fn server_transport(server: &TestServer) -> Transport {
+        Transport::unguarded(Arc::new(LoopbackResolver { addr: server.addr }))
     }
 
     #[tokio::test]
@@ -452,7 +512,7 @@ mod tests {
                 url,
                 &limits(),
                 &CancellationToken::new(),
-                &loopback_transport(),
+                &unguarded_transport(),
                 None,
             )
             .await
@@ -521,13 +581,13 @@ mod tests {
     async fn cross_origin_redirect_is_blocked_and_target_never_contacted() {
         let a = TestServer::start().await;
         let b = TestServer::start().await;
-        a.respond("/cross", test_server::redirect(302, &b.url("target")));
+        a.respond("/cross", test_server::redirect(302, &b.host_url("target")));
         b.respond("/target", test_server::ok("text/plain", b"secret"));
         let err = fetch_with_transport(
-            &a.url("cross"),
+            &a.host_url("cross"),
             &limits(),
             &CancellationToken::new(),
-            &loopback_transport(),
+            &server_transport(&a),
             None,
         )
         .await
@@ -596,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn redirect_hop_cap_blocks_the_chain() {
         let server = TestServer::start().await;
-        let base = format!("http://127.0.0.1:{}", server.addr.port());
+        let base = format!("http://{SERVER_HOST}:{}", server.addr.port());
         for hop in 1..=6 {
             server.respond(
                 &format!("/r{hop}"),
@@ -606,10 +666,10 @@ mod tests {
         server.respond("/r7", test_server::ok("text/plain", b"never"));
 
         let err = fetch_with_transport(
-            &server.url("r1"),
+            &server.host_url("r1"),
             &limits(),
             &CancellationToken::new(),
-            &loopback_transport(),
+            &server_transport(&server),
             None,
         )
         .await
@@ -620,16 +680,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_over_byte_cap_is_too_large() {
+    async fn declared_body_over_byte_cap_is_too_large() {
         let server = TestServer::start().await;
         server.respond("/big", test_server::ok("text/plain", vec![b'x'; 4096]));
         let mut lim = limits();
         lim.max_response_bytes = 1024;
         let err = fetch_with_transport(
-            &server.url("big"),
+            &server.host_url("big"),
             &lim,
             &CancellationToken::new(),
-            &loopback_transport(),
+            &server_transport(&server),
             None,
         )
         .await
@@ -638,6 +698,32 @@ mod tests {
             matches!(err, WebFetchError::TooLarge { received, cap } if received >= 4096 && cap == 1024),
             "{err}"
         );
+    }
+
+    /// A body that outgrows the cap without declaring it is cut short and
+    /// flagged: the caller keeps a bounded, usable prefix instead of nothing.
+    #[tokio::test]
+    async fn stream_over_byte_cap_is_truncated_and_flagged() {
+        let server = TestServer::start().await;
+        server.respond(
+            "/undeclared",
+            test_server::undeclared("text/plain", vec![b'x'; 4096]),
+        );
+        let mut lim = limits();
+        lim.max_response_bytes = 1024;
+        let res = fetch_with_transport(
+            &server.host_url("undeclared"),
+            &lim,
+            &CancellationToken::new(),
+            &server_transport(&server),
+            None,
+        )
+        .await
+        .expect("an undeclared over-cap body still fetches");
+        assert!(res.truncated, "{res:?}");
+        assert_eq!(res.total_bytes, 1024);
+        assert!(matches!(res.body, BodyKind::Text(ref t) if t.len() == 1024));
+        assert!(matches!(res.body, BodyKind::Text(_)));
     }
 
     #[tokio::test]
@@ -654,14 +740,15 @@ mod tests {
                 headers: vec![],
                 body: b"mystery bytes".to_vec(),
                 hang: false,
+                omit_content_length: false,
             },
         );
         for path in ["png", "noct"] {
             let err = fetch_with_transport(
-                &server.url(path),
+                &server.host_url(path),
                 &limits(),
                 &CancellationToken::new(),
-                &loopback_transport(),
+                &server_transport(&server),
                 None,
             )
             .await
@@ -682,10 +769,10 @@ mod tests {
                 .with_status(404),
         );
         let res = fetch_with_transport(
-            &server.url("gone"),
+            &server.host_url("gone"),
             &limits(),
             &CancellationToken::new(),
-            &loopback_transport(),
+            &server_transport(&server),
             None,
         )
         .await
@@ -712,10 +799,10 @@ mod tests {
         );
 
         let res = fetch_with_transport(
-            &server.url("gbk"),
+            &server.host_url("gbk"),
             &limits(),
             &CancellationToken::new(),
-            &loopback_transport(),
+            &server_transport(&server),
             None,
         )
         .await
@@ -723,10 +810,10 @@ mod tests {
         assert!(matches!(res.body, BodyKind::Text(ref t) if t == "你好世界"));
 
         let err = fetch_with_transport(
-            &server.url("unknown"),
+            &server.host_url("unknown"),
             &limits(),
             &CancellationToken::new(),
-            &loopback_transport(),
+            &server_transport(&server),
             None,
         )
         .await
@@ -738,10 +825,10 @@ mod tests {
         );
 
         let res = fetch_with_transport(
-            &server.url("default"),
+            &server.host_url("default"),
             &limits(),
             &CancellationToken::new(),
-            &loopback_transport(),
+            &server_transport(&server),
             None,
         )
         .await
@@ -754,10 +841,10 @@ mod tests {
         let server = TestServer::start().await;
         server.respond("/long", test_server::ok("text/plain", vec![b'a'; 150_000]));
         let res = fetch_with_transport(
-            &server.url("long"),
+            &server.host_url("long"),
             &limits(),
             &CancellationToken::new(),
-            &loopback_transport(),
+            &server_transport(&server),
             None,
         )
         .await
@@ -773,10 +860,10 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let err = fetch_with_transport(
-            &server.url("x"),
+            &server.host_url("x"),
             &limits(),
             &cancel,
-            &loopback_transport(),
+            &server_transport(&server),
             None,
         )
         .await
@@ -794,15 +881,16 @@ mod tests {
                 headers: vec![],
                 body: vec![],
                 hang: true,
+                omit_content_length: false,
             },
         );
         let mut lim = limits();
         lim.timeout = Duration::from_millis(500);
         let err = fetch_with_transport(
-            &server.url("hang"),
+            &server.host_url("hang"),
             &lim,
             &CancellationToken::new(),
-            &loopback_transport(),
+            &server_transport(&server),
             None,
         )
         .await
@@ -813,6 +901,11 @@ mod tests {
     #[test]
     fn classify_content_type_dispatch() {
         assert_eq!(classify_content_type("text/html"), ContentKind::Html);
+        assert_eq!(
+            classify_content_type("TEXT/HTML; charset=utf-8"),
+            ContentKind::Html
+        );
+        assert_eq!(classify_content_type("Application/JSON"), ContentKind::Text);
         assert_eq!(
             classify_content_type("text/html; charset=utf-8"),
             ContentKind::Html
@@ -836,5 +929,121 @@ mod tests {
             ContentKind::Binary
         );
         assert_eq!(classify_content_type(""), ContentKind::Missing);
+    }
+
+    /// The IP-literal check does not depend on the DNS guard: a proxied fetch
+    /// cannot validate resolved addresses, but a destination that is stated
+    /// rather than resolved is still refused.
+    #[tokio::test]
+    async fn private_ip_literal_is_blocked_without_the_dns_guard() {
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:8080/",
+            "http://2130706433/",
+        ] {
+            let err = fetch_with_transport(
+                url,
+                &limits(),
+                &CancellationToken::new(),
+                &unguarded_transport(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, WebFetchError::BlockedUrl(_)), "{url}: {err}");
+        }
+    }
+
+    /// Every redirect target re-earns the hygiene the request URL passed: a
+    /// Location cannot smuggle in credentials or an over-long URL.
+    #[tokio::test]
+    async fn redirect_targets_re_earn_url_hygiene() {
+        let server = TestServer::start().await;
+        // Both targets are same-origin with the request URL, so URL hygiene is
+        // the only thing that can refuse them.
+        let credentialed = format!("http://user:pass@{SERVER_HOST}:{}/x", server.addr.port());
+        let over_long = format!(
+            "http://{SERVER_HOST}:{}/{}",
+            server.addr.port(),
+            "a".repeat(2_100)
+        );
+        server.respond("/credentialed", test_server::redirect(302, &credentialed));
+        server.respond("/over-long", test_server::redirect(302, &over_long));
+        server.respond("/x", test_server::ok("text/plain", b"never"));
+        for (path, needle) in [("credentialed", "credentials"), ("over-long", "2048")] {
+            let err = fetch_with_transport(
+                &server.host_url(path),
+                &limits(),
+                &CancellationToken::new(),
+                &server_transport(&server),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, WebFetchError::InvalidUrl(_)), "{path}: {err}");
+            assert!(err.to_string().contains(needle), "{path}: {err}");
+            assert_eq!(
+                server.count(path),
+                1,
+                "{path}: the redirect was the only request"
+            );
+            assert_eq!(
+                server.count("x"),
+                0,
+                "the rejected target was never contacted"
+            );
+        }
+    }
+
+    /// Parameter names are case-insensitive and may be spaced, and the media
+    /// type is folded before it is classified.
+    #[tokio::test]
+    async fn charset_parameter_tolerates_case_and_spacing() {
+        let (gbk_bytes, _, _) = encoding_rs::GBK.encode("你好世界");
+        let server = TestServer::start().await;
+        server.respond(
+            "/upper",
+            test_server::ok("text/plain; Charset=gbk", gbk_bytes.as_ref().to_vec()),
+        );
+        server.respond(
+            "/spaced",
+            test_server::ok("TEXT/PLAIN; charset = \"gbk\"", gbk_bytes.as_ref().to_vec()),
+        );
+        for path in ["upper", "spaced"] {
+            let res = fetch_with_transport(
+                &server.host_url(path),
+                &limits(),
+                &CancellationToken::new(),
+                &server_transport(&server),
+                None,
+            )
+            .await
+            .expect("decodes");
+            assert!(
+                matches!(res.body, BodyKind::Text(ref t) if t == "你好世界"),
+                "{path}: {res:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_advertise_the_accepted_formats() {
+        let server = TestServer::start().await;
+        server.respond("/doc", test_server::ok("text/plain", b"ok"));
+        fetch_with_transport(
+            &server.host_url("doc"),
+            &limits(),
+            &CancellationToken::new(),
+            &server_transport(&server),
+            None,
+        )
+        .await
+        .expect("fetches");
+        let head = server
+            .last_request_head("doc")
+            .expect("request head recorded");
+        let head = head.to_ascii_lowercase();
+        assert!(head.contains("accept: text/html"), "{head}");
+        assert!(head.contains("manox/"), "{head}");
     }
 }

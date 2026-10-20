@@ -1,7 +1,7 @@
 //! A minimal scripted HTTP/1.1 server for `web_fetch` transport tests:
-//! per-path scripted responses plus per-path request counters, so tests can
-//! assert not only outcomes but also that a forbidden destination was never
-//! contacted.
+//! per-path scripted responses plus per-path request counters and heads, so
+//! tests can assert not only outcomes but also that a forbidden destination was
+//! never contacted and what the request actually carried.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -11,6 +11,11 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+/// The hostname the scripted server answers for. Production refuses loopback
+/// *literals*, so a transport test addresses the server by name and lets its
+/// resolver point that name at the loopback socket.
+pub(super) const SERVER_HOST: &str = "loopback.test";
+
 #[derive(Clone)]
 pub(super) struct ScriptedResponse {
     pub(super) status: u16,
@@ -18,6 +23,9 @@ pub(super) struct ScriptedResponse {
     pub(super) body: Vec<u8>,
     /// Accept and read the request, then never answer (timeout tests).
     pub(super) hang: bool,
+    /// Answer without a `Content-Length`, so the body is delimited by the
+    /// closed connection — the shape a server uses to under-report its length.
+    pub(super) omit_content_length: bool,
 }
 
 pub(super) fn ok(content_type: &str, body: impl Into<Vec<u8>>) -> ScriptedResponse {
@@ -26,6 +34,15 @@ pub(super) fn ok(content_type: &str, body: impl Into<Vec<u8>>) -> ScriptedRespon
         headers: vec![("Content-Type".into(), content_type.into())],
         body: body.into(),
         hang: false,
+        omit_content_length: false,
+    }
+}
+
+/// A `200` whose body length is not declared up front.
+pub(super) fn undeclared(content_type: &str, body: impl Into<Vec<u8>>) -> ScriptedResponse {
+    ScriptedResponse {
+        omit_content_length: true,
+        ..ok(content_type, body)
     }
 }
 
@@ -35,6 +52,7 @@ pub(super) fn redirect(status: u16, location: &str) -> ScriptedResponse {
         headers: vec![("Location".into(), location.into())],
         body: vec![],
         hang: false,
+        omit_content_length: false,
     }
 }
 
@@ -47,11 +65,13 @@ impl ScriptedResponse {
 
 type Script = Arc<Mutex<HashMap<String, ScriptedResponse>>>;
 type Counts = Arc<Mutex<HashMap<String, usize>>>;
+type Heads = Arc<Mutex<HashMap<String, String>>>;
 
 pub(super) struct TestServer {
     pub(super) addr: SocketAddr,
     script: Script,
     counts: Counts,
+    heads: Heads,
 }
 
 impl TestServer {
@@ -62,8 +82,10 @@ impl TestServer {
         let addr = listener.local_addr().expect("local addr");
         let script: Script = Arc::new(Mutex::new(HashMap::new()));
         let counts: Counts = Arc::new(Mutex::new(HashMap::new()));
+        let heads: Heads = Arc::new(Mutex::new(HashMap::new()));
         let task_script = Arc::clone(&script);
         let task_counts = Arc::clone(&counts);
+        let task_heads = Arc::clone(&heads);
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -71,13 +93,15 @@ impl TestServer {
                 };
                 let script = Arc::clone(&task_script);
                 let counts = Arc::clone(&task_counts);
-                tokio::spawn(handle(stream, script, counts));
+                let heads = Arc::clone(&task_heads);
+                tokio::spawn(handle(stream, script, counts, heads));
             }
         });
         TestServer {
             addr,
             script,
             counts,
+            heads,
         }
     }
 
@@ -95,12 +119,23 @@ impl TestServer {
         *self.counts.lock().get(&key).unwrap_or(&0)
     }
 
-    pub(super) fn url(&self, path: &str) -> String {
-        format!("http://{}/{}", self.addr, path)
+    /// The request head the server received for `path`, when it received one.
+    pub(super) fn last_request_head(&self, path: &str) -> Option<String> {
+        let key = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        self.heads.lock().get(&key).cloned()
+    }
+
+    /// A resource on this server, addressed by name (see [`SERVER_HOST`]).
+    pub(super) fn host_url(&self, path: &str) -> String {
+        format!("http://{SERVER_HOST}:{}/{}", self.addr.port(), path)
     }
 }
 
-async fn handle(mut stream: TcpStream, script: Script, counts: Counts) {
+async fn handle(mut stream: TcpStream, script: Script, counts: Counts, heads: Heads) {
     // Request head only: GET carries no body.
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -123,6 +158,7 @@ async fn handle(mut stream: TcpStream, script: Script, counts: Counts) {
         .unwrap_or("/")
         .to_string();
     *counts.lock().entry(path.clone()).or_insert(0) += 1;
+    heads.lock().insert(path.clone(), head.to_string());
     let Some(resp) = script.lock().get(&path).cloned() else {
         return;
     };
@@ -137,10 +173,10 @@ async fn handle(mut stream: TcpStream, script: Script, counts: Counts) {
     for (k, v) in &resp.headers {
         out.push_str(&format!("{k}: {v}\r\n"));
     }
-    out.push_str(&format!(
-        "Content-Length: {}\r\nConnection: close\r\n\r\n",
-        resp.body.len()
-    ));
+    if !resp.omit_content_length {
+        out.push_str(&format!("Content-Length: {}\r\n", resp.body.len()));
+    }
+    out.push_str("Connection: close\r\n\r\n");
     let _ = stream.write_all(out.as_bytes()).await;
     let _ = stream.write_all(&resp.body).await;
     let _ = stream.flush().await;
