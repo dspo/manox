@@ -2436,6 +2436,69 @@ mod dispatch {
         uninstall();
     }
 
+    /// The chat channel of a live-but-blank session must resolve on the wire.
+    ///
+    /// A claim (`createSession`) writes nothing durable — the journal
+    /// materializes lazily at the first turn — so every durable leg of
+    /// `thread_of_session` (the registry's active pointer, the journal
+    /// header's thread stamp, the store row) misses for the session the host
+    /// itself just created. `ensure_chat` consulted only those legs, so the
+    /// client's chat subscribe answered `not found` and the session's first
+    /// `ChatTurnStarted` dispatch was rejected before the runtime ever saw
+    /// it — a silent black hole for the first message of every fresh
+    /// session. The live session table is a first-class leg now (backend
+    /// `session_state_for_chat`); this drives the same wire path the client
+    /// drove (subscribe on `ahp-chat:/<id>`), not the seed's own seam.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blank_claimed_sessions_chat_channel_answers_on_the_wire() {
+        let _guards = install();
+        let id = format!("s-blank-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        let intent = crate::agent_server::SessionIntent {
+            session_id: Some(id.clone()),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            seed: None,
+            working_directories: Vec::new(),
+        };
+        let inner = Arc::clone(server.ahp_inner());
+        crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
+            .await
+            .expect("session opens");
+        assert!(
+            !core_journal(&id).exists(),
+            "the claim materializes nothing: this is the state under test"
+        );
+
+        let transport = runtime.inproc();
+        let client = ahp::Client::connect(transport, ahp::ClientConfig::default())
+            .await
+            .expect("client connects");
+        client
+            .initialize(
+                "probe".to_string(),
+                vec![PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes");
+        let (result, _sub) = client
+            .subscribe(manox_ahp::channels::chat::uri(&id))
+            .await
+            .expect("a live blank session's chat channel subscribes");
+        assert!(
+            result.snapshot.is_some(),
+            "the empty chat answers a snapshot, not `not found`"
+        );
+        uninstall();
+    }
+
     /// Subscribing to a declared extension channel must deliver its state, not
     /// silence.
     ///
