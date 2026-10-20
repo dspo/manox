@@ -608,23 +608,29 @@ async fn drive_run(run: DrivenRun) -> RunResult {
             diagnostic: Some(cap_diagnostic(&format!("aborted{kept_note}"))),
             stop_reason: StopReason::Aborted,
         },
+        // The budget endings carry their OWN stop reasons: the settlement
+        // vocabulary has a first-class `timed-out` / `stalled`, and a
+        // producer that folds them into `Error` leaves those kinds
+        // unreachable — every consumer then reads a generic failure where
+        // the run's actual ending is known. The diagnostic keeps the
+        // numbers (the verdict line already names the ending).
         Ending::TimedOut => RunResult {
             output: partial,
             structured: None,
             diagnostic: Some(cap_diagnostic(&format!(
-                "subagent timed out: budget {}ms exceeded{kept_note}",
+                "time budget {}ms exceeded{kept_note}",
                 budgets.timeout_ms.unwrap_or_default()
             ))),
-            stop_reason: StopReason::Error,
+            stop_reason: StopReason::TimedOut,
         },
         Ending::Stalled => RunResult {
             output: partial,
             structured: None,
             diagnostic: Some(cap_diagnostic(&format!(
-                "subagent timed out: stalled — idle budget {}ms exceeded{kept_note}",
+                "idle budget {}ms exceeded with no activity{kept_note}",
                 budgets.idle_timeout_ms.unwrap_or_default()
             ))),
-            stop_reason: StopReason::Error,
+            stop_reason: StopReason::Stalled,
         },
     };
     if let Some(observer) = &observer {

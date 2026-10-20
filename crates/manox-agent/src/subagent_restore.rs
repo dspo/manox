@@ -106,12 +106,17 @@ pub fn rebuild_from_messages(messages: &[Message]) -> Vec<RestoredSubagent> {
                 .display_text
                 .clone()
                 .unwrap_or_else(|| unwrap_peer_text(from, &text_of(m)));
-            // Every ending delivers, verdict-first: the opening line is
-            // the host's judgment, and it names the outcome class.
+            // Every ending delivers, verdict-first: the opening line is the
+            // host's judgment, and its TAIL names the outcome class. Only
+            // the tail may decide: the line embeds the run's label, which is
+            // model-authored text, so a substring search reads a label that
+            // happens to end in "completed." as a completed run even when
+            // the verdict says it was stopped. An unknown tail reads as
+            // Error — the safe side of a reworded verdict.
             let first_line = final_text.lines().next().unwrap_or("");
-            row.status = if first_line.contains("completed.") {
+            row.status = if first_line.ends_with("completed.") {
                 ToolCallStatus::Success
-            } else if first_line.contains("was stopped before it finished") {
+            } else if first_line.ends_with("was stopped before it finished.") {
                 ToolCallStatus::Cancelled
             } else {
                 ToolCallStatus::Error
@@ -318,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn background_run_settles_via_peer_delivery_prefixes() {
+    fn background_run_settles_from_the_verdict_line() {
         let messages = vec![
             message(vec![
                 tool_use(
@@ -328,13 +333,65 @@ mod tests {
                 ),
                 background_result("t1", "sub-2"),
             ]),
-            // Legacy transcript shape: the peer text carries the wrapped
-            // model-facing prefix, which the row strips.
-            peer("sub-2", "[from sub-2] subagent failed: boom"),
+            // The delivery as the host writes it: the verdict line first,
+            // the salvage after it. The wrapped model-facing prefix rides
+            // legacy transcripts only and is stripped either way.
+            peer(
+                "sub-2",
+                "[from sub-2] `w` failed before it finished.\n\nPartial result:\nboom",
+            ),
         ];
         let rows = rebuild_from_messages(&messages);
         assert_eq!(rows[0].status, ToolCallStatus::Error);
-        assert_eq!(rows[0].final_text.as_deref(), Some("subagent failed: boom"));
+        assert!(
+            rows[0]
+                .final_text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("boom"),
+            "the salvage survives the rebuild: {:?}",
+            rows[0].final_text
+        );
+    }
+
+    #[test]
+    fn an_aborted_delivery_whose_label_ends_in_completed_is_still_cancelled() {
+        // The label is model-authored text and may contain any word the
+        // verdict vocabulary uses; only the line's tail may decide. A
+        // substring search reads this aborted run as a success.
+        let messages = vec![
+            message(vec![
+                tool_use(
+                    "t1",
+                    "Sailor",
+                    serde_json::json!({"description": "w", "prompt": "p"}),
+                ),
+                background_result("t1", "sub-4"),
+            ]),
+            peer(
+                "sub-4",
+                "`check whether the migration is completed.` was stopped before it finished.",
+            ),
+        ];
+        let rows = rebuild_from_messages(&messages);
+        assert_eq!(rows[0].status, ToolCallStatus::Cancelled);
+    }
+
+    #[test]
+    fn a_completed_delivery_reads_success() {
+        let messages = vec![
+            message(vec![
+                tool_use(
+                    "t1",
+                    "Sailor",
+                    serde_json::json!({"description": "w", "prompt": "p"}),
+                ),
+                background_result("t1", "sub-5"),
+            ]),
+            peer("sub-5", "`w` completed.\n\nthe report"),
+        ];
+        let rows = rebuild_from_messages(&messages);
+        assert_eq!(rows[0].status, ToolCallStatus::Success);
     }
 
     #[test]

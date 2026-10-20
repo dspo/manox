@@ -3,7 +3,13 @@
 // host, never to the child, and it always exists — including the explicit
 // no-closing-message line when salvage found nothing. This module is the
 // single wording table; delivery paths compose it, the journal carries the
-// kind verbatim, and nothing downstream string-matches.
+// kind verbatim, and nothing downstream string-matches — with one exception
+// the table itself must keep true: `manox-agent`'s transcript rebuild reads
+// a restored row's status off the delivery's first line (the verdict), which
+// is the only copy that survives a peer delivery, so it matches the line's
+// TAIL (never a substring: the line embeds the run's label). Reword a verdict
+// and that rebuild falls back to Error, its safe side; keep every kind's tail
+// distinct and it stays exact.
 
 use crate::core::session::event::SettlementKind;
 use crate::subagent::StopReason;
