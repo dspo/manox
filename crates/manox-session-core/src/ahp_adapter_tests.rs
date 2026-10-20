@@ -2666,6 +2666,52 @@ mod dispatch {
         uninstall();
     }
 
+    /// A turn another process is running must not fold as settled.
+    ///
+    /// The state root is shared: the cx CLI (or a second desktop) can be
+    /// driving a journal this process only folds. The `turnStart` row's owner
+    /// stamp is the documented way to tell a dead owner from one running
+    /// elsewhere — the same stamp `x-manox/openTurn` serves to clients — so a
+    /// cold fold that settles without consulting it cancels a live turn and
+    /// contradicts the contract it hands clients.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_owners_open_turn_stays_open_on_the_cold_seed() {
+        let _guards = install();
+        let mut start = turn_start();
+        if let E::TurnStart { owner, .. } = &mut start {
+            *owner = Some(manox_harness::session::TurnOwner::for_current_process());
+        }
+        seed_session(
+            "s-liveowner",
+            "thread-liveowner",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", start),
+                ("e3", delta("partial")),
+                // No turn_finish: the owner is still running it.
+            ],
+        )
+        .await;
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let state = backend
+            .chat_state("s-liveowner")
+            .expect("the cold seed answers");
+        assert!(
+            state.active_turn.is_some(),
+            "a live owner's turn stays open across the cold seed"
+        );
+        assert_eq!(
+            state.status & SessionStatus::InProgress.bits(),
+            SessionStatus::InProgress.bits(),
+            "the chat still reads InProgress"
+        );
+        uninstall();
+    }
+
     /// Cancelling a cold session (journal on disk, no live engine in this
     /// process) must open it and answer Ok — the cancel is a no-op settle
     /// on the loaded thread. Refusing "unknown session" left a restored

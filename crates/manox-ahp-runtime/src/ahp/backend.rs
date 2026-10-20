@@ -363,8 +363,21 @@ impl RuntimeBackend {
                 .iter()
                 .any(|part| matches!(part, ahp_types::state::ResponsePart::InputRequest(input) if input.response.is_none()))
         });
+        // The third exemption: another process owns the turn. The state root
+        // is shared (the cx CLI drives journals this process only folds), and
+        // the `turnStart` row's owner stamp is the documented way to tell a
+        // dead owner from one running elsewhere — the same stamp the
+        // `x-manox/openTurn` command serves to clients. Settling here without
+        // consulting it would cancel a turn that keeps streaming into this
+        // very chat. A reused pid reads as alive, the conservative side the
+        // stamp's own reader documents: the turn is left for a deliberate
+        // settle, never auto-cancelled.
+        let live_owner = super::open_turn_owner(session_id)
+            .await
+            .is_some_and(|owner| owner.is_alive());
         if !live_leg
             && !parked_ask
+            && !live_owner
             && let Some(active) = chat.active_turn.clone()
         {
             let mut reason = serde_json::Map::new();
