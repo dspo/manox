@@ -1933,6 +1933,82 @@ mod dispatch {
         engine
     }
 
+    /// A sub-agent child's chat channel subscribes without its session
+    /// channel, and declares its lineage while doing it.
+    ///
+    /// The drill-down attaches the child by run id; the child is not a
+    /// sidebar session (no store row, no live engine in this process), so
+    /// the resolution may not depend on a list scan or on the session
+    /// channel having been subscribed first — the journal on disk is the
+    /// fact, and `thread_of_session` now reads it. The snapshot is also
+    /// where the reverse half of the lineage pair lives: the child chat
+    /// names the tool call that spawned it and is read-only to the user.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_child_chats_channel_subscribes_on_its_own_journal() {
+        let _guards = install();
+        let id = format!("sub-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cwd_string = cwd.to_string_lossy().into_owned();
+        let path = core_journal(&id);
+        let storage = JsonlSessionStorage::create(
+            &path,
+            manox_harness::session::jsonl::JsonlSessionMetadata {
+                id: id.clone(),
+                cwd: cwd_string,
+                created_at: stamp(),
+                parent_session_path: None,
+                metadata: Some(json!({
+                    "subagent": { "parent": "s-parent", "toolCallId": "tu_1" }
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        storage
+            .append_entries(&[with_chain("e-1", None, user("child prompt"))])
+            .await
+            .unwrap();
+        drop(storage);
+
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        let transport = runtime.inproc();
+        let client = ahp::Client::connect(transport, ahp::ClientConfig::default())
+            .await
+            .expect("client connects");
+        client
+            .initialize(
+                "probe".to_string(),
+                vec![PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes");
+        let (result, _sub) = client
+            .subscribe(manox_ahp::channels::chat::uri(&id))
+            .await
+            .expect("a child chat subscribes off its own journal");
+        let snapshot = result.snapshot.expect("the child chat answers a snapshot");
+        let ahp_types::state::SnapshotState::Chat(state) = &snapshot.state else {
+            panic!("the child chat's snapshot is a chat state: {snapshot:?}");
+        };
+        assert!(
+            matches!(
+                state.origin,
+                Some(ahp_types::state::ChatOrigin::Tool { .. })
+            ),
+            "the child chat declares its lineage: {:?}",
+            state.origin
+        );
+        assert_eq!(
+            state.interactivity,
+            Some(ahp_types::state::ChatInteractivity::ReadOnly),
+            "a worker chat is read-only"
+        );
+        uninstall();
+    }
+
     /// `chat/inputCompleted` must settle the parked question card. A dropped
     /// settle is silent: the card stays up and the turn never resumes.
     #[tokio::test(flavor = "multi_thread")]

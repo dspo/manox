@@ -732,10 +732,23 @@ pub(crate) async fn thread_of_session(session_id: &str) -> Option<String> {
             return Some(thread_id.clone());
         }
     }
-    if let Some(path) = crate::paths::persisted_session_file(session_id)
-        && let Some(thread_id) = header_thread_id(&path)
+    let journal = crate::paths::persisted_session_file(session_id);
+    if let Some(path) = journal.as_deref()
+        && let Some(thread_id) = header_thread_id(path)
     {
         return Some(thread_id);
+    }
+    // A journal with no thread stamp belongs to itself. v1.0.0 mints one
+    // session per conversation (thread id == session id), and a sub-agent's
+    // child journal is stamped with its lineage, never with a thread — so
+    // the store-row leg below, which needs a list scan to have run, is the
+    // only thing standing between a client and a session whose journal is
+    // right there. The sub-agent drill-down subscribes straight to the
+    // child's chat (`ahp-chat:/<run-id>`) and a reconnecting client can
+    // subscribe before any list refresh: both answered `not found` for a
+    // chat whose own journal was on disk.
+    if journal.is_some() {
+        return Some(session_id.to_string());
     }
     manox_agent::thread_store::try_global()
         .filter(|store| store.read(|state| state.summary_by_id(session_id).is_some()))
