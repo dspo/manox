@@ -26,6 +26,11 @@ struct ActiveRun {
     snapshot: RunSnapshot,
     dispose: CancellationToken,
     started_at: Instant,
+    /// The capacity slot, held for the entry's whole life: the permit drops
+    /// exactly when the run leaves the table (settle watcher, interrupt, or a
+    /// dropped entry), so the slot can never leak and the admission decision
+    /// is one atomic reservation instead of a count read before an `await`.
+    _capacity: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// How many child runs may be active at once. The limit keeps a model from
@@ -50,6 +55,8 @@ pub struct SubagentRuntime {
     /// re-emit `sub-0` and collide with the historical rows.
     namespace: String,
     run_seq: AtomicU64,
+    /// The active-capacity gate's permits (see [`DEFAULT_ACTIVE_CAPACITY`]).
+    capacity: Arc<tokio::sync::Semaphore>,
 }
 
 impl SubagentRuntime {
@@ -68,6 +75,7 @@ impl SubagentRuntime {
             events_tx,
             namespace: namespace.into(),
             run_seq: AtomicU64::new(0),
+            capacity: Arc::new(tokio::sync::Semaphore::new(DEFAULT_ACTIVE_CAPACITY)),
         })
     }
 
@@ -172,14 +180,20 @@ impl SubagentRuntime {
                  but the cap is {max}"
             )));
         }
-        let active = mutex(&self.runs).len();
-        if active >= DEFAULT_ACTIVE_CAPACITY {
-            return Err(SubagentError::InvalidRequest(format!(
-                "subagent limit reached (active child limit: {DEFAULT_ACTIVE_CAPACITY}); \
-                 wait for an existing child to finish or complete this work \
-                 with the current agents"
-            )));
-        }
+        // One atomic reservation per run: the permit is taken before the
+        // provider is asked to start and lives in the run-table entry, so two
+        // concurrent dispatches can no longer both read a stale count and
+        // overshoot the cap (the count used to be read before an `await`).
+        let capacity = match Arc::clone(&self.capacity).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Err(SubagentError::InvalidRequest(format!(
+                    "subagent limit reached (active child limit: {DEFAULT_ACTIVE_CAPACITY}); \
+                     wait for an existing child to finish or complete this work \
+                     with the current agents"
+                )));
+            }
+        };
         let mut descriptor = Descriptor::one_shot(
             provider,
             request.label.clone(),
@@ -222,6 +236,7 @@ impl SubagentRuntime {
                 },
                 dispose: run.dispose_token().clone(),
                 started_at: Instant::now(),
+                _capacity: capacity,
             },
         );
         if self
@@ -606,6 +621,72 @@ mod tests {
                     }
                 }),
             ))
+        }
+    }
+
+    /// Like [`HoldingProvider`], but yields inside `start` — the admission
+    /// window a count-based gate reads the table across.
+    struct YieldingHoldingProvider;
+
+    #[async_trait::async_trait]
+    impl SubagentProvider for YieldingHoldingProvider {
+        fn name(&self) -> &str {
+            "yielding"
+        }
+        fn capabilities(&self) -> Capabilities {
+            full_caps()
+        }
+        async fn start(&self, request: ResolvedStartRequest) -> Result<SubagentRun, SubagentError> {
+            tokio::task::yield_now().await;
+            let cancel = request.inner.cancel.clone();
+            Ok(SubagentRun::new(
+                request.run_id,
+                cancel.clone(),
+                Box::pin(async move {
+                    cancel.cancelled().await;
+                    RunResult {
+                        output: String::new(),
+                        structured: None,
+                        diagnostic: None,
+                        stop_reason: StopReason::Aborted,
+                    }
+                }),
+            ))
+        }
+    }
+
+    /// Concurrent dispatches cannot overshoot the cap.
+    ///
+    /// The gate used to read the live count and insert after
+    /// `provider.start().await` — a window in which every concurrent dispatch
+    /// saw the same stale count. The permit is reserved before the provider is
+    /// asked to start, so the Nth+1 reservation fails however the starts
+    /// interleave.
+    #[tokio::test]
+    async fn the_active_capacity_gate_survives_concurrent_dispatch() {
+        let runtime = SubagentRuntime::new();
+        let _guard = runtime.register_provider(Arc::new(YieldingHoldingProvider));
+        let starts: Vec<_> = (0..DEFAULT_ACTIVE_CAPACITY * 2)
+            .map(|i| {
+                let runtime = Arc::clone(&runtime);
+                async move {
+                    runtime
+                        .start("yielding", test_request(&format!("race-{i}"), "p"))
+                        .await
+                }
+            })
+            .collect();
+        let results = futures::future::join_all(starts).await;
+        let admitted = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            admitted,
+            DEFAULT_ACTIVE_CAPACITY,
+            "exactly the cap is admitted under concurrent dispatch: {} of {}",
+            admitted,
+            results.len()
+        );
+        for run in runtime.list_runs() {
+            runtime.interrupt(&run.id);
         }
     }
 
