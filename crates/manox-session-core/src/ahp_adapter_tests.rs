@@ -2438,6 +2438,124 @@ mod dispatch {
         uninstall();
     }
 
+    /// The claim table on the wire, one arm per test: the id the answer
+    /// carries is the id the client drives, and the guard arms refuse
+    /// instead of opening something else.
+    fn create_params(id: &str, cwd: Option<&str>) -> ahp_types::commands::CreateSessionParams {
+        ahp_types::commands::CreateSessionParams {
+            channel: session::uri(id),
+            meta: None,
+            provider: None,
+            working_directories: cwd.map(|dir| vec![format!("file://{dir}")]),
+            config: None,
+            active_client: None,
+            progress_token: None,
+        }
+    }
+
+    /// A retry of the client's own create drives the session it already
+    /// owns: the same id answers, the journal is never re-minted, and the
+    /// restore lands on the materialized conversation. Minting a second log
+    /// for one intent is the double-row accident the claim exists to
+    /// prevent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retried_create_restores_the_session_it_already_owns() {
+        let _guards = install();
+        let id = format!("s-retry-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cwd_string = cwd.to_string_lossy().into_owned();
+        seed_session(&id, &id, &cwd_string, vec![("e-1", user("first prompt"))]).await;
+
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        backend
+            .create_session(&id, &create_params(&id, Some(&cwd_string)))
+            .expect("the retry drives the id it already owns");
+        assert!(
+            server.ahp_inner().session_thread(&id).is_some(),
+            "the retry restored the materialized session"
+        );
+        assert!(
+            core_journal(&id).exists(),
+            "the retry never re-minted over the journal"
+        );
+        uninstall();
+    }
+
+    /// A materialized session lives where it was created: a create naming
+    /// another directory is an explicit conflict — never a silent redirect,
+    /// never a fresh session over the id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_create_naming_another_directory_is_an_explicit_conflict() {
+        let _guards = install();
+        let id = format!("s-conflict-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cwd_string = cwd.to_string_lossy().into_owned();
+        seed_session(&id, &id, &cwd_string, vec![("e-1", user("first prompt"))]).await;
+
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let err = backend
+            .create_session(&id, &create_params(&id, Some("/definitely/elsewhere")))
+            .expect_err("a create naming another directory is refused");
+        assert!(
+            format!("{err:?}").contains("lives in"),
+            "the conflict names both directories: {err:?}"
+        );
+        assert!(
+            server.ahp_inner().session_thread(&id).is_none(),
+            "the refusal opens nothing"
+        );
+        uninstall();
+    }
+
+    /// A subagent session belongs to its parent's run: the claim refuses it
+    /// outright, however the client learned the id. Without the ownership
+    /// guard a create would open the child's journal as a user session and
+    /// let a client drive a run's private log.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_session_cannot_be_claimed() {
+        let _guards = install();
+        let id = format!("sub-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cwd_string = cwd.to_string_lossy().into_owned();
+        // The child journal the spawn writes: lineage in the header metadata.
+        let path = core_journal(&id);
+        let storage = JsonlSessionStorage::create(
+            &path,
+            manox_harness::session::jsonl::JsonlSessionMetadata {
+                id: id.clone(),
+                cwd: cwd_string.clone(),
+                created_at: stamp(),
+                parent_session_path: None,
+                metadata: Some(json!({
+                    "subagent": { "parent": "s-parent", "toolCallId": "tu_1" }
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        drop(storage);
+
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let err = backend
+            .create_session(&id, &create_params(&id, Some(&cwd_string)))
+            .expect_err("a subagent session is never claimed");
+        assert!(
+            format!("{err:?}").contains("cannot be claimed"),
+            "the refusal names the ownership: {err:?}"
+        );
+        assert!(
+            server.ahp_inner().session_thread(&id).is_none(),
+            "the refusal opens nothing"
+        );
+        uninstall();
+    }
+
     /// The chat channel of a live-but-blank session must resolve on the wire.
     ///
     /// A claim (`createSession`) writes nothing durable — the journal
