@@ -1520,6 +1520,15 @@ impl Backend for RuntimeBackend {
     }
 
     fn session_state_for_chat(&self, chat_id: &str) -> Option<String> {
+        // A live session owns its chat from the moment `createSession`
+        // answered: the blank claim is lazily materialized (nothing durable
+        // exists until the first journal append), so the durable legs below
+        // resolve it only after the turn that wrote them. Without this leg
+        // the chat channel of a fresh session answers not-found — and the
+        // first dispatch on it is rejected before the runtime ever sees it.
+        if self.server.has_session(chat_id) {
+            return Some(chat_id.to_string());
+        }
         block_on(super::thread_of_session(chat_id))
     }
 
