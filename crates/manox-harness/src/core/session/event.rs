@@ -512,13 +512,6 @@ pub enum Event {
         metric_type: String,
         data: JsonValue,
     },
-    /// The session was disposed: its rows stop here and every list drops it.
-    #[serde(rename = "session/disposed", rename_all = "camelCase")]
-    Disposed {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-    },
     /// A swarm run started: one delegated child session under this log.
     #[serde(rename = "run/started", rename_all = "camelCase")]
     RunStarted {
@@ -751,6 +744,15 @@ mod tests {
     #[test]
     fn unknown_event_types_are_refused_not_guessed() {
         let bad = r#"{"seq":1,"ts":"1970-01-01T00:00:00Z","type":"quantum/flip"}"#;
+        assert!(serde_json::from_str::<Envelope>(bad).is_err());
+    }
+
+    /// A retired row name is refused like any other unknown one. The
+    /// vocabulary has no compatibility reads: a journal naming a row this
+    /// build does not write fails loudly instead of folding to a guess.
+    #[test]
+    fn a_retired_row_name_is_refused_like_an_unknown_one() {
+        let bad = r#"{"seq":1,"ts":"1970-01-01T00:00:00Z","type":"session/disposed","id":"e-1","parentId":null,"timestamp":"1970-01-01T00:00:00Z"}"#;
         assert!(serde_json::from_str::<Envelope>(bad).is_err());
     }
 }

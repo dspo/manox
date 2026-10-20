@@ -219,7 +219,6 @@ pub(crate) fn target_of(entry: &SessionTreeEntry) -> Target {
         | E::RunSettled { .. }
         | E::RunEscalated { .. }
         | E::RunContinued { .. } => Target::Chat,
-        E::Disposed { .. } => Target::Session,
         // ── session state ────────────────────────────────────────────
         E::ModelChange { .. }
         | E::CwdChange { .. }
@@ -1130,9 +1129,6 @@ impl Translator {
                     serde_json::json!({ "runEscalated": { "runId": run_id } }),
                     &mut out,
                 );
-            }
-            SessionTreeEntry::Disposed { .. } => {
-                // Disposal folds with the session list — not this pass.
             }
             SessionTreeEntry::SubagentProgress { .. } => {
                 // Retired forwarding rows: run/* rows are the only
