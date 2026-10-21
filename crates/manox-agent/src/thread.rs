@@ -837,6 +837,22 @@ impl Thread {
         Self::open(id, cwd, Some(path), None, false, Some(lease))
     }
 
+    /// The working directory a conversation with no project runs in: its own
+    /// temporary workspace, derived from the conversation id so a reopen
+    /// reuses it instead of minting a sibling, and created here — the app's
+    /// create leaves one row and nothing on disk.
+    ///
+    /// A delegated seat never takes this path: a subagent inherits the
+    /// directory of the conversation that spawned it, because it is working
+    /// inside that conversation's project, not in a conversation of its own.
+    fn unfiled_cwd(id: &ThreadId) -> PathBuf {
+        let workspace = crate::paths::unfiled_workspace(&id.0);
+        if let Err(err) = std::fs::create_dir_all(&workspace) {
+            tracing::warn!(path = %workspace.display(), %err, "unfiled workspace");
+        }
+        workspace
+    }
+
     fn open(
         id: ThreadId,
         cwd: PathBuf,
@@ -845,6 +861,15 @@ impl Thread {
         fresh: bool,
         lease: Option<std::sync::Arc<crate::session_lease::LeaseEntry>>,
     ) -> ThreadHandle {
+        // A genuinely new conversation with no project is the special
+        // project: it runs in its own temporary workspace rather than in
+        // whatever directory the app was launched from. A reopen takes its
+        // directory from the transcript it restores, so the shard and the cwd
+        // a conversation was born with stay its own.
+        let cwd = match (&project, fresh) {
+            (None, true) => Self::unfiled_cwd(&id),
+            _ => cwd,
+        };
         // A concrete session file means an authoritative restore is pending;
         // the facade reports `Loading` until `Ready` so the workspace can
         // gate input and render the streaming preview.
@@ -944,7 +969,10 @@ impl Thread {
         if self.goal_bridge.is_none() {
             self.goal_bridge = Some(GoalBridge::for_thread(&self.id.0));
         }
-        let cwd = project.clone().unwrap_or_else(|| self.cwd.clone());
+        let cwd = match &project {
+            Some(project) => project.clone(),
+            None => Self::unfiled_cwd(&self.id),
+        };
         let model = self.model.clone();
         // The v1.0.0 core layout: one directory per session under its
         // project bucket, the journal (`log.v1.jsonl`) inside. The legacy
@@ -3364,6 +3392,20 @@ pub(crate) mod tests {
         assert_eq!(thread.read(|t| t.messages.len()), 4);
 
         crate::object_store::set_path_for_test(None);
+    }
+
+    /// The special project's initial-cwd policy: derived from the
+    /// conversation id, and created on demand — a conversation that is never
+    /// spoken to leaves nothing behind, and a reopen reuses the same
+    /// directory instead of minting a sibling.
+    #[test]
+    fn a_project_less_conversation_gets_its_own_workspace() {
+        let id = ThreadId(format!("policy-{}", uuid::Uuid::new_v4()));
+        let workspace = Thread::unfiled_cwd(&id);
+        assert_eq!(workspace, crate::paths::unfiled_workspace(&id.0));
+        assert!(workspace.is_dir(), "materializing the session creates it");
+        assert_eq!(Thread::unfiled_cwd(&id), workspace, "a reopen reuses it");
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     /// The version watermark: a write that restates the picks the thread
