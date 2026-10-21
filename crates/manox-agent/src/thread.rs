@@ -394,6 +394,12 @@ pub struct Thread {
     /// borrow); `ensure_engine` runs inside a `with_mut`, so it parks the
     /// receiver here and that enclosing call spawns the pump.
     pending_engine_events: Option<tokio::sync::mpsc::UnboundedReceiver<BackendNotice>>,
+    /// Which engine's notices the facade is listening to. Bumped whenever a
+    /// different engine takes over, so a pump started for the previous one
+    /// stops dispatching: its late notices describe a session nobody is
+    /// looking at any more, and a discarded run's `Settled` must not end the
+    /// run that replaced it.
+    engine_generation: u64,
 }
 
 /// A live-thread registry seam: the kernel looks up / registers live threads
@@ -514,15 +520,15 @@ impl ThreadHandle {
     /// Three-phase: lock -> mutate (collecting `pending_events`) -> unlock ->
     /// emit. The closure must never await.
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut Thread) -> R) -> R {
-        let (r, events, engine_events) = {
+        let (r, events, engine_events, generation) = {
             let mut state = self.0.state.write();
             let r = f(&mut state);
             let events = std::mem::take(&mut state.pending_events);
             let engine_events = state.pending_engine_events.take();
-            (r, events, engine_events)
+            (r, events, engine_events, state.engine_generation)
         };
         if let Some(rx) = engine_events {
-            drain_engine_notices(self.clone(), rx);
+            drain_engine_notices(self.clone(), rx, generation);
         }
         self.broadcast(events);
         r
@@ -807,6 +813,7 @@ impl Thread {
             cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
+            engine_generation: 0,
             extra_working_dirs: Vec::new(),
         })
     }
@@ -948,10 +955,11 @@ impl Thread {
             cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
+            engine_generation: 0,
             extra_working_dirs: Vec::new(),
         });
         handle.set_restore_ready(restore_ready);
-        drain_engine_notices(handle.clone(), events);
+        drain_engine_notices(handle.clone(), events, 0);
         handle
     }
 
@@ -1017,6 +1025,7 @@ impl Thread {
         for suite in self.browser_suites.clone() {
             engine.set_browser_suite(suite, true);
         }
+        self.engine_generation += 1;
         self.engine = Some(engine.clone());
         self.pending_engine_events = Some(events);
     }
@@ -1506,6 +1515,10 @@ impl Thread {
         engine: Arc<dyn ThreadEngine>,
         events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
     ) {
+        // The replaced engine's actor is still winding down and its notices
+        // are still queued; the generation bump is what stops them from
+        // mutating a facade that has moved on.
+        self.engine_generation += 1;
         self.engine = Some(engine);
         self.pending_engine_events = Some(events);
     }
@@ -1935,10 +1948,11 @@ impl Thread {
             cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
+            engine_generation: 0,
             extra_working_dirs: Vec::new(),
         });
         handle.set_restore_ready(restore_ready);
-        drain_engine_notices(handle.clone(), events);
+        drain_engine_notices(handle.clone(), events, 0);
         handle
     }
 
@@ -2355,9 +2369,15 @@ impl Thread {
 fn drain_engine_notices(
     handle: ThreadHandle,
     mut events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
+    generation: u64,
 ) {
     crate::runtime::handle().spawn(async move {
         while let Some(notice) = events.recv().await {
+            // The facade moved to another engine: this pump's remaining
+            // notices describe a session nobody is looking at any more.
+            if !handle.read(|t| t.engine_generation == generation) {
+                break;
+            }
             handle.handle_notice(notice);
         }
     });
@@ -3019,6 +3039,7 @@ pub(crate) mod tests {
             cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
+            engine_generation: 0,
             extra_working_dirs: Vec::new(),
         })
     }
