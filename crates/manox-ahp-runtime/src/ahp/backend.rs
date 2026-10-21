@@ -1526,6 +1526,24 @@ fn summary_from_row(
             None,
         ),
     };
+    // Belonging comes from the OBJECT STORE (the user's attach decision),
+    // never from any cwd: a conversation whose working directory wandered
+    // into a tool-created worktree keeps its project. The scan row's path
+    // is only the fallback for a conversation with no object row
+    // (pre-migration journals).
+    let objects = manox_agent::object_store::ObjectStore::try_global();
+    let project_path = objects
+        .as_ref()
+        .and_then(|store| store.conversation(&row.id))
+        .and_then(|conversation| {
+            conversation
+                .project_id
+                .and_then(|pid| objects.as_ref()?.project_path(&pid))
+        })
+        .unwrap_or_else(|| row.project.clone());
+    let project_alias = objects
+        .as_ref()
+        .and_then(|store| store.project_alias(&project_path));
     SessionSummary {
         provider: row.provider_id.clone().unwrap_or_default(),
         // The row's `display_title` already applied user-rename precedence; a
@@ -1537,14 +1555,11 @@ fn summary_from_row(
         status,
         activity,
         origin: None,
-        project: (!row.project.is_empty()).then(|| ahp_types::state::ProjectInfo {
-            uri: row.project.clone(),
-            // The user's alias is the project's display name; the raw path is
-            // the fallback.
-            display_name: store
-                .project_alias(&row.project)
-                .map(str::to_string)
-                .unwrap_or_else(|| row.project.clone()),
+        project: (!project_path.is_empty()).then(|| ahp_types::state::ProjectInfo {
+            uri: project_path.clone(),
+            // The user's alias is the project's display name; the raw path
+            // is the fallback.
+            display_name: project_alias.unwrap_or(project_path),
         }),
         working_directories: directories,
         annotations: None,

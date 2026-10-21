@@ -3257,6 +3257,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn object_store_config_changes_apply_with_a_notice() {
         // The store at a scratch path; no row for this thread at first.
+        // The guard serializes against the object-store suite's own tests —
+        // both swap the process-global connection.
+        let _lock = crate::object_store::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         crate::object_store::set_path_for_test(Some(dir.path().join("objects.db")));
         crate::object_store::init();

@@ -163,6 +163,11 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Serializes tests that swap the process-global connection (the same
+/// discipline the thread store's tests use).
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The zero-sized handle to the process-global store; every method is one
 /// short synchronous statement. Clone and share freely.
 #[derive(Debug, Clone, Copy, Default)]
@@ -264,6 +269,33 @@ impl ObjectStore {
                 .expect("position update");
             }
             true
+        })
+    }
+
+    /// A project's display alias, when the user set one.
+    pub fn project_alias(&self, path: &str) -> Option<String> {
+        with(|conn| {
+            conn.query_row(
+                "SELECT alias FROM projects WHERE path = ?1",
+                params![path],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .expect("alias query")
+            .flatten()
+        })
+    }
+
+    /// The path of a project id, when it exists.
+    pub fn project_path(&self, id: &str) -> Option<String> {
+        with(|conn| {
+            conn.query_row(
+                "SELECT path FROM projects WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .expect("project path query")
         })
     }
 
@@ -657,11 +689,10 @@ fn first_human_message_at(journal: &Path) -> Option<i64> {
 mod tests {
     use super::*;
 
-    /// The store global is a process singleton: serialize the tests that
-    /// swap it (the same discipline the thread store's tests use).
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn scratch() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
