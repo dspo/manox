@@ -33,7 +33,7 @@ impl ObjectConfigSource {
 impl ConversationConfigSource for ObjectConfigSource {
     fn model(&self) -> Option<manox_harness::types::Model> {
         let model_ref = self.model_ref()?;
-        let registry = crate::provider_glue::global();
+        let registry = crate::provider_glue::try_global()?;
         manox_harness::model_ref::resolve_model_ref(&registry, &model_ref)
     }
 

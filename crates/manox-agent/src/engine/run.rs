@@ -176,20 +176,10 @@ where
                     }
                 }
                 Some(SessionCmd::SetThinkingLevel(level)) => {
-                    // Mid-run switch: the queued mutation lands at the next
-                    // turn boundary (same semantics as `set_model`); persist
-                    // the choice so a reopened session restores it.
+                    // Mid-run switch: the change lands on the runtime snapshot
+                    // at once and governs the next request. Nothing durable is
+                    // written — the conversation's row owns the pick.
                     handle.set_thinking_level(level.clone());
-                    if let Some(effort) = level.as_deref().and_then(parse_reasoning_effort)
-                        && let Err(err) = write_reasoning_effort_sidecar(
-                            sessions_dir,
-                            session_path,
-                            effort,
-                        )
-                        .await
-                    {
-                        tracing::warn!(error = %err, "failed to persist reasoning effort");
-                    }
                 }
                 Some(SessionCmd::PersistGeneratedTitle {
                     session_path: target,

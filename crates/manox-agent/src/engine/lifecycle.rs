@@ -413,14 +413,29 @@ pub(super) fn session_builder(
 /// projects its persisted model onto the harness, and the actor's working
 /// model plus the shared slot must follow so `Ready` and the title
 /// scheduler all see the restored choice.
-pub(super) fn adopt_session_model(
-    session: &AgentSession,
+pub(super) async fn adopt_session_model(
+    session: &mut AgentSession,
     harness_model: &mut HarnessModel,
     state: &EngineState,
+    conversation_id: &str,
 ) {
-    let restored = session.model().clone();
-    *harness_model = restored.clone();
-    *state.model.lock().unwrap() = Some(restored);
+    // The conversation's row is the model's authority — the same surface the
+    // request boundary reads. The session's own value is the tolerated legacy
+    // read: it still answers for a conversation the store has never seen (a
+    // subagent seat, a session created outside the app), and the row wins
+    // wherever it carries a pick.
+    let picked = crate::conversation_config::ObjectConfigSource::for_session(conversation_id)
+        .model()
+        .unwrap_or_else(|| session.model().clone());
+    if let Err(err) = session.set_model(picked.clone()).await {
+        tracing::warn!(
+            error = %err,
+            "restored model refused; keeping the actor's working model"
+        );
+        return;
+    }
+    *harness_model = picked.clone();
+    *state.model.lock().unwrap() = Some(picked);
 }
 
 /// Register plan-mode extension hooks on a freshly built/restored session:
@@ -565,7 +580,7 @@ pub(super) async fn rebuild_session(
             // never attach (write confinement is now in ApprovalGatedTool).
             attach_plugin_hooks(&mut s, &cwd);
             attach_prefix_gate(&mut s, notice_tx, thread_id);
-            adopt_session_model(&s, harness_model, state);
+            adopt_session_model(&mut s, harness_model, state, thread_id).await;
             *session = s;
             // The rebuilt session owns a new storage: its own journal relay.
             spawn_journal_relay(session, &state.journal_tx);

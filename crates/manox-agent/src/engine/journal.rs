@@ -105,15 +105,12 @@ pub(super) fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde
             "tool_output_chunk".into(),
             json!({ "callId": id, "chunk": chunk }),
         ),
-        // ── state changes (sidecar writes continue during migration; the
-        //    journal entry is the future single truth, L10) ───────────────
-        ThreadEvent::PermissionModeChanged { mode } => (
-            "permission_mode_change".into(),
-            // The closed kebab wire vocabulary (§C.2 `mode`), never the
-            // Debug name: the replay fold, the sidecar cache, and the wire
-            // projection all parse `from_wire`.
-            json!({ "mode": mode.wire() }),
-        ),
+        // ── state changes ────────────────────────────────────────────────
+        // The permission mode is NOT here: its durable home is the
+        // conversation's object row, which the client writes, and the engine
+        // reads it live before every tool call. Journaling a second copy is
+        // what made "which one is in force" unanswerable.
+        ThreadEvent::PermissionModeChanged { .. } => return None,
         ThreadEvent::PlanModeChanged { enabled } => {
             ("plan_mode_change".into(), json!({ "enabled": enabled }))
         }

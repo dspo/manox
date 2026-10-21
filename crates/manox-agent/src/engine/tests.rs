@@ -121,34 +121,6 @@ fn session_metadata_tags_host_thread_and_optional_team_parent() {
 }
 
 #[tokio::test]
-async fn permission_mode_sidecar_round_trips() {
-    let dir = tempfile::tempdir().unwrap();
-    let session = dir.path().join("sess-1.jsonl");
-
-    // Fresh session: no sidecar -> default.
-    assert_eq!(
-        load_approval_mode(dir.path(), &session).await,
-        PermissionMode::WorkspaceWrite
-    );
-
-    write_approval_mode_sidecar(dir.path(), &session, PermissionMode::DangerFullAccess)
-        .await
-        .unwrap();
-    assert_eq!(
-        load_approval_mode(dir.path(), &session).await,
-        PermissionMode::DangerFullAccess
-    );
-
-    write_approval_mode_sidecar(dir.path(), &session, PermissionMode::ReadOnly)
-        .await
-        .unwrap();
-    assert_eq!(
-        load_approval_mode(dir.path(), &session).await,
-        PermissionMode::ReadOnly
-    );
-}
-
-#[tokio::test]
 
 async fn attach_registry_displays_restores_sidecar_compact_forms() {
     let dir = tempfile::tempdir().unwrap();
@@ -338,48 +310,6 @@ async fn clear_user_chrome_is_noop_when_empty() {
     assert!(displays.is_empty());
 }
 
-#[tokio::test]
-async fn permission_mode_sidecar_tolerates_unknown_values() {
-    let dir = tempfile::tempdir().unwrap();
-    let session = dir.path().join("sess-2.jsonl");
-    let meta = manox_harness::session_meta::SessionMeta {
-        approval_mode: Some("yolo".to_string()),
-        ..Default::default()
-    };
-    manox_harness::session_meta::save(dir.path(), &session, &meta)
-        .await
-        .unwrap();
-    assert_eq!(
-        load_approval_mode(dir.path(), &session).await,
-        PermissionMode::WorkspaceWrite,
-        "unknown persisted modes fall back to the bounded default"
-    );
-}
-
-#[tokio::test]
-async fn permission_mode_write_preserves_other_sidecar_fields() {
-    let dir = tempfile::tempdir().unwrap();
-    let session = dir.path().join("sess-3.jsonl");
-    let meta = manox_harness::session_meta::SessionMeta {
-        title: Some("my thread".to_string()),
-        project: Some("/tmp/proj".to_string()),
-        ..Default::default()
-    };
-    manox_harness::session_meta::save(dir.path(), &session, &meta)
-        .await
-        .unwrap();
-
-    write_approval_mode_sidecar(dir.path(), &session, PermissionMode::DangerFullAccess)
-        .await
-        .unwrap();
-
-    let loaded = manox_harness::session_meta::load(dir.path(), &session)
-        .await
-        .unwrap();
-    assert_eq!(loaded.title.as_deref(), Some("my thread"));
-    assert_eq!(loaded.project.as_deref(), Some("/tmp/proj"));
-    assert_eq!(loaded.approval_mode.as_deref(), Some("danger-full-access"));
-}
 /// Build an idle `AgentSession` backed by a stream that answers every
 /// request with a terminal assistant turn, so a `continue_` round driven by
 /// the actor's continuation helper runs to settle in the test.
@@ -1029,9 +959,6 @@ fn durable_journal_mapping_round_trips_every_journaled_event() {
         ThreadEvent::ToolOutput {
             id: "tc-1".into(),
             chunk: "a".into(),
-        },
-        ThreadEvent::PermissionModeChanged {
-            mode: manox_harness::sandbox::PermissionMode::default(),
         },
         ThreadEvent::PlanModeChanged { enabled: true },
         ThreadEvent::PlanUpdated {
@@ -3176,14 +3103,12 @@ impl manox_harness::coding_agent::model_runtime::ModelCatalog for TestModelCatal
     }
 }
 
-/// A reopened session must project its own persisted model onto the
-/// harness: the restore path builds with no model override so
-/// `builder.open()` restores the session model, and
-/// `adopt_session_model` mirrors it into the actor's working model and
-/// the shared slot. Regression for the reopen that showed the default
-/// model in the composer selector.
+/// With no row to read, the restore keeps what the reopened session carries
+/// — the tolerated legacy read. A conversation the store has never seen (a
+/// subagent seat, a session created outside the app) must not be reset to the
+/// default just because it has no object.
 #[tokio::test]
-async fn reopened_session_restores_its_own_model() {
+async fn adopt_session_model_keeps_the_sessions_model_without_a_row() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().join("proj");
     tokio::fs::create_dir_all(&cwd).await.unwrap();
@@ -3195,12 +3120,11 @@ async fn reopened_session_restores_its_own_model() {
     });
     let runtime = ModelRuntime::new(resolver).with_catalog(Arc::new(TestModelCatalog));
 
-    // Phase 1: a session that ran under `test` and switched to `new`.
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(&sessions)
         .with_model_runtime(runtime.clone())
-        .with_model(test_model())
+        .with_model(test_model_switched())
         .with_tools(vec![
             Arc::new(EchoTool) as Arc<dyn manox_harness::tool::AgentTool>
         ])
@@ -3209,20 +3133,10 @@ async fn reopened_session_restores_its_own_model() {
         .await
         .unwrap();
     let path = session.path().clone();
-    // A prompt materializes the JSONL (the deferred-first contract
-    // writes disk only once an assistant message exists).
     let _ = session.prompt("first turn").await.unwrap();
-    session.set_model(test_model_switched()).await.unwrap();
-    let jsonl = tokio::fs::read_to_string(&path).await.unwrap();
-    assert!(
-        jsonl.contains("\"type\":\"model_change\"") && jsonl.contains("\"modelId\":\"new\""),
-        "the switch must persist a model_change entry for the new model"
-    );
     session.close().await.unwrap();
 
-    // Phase 2: the fixed restore path — no model override on the
-    // builder, so `open()` restores the session's own model.
-    let reopened = create_agent_session()
+    let mut reopened = create_agent_session()
         .with_model_runtime(runtime)
         .with_tools(vec![
             Arc::new(EchoTool) as Arc<dyn manox_harness::tool::AgentTool>
@@ -3231,70 +3145,71 @@ async fn reopened_session_restores_its_own_model() {
         .open(path)
         .await
         .unwrap();
-    assert_eq!(
-        reopened.model().id,
-        "new",
-        "the reopened session must restore its own model, not the default"
-    );
 
     let state = test_engine_state();
     let mut harness_model = test_model();
-    adopt_session_model(&reopened, &mut harness_model, &state);
+    adopt_session_model(&mut reopened, &mut harness_model, &state, "no-such-row").await;
     assert_eq!(
         harness_model.id, "new",
-        "the actor's working model follows the restored session"
+        "the reopened session's own model stands when the store has no row"
     );
     assert_eq!(
         state.model.lock().unwrap().as_ref().map(|m| m.id.as_str()),
         Some("new"),
-        "the shared model slot follows the restored session"
+        "the shared model slot follows it"
     );
 }
 
-#[tokio::test]
-async fn reasoning_effort_sidecar_round_trips() {
-    let dir = tempfile::tempdir().unwrap();
-    let session = dir.path().join("sess-effort.jsonl");
+/// A configuration source that carries no picks — the shape a conversation
+/// the store has never seen produces, which leaves the sidecar as the
+/// fallback.
+struct NoPicks;
 
-    // Fresh session: no sidecar -> default High.
-    assert_eq!(
-        load_reasoning_effort(dir.path(), &session).await,
-        ReasoningEffort::High
-    );
+impl manox_harness::ConversationConfigSource for NoPicks {
+    fn model(&self) -> Option<manox_harness::types::Model> {
+        None
+    }
 
-    write_reasoning_effort_sidecar(dir.path(), &session, ReasoningEffort::Max)
-        .await
-        .unwrap();
-    assert_eq!(
-        load_reasoning_effort(dir.path(), &session).await,
-        ReasoningEffort::Max
-    );
+    fn model_ref(&self) -> Option<String> {
+        None
+    }
 
-    write_reasoning_effort_sidecar(dir.path(), &session, ReasoningEffort::High)
-        .await
-        .unwrap();
-    assert_eq!(
-        load_reasoning_effort(dir.path(), &session).await,
-        ReasoningEffort::High
-    );
+    fn permission_mode(&self) -> Option<PermissionMode> {
+        None
+    }
+
+    fn reasoning_effort(&self) -> Option<String> {
+        None
+    }
+
+    fn config_version(&self) -> i64 {
+        0
+    }
 }
 
-#[tokio::test]
-async fn reasoning_effort_sidecar_tolerates_unknown_values() {
-    let dir = tempfile::tempdir().unwrap();
-    let session = dir.path().join("sess-effort-unknown.jsonl");
-    let meta = manox_harness::session_meta::SessionMeta {
-        reasoning_effort: Some("medium".to_string()),
-        ..Default::default()
-    };
-    manox_harness::session_meta::save(dir.path(), &session, &meta)
-        .await
-        .unwrap();
-    assert_eq!(
-        load_reasoning_effort(dir.path(), &session).await,
-        ReasoningEffort::High,
-        "unknown persisted efforts fall back to the default"
-    );
+/// A configuration source carrying the picks a conversation's row holds.
+struct Picks;
+
+impl manox_harness::ConversationConfigSource for Picks {
+    fn model(&self) -> Option<manox_harness::types::Model> {
+        None
+    }
+
+    fn model_ref(&self) -> Option<String> {
+        None
+    }
+
+    fn permission_mode(&self) -> Option<PermissionMode> {
+        Some(PermissionMode::ReadOnly)
+    }
+
+    fn reasoning_effort(&self) -> Option<String> {
+        Some("high".to_string())
+    }
+
+    fn config_version(&self) -> i64 {
+        1
+    }
 }
 
 fn assistant_usage(cache_read: u64) -> manox_harness::types::Usage {
@@ -3955,7 +3870,7 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     // ── Live-state capture. ──────────────────────────────────────────
     let live_records = appender.storage().journal_range(0, u64::MAX).await.unwrap();
     let live_replay = crate::replay::replay_thread_state(&live_records);
-    let live_rebuilt = rebuild_restored_state(&session, &sessions).await;
+    let live_rebuilt = rebuild_restored_state(&session, &sessions, "t-1").await;
     let live_entries = session.context_entries().await.unwrap();
     let (live_display, live_notes) = adapt::entries_to_display(&live_entries);
     let live_cursor = appender.storage().journal_cursor().await;
@@ -3980,11 +3895,6 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     assert_eq!(live_replay.pinned, Some(false));
     assert_eq!(live_replay.archived, Some(true));
     assert_eq!(live_replay.project, Some(Some("/replay/proj".into())));
-    assert_eq!(
-        live_replay.permission_mode,
-        Some(PermissionMode::DangerFullAccess)
-    );
-    assert_eq!(live_replay.reasoning_effort, Some(ReasoningEffort::Max));
     assert_eq!(live_replay.plan_mode, Some(true));
     assert_eq!(live_replay.cwd.as_deref(), Some("/replay/work"));
     assert_eq!(
@@ -4000,9 +3910,11 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     assert_eq!(live_rebuilt.project, Some(PathBuf::from("/replay/proj")));
     assert_eq!(
         live_rebuilt.permission_mode,
-        PermissionMode::DangerFullAccess
+        PermissionMode::WorkspaceWrite,
+        "the chain's permission row is inert; with no object row the bounded \
+         default stands"
     );
-    assert_eq!(live_rebuilt.reasoning_effort, ReasoningEffort::Max);
+    assert_eq!(live_rebuilt.reasoning_effort, ReasoningEffort::High);
     assert!(live_rebuilt.plan_mode);
 
     // K2 cache repair: the diverging (here: empty) sidecar converges
@@ -4017,11 +3929,11 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     assert_eq!(repaired.title.as_deref(), Some("replayed title"));
     assert!(!repaired.pinned && repaired.archived);
     assert_eq!(repaired.project.as_deref(), Some("/replay/proj"));
-    assert_eq!(
-        repaired.approval_mode.as_deref(),
-        Some("danger-full-access")
-    );
-    assert_eq!(repaired.reasoning_effort.as_deref(), Some("max"));
+    // Neither the mode nor the effort is re-stamped: the conversation's row
+    // owns them, and repairing the cache from the journal would put a second
+    // copy back in play.
+    assert_eq!(repaired.approval_mode, None);
+    assert_eq!(repaired.reasoning_effort, None);
     // Plan state has no sidecar mirror anymore (W4): the journal is the
     // single source, so there is nothing to repair or assert here.
 
@@ -4052,7 +3964,7 @@ async fn journal_replay_is_consistent_across_disk_reload() {
         .unwrap();
     let reloaded_records = reloaded.journal_range(0, u64::MAX).await.unwrap();
     let reloaded_replay = crate::replay::replay_thread_state(&reloaded_records);
-    let reloaded_rebuilt = rebuild_restored_state(&reloaded, &sessions).await;
+    let reloaded_rebuilt = rebuild_restored_state(&reloaded, &sessions, "t-1").await;
     let reloaded_entries = reloaded.context_entries().await.unwrap();
     let (reloaded_display, reloaded_notes) = adapt::entries_to_display(&reloaded_entries);
     let reloaded_cursor = reloaded.journal_cursor().await;
@@ -4147,9 +4059,11 @@ async fn journal_replay_is_consistent_across_disk_reload() {
 }
 
 /// K2 authority: the journal rebuild WINS over a diverging sidecar, and
-/// the sidecar cache is repaired toward the journal.
+/// the sidecar cache is repaired toward the journal, while the permission
+/// mode is read from the conversation's row (absent here) with the sidecar as
+/// its fallback — never from the chain, whose own permission row is inert.
 #[tokio::test]
-async fn restored_state_prefers_journal_over_sidecar_and_repairs_cache() {
+async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().join("proj");
     tokio::fs::create_dir_all(&cwd).await.unwrap();
@@ -4223,11 +4137,15 @@ async fn restored_state_prefers_journal_over_sidecar_and_repairs_cache() {
         .await
         .unwrap();
 
-    let rebuilt = rebuild_restored_state(&session, &sessions).await;
+    let rebuilt = rebuild_restored_state(&session, &sessions, "t-1").await;
     assert_eq!(rebuilt.title.as_deref(), Some("journal title"));
     assert!(!rebuilt.pinned);
     assert!(rebuilt.archived);
-    assert_eq!(rebuilt.permission_mode, PermissionMode::WorkspaceWrite);
+    assert_eq!(
+        rebuilt.permission_mode,
+        PermissionMode::ReadOnly,
+        "no object row: the sidecar's value stands, not the chain's"
+    );
     assert_eq!(rebuilt.project, Some(PathBuf::from("/journal/project")));
     // Goal stage ②: the rebuild passes the replayed journal snapshot
     // through to the Ready chain (the bridge seed's authority).
@@ -4257,7 +4175,11 @@ async fn restored_state_prefers_journal_over_sidecar_and_repairs_cache() {
         .unwrap();
     assert_eq!(repaired.title.as_deref(), Some("journal title"));
     assert!(!repaired.pinned && repaired.archived);
-    assert_eq!(repaired.approval_mode.as_deref(), Some("workspace-write"));
+    assert_eq!(
+        repaired.approval_mode.as_deref(),
+        Some("read-only"),
+        "the stale cache is not re-stamped from an inert journal row"
+    );
     assert_eq!(repaired.project.as_deref(), Some("/journal/project"));
     session.close().await.unwrap();
 }
@@ -4269,7 +4191,7 @@ async fn restored_state_prefers_journal_over_sidecar_and_repairs_cache() {
 /// chain that never saw them restores plan mode OFF (the radical
 /// no-compat-read stance; W4 sidecar retirement).
 #[tokio::test]
-async fn restored_state_falls_back_to_sidecar_for_legacy_chains() {
+async fn restored_state_falls_back_to_the_sidecar_for_a_conversation_without_a_row() {
     let replayed = crate::replay::ReplayedThreadState::default();
     let meta = manox_harness::session_meta::SessionMeta {
         title: Some("sidecar title".into()),
@@ -4282,7 +4204,7 @@ async fn restored_state_falls_back_to_sidecar_for_legacy_chains() {
         archived: true,
         ..Default::default()
     };
-    let merged = merge_restored_state(&replayed, &meta);
+    let merged = merge_restored_state(&replayed, &meta, &NoPicks);
     assert_eq!(merged.title.as_deref(), Some("sidecar title"));
     assert_eq!(merged.project, Some(PathBuf::from("/sidecar/project")));
     assert_eq!(merged.permission_mode, PermissionMode::ReadOnly);
@@ -4297,6 +4219,22 @@ async fn restored_state_falls_back_to_sidecar_for_legacy_chains() {
     assert!(merged.pinned && merged.archived);
 }
 
+/// The row beats the sidecar. A conversation the store knows restores the
+/// picks its row holds, whatever a stale cache still says — one authority,
+/// with the cache as a fallback and never a competing answer.
+#[test]
+fn the_conversations_row_beats_the_sidecar() {
+    let replayed = crate::replay::ReplayedThreadState::default();
+    let meta = manox_harness::session_meta::SessionMeta {
+        approval_mode: Some("danger-full-access".into()),
+        reasoning_effort: Some("max".into()),
+        ..Default::default()
+    };
+    let merged = merge_restored_state(&replayed, &meta, &Picks);
+    assert_eq!(merged.permission_mode, PermissionMode::ReadOnly);
+    assert_eq!(merged.reasoning_effort, ReasoningEffort::High);
+}
+
 /// A cleared plan (the empty `plan_update` snapshot the facade
 /// persists on clear) normalizes to the sidecar's absence semantics —
 /// the rebuild must not resurrect an empty plan rail.
@@ -4307,7 +4245,7 @@ fn cleared_plan_snapshot_normalizes_to_absence() {
         ..Default::default()
     };
     let meta = manox_harness::session_meta::SessionMeta::default();
-    let merged = merge_restored_state(&replayed, &meta);
+    let merged = merge_restored_state(&replayed, &meta, &NoPicks);
     assert_eq!(merged.plan_snapshot, None);
 }
 
@@ -4472,12 +4410,13 @@ async fn project_binding_journals_project_change_entry() {
     session.close().await.unwrap();
 }
 
-/// K3 (L3) regression: the permission-mode decision emits the notice
-/// whose tap mapping journals `permission_mode_change` — pre-fix the
-/// choice landed in the gate and the sidecar only, so the chain never
-/// carried the user's mode toggle.
+/// K3 (L3): the permission-mode decision settles the gate and notifies the
+/// UI, and writes nothing durable. The conversation's object row is the
+/// mode's home — written by whoever made the pick, read live by the gate per
+/// tool call — so a second copy in the chain or the sidecar would only give
+/// "which one is in force" a second answer.
 #[tokio::test]
-async fn permission_mode_decision_journals_through_the_tap() {
+async fn permission_mode_decision_settles_the_gate_and_journals_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("sessions");
     let session = decision_rig_session(&dir).await;
@@ -4497,12 +4436,13 @@ async fn permission_mode_decision_journals_through_the_tap() {
     let meta = manox_harness::session_meta::load(&sessions, session.path())
         .await
         .unwrap();
-    assert_eq!(meta.approval_mode.as_deref(), Some("read-only"));
+    assert_eq!(
+        meta.approval_mode, None,
+        "the sidecar copy retired with the journal row"
+    );
 
-    // The decision notifies, and the tap's mapping of that notice is
-    // the journal row (the same `durable_journal_payload` face the
-    // spawn_engine tap runs). Bounded: a missing emission must fail
-    // the test, not hang it.
+    // The decision still notifies — that is how the UI learns the switch.
+    // Bounded: a missing emission must fail the test, not hang it.
     let notice = tokio::time::timeout(std::time::Duration::from_secs(5), notice_rx.recv())
         .await
         .unwrap_or_else(|_| panic!("the mode decision must reach the notice face"))
@@ -4514,22 +4454,9 @@ async fn permission_mode_decision_journals_through_the_tap() {
         panic!("expected PermissionModeChanged");
     };
     assert_eq!(mode, PermissionMode::ReadOnly);
-    let (kind, payload) = durable_journal_payload(&ThreadEvent::PermissionModeChanged { mode })
-        .expect("the tap maps the decision to a typed row");
-    assert_eq!(kind, "permission_mode_change");
-    session
-        .journal_appender()
-        .append_typed(&kind, payload)
-        .await
-        .unwrap();
-    let rows = session.journal_range(0, u64::MAX).await.unwrap();
     assert!(
-        rows.iter().any(|record| matches!(
-            &record.entry,
-            manox_harness::session::SessionTreeEntry::PermissionModeChange { mode, .. }
-                if mode == "read-only"
-        )),
-        "the decision must land a permission_mode_change entry"
+        durable_journal_payload(&ThreadEvent::PermissionModeChanged { mode }).is_none(),
+        "the mode decision must not map to a journal row"
     );
     session.close().await.unwrap();
 }

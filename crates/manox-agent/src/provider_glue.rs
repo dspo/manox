@@ -166,14 +166,22 @@ pub async fn wait_ready() {
 /// snapshot for life, so a later `reload` only affects threads spawned
 /// afterwards (same semantics as the manox registry).
 pub fn global() -> Arc<ProviderRegistry> {
+    try_global().expect("provider registry not initialized; call manox_agent::init first")
+}
+
+/// [`global`] without the panic. A reader that merely wants to *resolve* a
+/// pick — the conversation's model, say — must degrade to "no pick" before
+/// initialization rather than take the engine down with it.
+pub fn try_global() -> Option<Arc<ProviderRegistry>> {
     // A poisoned lock (a panic mid-swap) should degrade to the last good
     // snapshot, not cascade into every model-listing view.
-    REGISTRY
-        .get()
-        .expect("provider registry not initialized; call manox_agent::init first")
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    Some(
+        REGISTRY
+            .get()?
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+    )
 }
 
 /// Post-swap reload listener (single slot, last registration wins): the
