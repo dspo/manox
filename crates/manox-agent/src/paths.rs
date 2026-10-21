@@ -68,19 +68,47 @@ pub fn core_root() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("core"))
 }
 
+/// The bucket a conversation's journal is sharded into: its project's path,
+/// or the single bucket every conversation with no project shares.
+///
+/// The bucket is a storage locality key, fixed when the session directory is
+/// first created and never moved — belonging can change (attach, detach)
+/// without the journal changing shard, which is what keeps a folder move from
+/// stranding a conversation's history.
+///
+/// A conversation with no project is a *special project*, not an absence: it
+/// has the same shape as any other (one row, an id, a folder in the sidebar),
+/// and differs only in its initial-cwd policy. Its bucket is the fixed
+/// [`UNFILED`] name rather than a slug of that policy's directory — the
+/// directory is a working detail that must not scatter one conversation's
+/// history across a bucket per temporary path.
+pub fn conversation_bucket(project: Option<&std::path::Path>) -> String {
+    match project {
+        Some(path) => manox_harness::session::identity::project_slug(&path.to_string_lossy()),
+        None => manox_harness::session::identity::project_slug(UNFILED),
+    }
+}
+
+/// The bucket name the project-less special project owns.
+pub const UNFILED: &str = "unfiled";
+
+/// The initial working directory a conversation with no project runs in,
+/// created on demand — a conversation that is never spoken to leaves nothing
+/// behind. Derived from the conversation id, so a reopen reuses the same
+/// directory instead of minting a sibling.
+pub fn unfiled_workspace(id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("steer-{id}"))
+}
+
 /// One session's directory under the core root (created lazily by the
 /// engine's first append — a session that never runs leaves nothing).
-pub fn core_session_dir(cwd: &std::path::Path, id: &str) -> Result<PathBuf> {
-    Ok(core_root()?
-        .join(manox_harness::session::identity::project_slug(
-            &cwd.to_string_lossy(),
-        ))
-        .join(id))
+pub fn core_session_dir(project: Option<&std::path::Path>, id: &str) -> Result<PathBuf> {
+    Ok(core_root()?.join(conversation_bucket(project)).join(id))
 }
 
 /// The engine journal file inside a session's core directory.
-pub fn core_session_file(cwd: &std::path::Path, id: &str) -> Result<PathBuf> {
-    Ok(core_session_dir(cwd, id)?.join(manox_harness::session::identity::JOURNAL_FILE))
+pub fn core_session_file(project: Option<&std::path::Path>, id: &str) -> Result<PathBuf> {
+    Ok(core_session_dir(project, id)?.join(manox_harness::session::identity::JOURNAL_FILE))
 }
 
 /// `(dir, exact-file)` for a session's core location: the per-session
@@ -88,8 +116,11 @@ pub fn core_session_file(cwd: &std::path::Path, id: &str) -> Result<PathBuf> {
 /// journal file the builder pins. `Err` only when the config dir is
 /// unresolvable — callers fall back to the legacy flat shape rather than
 /// refusing to spawn.
-pub fn core_session_parts(cwd: &std::path::Path, id: &str) -> Result<(PathBuf, Option<PathBuf>)> {
-    let dir = core_session_dir(cwd, id)?;
+pub fn core_session_parts(
+    project: Option<&std::path::Path>,
+    id: &str,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    let dir = core_session_dir(project, id)?;
     let file = dir.join(manox_harness::session::identity::JOURNAL_FILE);
     Ok((dir, Some(file)))
 }
@@ -251,5 +282,53 @@ pub(crate) mod tests {
         let skills = skills_dir().unwrap();
         unsafe { std::env::remove_var("MANOX_CLAUDE_HOME") };
         assert_eq!(skills, claude.path().join("skills"));
+    }
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::*;
+
+    /// A conversation with no project is the special project: it shards into
+    /// one fixed bucket, never one per working directory. A conversation that
+    /// is never spoken to has no directory at all, so the bucket has to be
+    /// answerable before any turn has run.
+    #[test]
+    fn a_conversation_without_a_project_shards_into_one_bucket() {
+        assert_eq!(conversation_bucket(None), "--unfiled--");
+        assert_eq!(
+            conversation_bucket(None),
+            conversation_bucket(None),
+            "the unfiled bucket is a constant, not a per-conversation path"
+        );
+    }
+
+    /// A project-bound conversation shards by its project, not by any working
+    /// directory it happens to run in: belonging and cwd are disjoint.
+    #[test]
+    fn a_project_bound_conversation_shards_by_its_project() {
+        assert_eq!(
+            conversation_bucket(Some(std::path::Path::new("/p/proj"))),
+            "--p-proj--"
+        );
+        assert_ne!(
+            conversation_bucket(Some(std::path::Path::new("/p/proj"))),
+            conversation_bucket(None)
+        );
+    }
+
+    /// The initial working directory of a project-less conversation is
+    /// derived from the conversation id, so a reopen reuses the same one
+    /// instead of minting a sibling — and computing it creates nothing.
+    #[test]
+    fn the_unfiled_workspace_is_derived_and_lazy() {
+        let dir = unfiled_workspace("abc-123");
+        assert_eq!(dir, unfiled_workspace("abc-123"));
+        assert_ne!(dir, unfiled_workspace("other"));
+        assert!(
+            dir.to_string_lossy().ends_with("steer-abc-123"),
+            "named after the conversation: {dir:?}"
+        );
+        assert!(!dir.exists(), "computing the path must not create it");
     }
 }

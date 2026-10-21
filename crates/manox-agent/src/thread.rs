@@ -850,8 +850,8 @@ impl Thread {
         // gate input and render the streaming preview.
         let loading = initial_path.is_some();
         let model = crate::provider_glue::default_model();
-        let (sessions_dir, session_file) = crate::paths::core_session_parts(&cwd, &id.0)
-            .unwrap_or_else(|_| {
+        let (sessions_dir, session_file) =
+            crate::paths::core_session_parts(project.as_deref(), &id.0).unwrap_or_else(|_| {
                 (
                     crate::paths::manox_config_dir()
                         .unwrap_or_else(|_| PathBuf::from("."))
@@ -949,8 +949,8 @@ impl Thread {
         // The v1.0.0 core layout: one directory per session under its
         // project bucket, the journal (`log.v1.jsonl`) inside. The legacy
         // flat `sessions/` tree is never written again.
-        let (sessions_dir, session_file) = crate::paths::core_session_parts(&cwd, &self.id.0)
-            .unwrap_or_else(|_| {
+        let (sessions_dir, session_file) =
+            crate::paths::core_session_parts(project.as_deref(), &self.id.0).unwrap_or_else(|_| {
                 (
                     crate::paths::manox_config_dir()
                         .unwrap_or_else(|_| PathBuf::from("."))
@@ -1835,8 +1835,9 @@ impl Thread {
         let model = self.model.clone();
         let permission_mode = self.permission_mode;
         let reasoning_effort = self.reasoning_effort;
-        let (sessions_dir, session_file) = crate::paths::core_session_parts(&cwd, &id.0)
-            .unwrap_or_else(|_| {
+        // A member works in its leader's project, so it shards there.
+        let (sessions_dir, session_file) =
+            crate::paths::core_session_parts(self.project.as_deref(), &id.0).unwrap_or_else(|_| {
                 (
                     crate::paths::manox_config_dir()
                         .unwrap_or_else(|_| PathBuf::from("."))

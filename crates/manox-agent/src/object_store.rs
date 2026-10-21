@@ -286,6 +286,25 @@ impl ObjectStore {
         })
     }
 
+    /// The project a conversation belongs to, as its path.
+    ///
+    /// This is the one place belonging is resolved: every reader that needs
+    /// "which project is this conversation in" — the journal's shard key, the
+    /// sidebar's grouping — asks here rather than deriving it from a working
+    /// directory, which is what keeps a tool moving a worktree from
+    /// regrouping a conversation.
+    ///
+    /// `None` means the conversation has no project — the special project:
+    /// the same shape as any other (one row, an id, a folder), differing only
+    /// in the initial working directory its first materialization gets. An
+    /// unknown conversation also answers `None`, and deliberately so: both
+    /// shard into the unfiled bucket, so no caller can tell them apart by
+    /// accident.
+    pub fn project_of(&self, id: &str) -> Option<String> {
+        let row = self.conversation(id)?;
+        self.project_path(row.project_id.as_deref()?)
+    }
+
     /// The path of a project id, when it exists.
     pub fn project_path(&self, id: &str) -> Option<String> {
         with(|conn| {
@@ -860,6 +879,31 @@ mod tests {
         let row = store.conversation("attached").expect("attach materialized");
         assert!(row.project_id.is_some());
         assert_eq!(row.config_version, 1);
+    }
+
+    /// Belonging is resolved in one place, and the special project is one of
+    /// its answers rather than a hole: a project-less conversation, an
+    /// unknown one, and a detached one all read the same way. The journal's
+    /// shard key and the sidebar's grouping both ask here, so the two cannot
+    /// disagree about which folder a conversation is in.
+    #[test]
+    fn belonging_resolves_through_one_entry_point() {
+        let (_dir, _lock) = scratch();
+        let store = ObjectStore;
+        let sid = "c-1";
+        store.create_conversation(sid, Some("/p/proj"));
+        assert_eq!(store.project_of(sid).as_deref(), Some("/p/proj"));
+
+        // The round trip the sidebar's group-by rides: detach returns the
+        // conversation to the special project, attach puts it back.
+        store.detach(sid);
+        assert_eq!(store.project_of(sid), None, "detached reads as no project");
+        store.attach(sid, "/p/other");
+        assert_eq!(store.project_of(sid).as_deref(), Some("/p/other"));
+
+        // A conversation the store has never seen answers the same as a
+        // project-less one, deliberately: both shard into the unfiled bucket.
+        assert_eq!(store.project_of("never-seen"), None);
     }
 
     /// The engine's change-notice watermark contract: config writes bump

@@ -919,6 +919,16 @@ pub(crate) async fn open_session(
 ///
 /// Shared by the runtime intents that refuse with `session/notFound`, so the
 /// code a client matches on does not depend on which intent refused.
+/// The project a conversation belongs to, as its path, resolved through the
+/// object store — the one place belonging lives. `None` covers both "no
+/// project" (the special project) and "no row yet"; both shard into the
+/// unfiled bucket, so the journal's shard key never has to tell them apart.
+fn object_project_of(session_id: &str) -> Option<PathBuf> {
+    manox_agent::object_store::ObjectStore::try_global()
+        .and_then(|store| store.project_of(session_id))
+        .map(PathBuf::from)
+}
+
 fn unknown_session(session_id: &str) -> manox_ahp_runtime::error::RuntimeError {
     manox_ahp_runtime::error::RuntimeError::new(format!("unknown session: {session_id}"))
         .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)
@@ -1104,11 +1114,11 @@ pub(crate) async fn fork_session(
     // Materialize the fork file immediately (never deferred — a non-empty
     // prefix must be visible to `list` and loadable cold).
     let session_id = target_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let target_cwd = cwd
-        .as_deref()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| inner.cwd.clone());
-    let Some(target_path) = manox_ahp_runtime::paths::session_file_under(&session_id, &target_cwd)
+    // A fork shares the source's project, so it shards where the source
+    // does; the new id has no row of its own yet to ask.
+    let fork_project = object_project_of(&source_session_id);
+    let Some(target_path) =
+        manox_ahp_runtime::paths::session_file_under(&session_id, fork_project.as_deref())
     else {
         return Err(manox_ahp_runtime::error::RuntimeError::new(
             "minted fork id failed the path gate",
@@ -1432,7 +1442,10 @@ impl AgentServerInner {
                 .map(PathBuf::from)
                 .or_else(|| intent.project.clone().map(PathBuf::from))
                 .unwrap_or_else(|| inner.cwd.clone());
-            let Some(path) = manox_ahp_runtime::paths::session_file_under(&session_id, &cwd) else {
+            let project = object_project_of(&session_id);
+            let Some(path) =
+                manox_ahp_runtime::paths::session_file_under(&session_id, project.as_deref())
+            else {
                 return Err(manox_ahp_runtime::error::RuntimeError::new(
                     "minted session id failed the path gate",
                 )
@@ -1550,7 +1563,10 @@ impl AgentServerInner {
         // (the journal materializes lazily at the first turn) so the
         // sidecar write is addressable.
         if !intent.working_directories.is_empty()
-            && let Some(path) = manox_ahp_runtime::paths::session_file_under(&session_id, &cwd)
+            && let Some(path) = manox_ahp_runtime::paths::session_file_under(
+                &session_id,
+                object_project_of(&session_id).as_deref(),
+            )
         {
             let dirs = intent.working_directories.clone();
             manox_agent::thread_store::global().with_mut(|s| {

@@ -6,15 +6,22 @@
 
 use std::path::PathBuf;
 
-/// The file a NEW session under `cwd` will write (the core layout), after a
-/// walk for an already-materialized journal — create flows resolve "the
-/// path it will write" through this, never the bare walk.
-pub fn session_file_under(session_id: &str, cwd: &std::path::Path) -> Option<PathBuf> {
+/// The file a NEW session will write (the core layout), after a walk for an
+/// already-materialized journal — create flows resolve "the path it will
+/// write" through this, never the bare walk.
+///
+/// The shard comes from the conversation's *project*, not from a working
+/// directory: belonging and cwd are disjoint, so a tool moving the workspace
+/// must not move the journal, and a conversation with no project shards into
+/// the one unfiled bucket rather than scattering by whatever temporary
+/// directory its first turn happens to run in. Callers resolve the project
+/// from the object row — for a fork, from the row of the session it copies.
+pub fn session_file_under(session_id: &str, project: Option<&std::path::Path>) -> Option<PathBuf> {
     if let Some(found) = persisted_session_file(session_id) {
         return Some(found);
     }
     Some(
-        manox_agent::paths::core_session_file(cwd, session_id).unwrap_or_else(|_| {
+        manox_agent::paths::core_session_file(project, session_id).unwrap_or_else(|_| {
             manox_agent::paths::core_root()
                 .unwrap_or_default()
                 .join(session_id)
