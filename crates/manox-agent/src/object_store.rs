@@ -342,23 +342,38 @@ impl ObjectStore {
     /// One configuration write: the field assignments plus the automatic
     /// config-version bump and updated_at. Placeholders bind positionally —
     /// fields first, then the timestamp, then the conversation id.
+    ///
+    /// The row is materialized first when the store has never seen the id.
+    /// A conversation id is minted by the client, and its row is the
+    /// object's birth — no journal and no session directory exist until the
+    /// user speaks — so a write that arrives ahead of any create still
+    /// addresses a real object. Refusing it would either abort the caller
+    /// or drop the pick silently, depending on the build profile.
     fn bump(conn: &Connection, id: &str, assignments: &str, fields: &[&dyn rusqlite::ToSql]) {
         let at = now();
+        let materialized = conn
+            .execute(
+                "INSERT OR IGNORE INTO conversations (id, created_at, updated_at) \
+                 VALUES (?1, ?2, ?2)",
+                params![id, at],
+            )
+            .expect("conversation ensure");
+        if materialized > 0 {
+            tracing::debug!(conversation = id, "config write materialized the row");
+        }
         let mut params: Vec<&dyn rusqlite::ToSql> = fields.to_vec();
         params.push(&at);
         params.push(&id);
-        let changed = conn
-            .execute(
-                &format!(
-                    "UPDATE conversations SET {assignments}, config_version = config_version + 1, \
-                     updated_at = ?{n} WHERE id = ?{k}",
-                    n = params.len() - 1,
-                    k = params.len()
-                ),
-                rusqlite::params_from_iter(params),
-            )
-            .expect("conversation update");
-        debug_assert!(changed > 0, "config write on an unknown conversation {id}");
+        conn.execute(
+            &format!(
+                "UPDATE conversations SET {assignments}, config_version = config_version + 1, \
+                 updated_at = ?{n} WHERE id = ?{k}",
+                n = params.len() - 1,
+                k = params.len()
+            ),
+            rusqlite::params_from_iter(params),
+        )
+        .expect("conversation update");
     }
 
     /// Attach a conversation to a project (registering the path first).
@@ -819,6 +834,32 @@ mod tests {
                 .last_human_message_at
                 .is_none()
         );
+    }
+
+    /// A config write addressed at a conversation the store has never seen
+    /// materializes its row: the client mints the id and may land a pick
+    /// before (or instead of) its explicit create — the row is the object's
+    /// birth, and nothing may abort or vanish over the ordering.
+    #[test]
+    fn a_config_write_materializes_an_unknown_conversation() {
+        let (_dir, _lock) = scratch();
+        let store = ObjectStore;
+        assert!(store.conversation("fresh").is_none());
+
+        store.set_permission_mode("fresh", Some("read-only"));
+        let row = store
+            .conversation("fresh")
+            .expect("the pick materialized the row");
+        assert_eq!(row.permission_mode.as_deref(), Some("read-only"));
+        assert_eq!(row.config_version, 1);
+        assert!(row.project_id.is_none(), "materialized project-less");
+        assert!(row.last_human_message_at.is_none(), "still a draft");
+
+        // Attaching an unseen conversation lands its belonging the same way.
+        store.attach("attached", "/p/proj");
+        let row = store.conversation("attached").expect("attach materialized");
+        assert!(row.project_id.is_some());
+        assert_eq!(row.config_version, 1);
     }
 
     /// The engine's change-notice watermark contract: config writes bump
