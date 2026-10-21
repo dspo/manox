@@ -379,20 +379,14 @@ impl AgentSession {
             .filter(|l| l != "off");
         let wire = effective.clone().unwrap_or_else(|| "off".into());
 
-        // Order: update agent (append model_change + in-memory), then append
-        // the thinking entry. The session JSONL is authoritative on reopen.
+        // Update the agent (in-memory), then remember the preference. Neither
+        // half is persisted here: the conversation's configuration is the
+        // pick's durable home.
         self.harness.set_model(model.clone()).await?;
-        // Persist only when the effective level actually changes; the entry
-        // write is synchronous and throws on failure — propagate it so the
-        // caller knows the state did not land.
-        if effective != current_level {
-            self.harness
-                .session()
-                .append_thinking_level_change(&wire)
-                .await?;
-            if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
-                self.thinking_preference = Some(wire.clone());
-            }
+        if effective != current_level
+            && (model.thinking != crate::types::ThinkingKind::None || wire != "off")
+        {
+            self.thinking_preference = Some(wire.clone());
         }
         self.harness.set_initial_thinking_level(effective);
         Ok(())
@@ -403,12 +397,12 @@ impl AgentSession {
         self.harness.agent().state().thinking_level.clone()
     }
 
-    /// Set the reasoning tier (persisted via the session's thinking entry).
-    /// `None` reads as `"off"` (the facade's contract, mirrored by the
-    /// harness); the effective level is clamped against the current model and
-    /// persisted only when it changes. Subagent sessions apply their pinned
-    /// effort through the same path — the facade touches nothing outside the
-    /// session's own JSONL.
+    /// Set the reasoning tier. `None` reads as `"off"` (the facade's
+    /// contract, mirrored by the harness); the effective level is clamped
+    /// against the current model. The pick's durable home is the
+    /// conversation's configuration, so this touches the running session
+    /// only — subagent sessions apply their pinned effort through the same
+    /// path.
     pub async fn set_thinking_level(&mut self, level: Option<String>) -> Result<(), anyhow::Error> {
         let model = self.harness.model().clone();
         let levels = self.runtime.thinking_levels(&model);
@@ -417,14 +411,10 @@ impl AgentSession {
                 .filter(|l| l != "off");
         let wire = effective.clone().unwrap_or_else(|| "off".into());
         let previous = self.harness.agent().state().thinking_level.clone();
-        if effective != previous {
-            self.harness
-                .session()
-                .append_thinking_level_change(&wire)
-                .await?;
-            if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
-                self.thinking_preference = Some(wire.clone());
-            }
+        if effective != previous
+            && (model.thinking != crate::types::ThinkingKind::None || wire != "off")
+        {
+            self.thinking_preference = Some(wire.clone());
         }
         self.harness.set_initial_thinking_level(effective);
         Ok(())
@@ -1111,28 +1101,16 @@ impl AgentSessionBuilder {
         // thinking clamp needs it after restore.
         let model_key = (model.provider.clone(), model.id.clone(), model.thinking);
 
-        // A new session persists its initial model and thinking entries; they
-        // buffer in the deferred storage until the first assistant message
-        // materializes the file, so a close/reopen or a pre-first-message
-        // fork projects the same configuration.
+        // A new session writes no configuration rows: the model and the
+        // thinking level are the caller's intent for this build, and their
+        // durable home is the conversation's configuration — read back by the
+        // host, never mirrored into the transcript. A reopened session still
+        // reads whatever entries its own transcript carries (a pre-store
+        // journal), which is the tolerated legacy read.
         let has_thinking_entry = if restore {
             session.build_session_context().await?.has_thinking_entry
         } else {
-            let _ = session
-                .append_model_change(&model.provider, &model.id)
-                .await?;
-            let _ = session
-                .append_thinking_level_change(
-                    clamp_thinking(
-                        &model,
-                        &runtime.thinking_levels(&model),
-                        self.default_thinking_level.clone(),
-                    )
-                    .unwrap_or_else(|| "off".into())
-                    .as_str(),
-                )
-                .await?;
-            true
+            false
         };
 
         let stream_fn = runtime.resolver()(&model)?;
@@ -1985,7 +1963,7 @@ mod tests {
     /// A model id can be served by either protocol; an injected catalog
     /// pins it, and a session switched to it reopens on the same protocol.
     #[tokio::test]
-    async fn reopen_keeps_model_on_its_original_api_via_catalog() {
+    async fn a_legacy_model_row_resolves_on_its_original_api_via_catalog() {
         use crate::coding_agent::model_runtime::ModelCatalog;
 
         struct PinApi(&'static str);
@@ -2032,14 +2010,19 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            // Prompt first, then switch: the model_change entry is the last
-            // model-bearing entry on the path, so the reopen projects it.
+            // Prompt first, then plant the row a pre-store transcript would
+            // carry: it is the last model-bearing entry on the path.
             session.prompt("hi").await.unwrap();
-            session.set_model(model.clone()).await.unwrap();
+            session
+                .harness
+                .session()
+                .append_model_change(&model.provider, &model.id)
+                .await
+                .unwrap();
             let path = session.close().await.unwrap();
 
-            // Reopen with the same catalog: the session model restores on
-            // the exact api, not a heuristic.
+            // Reopen with the same catalog: the legacy row resolves on the
+            // exact api the catalog names, not a heuristic.
             let resumed = create_agent_session()
                 .with_model_runtime(runtime(api))
                 .open(path)
@@ -2213,7 +2196,7 @@ mod tests {
     /// A catalog miss on reopen falls back to the initial model with an
     /// observable notice.
     #[tokio::test]
-    async fn catalog_miss_falls_back_with_notice() {
+    async fn a_legacy_model_row_that_misses_the_catalog_falls_back_with_notice() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
@@ -2226,13 +2209,15 @@ mod tests {
             .await
             .unwrap();
         session.prompt("hi").await.unwrap();
-        // Switch to a model the catalog cannot resolve (unknown provider).
-        let unknown = Model {
-            provider: "other".into(),
-            id: "unknown-model".into(),
-            ..test_model()
-        };
-        session.set_model(unknown).await.unwrap();
+        // A pre-store transcript that still carries its own model row: the
+        // tolerated legacy read, and the only way a reopen can now be asked
+        // to resolve a model the catalog cannot serve.
+        session
+            .harness
+            .session()
+            .append_model_change("other", "unknown-model")
+            .await
+            .unwrap();
         let path = session.close().await.unwrap();
 
         let resumed = create_agent_session()
@@ -2436,10 +2421,11 @@ mod tests {
     }
 
     /// set_model re-clamps thinking: thinking high -> non-thinking becomes
-    /// off (in-memory AND persisted); non-thinking -> thinking restores the
-    /// configured default.
+    /// off; non-thinking -> thinking restores the configured default. Both
+    /// live in the running session — the pick's durable home is the
+    /// conversation's configuration, not the transcript.
     #[tokio::test]
-    async fn set_model_reclamps_thinking_and_persists() {
+    async fn set_model_reclamps_thinking() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
@@ -2488,7 +2474,7 @@ mod tests {
             Some("high"),
             "non-thinking -> thinking restores the configured default"
         );
-        // The persisted entries reflect the clamps.
+        // Nothing about the pick reached the transcript.
         let entries = session
             .harness
             .session()
@@ -2496,20 +2482,11 @@ mod tests {
             .get_entries(Default::default())
             .await
             .unwrap();
-        let levels: Vec<String> = entries
-            .iter()
-            .filter_map(|e| match e {
-                SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => {
-                    Some(thinking_level.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        assert!(levels.iter().any(|l| l == "off"), "{levels:?}");
-        assert_eq!(
-            levels.last().map(String::as_str),
-            Some("high"),
-            "{levels:?}"
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. })),
+            "a thinking-level change must not be journaled: {entries:?}"
         );
     }
 
@@ -2563,7 +2540,7 @@ mod tests {
     /// high -> high model switch writes no extra entry; the preference
     /// survives a non-thinking round trip and a fork.
     #[tokio::test]
-    async fn thinking_entries_are_deduplicated_and_preference_survives() {
+    async fn the_thinking_preference_survives_a_model_switch() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         let session_dir = dir.path().join("sessions");
@@ -2585,7 +2562,7 @@ mod tests {
             .await
             .unwrap();
 
-        // A high -> high model switch changes nothing: no extra entry.
+        // A high -> high model switch changes nothing.
         let another_thinking = Model {
             thinking: crate::types::ThinkingKind::Enabled,
             id: "thinking-b".into(),
@@ -2596,23 +2573,17 @@ mod tests {
             session.harness.agent().state().thinking_level.as_deref(),
             Some("high")
         );
-        async fn thinking_entry_count(s: &AgentSession) -> usize {
-            s.harness
+        assert!(
+            !session
+                .harness
                 .session()
                 .storage()
                 .get_entries(Default::default())
                 .await
                 .unwrap()
                 .iter()
-                .filter(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. }))
-                .count()
-        }
-        // Assembly persisted the initial medium entry; the explicit high is
-        // the second. A high -> high model switch must not add a third.
-        assert_eq!(
-            thinking_entry_count(&session).await,
-            2,
-            "initial medium + explicit high; high -> high adds nothing"
+                .any(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. })),
+            "no thinking entry is written at all"
         );
 
         // Non-thinking round trip keeps the high preference: switching back
@@ -2766,53 +2737,6 @@ mod tests {
     /// in-memory tier is not updated (no divergence between runtime and
     /// persisted state).
     #[cfg(unix)]
-    #[tokio::test]
-    async fn thinking_append_failure_propagates_and_leaves_state_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        let session_dir = dir.path().join("sessions");
-        tokio::fs::create_dir_all(&cwd).await.unwrap();
-        let mut session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(&session_dir)
-            .with_model_runtime(fake_runtime())
-            .with_model(Model {
-                thinking: crate::types::ThinkingKind::Enabled,
-                ..test_model()
-            })
-            .build()
-            .await
-            .unwrap();
-        // Materialize the session file so append writes to it directly.
-        let _ = session.prompt("seed").await.unwrap();
-        let before = session.harness.agent().state().thinking_level.clone();
-        // Make the session file read-only so the append write fails.
-        use std::os::unix::fs::PermissionsExt as _;
-        let path = session.harness.session().storage().path().to_path_buf();
-        let original_mode = tokio::fs::metadata(&path)
-            .await
-            .unwrap()
-            .permissions()
-            .mode();
-        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
-            .await
-            .unwrap();
-        let result = session.set_thinking_level(Some("high".into())).await;
-        // Restore writability for teardown.
-        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(original_mode))
-            .await
-            .unwrap();
-        assert!(
-            result.is_err(),
-            "append failure must propagate, got {result:?}"
-        );
-        assert_eq!(
-            session.harness.agent().state().thinking_level,
-            before,
-            "in-memory tier unchanged on append failure"
-        );
-    }
-
     #[tokio::test]
     async fn custom_catalog_restricts_thinking_levels() {
         let dir = tempfile::tempdir().unwrap();

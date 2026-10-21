@@ -1577,14 +1577,13 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
         "switched-turn usage must enter the per-model stats: {:?}",
         stats.per_model
     );
-    // The switch persisted as exactly one model_change entry, so a reload
-    // attributes the same history the same way.
+    // The switch wrote no transcript rows: the conversation's configuration
+    // owns the pick, and a reopen reads it there.
     let jsonl = tokio::fs::read_to_string(session.path()).await.unwrap();
     assert_eq!(
-        jsonl.matches("\"modelId\":\"new\"").count(),
-        1,
-        "the mid-run switch must persist one model_change entry for the new model, even \
-             when the same model is picked twice: {jsonl}"
+        jsonl.matches("\"type\":\"model_change\"").count(),
+        0,
+        "the mid-run switch must not be journaled: {jsonl}"
     );
 }
 
@@ -5019,7 +5018,7 @@ async fn session_model_changes(session: &AgentSession) -> Vec<String> {
 /// bug broke (an accepted echo with no journal row meant every reopen
 /// snapped back to the old model).
 #[tokio::test]
-async fn an_idle_set_model_appends_its_journal_row() {
+async fn an_idle_set_model_lands_without_journaling() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().join("proj");
     tokio::fs::create_dir_all(&cwd).await.unwrap();
@@ -5052,19 +5051,18 @@ async fn an_idle_set_model_appends_its_journal_row() {
         state.model.lock().unwrap().as_ref().map(|m| m.id.clone()),
         Some("new".to_string())
     );
-    let landed = session_model_changes(&session).await;
-    assert_eq!(
-        landed.last().map(String::as_str),
-        Some("new"),
-        "the durable half landed with the echo (chain view, deferred file and all)"
+    assert!(
+        session_model_changes(&session).await.is_empty(),
+        "the pick's durable home is the conversation's configuration, not the \
+         transcript"
     );
 }
 
-/// The idle `SetModel` landing's fallback: when the durable path refuses
-/// (here: the session's resolver cannot serve the pick), the queueing
-/// semantics of the mid-run arm take over — the mirrors land, effective at
-/// the next request boundary, journaled by that boundary's flush — instead
-/// of the switch dying after the dispatch was already echoed as accepted.
+/// The idle `SetModel` landing's fallback: when the session refuses the
+/// switch (here: its resolver cannot serve the pick), the queueing semantics
+/// of the mid-run arm take over — the mirrors land, effective at the next
+/// request boundary — instead of the switch dying after the dispatch was
+/// already echoed as accepted.
 #[tokio::test]
 async fn an_idle_set_model_refused_by_the_durable_path_lands_via_the_queue() {
     let dir = tempfile::tempdir().unwrap();
@@ -5111,14 +5109,8 @@ async fn an_idle_set_model_refused_by_the_durable_path_lands_via_the_queue() {
         state.model.lock().unwrap().as_ref().map(|m| m.id.clone()),
         Some("new".to_string())
     );
-    let landed = session_model_changes(&session).await;
     assert!(
-        !landed.iter().any(|id| id == "new"),
-        "the queued switch journals at the next boundary flush, not now: {landed:?}"
-    );
-    assert_eq!(
-        landed.last().map(String::as_str),
-        Some("test"),
-        "the construction model's initial row is untouched"
+        session_model_changes(&session).await.is_empty(),
+        "a model switch writes no transcript rows at all"
     );
 }

@@ -214,12 +214,16 @@ struct HarnessControl {
 
 /// A runtime mutation queued mid-run; applied to the shared snapshot
 /// immediately and persisted by the harness once the run settles.
+///
+/// Model and thinking-level changes are not here: their durable home is the
+/// conversation's configuration — the host's object store — so the harness
+/// holds no copy to write and nothing to defer.
 #[derive(Clone)]
 enum PendingMutation {
-    Model(Model),
-    ThinkingLevel(Option<String>),
     ActiveTools(Vec<String>),
-    Message(AgentMessage),
+    /// Boxed: a queued message is an order of magnitude larger than any
+    /// other entry, and the queue holds them by value.
+    Message(Box<AgentMessage>),
 }
 
 /// Events a harness emits outside the agent run. Listeners are sync
@@ -467,11 +471,6 @@ impl HarnessHandle {
         self.control.emit_harness(HarnessEvent::ModelUpdate {
             model: model.clone(),
         });
-        self.control
-            .pending_mutations
-            .lock()
-            .unwrap()
-            .push(PendingMutation::Model(model));
         true
     }
 
@@ -483,11 +482,6 @@ impl HarnessHandle {
             .emit_harness(HarnessEvent::ThinkingLevelUpdate {
                 level: level.clone(),
             });
-        self.control
-            .pending_mutations
-            .lock()
-            .unwrap()
-            .push(PendingMutation::ThinkingLevel(level));
     }
 
     /// Queue an active-tools change for the next turn boundary of the
@@ -569,7 +563,7 @@ impl HarnessHandle {
             .pending_mutations
             .lock()
             .unwrap()
-            .push(PendingMutation::Message(message));
+            .push(PendingMutation::Message(Box::new(message)));
     }
 }
 
@@ -1726,7 +1720,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 .pending_mutations
                 .lock()
                 .unwrap()
-                .push(PendingMutation::Message(message));
+                .push(PendingMutation::Message(Box::new(message)));
         }
         Ok(())
     }
@@ -1785,8 +1779,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.active_tool_names.as_deref()
     }
 
-    /// Switch the model the next turn runs against, persisting a
-    /// `model_change` entry so a later restore projects the same choice.
+    /// Switch the model the next turn runs against. The choice's durable
+    /// home is the conversation's configuration (the host's object store),
+    /// which the host reads back through `ConversationConfigSource` — the
+    /// transcript carries no configuration of its own, so a reopen asks the
+    /// conversation rather than folding rows back out of its history.
     pub async fn set_model(&mut self, model: Model) -> Result<(), anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!(
@@ -1808,9 +1805,6 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 self.stream_fn.api()
             );
         }
-        self.session
-            .append_model_change(&model.provider, &model.id)
-            .await?;
         self.control.turn_runtime.lock().unwrap().model = model.clone();
         self.agent.set_model(model.clone());
         self.model = model;
@@ -1847,9 +1841,9 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         Ok(())
     }
 
-    /// Set the reasoning tier for following turns, persisting a
-    /// `thinking_level_change` entry so a later restore projects it. `None`
-    /// reads as `"off"` on the session path. Mid-run changes go through
+    /// Set the reasoning tier for following turns. Like the model pick, the
+    /// durable home is the conversation's configuration. `None` reads as
+    /// `"off"` on the session path. Mid-run changes go through
     /// [`HarnessHandle::set_thinking_level`] instead.
     pub async fn set_thinking_level(
         &mut self,
@@ -1861,9 +1855,6 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 self.phase
             );
         }
-        self.session
-            .append_thinking_level_change(thinking_level.as_deref().unwrap_or("off"))
-            .await?;
         self.control.turn_runtime.lock().unwrap().thinking_level = thinking_level.clone();
         self.agent.set_thinking_level(thinking_level);
         Ok(())
@@ -1946,20 +1937,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 break;
             };
             match mutation {
-                PendingMutation::Model(model) => {
-                    self.session
-                        .append_model_change(&model.provider, &model.id)
-                        .await?;
-                }
-                PendingMutation::ThinkingLevel(level) => {
-                    self.session
-                        .append_thinking_level_change(level.as_deref().unwrap_or("off"))
-                        .await?;
-                }
                 PendingMutation::ActiveTools(names) => {
                     self.session.append_active_tools_change(&names).await?;
                 }
                 PendingMutation::Message(message) => {
+                    let message = *message;
                     let entry_id = self.session.append_message(message.clone()).await?;
                     // Deferred to here rather than to the run that queued it,
                     // so the message lands after that turn's own messages
@@ -3014,10 +2996,6 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             let mut snapshot = self.control.turn_runtime.lock().unwrap();
             for mutation in self.control.pending_mutations.lock().unwrap().iter() {
                 match mutation {
-                    PendingMutation::Model(model) => snapshot.model = model.clone(),
-                    PendingMutation::ThinkingLevel(level) => {
-                        snapshot.thinking_level = level.clone()
-                    }
                     PendingMutation::ActiveTools(names) => {
                         snapshot.active_tool_names = Some(names.clone())
                     }
@@ -3916,20 +3894,11 @@ fn build_loop_hooks<S: SessionStorage + 'static>(
                 let next = runtime.pending_mutations.lock().unwrap().first().cloned();
                 let Some(mutation) = next else { break };
                 match &mutation {
-                    PendingMutation::Model(model) => {
-                        durable
-                            .append_model_change(&model.provider, &model.id)
-                            .await?;
-                    }
-                    PendingMutation::ThinkingLevel(level) => {
-                        durable
-                            .append_thinking_level_change(level.as_deref().unwrap_or("off"))
-                            .await?;
-                    }
                     PendingMutation::ActiveTools(names) => {
                         durable.append_active_tools_change(names).await?;
                     }
                     PendingMutation::Message(message) => {
+                        let message = message.as_ref();
                         let entry_id = durable.append_message(message.clone()).await?;
                         // Recorded for both consumers of this boundary: the
                         // loop's in-flight context, and the agent transcript
@@ -4231,7 +4200,7 @@ pub(crate) mod tests {
         fail_at_call: std::sync::Mutex<u64>,
         /// When set, a `model_change` append for this model id fails — the
         /// durability hook for flush tests.
-        fail_model_id: std::sync::Mutex<Option<String>>,
+        fail_active_tools: std::sync::Mutex<bool>,
     }
 
     impl MemStorage {
@@ -4241,7 +4210,7 @@ pub(crate) mod tests {
                 leaf_id: std::sync::Mutex::new(None),
                 append_calls: std::sync::Mutex::new(0),
                 fail_at_call: std::sync::Mutex::new(u64::MAX),
-                fail_model_id: std::sync::Mutex::new(None),
+                fail_active_tools: std::sync::Mutex::new(false),
             }
         }
 
@@ -4254,7 +4223,7 @@ pub(crate) mod tests {
                 leaf_id: std::sync::Mutex::new(leaf_id),
                 append_calls: std::sync::Mutex::new(0),
                 fail_at_call: std::sync::Mutex::new(u64::MAX),
-                fail_model_id: std::sync::Mutex::new(None),
+                fail_active_tools: std::sync::Mutex::new(false),
             }
         }
     }
@@ -4265,11 +4234,10 @@ pub(crate) mod tests {
             Ok(uuid::Uuid::new_v4().to_string())
         }
         async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
-            if let SessionTreeEntry::ModelChange { model_id, .. } = entry
-                && let Some(fail_id) = self.fail_model_id.lock().unwrap().as_ref()
-                && fail_id == model_id
+            if matches!(entry, SessionTreeEntry::ActiveToolsChange { .. })
+                && *self.fail_active_tools.lock().unwrap()
             {
-                anyhow::bail!("injected model change failure");
+                anyhow::bail!("injected active-tools change failure");
             }
             let mut calls = self.append_calls.lock().unwrap();
             *calls += 1;
@@ -5876,7 +5844,7 @@ pub(crate) mod tests {
     /// A model queued mid-run reaches the next turn's provider request (the
     /// loop's prepare-next-turn seam) and is persisted once the run settles.
     #[tokio::test]
-    async fn test_handle_set_model_applies_next_turn_and_persists() {
+    async fn test_handle_set_model_applies_next_turn() {
         let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_in_stream = Arc::clone(&seen);
         let storage = MemStorage::new();
@@ -5920,7 +5888,8 @@ pub(crate) mod tests {
             vec!["test".to_string(), "claude-opus".to_string()],
             "prepare_next_turn must refresh the context before the next request"
         );
-        // The mutation persisted and the harness state caught up.
+        // The harness state caught up, and nothing about the switch was
+        // journaled — the conversation's configuration owns the pick.
         assert_eq!(harness.model().id, "claude-opus");
         let entries = harness
             .session()
@@ -5929,11 +5898,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            entries.iter().any(|e| matches!(
-                e,
-                SessionTreeEntry::ModelChange { model_id, .. } if model_id == "claude-opus"
-            )),
-            "the queued model change was persisted: {entries:?}"
+            !entries
+                .iter()
+                .any(|e| matches!(e, SessionTreeEntry::ModelChange { .. })),
+            "a queued model change must not be journaled: {entries:?}"
         );
     }
 
@@ -6428,13 +6396,13 @@ pub(crate) mod tests {
 
     /// A failed durable write keeps the mutation in the queue (and the tail
     /// after it) for the next flush — nothing is dropped, and a later flush
-    /// retries the suffix until it lands. The recovered run must also be
-    /// served by the queued model: the failed write must not revert the next
-    /// provider request to the persisted model.
+    /// retries the suffix until it lands. The recovered run must also run
+    /// under the queued selection: the failed write must not revert the next
+    /// provider request to the persisted one.
     #[tokio::test]
     async fn test_flush_keeps_unpersisted_mutation_on_failure() {
         let storage = MemStorage::new();
-        *storage.fail_model_id.lock().unwrap() = Some("model-b".into());
+        *storage.fail_active_tools.lock().unwrap() = true;
         let session = Session::new(storage);
         let served: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6464,63 +6432,50 @@ pub(crate) mod tests {
                 if matches!(event, AgentEvent::TurnEnd { .. })
                     && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
                 {
-                    handle.set_model(Model {
-                        provider: "test".into(),
-                        api: "test".into(),
-                        id: "model-a".into(),
-                        context_window: 100_000,
-                        max_tokens: 8_192,
-                        thinking: ThinkingKind::None,
-                        metadata: Default::default(),
-                    });
-                    handle.set_model(Model {
-                        provider: "test".into(),
-                        api: "test".into(),
-                        id: "model-b".into(),
-                        context_window: 100_000,
-                        max_tokens: 8_192,
-                        thinking: ThinkingKind::None,
-                        metadata: Default::default(),
-                    });
+                    handle.set_active_tools(vec!["echo".into()]);
                 }
             })
         }));
 
-        async fn model_changes(harness: &AgentHarness<MemStorage>) -> Vec<String> {
-            let entries = harness
+        async fn active_tool_entries(harness: &AgentHarness<MemStorage>) -> Vec<Vec<String>> {
+            harness
                 .session()
                 .storage()
                 .get_entries(Default::default())
                 .await
-                .unwrap();
-            entries
+                .unwrap()
                 .iter()
                 .filter_map(|e| match e {
-                    SessionTreeEntry::ModelChange { model_id, .. } => Some(model_id.clone()),
+                    SessionTreeEntry::ActiveToolsChange {
+                        active_tool_names, ..
+                    } => Some(active_tool_names.clone()),
                     _ => None,
                 })
                 .collect()
         }
 
-        // model_a persists (flushed at the first turn boundary); model_b's
-        // append fails at the next turn boundary and surfaces the error.
+        // The selection's append fails at the turn boundary and surfaces the
+        // error; nothing landed.
         assert!(harness.prompt("use the tool").await.is_err());
-        assert_eq!(model_changes(&harness).await, vec!["model-a".to_string()]);
+        assert!(active_tool_entries(&harness).await.is_empty());
 
         // The failed write stayed queued: the next run's flush retries it and
-        // both changes land — and the run itself is served by the queued
-        // model, not the persisted one.
-        *harness.session().storage().fail_model_id.lock().unwrap() = None;
+        // the selection lands.
+        *harness
+            .session()
+            .storage()
+            .fail_active_tools
+            .lock()
+            .unwrap() = false;
         let _ = harness.prompt("again").await.unwrap();
         assert_eq!(
-            model_changes(&harness).await,
-            vec!["model-a".to_string(), "model-b".to_string()]
+            active_tool_entries(&harness).await,
+            vec![vec!["echo".to_string()]]
         );
         assert_eq!(
             *served.lock().unwrap(),
-            vec!["test".to_string(), "model-b".to_string()],
-            "the recovered run must be served by the queued model, not the \
-             persisted one"
+            vec!["test".to_string(), "test".to_string()],
+            "both runs are served by the same model"
         );
     }
 
@@ -6805,7 +6760,8 @@ pub(crate) mod tests {
             }
         });
 
-        // Harness 1 persists the model change.
+        // Harness 1 leaves the transcript a pre-store session would carry:
+        // the legacy model row the reopen tolerates.
         let mut h1 = AgentHarness::new(
             Session::new(MemStorage::new()),
             "You are a test assistant.",
@@ -6813,6 +6769,10 @@ pub(crate) mod tests {
             Arc::new(TestStreamFn),
         );
         h1.set_model(responses.clone()).await.unwrap();
+        h1.session()
+            .append_model_change(&responses.provider, &responses.id)
+            .await
+            .unwrap();
         let entries = h1
             .session()
             .storage()
@@ -6877,6 +6837,10 @@ pub(crate) mod tests {
         )
         .with_stream_resolver(resolver);
         h1.set_model(broken.clone()).await.unwrap();
+        h1.session()
+            .append_model_change(&broken.provider, &broken.id)
+            .await
+            .unwrap();
         let entries = h1
             .session()
             .storage()
@@ -6974,7 +6938,7 @@ pub(crate) mod tests {
     /// The thinking-level setter persists a `thinking_level_change` entry
     /// that a later restore projects back onto the agent.
     #[tokio::test]
-    async fn test_set_thinking_level_persists_and_restores() {
+    async fn test_set_thinking_level_applies() {
         let storage = MemStorage::new();
         let session = Session::new(storage);
         let mut harness = AgentHarness::new(
@@ -7000,27 +6964,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            entries.iter().any(|e| matches!(
-                e,
-                SessionTreeEntry::ThinkingLevelChange {
-                    thinking_level: l,
-                    ..
-                } if l == "high"
-            )),
-            "the thinking level change was persisted: {entries:?}"
-        );
-
-        // A fresh harness over the same session restores the tier.
-        let mut restored = AgentHarness::new(
-            Session::new(MemStorage::from_entries(entries)),
-            "You are a test assistant.",
-            test_model(),
-            Arc::new(TestStreamFn),
-        );
-        restored.restore().await.unwrap();
-        assert_eq!(
-            restored.agent().state().thinking_level.as_deref(),
-            Some("high")
+            !entries
+                .iter()
+                .any(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. })),
+            "a thinking-level change must not be journaled: {entries:?}"
         );
     }
 
@@ -8251,7 +8198,7 @@ pub(crate) mod tests {
     /// `set_model` persists a `model_change` entry, and a restore replays it
     /// through the resolver even after the in-memory model was scrambled.
     #[tokio::test]
-    async fn test_set_model_persists_and_replays() {
+    async fn test_set_model_applies_and_holds() {
         let session = Session::new(MemStorage::new());
         let mut harness = AgentHarness::new(
             session,
@@ -8265,27 +8212,20 @@ pub(crate) mod tests {
         assert_eq!(harness.model().id, "claude-opus");
         assert_eq!(harness.agent().state().model.id, "claude-opus");
 
+        // Nothing about the pick reached the transcript: its durable home is
+        // the conversation's configuration, which the host reads back.
         let entries = harness
             .session()
             .storage()
             .get_entries(Default::default())
             .await
             .unwrap();
-        match entries.last() {
-            Some(SessionTreeEntry::ModelChange {
-                provider, model_id, ..
-            }) => {
-                assert_eq!(provider, "anthropic");
-                assert_eq!(model_id, "claude-opus");
-            }
-            other => panic!("expected a trailing ModelChange, got {other:?}"),
-        }
-
-        // Scramble the in-memory model; restore replays the persisted choice.
-        harness.agent_mut().set_model(test_model());
-        harness.restore().await.unwrap();
-        assert_eq!(harness.model().id, "claude-opus");
-        assert_eq!(harness.agent().state().model.id, "claude-opus");
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, SessionTreeEntry::ModelChange { .. })),
+            "a model switch must not be journaled: {entries:?}"
+        );
     }
 
     /// `set_active_tools` rejects names outside the mounted set, filters the
@@ -9842,79 +9782,12 @@ pub(crate) mod tests {
         ));
     }
 
-    /// A TurnEnd model switch is persisted before the next provider request:
-    /// the model_change entry lands ahead of the messages the new model
-    /// produces.
-    #[tokio::test]
-    async fn test_model_change_precedes_next_turn_messages() {
-        let storage = MemStorage::new();
-        let session = Session::new(storage);
-        let mut harness = AgentHarness::new(
-            session,
-            "You are a test assistant.",
-            test_model(),
-            Arc::new(ToolUseStreamFn {
-                call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                seen: None,
-            }),
-        )
-        .with_tools(Arc::from(vec![
-            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
-        ]));
-
-        let handle = harness.handle();
-        let handle_in_listener = handle.clone();
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-        let turn_ends = Arc::new(AtomicUsize::new(0));
-        let turns = Arc::clone(&turn_ends);
-        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
-            let handle = handle_in_listener.clone();
-            let turns = Arc::clone(&turns);
-            Box::pin(async move {
-                if matches!(event, AgentEvent::TurnEnd { .. })
-                    && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
-                {
-                    handle.set_model(resolved_model());
-                }
-            })
-        }));
-
-        let _ = harness.prompt("use the tool").await.unwrap();
-        let entries = harness
-            .session()
-            .storage()
-            .get_entries(Default::default())
-            .await
-            .unwrap();
-        // model_change sits before the new model's assistant reply.
-        let model_change_at = entries
-            .iter()
-            .position(|e| matches!(e, SessionTreeEntry::ModelChange { .. }))
-            .expect("model change persisted");
-        let last_assistant_at = entries
-            .iter()
-            .rposition(|e| {
-                matches!(
-                    e,
-                    SessionTreeEntry::Message {
-                        message: AgentMessage::Assistant { .. },
-                        ..
-                    }
-                )
-            })
-            .expect("turn-two assistant");
-        assert!(
-            model_change_at < last_assistant_at,
-            "model change must precede the new model's messages: {entries:?}"
-        );
-    }
-
     /// A failed mutation append aborts the run at the turn boundary: the next
     /// provider request never starts.
     #[tokio::test]
     async fn test_mutation_append_failure_blocks_next_request() {
         let storage = MemStorage::new();
-        *storage.fail_model_id.lock().unwrap() = Some("claude-opus".into());
+        *storage.fail_active_tools.lock().unwrap() = true;
         let session = Session::new(storage);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_in_stream = Arc::clone(&calls);
@@ -9943,7 +9816,7 @@ pub(crate) mod tests {
                 if matches!(event, AgentEvent::TurnEnd { .. })
                     && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
                 {
-                    handle.set_model(resolved_model());
+                    handle.set_active_tools(vec!["echo".into()]);
                 }
             })
         }));
@@ -9952,7 +9825,8 @@ pub(crate) mod tests {
         // provider call never happens.
         let err = harness.prompt("use the tool").await.unwrap_err();
         assert!(
-            err.to_string().contains("injected model change failure"),
+            err.to_string()
+                .contains("injected active-tools change failure"),
             "{err:#}"
         );
         assert_eq!(
