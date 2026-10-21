@@ -1475,6 +1475,25 @@ fn command_catalogue() -> Value {
     serde_json::json!({ "commands": commands })
 }
 
+/// The `sessions` payload of `x-manox/archivedChanged`: a non-empty array of
+/// session ids, or `None` for any other shape.
+fn session_ids_of(value: Option<&Value>) -> Option<Vec<String>> {
+    let ids = value?.as_array()?;
+    if ids.is_empty() {
+        return None;
+    }
+    ids.iter()
+        .map(|id| id.as_str().map(str::to_string))
+        .collect()
+}
+
+/// Whether the store accounts a row for `session_id`, in either partition —
+/// the same existence the pin write checks.
+fn store_has_row(session_id: &str) -> bool {
+    manox_agent::thread_store::try_global()
+        .is_some_and(|store| store.read(|state| state.summary_by_id(session_id).is_some()))
+}
+
 /// The mutable half of a session summary, as an AHP delta.
 ///
 /// Only fields a store change can move are carried: the channel URI keys the
@@ -2332,6 +2351,40 @@ impl Backend for RuntimeBackend {
                 } else {
                     DispatchOutcome::Rejected(format!("unknown session: {session_id}"))
                 }
+            }
+            StateAction::Unknown(tag)
+                if tag.get("type").and_then(Value::as_str)
+                    == Some(manox_ahp::ext::actions::ARCHIVED_CHANGED) =>
+            {
+                // The batch-capable archive write. The ids ride the payload —
+                // the native `session/isArchivedChanged` resolves its target
+                // from the channel, which would cost one session-channel
+                // subscription (a whole-journal fold) per row — so a client
+                // dispatches the batch on the catalogue root it already
+                // holds. All ids are validated before the first write: a
+                // half-applied batch is the worst of both worlds.
+                let Some(ids) = session_ids_of(tag.get("sessions")) else {
+                    return DispatchOutcome::Rejected(
+                        "x-manox/archivedChanged needs a non-empty `sessions` id array".to_string(),
+                    );
+                };
+                let Some(archived) = tag.get("archived").and_then(Value::as_bool) else {
+                    return DispatchOutcome::Rejected(
+                        "x-manox/archivedChanged needs a boolean `archived`".to_string(),
+                    );
+                };
+                let unknown: Vec<&str> = ids
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| !store_has_row(id))
+                    .collect();
+                if !unknown.is_empty() {
+                    return DispatchOutcome::Rejected(format!("unknown sessions: {unknown:?}"));
+                }
+                for id in &ids {
+                    self.server.archive_session(&origin.client_id, id, archived);
+                }
+                DispatchOutcome::Accepted
             }
             StateAction::Unknown(tag)
                 if tag.get("type").and_then(Value::as_str)

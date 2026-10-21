@@ -3444,6 +3444,117 @@ mod dispatch {
         uninstall();
     }
 
+    /// `x-manox/archivedChanged` is the batch archive write: the ids ride the
+    /// payload, so the dispatch lands on the catalogue root (the channel every
+    /// client holds) instead of paying a session-channel subscription — a
+    /// whole-journal fold — per row. All ids validate before the first write,
+    /// and the durable rows move partitions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archived_changed_moves_the_durable_rows_in_one_dispatch() {
+        use manox_agent::thread_store;
+        use manox_ahp::channels::root;
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        thread_store::global().with_mut(|s| {
+            s.insert_summary_for_test("s-keep", None);
+            s.insert_summary_for_test("s-gone", None);
+        });
+
+        let archive = StateAction::Unknown(json!({
+            "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
+            "sessions": ["s-keep", "s-gone"],
+            "archived": true,
+        }));
+        assert_eq!(
+            backend.dispatch(root::URI, &archive, &origin()),
+            DispatchOutcome::Accepted,
+            "the batch rides the root channel"
+        );
+        let archived: Vec<String> = thread_store::global().read(|s| {
+            s.archived_summaries()
+                .iter()
+                .map(|row| row.id.clone())
+                .collect()
+        });
+        assert!(
+            archived.contains(&"s-keep".to_string()) && archived.contains(&"s-gone".to_string()),
+            "every named row crosses to the archived partition: {archived:?}"
+        );
+
+        // Unarchive is the same write in the other direction.
+        let unarchive = StateAction::Unknown(json!({
+            "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
+            "sessions": ["s-gone"],
+            "archived": false,
+        }));
+        assert_eq!(
+            backend.dispatch(root::URI, &unarchive, &origin()),
+            DispatchOutcome::Accepted
+        );
+        let gone_is_back =
+            thread_store::global().read(|s| s.summaries().iter().any(|row| row.id == "s-gone"));
+        assert!(
+            gone_is_back,
+            "the unarchived row returns to the active partition"
+        );
+
+        // All-or-nothing: one unknown id refuses the batch and nothing moves.
+        thread_store::global().with_mut(|s| {
+            s.insert_summary_for_test("s-guarded", None);
+        });
+        assert!(matches!(
+            backend.dispatch(
+                root::URI,
+                &StateAction::Unknown(json!({
+                    "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
+                    "sessions": ["s-guarded", "s-absent"],
+                    "archived": true,
+                })),
+                &origin(),
+            ),
+            DispatchOutcome::Rejected(_)
+        ));
+        let guarded_archived =
+            thread_store::global().read(|s| s.summary_by_id("s-guarded").map(|row| row.archived));
+        assert_eq!(
+            guarded_archived,
+            Some(false),
+            "a refused batch writes nothing"
+        );
+
+        // A malformed payload is refused by name, not folded.
+        for payload in [
+            json!({
+                "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
+                "sessions": [],
+                "archived": true,
+            }),
+            json!({
+                "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
+                "sessions": ["s-guarded"],
+            }),
+            json!({
+                "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
+                "sessions": "s-guarded",
+                "archived": true,
+            }),
+            json!({
+                "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
+                "sessions": ["s-guarded"],
+                "archived": "yes",
+            }),
+        ] {
+            assert!(
+                matches!(
+                    backend.dispatch(root::URI, &StateAction::Unknown(payload.clone()), &origin()),
+                    DispatchOutcome::Rejected(_)
+                ),
+                "malformed payload refused: {payload}"
+            );
+        }
+        uninstall();
+    }
+
     /// An action with no intent at all is refused loudly — the trait contract
     /// is that a refused write never looks accepted.
     #[tokio::test(flavor = "multi_thread")]
