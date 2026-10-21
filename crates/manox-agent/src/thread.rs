@@ -352,6 +352,12 @@ pub struct Thread {
     /// assembling: a switch chosen inside that window is only queued to the
     /// actor, so the projection cannot know about it.
     model_explicitly_set: bool,
+    /// The configuration version this thread last applied. The request
+    /// boundary reads it from the conversation's config source and skips the
+    /// snapshot when nothing was written; a thread is built holding the picks
+    /// its row already carries, so the build's values are current from the
+    /// first boundary on and a reopened conversation replays no notices.
+    applied_config_version: i64,
     /// Opt-in browser tool suites the user activated; the composer chips
     /// derive from this mirror. Replayed to the engine when a landing thread
     /// materializes it, so a pre-engine toggle is never dropped.
@@ -790,6 +796,7 @@ impl Thread {
             permission_mode_explicitly_set: false,
             reasoning_effort_explicitly_set: false,
             model_explicitly_set: false,
+            applied_config_version: 0,
             browser_suites: Vec::new(),
             browser_suites_explicitly_set: false,
             plan_mode: false,
@@ -905,6 +912,7 @@ impl Thread {
             permission_mode_explicitly_set: false,
             reasoning_effort_explicitly_set: false,
             model_explicitly_set: false,
+            applied_config_version: 0,
             browser_suites: Vec::new(),
             browser_suites_explicitly_set: false,
             plan_mode: false,
@@ -1885,6 +1893,7 @@ impl Thread {
             permission_mode_explicitly_set: true,
             reasoning_effort_explicitly_set: true,
             model_explicitly_set: true,
+            applied_config_version: 0,
             browser_suites: Vec::new(),
             // Members never mount browser suites; the explicit flag keeps
             // even an empty-mirror seed from the Ready projection out.
@@ -2165,53 +2174,62 @@ impl Thread {
         }
     }
 
-    /// The object-store handshake at the request boundary. The
-    /// conversation's row is the authority for the user's picks — any
-    /// diff against what this thread last applied (model, permission
-    /// mode, reasoning effort) is applied through the normal setters and
-    /// announced to the model as a harness-authored notice, inserted
-    /// ahead of the message that triggered this request. Restore seeds
-    /// the watermark implicitly (everything applied at build), so a
-    /// reopened conversation never replays notices.
+    /// The configuration handshake at the request boundary. The
+    /// conversation's [`ConversationConfigSource`] is the authority for the
+    /// user's picks — the same surface the permission gate reads before
+    /// every tool call. Any diff against what this thread last applied
+    /// (model, reasoning effort) is applied through the normal setters and
+    /// announced to the model as a harness-authored notice, inserted ahead
+    /// of the message that triggered this request.
+    ///
+    /// The version watermark is what keeps a reopened conversation silent.
+    /// A thread is built with the picks its row already carries, so the
+    /// first boundary's diff is empty and emits nothing; the watermark then
+    /// records that the build's values are current, and a write that
+    /// restates the same picks moves the version without a diff — hence
+    /// without a notice.
     pub fn sync_object_config(&mut self) {
-        let Some(store) = crate::object_store::ObjectStore::try_global() else {
+        let source = self.config_source();
+        let version = source.config_version();
+        if version == self.applied_config_version {
             return;
-        };
-        let Some(row) = store.conversation(&self.id.0) else {
-            return;
-        };
+        }
+        // A pick the row carries but that cannot resolve yet (a provider that
+        // is not registered) leaves the watermark behind, so a later boundary
+        // retries instead of dropping the user's choice for good.
+        let mut settled = true;
 
-        if let (Some(provider), Some(model_id)) = (row.model_provider.clone(), row.model_id.clone())
-        {
-            let current = self.model.as_ref();
-            let changed = !current.is_some_and(|m| m.provider == provider && m.id == model_id);
-            if changed {
-                let registry = crate::provider_glue::global();
-                if let Some(model) =
-                    manox_harness::model_ref::resolve_model_ref(&registry, &model_id)
-                {
-                    self.set_model(model);
-                    self.insert_config_notice(&format!(
-                        "[harness] The model has been switched to {model_id} ({provider})."
-                    ));
-                } else {
-                    tracing::warn!(model = %model_id, "object-store model pick unresolvable");
+        if let Some(model_ref) = source.model_ref() {
+            match source.model() {
+                Some(model) => {
+                    let current = self.model.as_ref();
+                    let changed =
+                        !current.is_some_and(|m| m.provider == model.provider && m.id == model.id);
+                    if changed {
+                        self.set_model(model);
+                        self.insert_config_notice(&format!(
+                            "[harness] The model has been switched to {model_ref}."
+                        ));
+                    }
+                }
+                None => {
+                    settled = false;
+                    tracing::warn!(model = %model_ref, "conversation model pick unresolvable");
                 }
             }
         }
 
-        if let Some(mode) = row.permission_mode.clone()
-            && let Ok(parsed) =
-                serde_json::from_value::<PermissionMode>(serde_json::Value::String(mode.clone()))
-            && parsed != self.permission_mode
+        if let Some(mode) = source.permission_mode()
+            && mode != self.permission_mode
         {
-            self.set_permission_mode(parsed);
+            self.set_permission_mode(mode);
             self.insert_config_notice(&format!(
-                "[harness] The permission mode is now {mode}. Adjust your approach accordingly."
+                "[harness] The permission mode is now {}. Adjust your approach accordingly.",
+                mode.wire()
             ));
         }
 
-        if let Some(effort) = row.reasoning_effort.clone() {
+        if let Some(effort) = source.reasoning_effort() {
             let parsed = match effort.as_str() {
                 "high" => Some(ReasoningEffort::High),
                 "max" => Some(ReasoningEffort::Max),
@@ -2226,6 +2244,15 @@ impl Thread {
                 ));
             }
         }
+
+        if settled {
+            self.applied_config_version = version;
+        }
+    }
+
+    /// The conversation's configuration surface, keyed by this thread's id.
+    fn config_source(&self) -> Arc<dyn manox_harness::ConversationConfigSource> {
+        crate::conversation_config::ObjectConfigSource::for_session(self.id.0.clone())
     }
 
     /// One harness-authored configuration notice: a user-role message the
@@ -2952,6 +2979,7 @@ pub(crate) mod tests {
             permission_mode_explicitly_set: false,
             reasoning_effort_explicitly_set: false,
             model_explicitly_set: false,
+            applied_config_version: 0,
             browser_suites: Vec::new(),
             browser_suites_explicitly_set: false,
             plan_mode: false,
@@ -3333,6 +3361,60 @@ pub(crate) mod tests {
             t.insert_user_message_with_ui_metadata("third".to_string(), None);
         });
         assert_eq!(thread.read(|t| t.messages.len()), 4);
+
+        crate::object_store::set_path_for_test(None);
+    }
+
+    /// The version watermark: a write that restates the picks the thread
+    /// already holds moves the row's version but changes nothing the model
+    /// could act on, so no notice is inserted. The value diff alone would
+    /// also stay silent here, so this pins the watermark's own half of the
+    /// contract — the boundary may skip a read it does not need, and must
+    /// not invent a change to justify having looked.
+    #[tokio::test]
+    async fn a_restated_pick_inserts_no_notice() {
+        let _lock = crate::object_store::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::object_store::set_path_for_test(Some(dir.path().join("objects.db")));
+        crate::object_store::init();
+        let store = crate::object_store::ObjectStore;
+
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+            permission_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
+        });
+        let thread = thread_with_engine_id(HistoryPhase::Ready, engine.clone(), "restated");
+        let sid = "restated".to_string();
+        store.create_conversation(&sid, None);
+        store.set_permission_mode(&sid, Some(PermissionMode::ReadOnly.wire()));
+        thread.with_mut(|t| {
+            t.insert_user_message_with_ui_metadata("first".to_string(), None);
+        });
+        assert_eq!(
+            thread.read(|t| t.messages.len()),
+            2,
+            "the pick lands with its notice ahead of the message"
+        );
+
+        // The same pick again: the version moves, the observable value does not.
+        store.set_permission_mode(&sid, Some(PermissionMode::ReadOnly.wire()));
+        thread.with_mut(|t| {
+            t.insert_user_message_with_ui_metadata("second".to_string(), None);
+        });
+        assert_eq!(
+            thread.read(|t| t.messages.len()),
+            3,
+            "a re-statement adds the message alone, with no notice"
+        );
 
         crate::object_store::set_path_for_test(None);
     }

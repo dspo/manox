@@ -517,6 +517,11 @@ pub fn spawn_engine(
         notice_tx.clone(),
         Arc::clone(&model_slot),
     ));
+    // The conversation's row is the mode's authority: the gate reads it per
+    // tool call, so a switch governs the next call rather than the next turn.
+    gate.set_config_source(crate::conversation_config::ObjectConfigSource::for_session(
+        thread_id.clone(),
+    ));
     // K3: the user's verdict on a parked card is an observable state
     // change — the gate journals it as an `approval` decision entry through
     // the actor queue (the request entry rides the notice tap).

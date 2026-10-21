@@ -12,6 +12,7 @@ pub mod chrome_use;
 pub mod claude_md;
 pub mod collaboration_mode;
 pub mod command;
+pub mod conversation_config;
 pub mod db;
 pub mod embedder_tools;
 pub mod file_lock;

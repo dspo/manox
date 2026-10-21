@@ -62,6 +62,13 @@ struct PendingAuth {
 /// respond path (gpui side) see one source of truth.
 pub struct ApprovalGate {
     mode: Mutex<PermissionMode>,
+    /// The conversation's configuration authority. When installed it answers
+    /// [`Self::mode`], so every per-call reader — this gate's own tool
+    /// wrapper, the bash seatbelt's standing resolver, the Write/Edit
+    /// escalation baseline — sees a mid-turn switch on the very next tool
+    /// call. The `mode` mirror above remains the answer only for a gate with
+    /// no source (bare constructions, tests).
+    config_source: Mutex<Option<Arc<dyn manox_harness::ConversationConfigSource>>>,
     pending: Mutex<HashMap<String, PendingAuth>>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     model: Arc<Mutex<Option<HarnessModel>>>,
@@ -86,12 +93,21 @@ impl ApprovalGate {
     ) -> Self {
         Self {
             mode: Mutex::new(PermissionMode::default()),
+            config_source: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             notice_tx,
             model: model_slot,
             journal_sink: Mutex::new(None),
             delegated: false,
         }
+    }
+
+    /// Install the conversation's configuration authority. From here on
+    /// [`Self::mode`] answers from it, so the mode a tool call is gated on is
+    /// whatever the conversation's row says at that instant — not a value
+    /// cached when the request began.
+    pub fn set_config_source(&self, source: Arc<dyn manox_harness::ConversationConfigSource>) {
+        *self.config_source.lock().unwrap() = Some(source);
     }
 
     /// Mark this gate as belonging to a delegated (subagent) tool — the
@@ -114,7 +130,15 @@ impl ApprovalGate {
         *self.journal_sink.lock().unwrap() = Some(tx);
     }
 
+    /// The mode governing the *next* tool call. With a configuration source
+    /// installed this is a fresh read of the conversation's row, so a switch
+    /// that lands mid-turn governs the very next call rather than the next
+    /// turn.
     pub fn mode(&self) -> PermissionMode {
+        let source = self.config_source.lock().unwrap().clone();
+        if let Some(mode) = source.as_ref().and_then(|source| source.permission_mode()) {
+            return mode;
+        }
         *self.mode.lock().unwrap()
     }
 
@@ -1548,5 +1572,108 @@ mod tests {
                 PermissionDecision::Deny
             ))
         ));
+    }
+
+    /// A stand-in for the conversation's configuration surface. The test
+    /// flips `mode` between calls to stand in for the user's write landing
+    /// mid-run; the real object-store implementation is covered by
+    /// `conversation_config`'s own tests.
+    struct FakeConfigSource {
+        mode: Mutex<Option<PermissionMode>>,
+    }
+
+    impl manox_harness::ConversationConfigSource for FakeConfigSource {
+        fn model(&self) -> Option<manox_harness::types::Model> {
+            None
+        }
+
+        fn model_ref(&self) -> Option<String> {
+            None
+        }
+
+        fn permission_mode(&self) -> Option<PermissionMode> {
+            *self.mode.lock().unwrap()
+        }
+
+        fn reasoning_effort(&self) -> Option<String> {
+            None
+        }
+
+        fn config_version(&self) -> i64 {
+            0
+        }
+    }
+
+    fn gated_mutating_tool(
+        gate: Arc<ApprovalGate>,
+    ) -> (Arc<dyn HarnessAgentTool>, Arc<AtomicUsize>) {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let inner: Arc<dyn HarnessAgentTool> = Arc::new(MockTool {
+            name: "Write",
+            approval: false,
+            read_only: false,
+            ran: Arc::clone(&ran),
+        });
+        (Arc::new(ApprovalGatedTool::new(inner, gate)), ran)
+    }
+
+    /// The permission gate reads the conversation's configuration before
+    /// EVERY tool call: a mode the user flips mid-run governs the very next
+    /// call, not the next turn. Without the live read the gate would keep the
+    /// mode it was handed when the run began, and a user who notices the
+    /// model heading somewhere dangerous would have to stop the run to be
+    /// obeyed.
+    #[tokio::test]
+    async fn a_mode_flip_governs_the_very_next_tool_call() {
+        let source = Arc::new(FakeConfigSource {
+            mode: Mutex::new(Some(PermissionMode::ReadOnly)),
+        });
+        let gate = gate();
+        gate.set_config_source(source.clone());
+        // A stale mirror must not win over the source: this is the value the
+        // gate was handed when the run began.
+        gate.set_mode(PermissionMode::DangerFullAccess);
+
+        let (tool, ran) = gated_mutating_tool(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let err = tool
+            .execute("c1", serde_json::json!({}), CancellationToken::new(), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(DENY_READ_ONLY),
+            "the source's read-only governs the first call: {err}"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+
+        // The user's write lands while the run is in flight.
+        *source.mode.lock().unwrap() = Some(PermissionMode::DangerFullAccess);
+
+        let result = tool
+            .execute("c2", serde_json::json!({}), CancellationToken::new(), &ctx)
+            .await
+            .expect("the next call must be admitted");
+        assert!(!result.is_error);
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "the flipped mode governs the very next call"
+        );
+    }
+
+    /// A gate with no source keeps the mirror as its answer — the bare
+    /// constructions (subagent seats, tests) still work.
+    #[tokio::test]
+    async fn a_gate_without_a_source_keeps_its_mirror() {
+        let gate = gate();
+        gate.set_mode(PermissionMode::ReadOnly);
+        let (tool, ran) = gated_mutating_tool(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let err = tool
+            .execute("c1", serde_json::json!({}), CancellationToken::new(), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(DENY_READ_ONLY));
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 }
