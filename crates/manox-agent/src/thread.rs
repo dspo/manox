@@ -1292,6 +1292,7 @@ impl Thread {
         text: String,
         ui: Option<MessageUiMetadata>,
     ) {
+        self.sync_object_config();
         let ordinal = self.user_prompt_ordinal();
         let human = ui.as_ref().and_then(|u| u.author.as_ref()).is_none();
         let mut message = Message::user(text.clone());
@@ -1308,6 +1309,7 @@ impl Thread {
         content: Vec<MessageContent>,
         ui: Option<MessageUiMetadata>,
     ) {
+        self.sync_object_config();
         // Text blocks join the prompt text; image blocks ride the next
         // prompt as kernel `ContentBlock::Image`.
         let ordinal = self.user_prompt_ordinal();
@@ -2161,6 +2163,98 @@ impl Thread {
                 .preflight_stream(model)
                 .map_err(|err| format!("{err:#}")),
         }
+    }
+
+    /// The object-store handshake at the request boundary. The
+    /// conversation's row is the authority for the user's picks — any
+    /// diff against what this thread last applied (model, permission
+    /// mode, reasoning effort) is applied through the normal setters and
+    /// announced to the model as a harness-authored notice, inserted
+    /// ahead of the message that triggered this request. Restore seeds
+    /// the watermark implicitly (everything applied at build), so a
+    /// reopened conversation never replays notices.
+    pub fn sync_object_config(&mut self) {
+        let Some(store) = crate::object_store::ObjectStore::try_global() else {
+            return;
+        };
+        let Some(row) = store.conversation(&self.id.0) else {
+            return;
+        };
+
+        if let (Some(provider), Some(model_id)) = (row.model_provider.clone(), row.model_id.clone())
+        {
+            let current = self.model.as_ref();
+            let changed = !current.is_some_and(|m| m.provider == provider && m.id == model_id);
+            if changed {
+                let registry = crate::provider_glue::global();
+                if let Some(model) =
+                    manox_harness::model_ref::resolve_model_ref(&registry, &model_id)
+                {
+                    self.set_model(model);
+                    self.insert_config_notice(&format!(
+                        "[harness] The model has been switched to {model_id} ({provider})."
+                    ));
+                } else {
+                    tracing::warn!(model = %model_id, "object-store model pick unresolvable");
+                }
+            }
+        }
+
+        if let Some(mode) = row.permission_mode.clone()
+            && let Ok(parsed) =
+                serde_json::from_value::<PermissionMode>(serde_json::Value::String(mode.clone()))
+            && parsed != self.permission_mode
+        {
+            self.set_permission_mode(parsed);
+            self.insert_config_notice(&format!(
+                "[harness] The permission mode is now {mode}. Adjust your approach accordingly."
+            ));
+        }
+
+        if let Some(effort) = row.reasoning_effort.clone() {
+            let parsed = match effort.as_str() {
+                "high" => Some(ReasoningEffort::High),
+                "max" => Some(ReasoningEffort::Max),
+                _ => None,
+            };
+            if let Some(effort_value) = parsed
+                && effort_value != self.reasoning_effort
+            {
+                self.set_reasoning_effort(effort_value);
+                self.insert_config_notice(&format!(
+                    "[harness] The reasoning effort is now {effort}."
+                ));
+            }
+        }
+    }
+
+    /// One harness-authored configuration notice: a user-role message the
+    /// renderer attributes to the harness (never a human stamp), landing
+    /// ahead of the turn that triggered it.
+    fn insert_config_notice(&mut self, text: &str) {
+        let ui = MessageUiMetadata {
+            author: Some(crate::message::MessageAuthor::Harness),
+            ..Default::default()
+        };
+        self.insert_user_message_with_ui_metadata_no_sync(text.to_string(), Some(ui));
+    }
+
+    /// The raw insert the notice path uses — a notice must not re-enter the
+    /// handshake (it carries no user will).
+    fn insert_user_message_with_ui_metadata_no_sync(
+        &mut self,
+        text: String,
+        ui: Option<MessageUiMetadata>,
+    ) {
+        let ordinal = self.user_prompt_ordinal();
+        let human = ui.as_ref().and_then(|u| u.author.as_ref()).is_none();
+        let mut message = crate::message::Message::user(text.clone());
+        message.ui = ui.clone();
+        self.messages.push(message);
+        self.persist_user_attribution(ordinal, &ui);
+        self.stamp_interaction(human);
+        self.pending_prompts.push(text);
+        self.last_user_ui = ui;
     }
 
     /// Pick the model this thread runs on. The pick always reaches the engine
@@ -3156,6 +3250,69 @@ pub(crate) mod tests {
     /// Images ride the prompt's own user message. `run_turn` must
     /// hand the queued text AND the queued images to the engine in one turn,
     /// draining both queues.
+    /// The object-store handshake: a row whose model pick differs from the
+    /// thread's applied model applies the pick and lands the harness
+    /// notice AHEAD of the message that triggered the request. A row that
+    /// restates the current picks inserts nothing.
+    #[tokio::test]
+    async fn object_store_config_changes_apply_with_a_notice() {
+        // The store at a scratch path; no row for this thread at first.
+        let dir = tempfile::tempdir().unwrap();
+        crate::object_store::set_path_for_test(Some(dir.path().join("objects.db")));
+        crate::object_store::init();
+        let store = crate::object_store::ObjectStore;
+
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+            permission_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
+        let sid = "test-thread".to_string();
+
+        // Restating nothing (no row): the insert path is inert.
+        thread.with_mut(|t| {
+            t.insert_user_message_with_ui_metadata("first".to_string(), None);
+        });
+        assert_eq!(thread.read(|t| t.messages.len()), 1);
+
+        // A row with a changed permission pick: applied + noticed, in order.
+        store.create_conversation(&sid, None);
+        store.set_permission_mode(&sid, Some("read-only"));
+        thread.with_mut(|t| {
+            t.insert_user_message_with_ui_metadata("second".to_string(), None);
+        });
+        let applied = *engine.permission_mode.lock().unwrap();
+        assert_eq!(applied, Some(PermissionMode::ReadOnly));
+        let texts: Vec<String> = thread.read(|t| {
+            t.messages
+                .iter()
+                .map(|m| match m.content.first() {
+                    Some(MessageContent::Text(t)) => t.clone(),
+                    _ => String::new(),
+                })
+                .collect()
+        });
+        assert!(
+            texts[1].contains("[harness] The permission mode is now read-only"),
+            "the notice lands ahead of the triggering message: {texts:?}"
+        );
+        assert_eq!(texts[2], "second");
+        // No further row change: the next insert adds nothing.
+        thread.with_mut(|t| {
+            t.insert_user_message_with_ui_metadata("third".to_string(), None);
+        });
+        assert_eq!(thread.read(|t| t.messages.len()), 4);
+
+        crate::object_store::set_path_for_test(None);
+    }
+
     #[tokio::test]
     async fn run_turn_drains_pending_text_and_images() {
         let engine = Arc::new(FakeEngine {

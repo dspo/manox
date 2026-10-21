@@ -149,6 +149,12 @@ async fn run_loop_inner(
 ) -> Result<(), anyhow::Error> {
     sink.emit(AgentEvent::AgentStart).await?;
     let mut turn_count: usize = 0;
+    // Consecutive output-limit escalations: a Length stop truncated the
+    // response (often the tool-call arguments mid-JSON). The NEXT round
+    // runs with a raised output budget so long thinking plus complete
+    // arguments fit; three strikes and the model keeps its own budget —
+    // a runaway that burns every raise on more thinking must still settle.
+    let mut length_escalations: u32 = 0;
     // Turn-end gate budget: how many vetoes the gate may spend on this run
     // before a bare stop goes through.
     let mut turn_end_bounces: usize = 0;
@@ -251,6 +257,27 @@ async fn run_loop_inner(
                 AgentMessage::Assistant { stop_reason, .. } => *stop_reason,
                 _ => None,
             };
+            if stop_reason == Some(StopReason::Length) {
+                if length_escalations < 3 {
+                    length_escalations += 1;
+                    let ceiling = context
+                        .model
+                        .context_window
+                        .saturating_sub(1024)
+                        .max(context.model.max_tokens);
+                    let raised =
+                        (((context.model.max_tokens as f64) * 1.5).ceil() as usize).min(ceiling);
+                    tracing::info!(
+                        escalation = length_escalations,
+                        from = context.model.max_tokens,
+                        to = raised,
+                        "output-limit truncation: raising the next round's budget"
+                    );
+                    context.model.max_tokens = raised;
+                }
+            } else {
+                length_escalations = 0;
+            }
 
             // An error or abort stop reason carries no tool calls; end the
             // run without executing. Provider errors and local interrupts
@@ -299,6 +326,31 @@ async fn run_loop_inner(
 
             let mut tool_results: Vec<AgentMessage> = Vec::new();
             has_more_tool_calls = false;
+
+            // A Length stop with nothing executable (the budget died in
+            // thinking or prose) retries with the escalated budget instead
+            // of settling the turn: the nudge anchors the continuation on
+            // the model's own truncated output.
+            if tool_calls.is_empty()
+                && stop_reason == Some(StopReason::Length)
+                && length_escalations <= 3
+            {
+                let nudge = AgentMessage::user(
+                    "[harness] Your previous response was cut off at the output limit. \
+                     Continue from where it stopped; keep tool-call arguments compact.",
+                );
+                sink.emit(AgentEvent::MessageStart {
+                    message: Box::new(nudge.clone()),
+                })
+                .await?;
+                context.messages.push(nudge.clone());
+                new_messages.push(nudge.clone());
+                sink.emit(AgentEvent::MessageEnd {
+                    message: Box::new(nudge.clone()),
+                })
+                .await?;
+                has_more_tool_calls = true;
+            }
 
             if !tool_calls.is_empty() {
                 // If the response was truncated, fail all tool calls.
@@ -1085,6 +1137,77 @@ mod tests {
         responses: Mutex<Vec<AgentMessage>>,
     }
 
+    /// A scripted stream that records the model budget of each round.
+    struct RecordingStreamFn {
+        responses: Mutex<Vec<AgentMessage>>,
+        on_model: Box<dyn Fn(&Model) + Send + Sync>,
+    }
+
+    impl RecordingStreamFn {
+        fn new(
+            responses: Vec<AgentMessage>,
+            on_model: impl Fn(&Model) + Send + Sync + 'static,
+        ) -> Self {
+            RecordingStreamFn {
+                responses: Mutex::new(responses),
+                on_model: Box::new(on_model),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for RecordingStreamFn {
+        async fn stream(
+            &self,
+            context: &AgentContext,
+            _signal: CancellationToken,
+            _event_tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            (self.on_model)(&context.model);
+            let mut guard = self.responses.lock().unwrap();
+            if guard.is_empty() {
+                return Ok(AgentMessage::Assistant {
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                        signature: None,
+                    }],
+                    model: "mock".into(),
+                    provider: "mock".into(),
+                    api: "mock".into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    raw_stop_reason: None,
+                    stop_reason: Some(StopReason::Stop),
+                    usage: Box::new(Usage::default()),
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                });
+            }
+            Ok(guard.remove(0))
+        }
+    }
+
+    fn assistant_with_stop(stop: StopReason) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: "partial".into(),
+                signature: None,
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            api: "mock".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(stop),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
     impl StatefulMockStreamFn {
         fn new(responses: Vec<AgentMessage>) -> Self {
             StatefulMockStreamFn {
@@ -1505,6 +1628,60 @@ mod tests {
             turn_count, 2,
             "a false return lets the run reach the second turn"
         );
+    }
+
+    /// A Length stop with nothing executable retries with an escalated
+    /// output budget instead of settling the turn: the harness nudges the
+    /// model to continue off its own truncated output.
+    #[tokio::test]
+    async fn length_truncation_escalates_the_budget_and_retries() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let mut context = minimal_context();
+        assert_eq!(
+            context.model.max_tokens, 8_192,
+            "test premise: the base budget"
+        );
+
+        // First response dies at the limit mid-prose (no executable calls);
+        // the mock records the per-round model budget it was asked to run
+        // under, then a normal completion ends the run.
+        let seen: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_probe = Arc::clone(&seen);
+        let stream_fn = Arc::new(RecordingStreamFn::new(
+            vec![
+                assistant_with_stop(StopReason::Length),
+                assistant_with_stop(StopReason::Stop),
+            ],
+            move |model| seen_probe.lock().unwrap().push(model.max_tokens),
+        ));
+        let result = run_loop(
+            &[AgentMessage::user("hi")],
+            &mut context,
+            &config,
+            None,
+            stream_fn,
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let budgets = seen.lock().unwrap().clone();
+        assert_eq!(budgets.len(), 2, "the truncated round retried once");
+        assert!(
+            budgets[1] > budgets[0],
+            "the retry runs under a raised budget: {budgets:?}"
+        );
+        // The continuation nudge is in the transcript ahead of the retry.
+        let events = sink.events.lock().unwrap();
+        let nudged = events.iter().any(|e| {
+            matches!(e, AgentEvent::MessageEnd { message }
+                if matches!(&**message, AgentMessage::User { content, .. }
+                    if matches!(content.first(), Some(ContentBlock::Text { text, .. })
+                        if text.contains("cut off at the output limit"))))
+        });
+        assert!(nudged, "the harness anchored the continuation");
     }
 
     // ── Truncation safety: stop_reason == Length fails all tool calls ────────
