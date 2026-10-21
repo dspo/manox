@@ -2679,6 +2679,12 @@ impl Thread {
         let Some(session_path) = self.active_session_path() else {
             return;
         };
+        // The object row's materialization stamp: the conversation actually
+        // happened the moment a human spoke to it (the ordering key and the
+        // draft-refill boundary in one write, draft cleared with it).
+        if let Some(objects) = crate::object_store::ObjectStore::try_global() {
+            objects.mark_human_message(&self.id.0, chrono::Utc::now().timestamp());
+        }
         persist_interaction_spawn(sessions_dir, session_path, chrono::Utc::now().timestamp());
     }
 
