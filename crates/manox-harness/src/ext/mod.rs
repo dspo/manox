@@ -6,6 +6,7 @@
 // product-level bash tool on top.
 
 pub mod bash;
+pub mod conversation_config;
 pub mod model_ref;
 pub mod path_selector;
 pub mod prompt;
@@ -20,6 +21,7 @@ pub mod tasks;
 
 pub use bash::background::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 pub use bash::persistent::PersistentShellOperations;
+pub use conversation_config::ConversationConfigSource;
 pub use subagent::SubagentRuntime;
 pub use tasks::{
     Settlement, SettlementCause, SettlementKind, TaskFamily, TaskLifecycle, TaskObserver,

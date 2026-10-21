@@ -105,58 +105,12 @@ pub(super) fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde
             "tool_output_chunk".into(),
             json!({ "callId": id, "chunk": chunk }),
         ),
-        ThreadEvent::SubagentStarted {
-            id,
-            subagent_type,
-            description,
-            child,
-        } => (
-            "subagent_child".into(),
-            json!({
-                "agentId": id,
-                "event": {
-                    "type": "started",
-                    "subagentType": subagent_type,
-                    "description": description,
-                    "childId": child.0,
-                },
-            }),
-        ),
-        ThreadEvent::SubagentProgress {
-            id,
-            subagent_type,
-            tool_uses,
-            token_usage,
-            latest_activity,
-            status,
-            ..
-        } => (
-            "subagent_progress".into(),
-            json!({
-                "agentId": id,
-                "agentType": subagent_type,
-                "toolUses": tool_uses,
-                "tokenUsage": serde_json::to_value(token_usage).unwrap_or(serde_json::Value::Null),
-                "latestActivity": latest_activity,
-                "status": status_str(status)?,
-            }),
-        ),
-        ThreadEvent::SubagentChild { id, child } => (
-            "subagent_child".into(),
-            json!({
-                "agentId": id,
-                "event": serde_json::to_value(child).unwrap_or(serde_json::Value::Null),
-            }),
-        ),
-        // ── state changes (sidecar writes continue during migration; the
-        //    journal entry is the future single truth, L10) ───────────────
-        ThreadEvent::PermissionModeChanged { mode } => (
-            "permission_mode_change".into(),
-            // The closed kebab wire vocabulary (§C.2 `mode`), never the
-            // Debug name: the replay fold, the sidecar cache, and the wire
-            // projection all parse `from_wire`.
-            json!({ "mode": mode.wire() }),
-        ),
+        // ── state changes ────────────────────────────────────────────────
+        // The permission mode is NOT here: its durable home is the
+        // conversation's object row, which the client writes, and the engine
+        // reads it live before every tool call. Journaling a second copy is
+        // what made "which one is in force" unanswerable.
+        ThreadEvent::PermissionModeChanged { .. } => return None,
         ThreadEvent::PlanModeChanged { enabled } => {
             ("plan_mode_change".into(), json!({ "enabled": enabled }))
         }

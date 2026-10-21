@@ -8,7 +8,7 @@
 // `fork` replaces the session with a root→leaf path fork; `close` settles the
 // harness before returning the path.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -379,20 +379,14 @@ impl AgentSession {
             .filter(|l| l != "off");
         let wire = effective.clone().unwrap_or_else(|| "off".into());
 
-        // Order: update agent (append model_change + in-memory), then append
-        // the thinking entry. The session JSONL is authoritative on reopen.
+        // Update the agent (in-memory), then remember the preference. Neither
+        // half is persisted here: the conversation's configuration is the
+        // pick's durable home.
         self.harness.set_model(model.clone()).await?;
-        // Persist only when the effective level actually changes; the entry
-        // write is synchronous and throws on failure — propagate it so the
-        // caller knows the state did not land.
-        if effective != current_level {
-            self.harness
-                .session()
-                .append_thinking_level_change(&wire)
-                .await?;
-            if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
-                self.thinking_preference = Some(wire.clone());
-            }
+        if effective != current_level
+            && (model.thinking != crate::types::ThinkingKind::None || wire != "off")
+        {
+            self.thinking_preference = Some(wire.clone());
         }
         self.harness.set_initial_thinking_level(effective);
         Ok(())
@@ -403,12 +397,12 @@ impl AgentSession {
         self.harness.agent().state().thinking_level.clone()
     }
 
-    /// Set the reasoning tier (persisted via the session's thinking entry).
-    /// `None` reads as `"off"` (the facade's contract, mirrored by the
-    /// harness); the effective level is clamped against the current model and
-    /// persisted only when it changes. Subagent sessions apply their pinned
-    /// effort through the same path — the facade touches nothing outside the
-    /// session's own JSONL.
+    /// Set the reasoning tier. `None` reads as `"off"` (the facade's
+    /// contract, mirrored by the harness); the effective level is clamped
+    /// against the current model. The pick's durable home is the
+    /// conversation's configuration, so this touches the running session
+    /// only — subagent sessions apply their pinned effort through the same
+    /// path.
     pub async fn set_thinking_level(&mut self, level: Option<String>) -> Result<(), anyhow::Error> {
         let model = self.harness.model().clone();
         let levels = self.runtime.thinking_levels(&model);
@@ -417,14 +411,10 @@ impl AgentSession {
                 .filter(|l| l != "off");
         let wire = effective.clone().unwrap_or_else(|| "off".into());
         let previous = self.harness.agent().state().thinking_level.clone();
-        if effective != previous {
-            self.harness
-                .session()
-                .append_thinking_level_change(&wire)
-                .await?;
-            if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
-                self.thinking_preference = Some(wire.clone());
-            }
+        if effective != previous
+            && (model.thinking != crate::types::ThinkingKind::None || wire != "off")
+        {
+            self.thinking_preference = Some(wire.clone());
         }
         self.harness.set_initial_thinking_level(effective);
         Ok(())
@@ -703,6 +693,13 @@ impl AgentSession {
         self.harness.session().storage().subscribe_journal()
     }
 
+    /// The journal broadcast's sender (see the storage accessor).
+    pub fn subscribe_journal_sender(
+        &self,
+    ) -> tokio::sync::broadcast::Sender<crate::session::jsonl::JournalEvent> {
+        self.harness.session().storage().journal_sender()
+    }
+
     /// The journal cursor (seq of the active leaf).
     pub async fn journal_cursor(&self) -> u64 {
         self.harness.session().storage().journal_cursor().await
@@ -761,6 +758,12 @@ impl AgentSession {
             .and_then(|context| context.cwd)
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    /// The currently rendered system prompt — the cwd line inside it follows
+    /// [`Self::set_session_cwd`] (the model's belief, not just the tools').
+    pub fn system_prompt(&self) -> &str {
+        self.harness.system_prompt()
     }
 
     /// Move the session's working directory (host-driven `SetCwd`): sticky
@@ -854,6 +857,7 @@ fn model_resolver(
 pub struct AgentSessionBuilder {
     cwd: Option<PathBuf>,
     session_dir: Option<PathBuf>,
+    session_file: Option<PathBuf>,
     model_runtime: Option<ModelRuntime>,
     resources: Option<HarnessResources>,
     tools: Vec<Arc<dyn AgentTool>>,
@@ -888,6 +892,15 @@ impl AgentSessionBuilder {
 
     pub fn with_session_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.session_dir = Some(dir.into());
+        self
+    }
+
+    /// Pin the exact journal file (the v1.0.0 core layout writes
+    /// `<core>/<slug>/<id>/log.v1.jsonl`; the per-session directory is the
+    /// parent). When set, `build()` creates at this path and `open()` is
+    /// the caller's path resolution.
+    pub fn with_session_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.session_file = Some(file.into());
         self
     }
 
@@ -1037,7 +1050,7 @@ impl AgentSessionBuilder {
             .unwrap_or_else(|| crate::system_prompt::DEFAULT_BASE_PROMPT.into());
         let custom_prompt = self.system_prompt.is_some();
         let system_prompt = match &self.system_prompt_builder {
-            Some(builder) => builder(&active_tools, &resources),
+            Some(builder) => builder(&active_tools, &resources, &cwd),
             None => crate::system_prompt::build_harness_prompt(
                 &base_prompt,
                 &cwd,
@@ -1088,28 +1101,16 @@ impl AgentSessionBuilder {
         // thinking clamp needs it after restore.
         let model_key = (model.provider.clone(), model.id.clone(), model.thinking);
 
-        // A new session persists its initial model and thinking entries; they
-        // buffer in the deferred storage until the first assistant message
-        // materializes the file, so a close/reopen or a pre-first-message
-        // fork projects the same configuration.
+        // A new session writes no configuration rows: the model and the
+        // thinking level are the caller's intent for this build, and their
+        // durable home is the conversation's configuration — read back by the
+        // host, never mirrored into the transcript. A reopened session still
+        // reads whatever entries its own transcript carries (a pre-store
+        // journal), which is the tolerated legacy read.
         let has_thinking_entry = if restore {
             session.build_session_context().await?.has_thinking_entry
         } else {
-            let _ = session
-                .append_model_change(&model.provider, &model.id)
-                .await?;
-            let _ = session
-                .append_thinking_level_change(
-                    clamp_thinking(
-                        &model,
-                        &runtime.thinking_levels(&model),
-                        self.default_thinking_level.clone(),
-                    )
-                    .unwrap_or_else(|| "off".into())
-                    .as_str(),
-                )
-                .await?;
-            true
+            false
         };
 
         let stream_fn = runtime.resolver()(&model)?;
@@ -1139,24 +1140,27 @@ impl AgentSessionBuilder {
         // Install the prompt builder: the harness rebuilds the system prompt
         // whenever the effective tool selection or resources change, so the
         // model never sees tools/skills that are not actually available.
+        // The builder renders from the harness's LIVE session cwd (seeded
+        // here, advanced by `set_session_cwd`): a directory picked after
+        // creation must reach the model's context, not just the tools.
+        harness.set_prompt_cwd(cwd.clone());
         match &self.system_prompt_builder {
             Some(builder) => {
                 let builder = builder.clone();
                 harness.set_system_prompt_builder(
-                    move |active_tools: &[String], resources: &HarnessResources| {
-                        builder(active_tools, resources)
+                    move |active_tools: &[String], resources: &HarnessResources, cwd: &Path| {
+                        builder(active_tools, resources, cwd)
                     },
                 );
             }
             None => {
                 let base_prompt_for_builder = base_prompt.clone();
-                let cwd_for_builder = cwd.clone();
                 let custom_for_builder = custom_prompt;
                 harness.set_system_prompt_builder(
-                    move |active_tools: &[String], resources: &HarnessResources| {
+                    move |active_tools: &[String], resources: &HarnessResources, cwd: &Path| {
                         crate::system_prompt::build_harness_prompt(
                             &base_prompt_for_builder,
-                            &cwd_for_builder,
+                            cwd,
                             active_tools,
                             &resources.context_files,
                             &resources.skills,
@@ -1237,18 +1241,20 @@ impl AgentSessionBuilder {
         })?;
         tokio::fs::create_dir_all(&session_dir).await?;
         let repo = SessionRepository::new(&session_dir);
-        let session = repo
-            .create(JsonlSessionMetadata {
-                id: self
-                    .session_id
-                    .clone()
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                cwd: cwd.to_string_lossy().into_owned(),
-                created_at: chrono::Utc::now(),
-                parent_session_path: None,
-                metadata: self.metadata.clone(),
-            })
-            .await?;
+        let metadata = JsonlSessionMetadata {
+            id: self
+                .session_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            cwd: cwd.to_string_lossy().into_owned(),
+            created_at: chrono::Utc::now(),
+            parent_session_path: None,
+            metadata: self.metadata.clone(),
+        };
+        let session = match &self.session_file {
+            Some(file) => repo.create_at(file, metadata).await?,
+            None => repo.create(metadata).await?,
+        };
         self.assemble_common(session, cwd, session_dir, false).await
     }
 
@@ -1850,6 +1856,44 @@ mod tests {
         assert!(!result.is_error, "sticky cwd follows the switch");
     }
 
+    /// The system prompt's working-directory line follows a host-driven
+    /// `SetCwd`: the sticky cwd alone moves the tools, and a prompt still
+    /// naming the claim-time directory leaves the model answering from a
+    /// stale belief (the "current cwd" question answered wrong).
+    #[tokio::test]
+    async fn set_session_cwd_rerenders_the_system_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("cwd-origin-dir");
+        let moved = dir.path().join("cwd-moved-dir");
+        tokio::fs::create_dir_all(&origin).await.unwrap();
+        tokio::fs::create_dir_all(&moved).await.unwrap();
+
+        let mut session = create_agent_session()
+            .with_cwd(&origin)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        assert!(
+            session.system_prompt().contains("cwd-origin-dir"),
+            "the initial prompt names the assembly cwd"
+        );
+
+        session.set_session_cwd(moved.clone()).await.unwrap();
+        let rendered = session.system_prompt();
+        assert!(
+            rendered.contains("cwd-moved-dir"),
+            "the prompt's cwd line follows the move"
+        );
+        assert!(
+            !rendered.contains("cwd-origin-dir"),
+            "the claim-time directory is gone from the prompt"
+        );
+    }
+
     /// A durable `cwd_change` tail projects onto a reopen: tools resolve in
     /// the moved-to directory even when the reopen's own cwd is wrong.
     #[tokio::test]
@@ -1919,7 +1963,7 @@ mod tests {
     /// A model id can be served by either protocol; an injected catalog
     /// pins it, and a session switched to it reopens on the same protocol.
     #[tokio::test]
-    async fn reopen_keeps_model_on_its_original_api_via_catalog() {
+    async fn a_legacy_model_row_resolves_on_its_original_api_via_catalog() {
         use crate::coding_agent::model_runtime::ModelCatalog;
 
         struct PinApi(&'static str);
@@ -1966,14 +2010,19 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            // Prompt first, then switch: the model_change entry is the last
-            // model-bearing entry on the path, so the reopen projects it.
+            // Prompt first, then plant the row a pre-store transcript would
+            // carry: it is the last model-bearing entry on the path.
             session.prompt("hi").await.unwrap();
-            session.set_model(model.clone()).await.unwrap();
+            session
+                .harness
+                .session()
+                .append_model_change(&model.provider, &model.id)
+                .await
+                .unwrap();
             let path = session.close().await.unwrap();
 
-            // Reopen with the same catalog: the session model restores on
-            // the exact api, not a heuristic.
+            // Reopen with the same catalog: the legacy row resolves on the
+            // exact api the catalog names, not a heuristic.
             let resumed = create_agent_session()
                 .with_model_runtime(runtime(api))
                 .open(path)
@@ -2147,7 +2196,7 @@ mod tests {
     /// A catalog miss on reopen falls back to the initial model with an
     /// observable notice.
     #[tokio::test]
-    async fn catalog_miss_falls_back_with_notice() {
+    async fn a_legacy_model_row_that_misses_the_catalog_falls_back_with_notice() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
@@ -2160,13 +2209,15 @@ mod tests {
             .await
             .unwrap();
         session.prompt("hi").await.unwrap();
-        // Switch to a model the catalog cannot resolve (unknown provider).
-        let unknown = Model {
-            provider: "other".into(),
-            id: "unknown-model".into(),
-            ..test_model()
-        };
-        session.set_model(unknown).await.unwrap();
+        // A pre-store transcript that still carries its own model row: the
+        // tolerated legacy read, and the only way a reopen can now be asked
+        // to resolve a model the catalog cannot serve.
+        session
+            .harness
+            .session()
+            .append_model_change("other", "unknown-model")
+            .await
+            .unwrap();
         let path = session.close().await.unwrap();
 
         let resumed = create_agent_session()
@@ -2193,10 +2244,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        let builder: crate::harness::SystemPromptBuilder =
-            Arc::new(|tools: &[String], _resources: &HarnessResources| {
+        let builder: crate::harness::SystemPromptBuilder = Arc::new(
+            |tools: &[String], _resources: &HarnessResources, _cwd: &Path| {
                 format!("CUSTOM[{}]", tools.join(","))
-            });
+            },
+        );
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))
@@ -2369,10 +2421,11 @@ mod tests {
     }
 
     /// set_model re-clamps thinking: thinking high -> non-thinking becomes
-    /// off (in-memory AND persisted); non-thinking -> thinking restores the
-    /// configured default.
+    /// off; non-thinking -> thinking restores the configured default. Both
+    /// live in the running session — the pick's durable home is the
+    /// conversation's configuration, not the transcript.
     #[tokio::test]
-    async fn set_model_reclamps_thinking_and_persists() {
+    async fn set_model_reclamps_thinking() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
@@ -2421,7 +2474,7 @@ mod tests {
             Some("high"),
             "non-thinking -> thinking restores the configured default"
         );
-        // The persisted entries reflect the clamps.
+        // Nothing about the pick reached the transcript.
         let entries = session
             .harness
             .session()
@@ -2429,20 +2482,11 @@ mod tests {
             .get_entries(Default::default())
             .await
             .unwrap();
-        let levels: Vec<String> = entries
-            .iter()
-            .filter_map(|e| match e {
-                SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => {
-                    Some(thinking_level.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        assert!(levels.iter().any(|l| l == "off"), "{levels:?}");
-        assert_eq!(
-            levels.last().map(String::as_str),
-            Some("high"),
-            "{levels:?}"
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. })),
+            "a thinking-level change must not be journaled: {entries:?}"
         );
     }
 
@@ -2496,7 +2540,7 @@ mod tests {
     /// high -> high model switch writes no extra entry; the preference
     /// survives a non-thinking round trip and a fork.
     #[tokio::test]
-    async fn thinking_entries_are_deduplicated_and_preference_survives() {
+    async fn the_thinking_preference_survives_a_model_switch() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         let session_dir = dir.path().join("sessions");
@@ -2518,7 +2562,7 @@ mod tests {
             .await
             .unwrap();
 
-        // A high -> high model switch changes nothing: no extra entry.
+        // A high -> high model switch changes nothing.
         let another_thinking = Model {
             thinking: crate::types::ThinkingKind::Enabled,
             id: "thinking-b".into(),
@@ -2529,23 +2573,17 @@ mod tests {
             session.harness.agent().state().thinking_level.as_deref(),
             Some("high")
         );
-        async fn thinking_entry_count(s: &AgentSession) -> usize {
-            s.harness
+        assert!(
+            !session
+                .harness
                 .session()
                 .storage()
                 .get_entries(Default::default())
                 .await
                 .unwrap()
                 .iter()
-                .filter(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. }))
-                .count()
-        }
-        // Assembly persisted the initial medium entry; the explicit high is
-        // the second. A high -> high model switch must not add a third.
-        assert_eq!(
-            thinking_entry_count(&session).await,
-            2,
-            "initial medium + explicit high; high -> high adds nothing"
+                .any(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. })),
+            "no thinking entry is written at all"
         );
 
         // Non-thinking round trip keeps the high preference: switching back
@@ -2699,53 +2737,6 @@ mod tests {
     /// in-memory tier is not updated (no divergence between runtime and
     /// persisted state).
     #[cfg(unix)]
-    #[tokio::test]
-    async fn thinking_append_failure_propagates_and_leaves_state_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        let session_dir = dir.path().join("sessions");
-        tokio::fs::create_dir_all(&cwd).await.unwrap();
-        let mut session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(&session_dir)
-            .with_model_runtime(fake_runtime())
-            .with_model(Model {
-                thinking: crate::types::ThinkingKind::Enabled,
-                ..test_model()
-            })
-            .build()
-            .await
-            .unwrap();
-        // Materialize the session file so append writes to it directly.
-        let _ = session.prompt("seed").await.unwrap();
-        let before = session.harness.agent().state().thinking_level.clone();
-        // Make the session file read-only so the append write fails.
-        use std::os::unix::fs::PermissionsExt as _;
-        let path = session.harness.session().storage().path().to_path_buf();
-        let original_mode = tokio::fs::metadata(&path)
-            .await
-            .unwrap()
-            .permissions()
-            .mode();
-        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
-            .await
-            .unwrap();
-        let result = session.set_thinking_level(Some("high".into())).await;
-        // Restore writability for teardown.
-        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(original_mode))
-            .await
-            .unwrap();
-        assert!(
-            result.is_err(),
-            "append failure must propagate, got {result:?}"
-        );
-        assert_eq!(
-            session.harness.agent().state().thinking_level,
-            before,
-            "in-memory tier unchanged on append failure"
-        );
-    }
-
     #[tokio::test]
     async fn custom_catalog_restricts_thinking_levels() {
         let dir = tempfile::tempdir().unwrap();

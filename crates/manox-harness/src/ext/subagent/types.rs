@@ -146,6 +146,15 @@ pub struct StartRequest {
     pub parent_depth: u32,
     /// Lineage: the parent's session id, written into the child header.
     pub parent_session: Option<String>,
+    /// The parent-side tool call id that dispatched this run — the join key
+    /// the `run/started` row carries so a card, a row, and a settled report
+    /// correlate without guessing.
+    pub tool_call_id: Option<String>,
+    /// `Some(run_id)` marks a CONTINUATION: the settled child session named
+    /// by the run id reopens and `prompt` is the follow-up. The run id IS
+    /// the child session id, so the continuation keeps every pointer
+    /// (`run/started`'s childSession, cards, drill-downs) intact.
+    pub continuation_of: Option<String>,
     /// Arming wall-clock/idle budgets.
     pub budgets: Budgets,
     /// `Some("worktree")` isolates the child in a throwaway git worktree
@@ -183,8 +192,16 @@ pub enum StopReason {
     Aborted,
     /// Model, transport, budget, or stall failure.
     Error,
-    /// Reserved: the child hit its token ceiling before finishing.
+    /// The child hit its token ceiling before finishing.
     MaxTokens,
+    /// The wall-clock budget expired and the run was stopped mid-flight.
+    TimedOut,
+    /// The idle budget expired with no child activity.
+    Stalled,
+    /// The foreground wait ended by promotion: the run continues in the
+    /// background and settles later through its own continued run. This
+    /// reason appears only on the promotion receipt, never on a settlement.
+    Promoted,
     /// Reserved: the child declined the task.
     Refusal,
     /// A backend-added variant this build does not know.
@@ -203,7 +220,10 @@ impl Serialize for StopReason {
 impl StopReason {
     /// Whether the run's `output` may be partial (anything non-completed).
     pub fn is_terminal_failure(&self) -> bool {
-        matches!(self, StopReason::Error | StopReason::Unknown(_))
+        matches!(
+            self,
+            StopReason::Error | StopReason::Unknown(_) | StopReason::TimedOut | StopReason::Stalled
+        )
     }
 }
 
@@ -219,6 +239,9 @@ impl<'de> serde::Deserialize<'de> for StopReason {
             "error" => StopReason::Error,
             "max-tokens" => StopReason::MaxTokens,
             "refusal" => StopReason::Refusal,
+            "timed-out" => StopReason::TimedOut,
+            "stalled" => StopReason::Stalled,
+            "promoted" => StopReason::Promoted,
             other => StopReason::Unknown(other.to_string()),
         })
     }
@@ -232,6 +255,9 @@ impl std::fmt::Display for StopReason {
             StopReason::Error => write!(f, "error"),
             StopReason::MaxTokens => write!(f, "max-tokens"),
             StopReason::Refusal => write!(f, "refusal"),
+            StopReason::TimedOut => write!(f, "timed-out"),
+            StopReason::Stalled => write!(f, "stalled"),
+            StopReason::Promoted => write!(f, "promoted"),
             StopReason::Unknown(s) => write!(f, "{s}"),
         }
     }
@@ -275,6 +301,8 @@ pub struct RunInfo {
     /// The dispatch's armed budgets — the host watchdog reads the idle
     /// budget from here.
     pub budgets: Budgets,
+    /// The parent-side tool call id that dispatched this run.
+    pub tool_call_id: Option<String>,
 }
 
 /// The static per-definition configuration one model-facing delegation tool
@@ -387,6 +415,8 @@ pub fn test_request(label: &str, prompt: &str) -> StartRequest {
         persona: None,
         parent_depth: 0,
         parent_session: None,
+        tool_call_id: None,
+        continuation_of: None,
         budgets: Budgets::default(),
         isolation: None,
         env: Arc::new(crate::core::env::TokioExecutionEnv::new(cwd.clone())),

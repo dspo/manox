@@ -148,37 +148,6 @@ pub enum ThreadEvent {
         id: String,
         chunk: String,
     },
-    /// A sub-agent's child thread was constructed. Not produced by the
-    /// backend in this stage (sub-agent observation panels are not wired).
-    /// Carries the child's [`ThreadId`] (value type) — the event crosses the
-    /// kernel boundary, so no handle/entity rides it.
-    SubagentStarted {
-        id: String,
-        subagent_type: String,
-        description: String,
-        child: ThreadId,
-    },
-    /// A spawned sub-agent's aggregated progress.
-    SubagentProgress {
-        id: String,
-        subagent_type: String,
-        tool_uses: u32,
-        token_usage: TokenUsage,
-        latest_activity: Option<String>,
-        status: ToolCallStatus,
-        /// The watchdog's one-line health verdict (`working`, `tool: Bash
-        /// 3m12s`, `stalled 2m0s`, `looping: Read src/a.rs`) when the event
-        /// carries one; `None` for lifecycle-only progress events.
-        health: Option<String>,
-    },
-    /// A streamed child-session event from a running sub-agent (the
-    /// bridge of the child's text/thinking deltas and tool lifecycle). The
-    /// conversation attaches these to the Agent tool call's drill-down
-    /// output; the rail uses them for live activity.
-    SubagentChild {
-        id: String,
-        child: SubagentChildEvent,
-    },
     /// Interactive question round trip: `AskUserQuestion` (and bubbled team
     /// member authorizations) parks here. The workspace renders the question
     /// card and answers through [`Thread::respond_authorization`]. Permission
@@ -334,12 +303,6 @@ pub struct Thread {
     messages: Vec<Message>,
     reasoning_effort: ReasoningEffort,
     pinned: bool,
-    /// This entity is a redirect stub for a bind successor: it shares the
-    /// successor's engine `Arc` without owning it, so `Drop` must not shut
-    /// that engine down (review #809 [sugg] 6 — the real engine's
-    /// `shutdown` asks the live actor to close, which would kill the
-    /// successor).
-    redirect_stub: bool,
     archived: bool,
     running: bool,
     restored: bool,
@@ -389,6 +352,12 @@ pub struct Thread {
     /// assembling: a switch chosen inside that window is only queued to the
     /// actor, so the projection cannot know about it.
     model_explicitly_set: bool,
+    /// The configuration version this thread last applied. The request
+    /// boundary reads it from the conversation's config source and skips the
+    /// snapshot when nothing was written; a thread is built holding the picks
+    /// its row already carries, so the build's values are current from the
+    /// first boundary on and a reopened conversation replays no notices.
+    applied_config_version: i64,
     /// Opt-in browser tool suites the user activated; the composer chips
     /// derive from this mirror. Replayed to the engine when a landing thread
     /// materializes it, so a pre-engine toggle is never dropped.
@@ -425,6 +394,12 @@ pub struct Thread {
     /// borrow); `ensure_engine` runs inside a `with_mut`, so it parks the
     /// receiver here and that enclosing call spawns the pump.
     pending_engine_events: Option<tokio::sync::mpsc::UnboundedReceiver<BackendNotice>>,
+    /// Which engine's notices the facade is listening to. Bumped whenever a
+    /// different engine takes over, so a pump started for the previous one
+    /// stops dispatching: its late notices describe a session nobody is
+    /// looking at any more, and a discarded run's `Settled` must not end the
+    /// run that replaced it.
+    engine_generation: u64,
 }
 
 /// A live-thread registry seam: the kernel looks up / registers live threads
@@ -545,15 +520,15 @@ impl ThreadHandle {
     /// Three-phase: lock -> mutate (collecting `pending_events`) -> unlock ->
     /// emit. The closure must never await.
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut Thread) -> R) -> R {
-        let (r, events, engine_events) = {
+        let (r, events, engine_events, generation) = {
             let mut state = self.0.state.write();
             let r = f(&mut state);
             let events = std::mem::take(&mut state.pending_events);
             let engine_events = state.pending_engine_events.take();
-            (r, events, engine_events)
+            (r, events, engine_events, state.engine_generation)
         };
         if let Some(rx) = engine_events {
-            drain_engine_notices(self.clone(), rx);
+            drain_engine_notices(self.clone(), rx, generation);
         }
         self.broadcast(events);
         r
@@ -812,7 +787,6 @@ impl Thread {
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
             archived: false,
-            redirect_stub: false,
             running: false,
             restored: false,
             display: Vec::new(),
@@ -828,6 +802,7 @@ impl Thread {
             permission_mode_explicitly_set: false,
             reasoning_effort_explicitly_set: false,
             model_explicitly_set: false,
+            applied_config_version: 0,
             browser_suites: Vec::new(),
             browser_suites_explicitly_set: false,
             plan_mode: false,
@@ -838,6 +813,7 @@ impl Thread {
             cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
+            engine_generation: 0,
             extra_working_dirs: Vec::new(),
         })
     }
@@ -868,6 +844,22 @@ impl Thread {
         Self::open(id, cwd, Some(path), None, false, Some(lease))
     }
 
+    /// The working directory a conversation with no project runs in: its own
+    /// temporary workspace, derived from the conversation id so a reopen
+    /// reuses it instead of minting a sibling, and created here — the app's
+    /// create leaves one row and nothing on disk.
+    ///
+    /// A delegated seat never takes this path: a subagent inherits the
+    /// directory of the conversation that spawned it, because it is working
+    /// inside that conversation's project, not in a conversation of its own.
+    fn unfiled_cwd(id: &ThreadId) -> PathBuf {
+        let workspace = crate::paths::unfiled_workspace(&id.0);
+        if let Err(err) = std::fs::create_dir_all(&workspace) {
+            tracing::warn!(path = %workspace.display(), %err, "unfiled workspace");
+        }
+        workspace
+    }
+
     fn open(
         id: ThreadId,
         cwd: PathBuf,
@@ -876,14 +868,29 @@ impl Thread {
         fresh: bool,
         lease: Option<std::sync::Arc<crate::session_lease::LeaseEntry>>,
     ) -> ThreadHandle {
+        // A genuinely new conversation with no project is the special
+        // project: it runs in its own temporary workspace rather than in
+        // whatever directory the app was launched from. A reopen takes its
+        // directory from the transcript it restores, so the shard and the cwd
+        // a conversation was born with stay its own.
+        let cwd = match (&project, fresh) {
+            (None, true) => Self::unfiled_cwd(&id),
+            _ => cwd,
+        };
         // A concrete session file means an authoritative restore is pending;
         // the facade reports `Loading` until `Ready` so the workspace can
         // gate input and render the streaming preview.
         let loading = initial_path.is_some();
         let model = crate::provider_glue::default_model();
-        let sessions_dir = crate::paths::manox_config_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("sessions");
+        let (sessions_dir, session_file) =
+            crate::paths::core_session_parts(project.as_deref(), &id.0).unwrap_or_else(|_| {
+                (
+                    crate::paths::manox_config_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join("sessions"),
+                    None,
+                )
+            });
         // The goal bridge is shared with the engine's goal tools; its
         // restore seed rides the Ready chain (seed_from_journal — the
         // journal is the goal authority; stage ③ retired the db leg and
@@ -897,6 +904,7 @@ impl Thread {
             cwd.clone(),
             model.clone(),
             sessions_dir,
+            session_file,
             initial_path,
             fresh,
             project.clone(),
@@ -917,7 +925,6 @@ impl Thread {
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
             archived: false,
-            redirect_stub: false,
             running: false,
             restored: false,
             display: Vec::new(),
@@ -937,6 +944,7 @@ impl Thread {
             permission_mode_explicitly_set: false,
             reasoning_effort_explicitly_set: false,
             model_explicitly_set: false,
+            applied_config_version: 0,
             browser_suites: Vec::new(),
             browser_suites_explicitly_set: false,
             plan_mode: false,
@@ -947,10 +955,11 @@ impl Thread {
             cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
+            engine_generation: 0,
             extra_working_dirs: Vec::new(),
         });
         handle.set_restore_ready(restore_ready);
-        drain_engine_notices(handle.clone(), events);
+        drain_engine_notices(handle.clone(), events, 0);
         handle
     }
 
@@ -968,11 +977,23 @@ impl Thread {
         if self.goal_bridge.is_none() {
             self.goal_bridge = Some(GoalBridge::for_thread(&self.id.0));
         }
-        let cwd = project.clone().unwrap_or_else(|| self.cwd.clone());
+        let cwd = match &project {
+            Some(project) => project.clone(),
+            None => Self::unfiled_cwd(&self.id),
+        };
         let model = self.model.clone();
-        let sessions_dir = crate::paths::manox_config_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("sessions");
+        // The v1.0.0 core layout: one directory per session under its
+        // project bucket, the journal (`log.v1.jsonl`) inside. The legacy
+        // flat `sessions/` tree is never written again.
+        let (sessions_dir, session_file) =
+            crate::paths::core_session_parts(project.as_deref(), &self.id.0).unwrap_or_else(|_| {
+                (
+                    crate::paths::manox_config_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join("sessions"),
+                    None,
+                )
+            });
         // A fresh spawn has nothing to restore: the default (already
         // ready) watch is the honest value, so the receiver is dropped.
         let SpawnedEngine {
@@ -983,6 +1004,7 @@ impl Thread {
             cwd.clone(),
             model,
             sessions_dir,
+            session_file,
             None,
             true,
             project,
@@ -1003,6 +1025,7 @@ impl Thread {
         for suite in self.browser_suites.clone() {
             engine.set_browser_suite(suite, true);
         }
+        self.engine_generation += 1;
         self.engine = Some(engine.clone());
         self.pending_engine_events = Some(events);
     }
@@ -1314,6 +1337,7 @@ impl Thread {
         text: String,
         ui: Option<MessageUiMetadata>,
     ) {
+        self.sync_object_config();
         let ordinal = self.user_prompt_ordinal();
         let human = ui.as_ref().and_then(|u| u.author.as_ref()).is_none();
         let mut message = Message::user(text.clone());
@@ -1330,6 +1354,7 @@ impl Thread {
         content: Vec<MessageContent>,
         ui: Option<MessageUiMetadata>,
     ) {
+        self.sync_object_config();
         // Text blocks join the prompt text; image blocks ride the next
         // prompt as kernel `ContentBlock::Image`.
         let ordinal = self.user_prompt_ordinal();
@@ -1490,6 +1515,10 @@ impl Thread {
         engine: Arc<dyn ThreadEngine>,
         events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
     ) {
+        // The replaced engine's actor is still winding down and its notices
+        // are still queued; the generation bump is what stops them from
+        // mutating a facade that has moved on.
+        self.engine_generation += 1;
         self.engine = Some(engine);
         self.pending_engine_events = Some(events);
     }
@@ -1847,9 +1876,16 @@ impl Thread {
         let model = self.model.clone();
         let permission_mode = self.permission_mode;
         let reasoning_effort = self.reasoning_effort;
-        let sessions_dir = crate::paths::manox_config_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("sessions");
+        // A member works in its leader's project, so it shards there.
+        let (sessions_dir, session_file) =
+            crate::paths::core_session_parts(self.project.as_deref(), &id.0).unwrap_or_else(|_| {
+                (
+                    crate::paths::manox_config_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join("sessions"),
+                    None,
+                )
+            });
         let SpawnedEngine {
             engine,
             events,
@@ -1858,6 +1894,7 @@ impl Thread {
             cwd.clone(),
             model.clone(),
             sessions_dir,
+            session_file,
             None,
             true,
             None,
@@ -1883,7 +1920,6 @@ impl Thread {
             reasoning_effort,
             pinned: false,
             archived: false,
-            redirect_stub: false,
             running: false,
             restored: false,
             display: Vec::new(),
@@ -1899,6 +1935,7 @@ impl Thread {
             permission_mode_explicitly_set: true,
             reasoning_effort_explicitly_set: true,
             model_explicitly_set: true,
+            applied_config_version: 0,
             browser_suites: Vec::new(),
             // Members never mount browser suites; the explicit flag keeps
             // even an empty-mirror seed from the Ready projection out.
@@ -1911,10 +1948,11 @@ impl Thread {
             cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
+            engine_generation: 0,
             extra_working_dirs: Vec::new(),
         });
         handle.set_restore_ready(restore_ready);
-        drain_engine_notices(handle.clone(), events);
+        drain_engine_notices(handle.clone(), events, 0);
         handle
     }
 
@@ -2064,21 +2102,26 @@ impl Thread {
     }
 
     /// Move the session's working directory at any interaction state —
-    /// the host-driven `SetCwd` path. Unlike a bind (which mints a
-    /// initial-only project binding, guarded by `has_interacted`), this
-    /// follows the per-call cwd machinery: the sticky cwd advances and the
-    /// move is durable as a `cwd_change` entry, never touching the header
-    /// cwd or the project binding.
-    pub fn set_cwd(&self, path: PathBuf) {
+    /// the host-driven `SetCwd` path. Identity never follows the
+    /// directory. A session nobody has interacted with yet relocates in
+    /// place: its project binding moves with it (the sidebar groups it
+    /// where the user is about to start) and the move rides the same
+    /// durable `cwd_change` entry, which lands as the first row when the
+    /// session materializes. An interacted session keeps its binding and
+    /// only advances the sticky cwd through that entry.
+    pub fn set_cwd(&mut self, path: PathBuf) {
+        if !self.has_interacted() {
+            self.cwd = path.clone();
+            self.project = Some(path.clone());
+        }
         if let Some(engine) = &self.engine {
             engine.set_cwd(path);
         }
     }
 
-    /// Creation-time project binding (the `new_in_project` path): the only
-    /// place a project binds — a live session never re-binds (identity
-    /// follows the log; a bind on a live thread mints a successor session
-    /// instead, see `AgentServerInner::bind_successor`).
+    /// Creation-time project binding (the `new_in_project` path). A session
+    /// nobody has interacted with yet may still relocate through `set_cwd`;
+    /// an interacted one never re-binds.
     pub fn bind_at_creation(&mut self, dir: PathBuf) {
         self.cwd = dir.clone();
         self.project = Some(dir.clone());
@@ -2087,26 +2130,6 @@ impl Thread {
             // one step (no orphaned pre-project session file).
             self.ensure_engine(Some(dir));
         }
-    }
-
-    /// Identity-follows-log hand-off: this predecessor entity becomes a
-    /// redirect stub for its bind successor — the successor's engine (its
-    /// journal feed and read seam) plus mirrored header fields — so live
-    /// streams and ops still addressed to the predecessor id converge on
-    /// the successor log (the seq regression resyncs them loudly).
-    pub fn adopt_successor(&mut self, engine: Arc<dyn ThreadEngine>, dir: PathBuf) {
-        self.cwd = dir.clone();
-        self.project = Some(dir);
-        self.engine = Some(engine);
-        // The stub shares the successor's engine without owning it: `Drop`
-        // must not ask that engine to shut down (review #809 [sugg] 6).
-        self.redirect_stub = true;
-    }
-
-    /// The engine behind this thread (the successor-stub hand-off shares it
-    /// between the predecessor stub and the canonical successor entity).
-    pub fn engine_clone(&self) -> Option<Arc<dyn ThreadEngine>> {
-        self.engine.clone()
     }
 
     /// Manual compaction (`/compact`): no-op while a turn is in flight (the
@@ -2194,6 +2217,116 @@ impl Thread {
         }
     }
 
+    /// The configuration handshake at the request boundary. The
+    /// conversation's [`ConversationConfigSource`] is the authority for the
+    /// user's picks — the same surface the permission gate reads before
+    /// every tool call. Any diff against what this thread last applied
+    /// (model, reasoning effort) is applied through the normal setters and
+    /// announced to the model as a harness-authored notice, inserted ahead
+    /// of the message that triggered this request.
+    ///
+    /// The version watermark is what keeps a reopened conversation silent.
+    /// A thread is built with the picks its row already carries, so the
+    /// first boundary's diff is empty and emits nothing; the watermark then
+    /// records that the build's values are current, and a write that
+    /// restates the same picks moves the version without a diff — hence
+    /// without a notice.
+    pub fn sync_object_config(&mut self) {
+        let source = self.config_source();
+        let version = source.config_version();
+        if version == self.applied_config_version {
+            return;
+        }
+        // A pick the row carries but that cannot resolve yet (a provider that
+        // is not registered) leaves the watermark behind, so a later boundary
+        // retries instead of dropping the user's choice for good.
+        let mut settled = true;
+
+        if let Some(model_ref) = source.model_ref() {
+            match source.model() {
+                Some(model) => {
+                    let current = self.model.as_ref();
+                    let changed =
+                        !current.is_some_and(|m| m.provider == model.provider && m.id == model.id);
+                    if changed {
+                        self.set_model(model);
+                        self.insert_config_notice(&format!(
+                            "[harness] The model has been switched to {model_ref}."
+                        ));
+                    }
+                }
+                None => {
+                    settled = false;
+                    tracing::warn!(model = %model_ref, "conversation model pick unresolvable");
+                }
+            }
+        }
+
+        if let Some(mode) = source.permission_mode()
+            && mode != self.permission_mode
+        {
+            self.set_permission_mode(mode);
+            self.insert_config_notice(&format!(
+                "[harness] The permission mode is now {}. Adjust your approach accordingly.",
+                mode.wire()
+            ));
+        }
+
+        if let Some(effort) = source.reasoning_effort() {
+            let parsed = match effort.as_str() {
+                "high" => Some(ReasoningEffort::High),
+                "max" => Some(ReasoningEffort::Max),
+                _ => None,
+            };
+            if let Some(effort_value) = parsed
+                && effort_value != self.reasoning_effort
+            {
+                self.set_reasoning_effort(effort_value);
+                self.insert_config_notice(&format!(
+                    "[harness] The reasoning effort is now {effort}."
+                ));
+            }
+        }
+
+        if settled {
+            self.applied_config_version = version;
+        }
+    }
+
+    /// The conversation's configuration surface, keyed by this thread's id.
+    fn config_source(&self) -> Arc<dyn manox_harness::ConversationConfigSource> {
+        crate::conversation_config::ObjectConfigSource::for_session(self.id.0.clone())
+    }
+
+    /// One harness-authored configuration notice: a user-role message the
+    /// renderer attributes to the harness (never a human stamp), landing
+    /// ahead of the turn that triggered it.
+    fn insert_config_notice(&mut self, text: &str) {
+        let ui = MessageUiMetadata {
+            author: Some(crate::message::MessageAuthor::Harness),
+            ..Default::default()
+        };
+        self.insert_user_message_with_ui_metadata_no_sync(text.to_string(), Some(ui));
+    }
+
+    /// The raw insert the notice path uses — a notice must not re-enter the
+    /// handshake (it carries no user will).
+    fn insert_user_message_with_ui_metadata_no_sync(
+        &mut self,
+        text: String,
+        ui: Option<MessageUiMetadata>,
+    ) {
+        let ordinal = self.user_prompt_ordinal();
+        let human = ui.as_ref().and_then(|u| u.author.as_ref()).is_none();
+        let mut message = crate::message::Message::user(text.clone());
+        message.ui = ui.clone();
+        self.messages.push(message);
+        self.persist_user_attribution(ordinal, &ui);
+        self.stamp_interaction(human);
+        self.pending_prompts.push(text);
+        self.last_user_ui = ui;
+    }
+
     /// Pick the model this thread runs on. The pick always reaches the engine
     /// — even one still assembling, where it lands as a queued switch — and
     /// sticks: no later `Ready` projection overwrites it.
@@ -2236,9 +2369,15 @@ impl Thread {
 fn drain_engine_notices(
     handle: ThreadHandle,
     mut events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
+    generation: u64,
 ) {
     crate::runtime::handle().spawn(async move {
         while let Some(notice) = events.recv().await {
+            // The facade moved to another engine: this pump's remaining
+            // notices describe a session nobody is looking at any more.
+            if !handle.read(|t| t.engine_generation == generation) {
+                break;
+            }
             handle.handle_notice(notice);
         }
     });
@@ -2616,6 +2755,12 @@ impl Thread {
         let Some(session_path) = self.active_session_path() else {
             return;
         };
+        // The object row's materialization stamp: the conversation actually
+        // happened the moment a human spoke to it (the ordering key and the
+        // draft-refill boundary in one write, draft cleared with it).
+        if let Some(objects) = crate::object_store::ObjectStore::try_global() {
+            objects.mark_human_message(&self.id.0, chrono::Utc::now().timestamp());
+        }
         persist_interaction_spawn(sessions_dir, session_path, chrono::Utc::now().timestamp());
     }
 
@@ -2712,12 +2857,7 @@ impl Drop for Thread {
     fn drop(&mut self) {
         // The engine owns the actor; ask it to close gracefully. If the
         // channel is already gone the actor exited on its own. A landing
-        // thread has no engine to shut down, and a redirect stub shares the
-        // successor's engine — shutting it down here would kill a live
-        // session (review #809 [sugg] 6).
-        if self.redirect_stub {
-            return;
-        }
+        // thread has no engine to shut down.
         if let Some(engine) = &self.engine {
             engine.shutdown();
         }
@@ -2850,8 +2990,21 @@ pub(crate) mod tests {
         phase: HistoryPhase,
         engine: Arc<dyn ThreadEngine>,
     ) -> ThreadHandle {
+        thread_with_engine_id(phase, engine, "test-thread")
+    }
+
+    /// [`thread_with_engine`] with the conversation id spelled out. The
+    /// object-store handshake reads its row by the thread's own id out of a
+    /// PROCESS-GLOBAL store, so a test that writes a config row must own an
+    /// id no sibling test's thread shares — otherwise a parallel test's turn
+    /// picks the row up and reports a change it never made.
+    pub(crate) fn thread_with_engine_id(
+        phase: HistoryPhase,
+        engine: Arc<dyn ThreadEngine>,
+        id: &str,
+    ) -> ThreadHandle {
         ThreadHandle::new(Thread {
-            id: ThreadId("test-thread".to_string()),
+            id: ThreadId(id.to_string()),
             cwd: PathBuf::from("/tmp"),
             project: None,
             model: None,
@@ -2860,7 +3013,6 @@ pub(crate) mod tests {
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
             archived: false,
-            redirect_stub: false,
             running: false,
             restored: false,
             display: Vec::new(),
@@ -2876,6 +3028,7 @@ pub(crate) mod tests {
             permission_mode_explicitly_set: false,
             reasoning_effort_explicitly_set: false,
             model_explicitly_set: false,
+            applied_config_version: 0,
             browser_suites: Vec::new(),
             browser_suites_explicitly_set: false,
             plan_mode: false,
@@ -2886,6 +3039,7 @@ pub(crate) mod tests {
             cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
+            engine_generation: 0,
             extra_working_dirs: Vec::new(),
         })
     }
@@ -3193,6 +3347,142 @@ pub(crate) mod tests {
     /// Images ride the prompt's own user message. `run_turn` must
     /// hand the queued text AND the queued images to the engine in one turn,
     /// draining both queues.
+    /// The object-store handshake: a row whose model pick differs from the
+    /// thread's applied model applies the pick and lands the harness
+    /// notice AHEAD of the message that triggered the request. A row that
+    /// restates the current picks inserts nothing.
+    #[tokio::test]
+    async fn object_store_config_changes_apply_with_a_notice() {
+        // The store at a scratch path; no row for this thread at first.
+        // The guard serializes against the object-store suite's own tests —
+        // both swap the process-global connection.
+        let _lock = crate::object_store::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::object_store::set_path_for_test(Some(dir.path().join("objects.db")));
+        crate::object_store::init();
+        let store = crate::object_store::ObjectStore;
+
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+            permission_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
+        });
+        let thread = thread_with_engine_id(HistoryPhase::Ready, engine.clone(), "cfg-handshake");
+        let sid = "cfg-handshake".to_string();
+
+        // Restating nothing (no row): the insert path is inert.
+        thread.with_mut(|t| {
+            t.insert_user_message_with_ui_metadata("first".to_string(), None);
+        });
+        assert_eq!(thread.read(|t| t.messages.len()), 1);
+
+        // A row with a changed permission pick: applied + noticed, in order.
+        store.create_conversation(&sid, None);
+        store.set_permission_mode(&sid, Some("read-only"));
+        thread.with_mut(|t| {
+            t.insert_user_message_with_ui_metadata("second".to_string(), None);
+        });
+        let applied = *engine.permission_mode.lock().unwrap();
+        assert_eq!(applied, Some(PermissionMode::ReadOnly));
+        let texts: Vec<String> = thread.read(|t| {
+            t.messages
+                .iter()
+                .map(|m| match m.content.first() {
+                    Some(MessageContent::Text(t)) => t.clone(),
+                    _ => String::new(),
+                })
+                .collect()
+        });
+        assert!(
+            texts[1].contains("[harness] The permission mode is now read-only"),
+            "the notice lands ahead of the triggering message: {texts:?}"
+        );
+        assert_eq!(texts[2], "second");
+        // No further row change: the next insert adds nothing.
+        thread.with_mut(|t| {
+            t.insert_user_message_with_ui_metadata("third".to_string(), None);
+        });
+        assert_eq!(thread.read(|t| t.messages.len()), 4);
+
+        crate::object_store::set_path_for_test(None);
+    }
+
+    /// The special project's initial-cwd policy: derived from the
+    /// conversation id, and created on demand — a conversation that is never
+    /// spoken to leaves nothing behind, and a reopen reuses the same
+    /// directory instead of minting a sibling.
+    #[test]
+    fn a_project_less_conversation_gets_its_own_workspace() {
+        let id = ThreadId(format!("policy-{}", uuid::Uuid::new_v4()));
+        let workspace = Thread::unfiled_cwd(&id);
+        assert_eq!(workspace, crate::paths::unfiled_workspace(&id.0));
+        assert!(workspace.is_dir(), "materializing the session creates it");
+        assert_eq!(Thread::unfiled_cwd(&id), workspace, "a reopen reuses it");
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// The version watermark: a write that restates the picks the thread
+    /// already holds moves the row's version but changes nothing the model
+    /// could act on, so no notice is inserted. The value diff alone would
+    /// also stay silent here, so this pins the watermark's own half of the
+    /// contract — the boundary may skip a read it does not need, and must
+    /// not invent a change to justify having looked.
+    #[tokio::test]
+    async fn a_restated_pick_inserts_no_notice() {
+        let _lock = crate::object_store::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::object_store::set_path_for_test(Some(dir.path().join("objects.db")));
+        crate::object_store::init();
+        let store = crate::object_store::ObjectStore;
+
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+            permission_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
+        });
+        let thread = thread_with_engine_id(HistoryPhase::Ready, engine.clone(), "restated");
+        let sid = "restated".to_string();
+        store.create_conversation(&sid, None);
+        store.set_permission_mode(&sid, Some(PermissionMode::ReadOnly.wire()));
+        thread.with_mut(|t| {
+            t.insert_user_message_with_ui_metadata("first".to_string(), None);
+        });
+        assert_eq!(
+            thread.read(|t| t.messages.len()),
+            2,
+            "the pick lands with its notice ahead of the message"
+        );
+
+        // The same pick again: the version moves, the observable value does not.
+        store.set_permission_mode(&sid, Some(PermissionMode::ReadOnly.wire()));
+        thread.with_mut(|t| {
+            t.insert_user_message_with_ui_metadata("second".to_string(), None);
+        });
+        assert_eq!(
+            thread.read(|t| t.messages.len()),
+            3,
+            "a re-statement adds the message alone, with no notice"
+        );
+
+        crate::object_store::set_path_for_test(None);
+    }
+
     #[tokio::test]
     async fn run_turn_drains_pending_text_and_images() {
         let engine = Arc::new(FakeEngine {

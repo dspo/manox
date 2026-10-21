@@ -17,9 +17,6 @@
 use manox_harness::session::SessionTreeEntry;
 use manox_harness::session::jsonl::JournalRecord;
 
-use crate::language_model::ReasoningEffort;
-use crate::thread::PermissionMode;
-
 /// The journal-backed observable state of one thread, folded from its
 /// active chain. Every field is `None` while the chain carries no entry
 /// for it — the restore path falls back to the sidecar cache for exactly
@@ -40,15 +37,6 @@ pub struct ReplayedThreadState {
     /// Project binding from the last `project_change` entry;
     /// `Some(None)` is an explicit unbind.
     pub project: Option<Option<String>>,
-    /// Permission mode from the last parseable `permission_mode_change`
-    /// entry (an unparseable mode string is skipped, keeping the previous
-    /// entry's value — the vocabulary is bounded but the fold stays
-    /// fail-soft on a hand-edited journal).
-    pub permission_mode: Option<PermissionMode>,
-    /// Reasoning effort from the last `thinking_level_change` entry whose
-    /// level parses as an effort (`"off"` and unknown levels are not
-    /// user-facing efforts and leave the field untouched).
-    pub reasoning_effort: Option<ReasoningEffort>,
     /// Plan-mode flag from the last `plan_mode_change` entry.
     pub plan_mode: Option<bool>,
     /// Snapshot value from the last `plan_update` entry (an empty snapshot
@@ -183,18 +171,6 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             SessionTreeEntry::ProjectChange { path, .. } => {
                 state.project = Some(path.clone());
             }
-            SessionTreeEntry::PermissionModeChange { mode, .. } => {
-                // The closed kebab vocabulary (`from_wire`): an unknown
-                // string leaves the previous entry in place.
-                if let Some(parsed) = PermissionMode::from_wire(mode) {
-                    state.permission_mode = Some(parsed);
-                }
-            }
-            SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => {
-                if let Some(effort) = crate::engine::parse_reasoning_effort(thinking_level) {
-                    state.reasoning_effort = Some(effort);
-                }
-            }
             SessionTreeEntry::PlanModeChange { enabled, .. } => {
                 state.plan_mode = Some(*enabled);
             }
@@ -234,12 +210,21 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             | SessionTreeEntry::Compaction { .. }
             | SessionTreeEntry::CompactionStarted { .. }
             | SessionTreeEntry::BranchSummary { .. } => {}
-            // ── live-only or kernel-owned state: the model rides the
-            //    kernel's own restore (`adopt_session_model`), the active
-            //    tool set rides `active_tools_change` through the kernel,
-            //    and lifecycle/delta/metrics rows carry no persistable
-            //    thread state ────────────────────────────────────────────
+            // ── live-only or kernel-owned state: the active tool set rides
+            //    `active_tools_change` through the kernel, and
+            //    lifecycle/delta/metrics rows carry no persistable thread
+            //    state ────────────────────────────────────────────────────
+            //
+            // The three configuration rows are here too, deliberately: the
+            // conversation's model, permission mode, and reasoning effort
+            // live in its object row (the engine reads them from there, the
+            // gate per tool call), and the journal carries no configuration
+            // of its own. Existing rows are left in place — this fold still
+            // parses them so a pre-store or hand-edited journal cannot break
+            // it — but nothing consumes them.
             SessionTreeEntry::ModelChange { .. }
+            | SessionTreeEntry::PermissionModeChange { .. }
+            | SessionTreeEntry::ThinkingLevelChange { .. }
             | SessionTreeEntry::ActiveToolsChange { .. }
             | SessionTreeEntry::TurnStart { .. }
             | SessionTreeEntry::TurnFinish { .. }
@@ -261,6 +246,10 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             | SessionTreeEntry::Label { .. }
             | SessionTreeEntry::SessionInfo { .. }
             | SessionTreeEntry::Leaf { .. }
+            | SessionTreeEntry::RunStarted { .. }
+            | SessionTreeEntry::RunSettled { .. }
+            | SessionTreeEntry::RunEscalated { .. }
+            | SessionTreeEntry::RunContinued { .. }
             | SessionTreeEntry::Metrics { .. } => {}
         }
     }
@@ -392,7 +381,7 @@ mod tests {
         let state = replay_thread_state(&[]);
         assert_eq!(state, ReplayedThreadState::default());
         assert!(state.title.is_none() && state.pinned.is_none());
-        assert!(state.permission_mode.is_none() && state.project.is_none());
+        assert!(state.project.is_none());
     }
 
     #[test]
@@ -445,19 +434,20 @@ mod tests {
         ];
         let state = replay_thread_state(&records);
         assert_eq!(state.project, Some(Some("/proj".into())));
-        assert_eq!(
-            state.permission_mode,
-            Some(PermissionMode::DangerFullAccess)
-        );
-        assert_eq!(state.reasoning_effort, Some(ReasoningEffort::Max));
         assert_eq!(state.plan_mode, Some(true));
         assert!(state.plan_snapshot.is_some());
         assert_eq!(state.goal, Some(serde_json::json!({"objective": "ship"})));
         assert_eq!(state.cwd.as_deref(), Some("/work"));
     }
 
+    /// The configuration rows are tolerated, not consumed: a pre-store or
+    /// hand-edited journal that still carries them (including one carrying a
+    /// mode string from no vocabulary) folds without complaint, and the
+    /// state it produces is the same one an empty chain produces. The
+    /// conversation's row is where the engine reads these, so a value here
+    /// must not leak into a restore and re-open a second authority.
     #[test]
-    fn unparseable_mode_and_off_level_do_not_clobber() {
+    fn configuration_rows_are_tolerated_but_not_consumed() {
         let ts = Utc::now();
         let id = || uuid::Uuid::new_v4().to_string();
         let records = vec![
@@ -477,17 +467,19 @@ mod tests {
                 id: id(),
                 parent_id: None,
                 timestamp: ts,
-                thinking_level: "high".into(),
+                thinking_level: "max".into(),
             }),
-            record(E::ThinkingLevelChange {
+            record(E::ModelChange {
                 id: id(),
                 parent_id: None,
                 timestamp: ts,
-                thinking_level: "off".into(),
+                provider: "p".into(),
+                model_id: "m".into(),
             }),
         ];
-        let state = replay_thread_state(&records);
-        assert_eq!(state.permission_mode, Some(PermissionMode::WorkspaceWrite));
-        assert_eq!(state.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(
+            replay_thread_state(&records),
+            ReplayedThreadState::default()
+        );
     }
 }

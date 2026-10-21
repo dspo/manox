@@ -255,7 +255,29 @@ impl SessionRuntime for GatewayRuntime {
 
     fn cancel_turn(&self, session_id: &str) -> Result<(), RuntimeError> {
         tracing::info!(session = %session_id, "gateway: cancelling the turn");
-        match self.server.ahp_inner().session_thread(session_id) {
+        let inner = Arc::clone(self.server.ahp_inner());
+        // A cold session (restored journal, no live engine in THIS process)
+        // still owes the cancel an answer: open it first, so the cancel
+        // either lands on its just-loaded thread (a no-op settle — the
+        // engine that owed the turn died elsewhere) or reports the foreign
+        // write lease honestly. Refusing "unknown session" left a restored
+        // dead turn unstoppable (real-device round, 2026-10-20).
+        if inner.session_thread(session_id).is_none() {
+            let owner = "ahp".to_string();
+            let id = session_id.to_string();
+            return block_on(async move {
+                crate::agent_server::open_session(&inner, &owner, &id).await?;
+                match inner.session_thread(&id) {
+                    Some(thread) => {
+                        thread.with_mut(|t| t.cancel());
+                        Ok(())
+                    }
+                    None => Err(RuntimeError::new(format!("unknown session {id}"))
+                        .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)),
+                }
+            });
+        }
+        match inner.session_thread(session_id) {
             Some(thread) => {
                 thread.with_mut(|t| t.cancel());
                 Ok(())
@@ -334,6 +356,10 @@ impl SessionRuntime for GatewayRuntime {
 
     fn order_session(&self, session_id: &str, before: Option<&str>) -> bool {
         self.server.ahp_inner().order_session(session_id, before)
+    }
+
+    fn set_project_alias(&self, path: &str, alias: Option<&str>) -> bool {
+        self.server.ahp_inner().set_project_alias(path, alias)
     }
 
     fn compact(&self, session_id: &str, instructions: Option<String>) -> Result<(), RuntimeError> {

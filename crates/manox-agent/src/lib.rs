@@ -12,6 +12,7 @@ pub mod chrome_use;
 pub mod claude_md;
 pub mod collaboration_mode;
 pub mod command;
+pub mod conversation_config;
 pub mod db;
 pub mod embedder_tools;
 pub mod file_lock;
@@ -27,6 +28,7 @@ pub mod language_model;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod message;
+pub mod object_store;
 pub mod path_env;
 pub mod path_policy;
 pub mod paths;
@@ -93,6 +95,7 @@ pub fn init() {
     // the resolver lands.
     path_env::install();
     runtime::init();
+    object_store::init();
     settings::init_optimization();
     provider_glue::init();
     // MCP servers (mcp.json + project/plugin .mcp.json layers) — blocks until the

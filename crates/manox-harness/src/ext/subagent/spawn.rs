@@ -18,7 +18,7 @@ use crate::core::coding_agent::{AgentSession, ModelRuntime, create_agent_session
 use crate::core::env::ExecutionEnv;
 use crate::core::ext_point_agent::{AgentDef, AgentRegistry};
 use crate::core::tool::{AgentTool, ToolError};
-use crate::core::types::{AgentEvent, AgentMessage, ContentBlock};
+use crate::core::types::{AgentEvent, AgentMessage};
 use crate::ext::prompt::base_prompt_builder;
 use crate::ext::subagent::SubagentRun;
 use crate::ext::subagent::provider::{RunObserver, SubagentProvider};
@@ -207,6 +207,15 @@ impl SubagentProvider for SpawnProvider {
             ));
         }
         let mut selected = self.select_child_tools(req.tool_filter.as_ref());
+        // The child's channel to the parent's user: one clarifying
+        // question, delivered once, ending the child's turn — the answer
+        // returns as a continuation of the same run.
+        if let Some(observer) = &self.observer {
+            selected.push(Arc::new(crate::ext::subagent::ask::AskParentTool::new(
+                run_id.clone(),
+                Arc::clone(observer),
+            )));
+        }
         let mut worktree = match req.isolation.as_deref() {
             Some("worktree") => Some(
                 Worktree::prepare(req.env.as_ref(), &req.cwd)
@@ -219,19 +228,30 @@ impl SubagentProvider for SpawnProvider {
             .as_ref()
             .map(|w| w.path.clone())
             .unwrap_or_else(|| req.cwd.clone());
-        let (session_dir, temp_guard): (PathBuf, Option<tempfile::TempDir>) = match &self
-            .session_dir
-        {
-            Some(dir) => (dir.clone(), None),
+        let (session_dir, session_file, temp_guard): (
+            PathBuf,
+            Option<PathBuf>,
+            Option<tempfile::TempDir>,
+        ) = match &self.session_dir {
+            // An explicit dir (tests) keeps the legacy flat layout.
+            Some(dir) => (dir.clone(), None, None),
+            // Production: the v1.0.0 core layout — one directory per
+            // child under its project bucket, `log.v1.jsonl` inside.
             None => {
-                let guard = tempfile::tempdir()
-                    .map_err(|e| SubagentError::Provider(self.name().to_string(), e.to_string()))?;
-                (guard.path().to_path_buf(), Some(guard))
+                let dir = crate::session::identity::core_session_dir_for(
+                    &child_cwd.to_string_lossy(),
+                    &run_id,
+                );
+                let file = dir.join(crate::session::identity::JOURNAL_FILE);
+                (dir, Some(file), None)
             }
         };
         let mut builder = create_agent_session()
             .with_cwd(child_cwd.clone())
-            .with_session_dir(session_dir)
+            .with_session_dir(session_dir.clone())
+            .with_session_file(session_file.clone().unwrap_or_else(|| {
+                session_dir.join(crate::session::repository::session_file_name(&run_id))
+            }))
             // The child session id IS the run id: every parent-side row
             // keyed by run id (progress ticks, tool-call correlation) then
             // names the child's own chat channel (`ahp-chat:/<run_id>`)
@@ -244,9 +264,10 @@ impl SubagentProvider for SpawnProvider {
             .with_tools(std::mem::take(&mut selected))
             // The lineage rides `metadata.subagent` (the sidebar filter and
             // usage accounting key off that object).
-            .with_metadata(
-                serde_json::json!({ "subagent": descriptor.metadata(req.parent_session.as_deref()) }),
-            );
+            .with_metadata(serde_json::json!({ "subagent": descriptor.metadata(
+                    req.parent_session.as_deref(),
+                    req.tool_call_id.as_deref(),
+                ) }));
         if let Some(runtime) = &self.model_runtime {
             builder = builder.with_model_runtime(runtime.clone());
         }
@@ -266,8 +287,28 @@ impl SubagentProvider for SpawnProvider {
         // Bounded assembly: a wedged child build fails the dispatch
         // stage-named (and never leaks the prepared worktree) instead of
         // hanging the parent turn forever.
+        // A continuation reopens the settled child's journal instead of
+        // creating a fresh session: the file carries its own header
+        // (lineage, persona binding) and the follow-up prompt rides the
+        // same drive loop, budgets, and salvage as a first dispatch.
+        let continuation_path = req.continuation_of.as_ref().map(|_| {
+            session_file.clone().unwrap_or_else(|| {
+                session_dir.join(crate::session::repository::session_file_name(&run_id))
+            })
+        });
+        if let Some(path) = &continuation_path
+            && !path.exists()
+        {
+            return Err(SubagentError::InvalidRequest(format!(
+                "no settled run named `{run_id}` to continue"
+            )));
+        }
         let built = tokio::time::timeout(START_TIMEOUT, async {
-            let mut session = builder.build().await.map_err(|e| {
+            let built_session = match &continuation_path {
+                Some(path) => builder.open(path.clone()).await,
+                None => builder.build().await,
+            };
+            let mut session = built_session.map_err(|e| {
                 SubagentError::Provider(
                     self.name().to_string(),
                     format!("failed to start subagent: {e}"),
@@ -313,6 +354,11 @@ impl SubagentProvider for SpawnProvider {
         };
         let handle = session.handle();
         let model = session.model().clone();
+        // The live feed for the child's own chat: registered for the run's
+        // whole life (the drive loop removes it on every exit below), so a
+        // bridge attaching at any moment during the run finds it.
+        let _feed_guard = ChildFeedGuard(run_id.clone());
+        super::feeds::register_child_feed(&run_id, &session.subscribe_journal_sender());
 
         let info = crate::ext::subagent::types::RunInfo {
             run_id: run_id.clone(),
@@ -322,6 +368,7 @@ impl SubagentProvider for SpawnProvider {
             model: Some(model),
             local: true,
             budgets: req.budgets,
+            tool_call_id: req.tool_call_id.clone(),
         };
         if let Some(observer) = &self.observer {
             observer.on_start(&info);
@@ -425,6 +472,16 @@ enum Ending {
     Stalled,
 }
 
+/// Removes the run's child feed entry when the drive loop exits, on every
+/// ending — the guard lives to the function's return, not just its tail.
+struct ChildFeedGuard(String);
+
+impl Drop for ChildFeedGuard {
+    fn drop(&mut self) {
+        super::feeds::remove_child_feed(&self.0);
+    }
+}
+
 async fn drive_run(run: DrivenRun) -> RunResult {
     let DrivenRun {
         mut session,
@@ -462,13 +519,17 @@ async fn drive_run(run: DrivenRun) -> RunResult {
     tokio::pin!(deadline);
     let mut watchdog_tick = tokio::time::interval(SUBAGENT_TICK);
     watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Partial-output salvage, read inside the killing arms right after the
+    // Partial-output salvage: the fold accumulates across the whole run
+    // (streamed text always, completed messages as the candidate), and the
+    // killing arms refresh it from the final message list right after the
     // prompt future is dropped (the borrow must provably end first).
+    let mut fold = super::salvage::OutputFold::new();
     let mut partial = String::new();
     let ending = loop {
         tokio::select! {
             r = prompt_fut.as_mut() => break Ending::Done(r),
             Some(event) = ev_rx.recv() => {
+                fold.observe(&event);
                 if let Some(observer) = &observer {
                     observer.on_child_event(&run_id, &event);
                 }
@@ -486,7 +547,8 @@ async fn drive_run(run: DrivenRun) -> RunResult {
                     break Ending::Done(r);
                 }
                 drop(prompt_fut);
-                partial = truncate_final(&extract_final_text(session.harness_messages()));
+                fold.observe_messages(session.harness_messages());
+                partial = fold.collect().map(|text| truncate_final(&text)).unwrap_or_default();
                 handle.abort();
                 break Ending::TimedOut;
             }
@@ -494,7 +556,8 @@ async fn drive_run(run: DrivenRun) -> RunResult {
                 let enforce = observer.as_ref().is_some_and(|o| o.on_tick(&run_id));
                 if enforce {
                     drop(prompt_fut);
-                    partial = truncate_final(&extract_final_text(session.harness_messages()));
+                    fold.observe_messages(session.harness_messages());
+                    partial = fold.collect().map(|text| truncate_final(&text)).unwrap_or_default();
                     handle.abort();
                     break Ending::Stalled;
                 }
@@ -515,16 +578,20 @@ async fn drive_run(run: DrivenRun) -> RunResult {
     // from the returned messages instead.
     let result = match ending {
         Ending::Done(Ok(messages)) => RunResult {
-            output: format!(
-                "{}{kept_note}",
-                truncate_final(&extract_final_text(&messages))
-            ),
+            output: format!("{}{kept_note}", {
+                fold.observe_messages(&messages);
+                fold.collect()
+                    .map(|text| truncate_final(&text))
+                    .unwrap_or_default()
+            }),
             structured: None,
             diagnostic: None,
             stop_reason: StopReason::Completed,
         },
         Ending::Done(Err(e)) if e.to_string().contains("aborted") => RunResult {
-            output: String::new(),
+            // The work the child finished before the abort is real: the
+            // fold carries it, and the settlement delivers it.
+            output: partial,
             structured: None,
             diagnostic: Some(cap_diagnostic("aborted")),
             stop_reason: StopReason::Aborted,
@@ -536,28 +603,34 @@ async fn drive_run(run: DrivenRun) -> RunResult {
             stop_reason: StopReason::Error,
         },
         Ending::Aborted => RunResult {
-            output: String::new(),
+            output: partial,
             structured: None,
             diagnostic: Some(cap_diagnostic(&format!("aborted{kept_note}"))),
             stop_reason: StopReason::Aborted,
         },
+        // The budget endings carry their OWN stop reasons: the settlement
+        // vocabulary has a first-class `timed-out` / `stalled`, and a
+        // producer that folds them into `Error` leaves those kinds
+        // unreachable — every consumer then reads a generic failure where
+        // the run's actual ending is known. The diagnostic keeps the
+        // numbers (the verdict line already names the ending).
         Ending::TimedOut => RunResult {
             output: partial,
             structured: None,
             diagnostic: Some(cap_diagnostic(&format!(
-                "subagent timed out: budget {}ms exceeded{kept_note}",
+                "time budget {}ms exceeded{kept_note}",
                 budgets.timeout_ms.unwrap_or_default()
             ))),
-            stop_reason: StopReason::Error,
+            stop_reason: StopReason::TimedOut,
         },
         Ending::Stalled => RunResult {
             output: partial,
             structured: None,
             diagnostic: Some(cap_diagnostic(&format!(
-                "subagent timed out: stalled — idle budget {}ms exceeded{kept_note}",
+                "idle budget {}ms exceeded with no activity{kept_note}",
                 budgets.idle_timeout_ms.unwrap_or_default()
             ))),
-            stop_reason: StopReason::Error,
+            stop_reason: StopReason::Stalled,
         },
     };
     if let Some(observer) = &observer {
@@ -571,27 +644,6 @@ async fn drive_run(run: DrivenRun) -> RunResult {
         });
     }
     result
-}
-
-/// Extract the final assistant text: the text blocks of the last assistant
-/// message that carried content, skipping empty/usage-only messages.
-pub fn extract_final_text(messages: &[AgentMessage]) -> String {
-    for msg in messages.iter().rev() {
-        if let AgentMessage::Assistant { content, .. } = msg {
-            let text: String = content
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text, .. } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text.is_empty() {
-                return text;
-            }
-        }
-    }
-    String::new()
 }
 
 fn truncate_final(text: &str) -> String {
@@ -1201,56 +1253,6 @@ mod tests {
             .arg(repo)
             .args(["branch", "-D", &branch])
             .output();
-    }
-
-    /// Output extraction: the last non-empty assistant message wins; an
-    /// empty transcript yields nothing.
-    #[test]
-    fn extract_final_text_prefers_last_non_empty_assistant() {
-        use crate::core::types::{AgentMessage, ContentBlock};
-        let text_block = |t: &str| {
-            vec![ContentBlock::Text {
-                text: t.to_string(),
-                signature: None,
-            }]
-        };
-        let messages = vec![
-            AgentMessage::Assistant {
-                content: text_block("intermediate narration"),
-                model: "m".into(),
-                provider: "p".into(),
-                api: "a".into(),
-                response_model: None,
-                response_id: None,
-                diagnostics: None,
-                raw_stop_reason: None,
-                stop_reason: None,
-                usage: Box::new(crate::core::types::Usage::default()),
-                error_message: None,
-                timestamp: chrono::Utc::now(),
-            },
-            AgentMessage::User {
-                content: Vec::new(),
-                timestamp: chrono::Utc::now(),
-                id: None,
-            },
-            AgentMessage::Assistant {
-                content: text_block("the final answer"),
-                model: "m".into(),
-                provider: "p".into(),
-                api: "a".into(),
-                response_model: None,
-                response_id: None,
-                diagnostics: None,
-                raw_stop_reason: None,
-                stop_reason: None,
-                usage: Box::new(crate::core::types::Usage::default()),
-                error_message: None,
-                timestamp: chrono::Utc::now(),
-            },
-        ];
-        assert_eq!(extract_final_text(&messages), "the final answer");
-        assert_eq!(extract_final_text(&[]), "");
     }
 
     /// Budget validation: below-minimum arms are input errors.

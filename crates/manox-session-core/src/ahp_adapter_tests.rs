@@ -44,8 +44,7 @@ pub(super) fn install() -> (
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&tmp).unwrap();
-    let db = Arc::new(manox_agent::db::ThreadsDatabase::open(&tmp.join("threads.db")).unwrap());
-    manox_agent::thread_store::init_for_test(db);
+    manox_agent::thread_store::init_for_test();
     manox_agent::thread_registry::set_registry_path_for_test(Some(
         tmp.join("threads.registry.json"),
     ));
@@ -78,6 +77,16 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
             ..
         }
         | E::TurnFinish {
+            id: i,
+            parent_id: p,
+            ..
+        }
+        | E::RunStarted {
+            id: i,
+            parent_id: p,
+            ..
+        }
+        | E::RunSettled {
             id: i,
             parent_id: p,
             ..
@@ -155,10 +164,19 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
     e
 }
 
-/// Write one session journal (`<id>.jsonl` under the store's sessions dir,
+/// A session journal's path in the core layout (bucket over per-session
+/// directories, `log.v1.jsonl` inside) under the store's root.
+fn core_journal(id: &str) -> std::path::PathBuf {
+    manox_agent::thread_store::global_sessions_dir()
+        .join("t")
+        .join(id)
+        .join(manox_harness::session::identity::JOURNAL_FILE)
+}
+
+/// Write one session journal (the core layout under the store's root,
 /// header stamped with its thread) with a linear entry chain.
 async fn seed_session(id: &str, thread: &str, cwd: &str, events: Vec<(&str, E)>) {
-    let path = manox_agent::thread_store::global_sessions_dir().join(format!("{id}.jsonl"));
+    let path = core_journal(id);
     let mut entries = Vec::with_capacity(events.len());
     let mut parent: Option<String> = None;
     for (eid, event) in events {
@@ -441,12 +459,9 @@ fn probe_real_journal_fold() {
     let dst = manox_agent::thread_store::global_sessions_dir().join(src.file_name().unwrap());
     std::fs::copy(&src, &dst).unwrap();
     manox_agent::runtime::handle().block_on(async {
-        let session_id = src
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .trim_end_matches(".jsonl");
+        // The core layout: `log.v1.jsonl` inside a directory named by the
+        // session's id.
+        let session_id = src.parent().unwrap().file_name().unwrap().to_str().unwrap();
         match chat_state(session_id).await {
             Some(state) => {
                 assert!(
@@ -670,10 +685,12 @@ fn folds_answer_none_for_absent_inputs() {
 // matches and the test would assert about the fallback instead of the mapping.
 
 mod dispatch {
+    use super::core_journal;
     use super::install;
     use super::uninstall;
     use super::{
-        JsonlSessionStorage, assistant, delta, seed_session, stamp, tool_call, user, with_chain,
+        JsonlSessionStorage, assistant, delta, seed_session, stamp, tool_call, turn_finish,
+        turn_start, user, with_chain,
     };
     use crate::agent_server::AgentServer;
     use ahp_types::actions::{
@@ -682,6 +699,7 @@ mod dispatch {
     };
     use ahp_types::common::JsonObject;
     use ahp_types::state::{Message, MessageKind, MessageOrigin, PendingMessageKind, ResponsePart};
+    use ahp_types::state::{SessionStatus, TurnState};
     use ahp_types::version::PROTOCOL_VERSION;
     use manox_ahp::backend::{Backend, DispatchOutcome};
     use manox_ahp::channels::{chat, session};
@@ -719,7 +737,7 @@ mod dispatch {
     /// live engine's own writes do, without the broadcast. The bridge's
     /// cold read is the reader these tests exercise.
     async fn append_session(id: &str, events: Vec<(&str, Option<&str>, E)>) {
-        let path = manox_agent::thread_store::global_sessions_dir().join(format!("{id}.jsonl"));
+        let path = core_journal(id);
         let storage = JsonlSessionStorage::open(&path)
             .await
             .expect("the seeded journal opens");
@@ -763,9 +781,7 @@ mod dispatch {
         crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
             .await
             .expect("session opens");
-        let _ = std::fs::remove_file(
-            manox_agent::thread_store::global_sessions_dir().join(format!("{session_id}.jsonl")),
-        );
+        let _ = std::fs::remove_file(core_journal(session_id));
         seed_session(session_id, thread_id, "/", events).await;
 
         let transport = runtime.inproc();
@@ -1743,8 +1759,7 @@ mod dispatch {
         let (_server, backend) = fixture().await;
         // A rename is only durable against a session that has a journal, so the
         // happy path needs one (the refusal case is its own test below).
-        let session_file =
-            manox_agent::thread_store::global_sessions_dir().join("s-dispatch.jsonl");
+        let session_file = core_journal("s-dispatch");
         std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
         std::fs::write(
             &session_file,
@@ -1918,6 +1933,82 @@ mod dispatch {
         engine
     }
 
+    /// A sub-agent child's chat channel subscribes without its session
+    /// channel, and declares its lineage while doing it.
+    ///
+    /// The drill-down attaches the child by run id; the child is not a
+    /// sidebar session (no store row, no live engine in this process), so
+    /// the resolution may not depend on a list scan or on the session
+    /// channel having been subscribed first — the journal on disk is the
+    /// fact, and `thread_of_session` now reads it. The snapshot is also
+    /// where the reverse half of the lineage pair lives: the child chat
+    /// names the tool call that spawned it and is read-only to the user.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_child_chats_channel_subscribes_on_its_own_journal() {
+        let _guards = install();
+        let id = format!("sub-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cwd_string = cwd.to_string_lossy().into_owned();
+        let path = core_journal(&id);
+        let storage = JsonlSessionStorage::create(
+            &path,
+            manox_harness::session::jsonl::JsonlSessionMetadata {
+                id: id.clone(),
+                cwd: cwd_string,
+                created_at: stamp(),
+                parent_session_path: None,
+                metadata: Some(json!({
+                    "subagent": { "parent": "s-parent", "toolCallId": "tu_1" }
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        storage
+            .append_entries(&[with_chain("e-1", None, user("child prompt"))])
+            .await
+            .unwrap();
+        drop(storage);
+
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        let transport = runtime.inproc();
+        let client = ahp::Client::connect(transport, ahp::ClientConfig::default())
+            .await
+            .expect("client connects");
+        client
+            .initialize(
+                "probe".to_string(),
+                vec![PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes");
+        let (result, _sub) = client
+            .subscribe(manox_ahp::channels::chat::uri(&id))
+            .await
+            .expect("a child chat subscribes off its own journal");
+        let snapshot = result.snapshot.expect("the child chat answers a snapshot");
+        let ahp_types::state::SnapshotState::Chat(state) = &snapshot.state else {
+            panic!("the child chat's snapshot is a chat state: {snapshot:?}");
+        };
+        assert!(
+            matches!(
+                state.origin,
+                Some(ahp_types::state::ChatOrigin::Tool { .. })
+            ),
+            "the child chat declares its lineage: {:?}",
+            state.origin
+        );
+        assert_eq!(
+            state.interactivity,
+            Some(ahp_types::state::ChatInteractivity::ReadOnly),
+            "a worker chat is read-only"
+        );
+        uninstall();
+    }
+
     /// `chat/inputCompleted` must settle the parked question card. A dropped
     /// settle is silent: the card stays up and the turn never resumes.
     #[tokio::test(flavor = "multi_thread")]
@@ -1973,20 +2064,16 @@ mod dispatch {
     /// is silent *and* dangerous: every later tool call would be fenced against
     /// the wrong root.
     ///
-    /// Two branches exist, and the difference is load-bearing: an *interacted*
-    /// session moves its cwd in place (synchronous, asserted here), while a
-    /// not-yet-interacted one binds a successor session on a spawned task
-    /// (`bind_successor`) and has no synchronous cwd to observe. The session is
-    /// therefore marked interacted first, so this pins the in-place leg rather
-    /// than racing a spawn.
+    /// Identity never follows the directory: both interaction states move the
+    /// cwd in place and synchronously under the same session id. The
+    /// not-yet-interacted leg is asserted first (the previous model handed
+    /// that one to a successor session on a spawned task), then the
+    /// interacted leg.
     #[tokio::test(flavor = "multi_thread")]
     async fn working_directory_set_reaches_the_engine_cwd() {
         let _guards = install();
         let (server, backend) = fixture().await;
         let engine = attach_engine(&server);
-        if let Some(thread) = server.ahp_inner().session_thread("s-dispatch") {
-            thread.with_mut(|t| t.insert_user_message_with_ui_metadata("first".into(), None));
-        }
 
         let action = StateAction::SessionWorkingDirectorySet(
             ahp_types::actions::SessionWorkingDirectorySetAction {
@@ -2000,7 +2087,32 @@ mod dispatch {
         assert_eq!(
             engine.cwds.lock().clone(),
             vec![std::path::PathBuf::from("/work/granted")],
-            "the new root reaches the engine's fence"
+            "a blank session relocates in place: the new root reaches the engine's fence"
+        );
+        assert!(
+            server.ahp_inner().session_thread("s-dispatch").is_some(),
+            "the session keeps its id — no successor is minted"
+        );
+
+        if let Some(thread) = server.ahp_inner().session_thread("s-dispatch") {
+            thread.with_mut(|t| t.insert_user_message_with_ui_metadata("first".into(), None));
+        }
+        let again = StateAction::SessionWorkingDirectorySet(
+            ahp_types::actions::SessionWorkingDirectorySetAction {
+                directory: "file:///work/granted-later".to_string(),
+            },
+        );
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &again, &origin()),
+            DispatchOutcome::Accepted
+        );
+        assert_eq!(
+            engine.cwds.lock().clone(),
+            vec![
+                std::path::PathBuf::from("/work/granted"),
+                std::path::PathBuf::from("/work/granted-later"),
+            ],
+            "an interacted session advances its sticky cwd in place"
         );
 
         // A non-file URI cannot name a grant, and must not be accepted as one.
@@ -2013,7 +2125,7 @@ mod dispatch {
             backend.dispatch(&session::uri("s-dispatch"), &bogus, &origin()),
             DispatchOutcome::Rejected(_)
         ));
-        assert_eq!(engine.cwds.lock().len(), 1, "the bogus grant never landed");
+        assert_eq!(engine.cwds.lock().len(), 2, "the bogus grant never landed");
         uninstall();
     }
 
@@ -2183,8 +2295,7 @@ mod dispatch {
     async fn title_changed_appends_the_journal_row() {
         let _guards = install();
         let session_id = format!("s-title-{}", uuid::Uuid::new_v4().simple());
-        let session_file =
-            manox_agent::thread_store::global_sessions_dir().join(format!("{session_id}.jsonl"));
+        let session_file = core_journal(&session_id);
         std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
         // The store's cold append (no live engine drives this session) writes to
         // an existing journal, opened through its header row.
@@ -2404,14 +2515,435 @@ mod dispatch {
                 // route alone is not that (a queued append to an engine that
                 // never opened a file is dropped without a trace).
                 assert!(
-                    manox_agent::thread_store::global_sessions_dir()
-                        .join(format!("{id}.jsonl"))
-                        .exists(),
+                    core_journal(&id).exists(),
                     "an accepted rename must have a journal behind it"
                 );
             }
             other => panic!("unexpected outcome: {other:?}"),
         }
+        uninstall();
+    }
+
+    /// The claim table on the wire, one arm per test: the id the answer
+    /// carries is the id the client drives, and the guard arms refuse
+    /// instead of opening something else.
+    fn create_params(id: &str, cwd: Option<&str>) -> ahp_types::commands::CreateSessionParams {
+        ahp_types::commands::CreateSessionParams {
+            channel: session::uri(id),
+            meta: None,
+            provider: None,
+            working_directories: cwd.map(|dir| vec![format!("file://{dir}")]),
+            config: None,
+            active_client: None,
+            progress_token: None,
+        }
+    }
+
+    /// A retry of the client's own create drives the session it already
+    /// owns: the same id answers, the journal is never re-minted, and the
+    /// restore lands on the materialized conversation. Minting a second log
+    /// for one intent is the double-row accident the claim exists to
+    /// prevent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retried_create_restores_the_session_it_already_owns() {
+        let _guards = install();
+        let id = format!("s-retry-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cwd_string = cwd.to_string_lossy().into_owned();
+        seed_session(&id, &id, &cwd_string, vec![("e-1", user("first prompt"))]).await;
+
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        backend
+            .create_session(&id, &create_params(&id, Some(&cwd_string)))
+            .expect("the retry drives the id it already owns");
+        assert!(
+            server.ahp_inner().session_thread(&id).is_some(),
+            "the retry restored the materialized session"
+        );
+        assert!(
+            core_journal(&id).exists(),
+            "the retry never re-minted over the journal"
+        );
+        uninstall();
+    }
+
+    /// A materialized session lives where it was created: a create naming
+    /// another directory is an explicit conflict — never a silent redirect,
+    /// never a fresh session over the id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_create_naming_another_directory_is_an_explicit_conflict() {
+        let _guards = install();
+        let id = format!("s-conflict-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cwd_string = cwd.to_string_lossy().into_owned();
+        seed_session(&id, &id, &cwd_string, vec![("e-1", user("first prompt"))]).await;
+
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let err = backend
+            .create_session(&id, &create_params(&id, Some("/definitely/elsewhere")))
+            .expect_err("a create naming another directory is refused");
+        assert!(
+            format!("{err:?}").contains("lives in"),
+            "the conflict names both directories: {err:?}"
+        );
+        assert!(
+            server.ahp_inner().session_thread(&id).is_none(),
+            "the refusal opens nothing"
+        );
+        uninstall();
+    }
+
+    /// A subagent session belongs to its parent's run: the claim refuses it
+    /// outright, however the client learned the id. Without the ownership
+    /// guard a create would open the child's journal as a user session and
+    /// let a client drive a run's private log.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subagent_session_cannot_be_claimed() {
+        let _guards = install();
+        let id = format!("sub-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cwd_string = cwd.to_string_lossy().into_owned();
+        // The child journal the spawn writes: lineage in the header metadata.
+        let path = core_journal(&id);
+        let storage = JsonlSessionStorage::create(
+            &path,
+            manox_harness::session::jsonl::JsonlSessionMetadata {
+                id: id.clone(),
+                cwd: cwd_string.clone(),
+                created_at: stamp(),
+                parent_session_path: None,
+                metadata: Some(json!({
+                    "subagent": { "parent": "s-parent", "toolCallId": "tu_1" }
+                })),
+            },
+        )
+        .await
+        .unwrap();
+        drop(storage);
+
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let err = backend
+            .create_session(&id, &create_params(&id, Some(&cwd_string)))
+            .expect_err("a subagent session is never claimed");
+        assert!(
+            format!("{err:?}").contains("cannot be claimed"),
+            "the refusal names the ownership: {err:?}"
+        );
+        assert!(
+            server.ahp_inner().session_thread(&id).is_none(),
+            "the refusal opens nothing"
+        );
+        uninstall();
+    }
+
+    /// The chat channel of a live-but-blank session must resolve on the wire.
+    ///
+    /// A claim (`createSession`) writes nothing durable — the journal
+    /// materializes lazily at the first turn — so every durable leg of
+    /// `thread_of_session` (the registry's active pointer, the journal
+    /// header's thread stamp, the store row) misses for the session the host
+    /// itself just created. `ensure_chat` consulted only those legs, so the
+    /// client's chat subscribe answered `not found` and the session's first
+    /// `ChatTurnStarted` dispatch was rejected before the runtime ever saw
+    /// it — a silent black hole for the first message of every fresh
+    /// session. The live session table is a first-class leg now (backend
+    /// `session_state_for_chat`); this drives the same wire path the client
+    /// drove (subscribe on `ahp-chat:/<id>`), not the seed's own seam.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blank_claimed_sessions_chat_channel_answers_on_the_wire() {
+        let _guards = install();
+        let id = format!("s-blank-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        let intent = crate::agent_server::SessionIntent {
+            session_id: Some(id.clone()),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            seed: None,
+            working_directories: Vec::new(),
+        };
+        let inner = Arc::clone(server.ahp_inner());
+        crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
+            .await
+            .expect("session opens");
+        assert!(
+            !core_journal(&id).exists(),
+            "the claim materializes nothing: this is the state under test"
+        );
+
+        let transport = runtime.inproc();
+        let client = ahp::Client::connect(transport, ahp::ClientConfig::default())
+            .await
+            .expect("client connects");
+        client
+            .initialize(
+                "probe".to_string(),
+                vec![PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes");
+        let (result, _sub) = client
+            .subscribe(manox_ahp::channels::chat::uri(&id))
+            .await
+            .expect("a live blank session's chat channel subscribes");
+        assert!(
+            result.snapshot.is_some(),
+            "the empty chat answers a snapshot, not `not found`"
+        );
+        uninstall();
+    }
+
+    /// An open `run/started` whose host died folds settled on the cold seed.
+    ///
+    /// The roster entry is opened by `run/started` and closed by
+    /// `run/settled`; a process that died mid-run leaves the pair unclosed, so
+    /// a cold fold would list a sub-agent that can never finish — the phantom
+    /// the turn-level settlement already clears, one level down. The live path
+    /// reports a cancelled turn's in-flight runs as removals (#812), and the
+    /// cold fold reports the same instead of inventing a settlement kind the
+    /// journal never recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_orphaned_run_folds_settled_on_the_cold_seed() {
+        let _guards = install();
+        seed_session(
+            "s-orphanrun",
+            "thread-orphanrun",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", turn_start()),
+                (
+                    "e3",
+                    E::RunStarted {
+                        id: String::new(),
+                        parent_id: None,
+                        timestamp: stamp(),
+                        run_id: "sub-orphan".into(),
+                        kind: "Explore".into(),
+                        label: "survey the fold".into(),
+                        child_session: "sub-orphan".into(),
+                        tool_call_id: "tu_1".into(),
+                        budgets: Default::default(),
+                        depth: 1,
+                    },
+                ),
+                ("e4", turn_finish()),
+                // No run/settled: the host that owed it died.
+            ],
+        )
+        .await;
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let state = backend
+            .chat_state("s-orphanrun")
+            .expect("the cold seed answers");
+        assert!(
+            state
+                .background_work
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty(),
+            "an orphaned run folds settled: {:?}",
+            state.background_work
+        );
+        uninstall();
+    }
+
+    /// The mirror: while the child's journal feed is registered the run is
+    /// live, so the same fold keeps its roster entry — the synthesis must
+    /// never clear work a running child can still settle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_childs_run_stays_listed_on_the_cold_seed() {
+        let _guards = install();
+        seed_session(
+            "s-liverun",
+            "thread-liverun",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", turn_start()),
+                (
+                    "e3",
+                    E::RunStarted {
+                        id: String::new(),
+                        parent_id: None,
+                        timestamp: stamp(),
+                        run_id: "sub-live".into(),
+                        kind: "Explore".into(),
+                        label: "survey the fold".into(),
+                        child_session: "sub-live".into(),
+                        tool_call_id: "tu_1".into(),
+                        budgets: Default::default(),
+                        depth: 1,
+                    },
+                ),
+                ("e4", turn_finish()),
+            ],
+        )
+        .await;
+        let (feed, _rx) = tokio::sync::broadcast::channel(8);
+        manox_harness::subagent::feeds::register_child_feed("sub-live", &feed);
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let state = backend
+            .chat_state("s-liverun")
+            .expect("the cold seed answers");
+        let listed = state.background_work.as_deref().unwrap_or_default().len();
+        manox_harness::subagent::feeds::remove_child_feed("sub-live");
+        assert_eq!(listed, 1, "a live child keeps its roster entry: {state:?}");
+        uninstall();
+    }
+
+    /// A turn the journal shows as started but never settled is dead by
+    /// construction on a cold read: the engine that owed the settlement
+    /// died with its process, and nothing will ever complete it. The cold
+    /// seed must fold the settlement itself (cancelled, "host exited") —
+    /// restoring the turn as running left a phantom spinner no stop could
+    /// clear (real-device round, 2026-10-20: a killed host's session
+    /// re-opened showing InProgress forever).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_hosts_open_turn_folds_settled_on_the_cold_seed() {
+        let _guards = install();
+        seed_session(
+            "s-deadturn",
+            "thread-dead",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", turn_start()),
+                ("e3", delta("partial")),
+                // No turn_finish: the process died mid-run.
+            ],
+        )
+        .await;
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let state = backend
+            .chat_state("s-deadturn")
+            .expect("the cold seed answers");
+        assert!(
+            state.active_turn.is_none(),
+            "a dead host's turn must not fold as running"
+        );
+        assert_eq!(state.turns.len(), 1, "the turn itself stays visible");
+        assert_eq!(
+            state.turns[0].state,
+            TurnState::Cancelled,
+            "the synthetic settlement reads as cancelled"
+        );
+        assert_eq!(
+            state.status & SessionStatus::InProgress.bits(),
+            0,
+            "the chat status no longer claims InProgress"
+        );
+        uninstall();
+    }
+
+    /// A turn another process is running must not fold as settled.
+    ///
+    /// The state root is shared: the cx CLI (or a second desktop) can be
+    /// driving a journal this process only folds. The `turnStart` row's owner
+    /// stamp is the documented way to tell a dead owner from one running
+    /// elsewhere — the same stamp `x-manox/openTurn` serves to clients — so a
+    /// cold fold that settles without consulting it cancels a live turn and
+    /// contradicts the contract it hands clients.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_owners_open_turn_stays_open_on_the_cold_seed() {
+        let _guards = install();
+        let mut start = turn_start();
+        if let E::TurnStart { owner, .. } = &mut start {
+            *owner = Some(manox_harness::session::TurnOwner::for_current_process());
+        }
+        seed_session(
+            "s-liveowner",
+            "thread-liveowner",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", start),
+                ("e3", delta("partial")),
+                // No turn_finish: the owner is still running it.
+            ],
+        )
+        .await;
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let state = backend
+            .chat_state("s-liveowner")
+            .expect("the cold seed answers");
+        assert!(
+            state.active_turn.is_some(),
+            "a live owner's turn stays open across the cold seed"
+        );
+        assert_eq!(
+            state.status & SessionStatus::InProgress.bits(),
+            SessionStatus::InProgress.bits(),
+            "the chat still reads InProgress"
+        );
+        uninstall();
+    }
+
+    /// Cancelling a cold session (journal on disk, no live engine in this
+    /// process) must open it and answer Ok — the cancel is a no-op settle
+    /// on the loaded thread. Refusing "unknown session" left a restored
+    /// dead turn unstoppable (the client's stop surfaced the rejection).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_cold_restored_session_opens_it_instead_of_refusing() {
+        let _guards = install();
+        seed_session(
+            "s-coldcancel",
+            "thread-cold",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", turn_start()),
+                ("e3", turn_finish()),
+            ],
+        )
+        .await;
+        // The scan is what teaches the store the id→path map on the real
+        // device (verified live: a refreshed store resolves the cold id);
+        // the test store's reconcile doesn't index direct file writes, so
+        // the note lands the same mapping the established idiom uses.
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.note_session_path("s-coldcancel", &core_journal("s-coldcancel")));
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let action = StateAction::ChatTurnCancelled(ahp_types::actions::ChatTurnCancelledAction {
+            turn_id: "t-irrelevant".to_string(),
+            duration: 0,
+            meta: None,
+        });
+        match backend.dispatch(&chat::uri("s-coldcancel"), &action, &origin()) {
+            DispatchOutcome::Accepted => {}
+            other => panic!("a cold session's cancel must open and settle, got {other:?}"),
+        }
+        assert!(
+            server.ahp_inner().session_thread("s-coldcancel").is_some(),
+            "the cancel's cold open loaded the session"
+        );
         uninstall();
     }
 
@@ -3210,11 +3742,7 @@ mod transport_parity {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&scratch).expect("scratch dir");
-        let db = Arc::new(
-            manox_agent::db::ThreadsDatabase::open(&scratch.join("threads.db"))
-                .expect("threads db"),
-        );
-        manox_agent::thread_store::init_for_test(db);
+        manox_agent::thread_store::init_for_test();
         manox_agent::thread_registry::set_registry_path_for_test(Some(
             scratch.join("threads.registry.json"),
         ));

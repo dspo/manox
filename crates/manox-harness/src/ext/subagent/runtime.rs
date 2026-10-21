@@ -26,7 +26,17 @@ struct ActiveRun {
     snapshot: RunSnapshot,
     dispose: CancellationToken,
     started_at: Instant,
+    /// The capacity slot, held for the entry's whole life: the permit drops
+    /// exactly when the run leaves the table (settle watcher, interrupt, or a
+    /// dropped entry), so the slot can never leak and the admission decision
+    /// is one atomic reservation instead of a count read before an `await`.
+    _capacity: tokio::sync::OwnedSemaphorePermit,
 }
+
+/// How many child runs may be active at once. The limit keeps a model from
+/// fanning out unbounded while any single run can still run to completion;
+/// hitting it is a routing decision the error text coaches, not a failure.
+pub const DEFAULT_ACTIVE_CAPACITY: usize = 4;
 
 /// The subagent service: registry + capability-checked starts + live-run
 /// table + the `start`/`end` observation broadcast. One per thread assembly.
@@ -45,6 +55,8 @@ pub struct SubagentRuntime {
     /// re-emit `sub-0` and collide with the historical rows.
     namespace: String,
     run_seq: AtomicU64,
+    /// The active-capacity gate's permits (see [`DEFAULT_ACTIVE_CAPACITY`]).
+    capacity: Arc<tokio::sync::Semaphore>,
 }
 
 impl SubagentRuntime {
@@ -63,6 +75,7 @@ impl SubagentRuntime {
             events_tx,
             namespace: namespace.into(),
             run_seq: AtomicU64::new(0),
+            capacity: Arc::new(tokio::sync::Semaphore::new(DEFAULT_ACTIVE_CAPACITY)),
         })
     }
 
@@ -130,6 +143,33 @@ impl SubagentRuntime {
         provider: &str,
         request: StartRequest,
     ) -> Result<SubagentRun, SubagentError> {
+        self.start_gated(provider, request, None).await
+    }
+
+    /// Continue a settled run: reopen the child session the run id names
+    /// and inject the follow-up prompt as a new turn. Every gate of
+    /// [`Self::start`] applies; the run keeps its id — the child session
+    /// id IS the run id, so cards, rows, and drill-downs stay pointed at
+    /// the same chat.
+    pub async fn continue_run(
+        self: &Arc<Self>,
+        provider: &str,
+        run_id: &str,
+        mut request: StartRequest,
+    ) -> Result<SubagentRun, SubagentError> {
+        request.continuation_of = Some(run_id.to_string());
+        self.start_gated(provider, request, Some(run_id.to_string()))
+            .await
+    }
+
+    /// The one start path: gates, id (minted or continued), provider
+    /// dispatch, run-table registration, settle watcher.
+    async fn start_gated(
+        self: &Arc<Self>,
+        provider: &str,
+        request: StartRequest,
+        explicit_id: Option<String>,
+    ) -> Result<SubagentRun, SubagentError> {
         let provider_impl = self.get_provider(provider)?;
         request.budgets.validate()?;
         assert_capabilities(provider, &provider_impl.capabilities(), &request)?;
@@ -140,6 +180,20 @@ impl SubagentRuntime {
                  but the cap is {max}"
             )));
         }
+        // One atomic reservation per run: the permit is taken before the
+        // provider is asked to start and lives in the run-table entry, so two
+        // concurrent dispatches can no longer both read a stale count and
+        // overshoot the cap (the count used to be read before an `await`).
+        let capacity = match Arc::clone(&self.capacity).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Err(SubagentError::InvalidRequest(format!(
+                    "subagent limit reached (active child limit: {DEFAULT_ACTIVE_CAPACITY}); \
+                     wait for an existing child to finish or complete this work \
+                     with the current agents"
+                )));
+            }
+        };
         let mut descriptor = Descriptor::one_shot(
             provider,
             request.label.clone(),
@@ -149,15 +203,18 @@ impl SubagentRuntime {
         descriptor.persona = request.persona.clone();
         descriptor.tool_filter = request.tool_filter.clone();
 
-        let run_id = format!(
-            "sub-{}-{}",
-            self.namespace,
-            self.run_seq.fetch_add(1, Ordering::SeqCst)
-        );
+        let run_id = explicit_id.unwrap_or_else(|| {
+            format!(
+                "sub-{}-{}",
+                self.namespace,
+                self.run_seq.fetch_add(1, Ordering::SeqCst)
+            )
+        });
         let label = request.label.clone();
         let kind = request.kind.clone();
         let request_kind = request.kind.clone();
         let request_model = request.agent_options.as_ref().and_then(|o| o.model.clone());
+        let resolved_tool_call_id = request.tool_call_id.clone();
         let resolved_budgets = request.budgets;
         let resolved = ResolvedStartRequest {
             run_id: run_id.clone(),
@@ -179,6 +236,7 @@ impl SubagentRuntime {
                 },
                 dispose: run.dispose_token().clone(),
                 started_at: Instant::now(),
+                _capacity: capacity,
             },
         );
         if self
@@ -191,6 +249,7 @@ impl SubagentRuntime {
                 model: request_model,
                 local: true,
                 budgets: resolved_budgets,
+                tool_call_id: resolved_tool_call_id,
             }))
             .is_err()
         {
@@ -531,5 +590,138 @@ mod tests {
         let names = runtime.delegation_tool_names();
         assert_eq!(names.len(), 2);
         assert!(names.contains("Explore") && names.contains("ListAgents"));
+    }
+
+    /// A provider whose runs never settle — the capacity gate's fixture:
+    /// active runs occupy slots for their whole life.
+    struct HoldingProvider;
+
+    #[async_trait::async_trait]
+    impl SubagentProvider for HoldingProvider {
+        fn name(&self) -> &str {
+            "holding"
+        }
+        fn capabilities(&self) -> Capabilities {
+            full_caps()
+        }
+        async fn start(&self, request: ResolvedStartRequest) -> Result<SubagentRun, SubagentError> {
+            let cancel = request.inner.cancel.clone();
+            Ok(SubagentRun::new(
+                request.run_id,
+                cancel.clone(),
+                Box::pin(async move {
+                    // Hold until the dispose token fires, then settle as
+                    // aborted — the cancellation the real drive loop takes.
+                    cancel.cancelled().await;
+                    RunResult {
+                        output: String::new(),
+                        structured: None,
+                        diagnostic: None,
+                        stop_reason: StopReason::Aborted,
+                    }
+                }),
+            ))
+        }
+    }
+
+    /// Like [`HoldingProvider`], but yields inside `start` — the admission
+    /// window a count-based gate reads the table across.
+    struct YieldingHoldingProvider;
+
+    #[async_trait::async_trait]
+    impl SubagentProvider for YieldingHoldingProvider {
+        fn name(&self) -> &str {
+            "yielding"
+        }
+        fn capabilities(&self) -> Capabilities {
+            full_caps()
+        }
+        async fn start(&self, request: ResolvedStartRequest) -> Result<SubagentRun, SubagentError> {
+            tokio::task::yield_now().await;
+            let cancel = request.inner.cancel.clone();
+            Ok(SubagentRun::new(
+                request.run_id,
+                cancel.clone(),
+                Box::pin(async move {
+                    cancel.cancelled().await;
+                    RunResult {
+                        output: String::new(),
+                        structured: None,
+                        diagnostic: None,
+                        stop_reason: StopReason::Aborted,
+                    }
+                }),
+            ))
+        }
+    }
+
+    /// Concurrent dispatches cannot overshoot the cap.
+    ///
+    /// The gate used to read the live count and insert after
+    /// `provider.start().await` — a window in which every concurrent dispatch
+    /// saw the same stale count. The permit is reserved before the provider is
+    /// asked to start, so the Nth+1 reservation fails however the starts
+    /// interleave.
+    #[tokio::test]
+    async fn the_active_capacity_gate_survives_concurrent_dispatch() {
+        let runtime = SubagentRuntime::new();
+        let _guard = runtime.register_provider(Arc::new(YieldingHoldingProvider));
+        let starts: Vec<_> = (0..DEFAULT_ACTIVE_CAPACITY * 2)
+            .map(|i| {
+                let runtime = Arc::clone(&runtime);
+                async move {
+                    runtime
+                        .start("yielding", test_request(&format!("race-{i}"), "p"))
+                        .await
+                }
+            })
+            .collect();
+        let results = futures::future::join_all(starts).await;
+        let admitted = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            admitted,
+            DEFAULT_ACTIVE_CAPACITY,
+            "exactly the cap is admitted under concurrent dispatch: {} of {}",
+            admitted,
+            results.len()
+        );
+        for run in runtime.list_runs() {
+            runtime.interrupt(&run.id);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_active_capacity_gate_coaches_instead_of_failing_silently() {
+        let runtime = SubagentRuntime::new();
+        let _guard = runtime.register_provider(Arc::new(HoldingProvider));
+        for _ in 0..DEFAULT_ACTIVE_CAPACITY {
+            runtime
+                .start("holding", test_request("l", "p"))
+                .await
+                .unwrap();
+        }
+        let err = runtime
+            .start("holding", test_request("one too many", "p"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("wait for an existing child"),
+            "{err}"
+        );
+        // Interrupting one run settles it, its watcher frees the slot, and
+        // the next start is admitted.
+        let live = runtime.list_runs();
+        let victim = live.first().expect("held runs").id.clone();
+        assert!(runtime.interrupt(&victim));
+        for _ in 0..50 {
+            if runtime.list_runs().len() < DEFAULT_ACTIVE_CAPACITY {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        runtime
+            .start("holding", test_request("after free", "p"))
+            .await
+            .expect("the freed slot admits a new run");
     }
 }

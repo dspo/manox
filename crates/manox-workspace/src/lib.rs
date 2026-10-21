@@ -849,11 +849,13 @@ mod tests {
     /// sidecar alone feeds the unmaterialized fallback).
     fn seed_sidecar(id: &str, project: &str) {
         use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
-        let sessions = manox_agent::paths::manox_config_dir()
-            .unwrap()
-            .join("sessions");
+        // The core layout: bucket over per-session directory.
+        let sessions = manox_agent::paths::core_root().unwrap().join("t");
         std::fs::create_dir_all(&sessions).unwrap();
-        let path = sessions.join(format!("{id}.jsonl"));
+        let path = sessions
+            .join(id)
+            .join(manox_harness::session::identity::JOURNAL_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let handle = manox_agent::runtime::handle();
         if !path.exists() {
             handle.block_on(async {
@@ -871,8 +873,10 @@ mod tests {
                 .expect("seed session file");
             });
         }
+        let sidecar = manox_harness::session_meta::meta_path(path.parent().unwrap(), &path);
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
         std::fs::write(
-            sessions.join(format!("{id}.meta.json")),
+            &sidecar,
             format!(
                 "{{\"project\":{}}}",
                 serde_json::to_string(project).unwrap()

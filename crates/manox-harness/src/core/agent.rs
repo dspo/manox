@@ -408,6 +408,11 @@ impl Agent {
         self.state.system_prompt = system_prompt.into();
     }
 
+    /// The current system prompt (the next turn's context snapshot source).
+    pub fn system_prompt(&self) -> &str {
+        &self.state.system_prompt
+    }
+
     /// Replace the model the next turn runs against.
     pub fn set_model(&mut self, model: crate::types::Model) {
         self.state.model = model;

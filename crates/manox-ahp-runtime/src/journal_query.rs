@@ -65,6 +65,19 @@ pub enum ColdRead {
     Data(manox_agent::engine::JournalSnapshotData),
 }
 
+/// The session journal's header metadata, for surfaces that key lineage
+/// off it (the subagent origin stamp). `None` when the id has no file.
+pub async fn header_metadata(session_id: &str) -> Option<serde_json::Value> {
+    let path = crate::paths::persisted_session_file(session_id)?;
+    if !path.exists() {
+        return None;
+    }
+    let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(&path)
+        .await
+        .ok()?;
+    storage.session_metadata().metadata.clone()
+}
+
 pub async fn cold_read(session_id: &str) -> ColdRead {
     let Some(path) = crate::paths::persisted_session_file(session_id) else {
         return ColdRead::NotFound;
@@ -254,9 +267,11 @@ mod cold_write_read_probe {
         crate::test_support::hermetic_home();
         crate::test_support::init_globals();
         manox_agent::runtime::handle().block_on(async {
-            let sessions = manox_agent::paths::sessions_dir().unwrap();
+            let sessions = manox_agent::paths::core_root().unwrap().join("t");
             std::fs::create_dir_all(&sessions).unwrap();
-            let path = sessions.join("probe-seed-1.jsonl");
+            let path = sessions
+                .join("probe-seed-1")
+                .join(manox_harness::session::identity::JOURNAL_FILE);
             let _ = std::fs::remove_file(&path);
             let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
                 &path,

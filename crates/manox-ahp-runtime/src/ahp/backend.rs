@@ -144,7 +144,7 @@ impl Cursor {
 /// lag-resync: asks, tool calls/results, plan reviews, lifecycle and config
 /// facts. Delta rows (streamed text/thinking/output chunks) are consciously
 /// dropped from a gap — replaying them at flood rate re-lags the bridge.
-/// `BackgroundTask` and `SubagentProgress` are NOT droppable: they are the
+/// `BackgroundTask` and `run/*` rows are NOT droppable: they are the
 /// sole state carriers of the work channel's registry views (upsert-by-key,
 /// no other repair path), and both are lifecycle/state-transition rows, not
 /// per-chunk floods — dropping one leaves the task or agent frozen at its
@@ -342,6 +342,97 @@ impl RuntimeBackend {
             Some(fold) => (fold.chat, fold.tail),
             None => (chat::initial(session_id), 0),
         };
+        // A turn the journal shows as started but never settled is dead by
+        // construction when no live leg exists AND nothing user-answerable
+        // is parked on it: the engine that owed the settlement died with
+        // its process, and nothing will ever complete it. Fold the
+        // settlement here (cancelled, "host exited") so a restored chat
+        // never carries a phantom running turn — the journal itself is
+        // never rewritten, and every cold fold synthesizes the same
+        // settlement deterministically. Two exemptions keep a turn open: a
+        // live leg (the session table or a running child's feed — the
+        // engine or the child bridge may still settle it), and an
+        // unanswered input request parked on the turn (the ask survives
+        // host death by design: the user's answer is still journalable,
+        // and a cancel settles the park explicitly).
+        let live_leg = self.server.has_session(session_id)
+            || manox_harness::subagent::feeds::child_journal_feed(session_id).is_some();
+        let parked_ask = chat.active_turn.as_ref().is_some_and(|active| {
+            active
+                .response_parts
+                .iter()
+                .any(|part| matches!(part, ahp_types::state::ResponsePart::InputRequest(input) if input.response.is_none()))
+        });
+        // The third exemption: another process owns the turn. The state root
+        // is shared (the cx CLI drives journals this process only folds), and
+        // the `turnStart` row's owner stamp is the documented way to tell a
+        // dead owner from one running elsewhere — the same stamp the
+        // `x-manox/openTurn` command serves to clients. Settling here without
+        // consulting it would cancel a turn that keeps streaming into this
+        // very chat. A reused pid reads as alive, the conservative side the
+        // stamp's own reader documents: the turn is left for a deliberate
+        // settle, never auto-cancelled.
+        let live_owner = super::open_turn_owner(session_id)
+            .await
+            .is_some_and(|owner| owner.is_alive());
+        if !live_leg
+            && !parked_ask
+            && !live_owner
+            && let Some(active) = chat.active_turn.clone()
+        {
+            let mut reason = serde_json::Map::new();
+            reason.insert("outcome".to_string(), serde_json::json!("aborted"));
+            reason.insert("reason".to_string(), serde_json::json!("host exited"));
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                manox_ahp::ext::META_KEY.to_string(),
+                serde_json::Value::Object(reason),
+            );
+            let _ = ahp::reducers::apply_action_to_chat(
+                &mut chat,
+                &StateAction::ChatTurnCancelled(ahp_types::actions::ChatTurnCancelledAction {
+                    turn_id: active.id,
+                    duration: 0,
+                    meta: Some(meta),
+                }),
+            );
+        }
+        // An open `run/started` is the same phantom one level down: the
+        // process that owed the run's `run/settled` row died with it, and
+        // nothing can ever close the roster entry. The live path reports a
+        // cancelled turn's in-flight runs as removals (#812) — the cold fold
+        // reports the same, deterministically, and invents no settlement the
+        // journal never recorded. The owner read is the same one the turn
+        // settlement above needs: a parent turn another process is running
+        // means that process's children are live too (children only ever run
+        // inside their parent's driver, so their feed is registered THERE).
+        let owner_running = super::open_turn_owner(session_id)
+            .await
+            .is_some_and(|owner| owner.is_alive());
+        if !live_leg
+            && !owner_running
+            && let Some(work) = chat.background_work.clone()
+        {
+            for entry in work {
+                // Only the run-backed kind: other work entries settle on
+                // their own rows, which this fold already replayed.
+                let ahp_types::state::BackgroundWork::Subagent(sub) = entry else {
+                    continue;
+                };
+                // A child running in THIS process can still settle its own
+                // run: its journal feed is the liveness signal (the same one
+                // the child-chat bridge attaches to).
+                if manox_harness::subagent::feeds::child_journal_feed(&sub.id).is_some() {
+                    continue;
+                }
+                let _ = ahp::reducers::apply_action_to_chat(
+                    &mut chat,
+                    &StateAction::ChatBackgroundWorkRemoved(
+                        ahp_types::actions::ChatBackgroundWorkRemovedAction { id: sub.id },
+                    ),
+                );
+            }
+        }
         // The session half needs the same tolerance as the chat half, for the
         // same reason: a brand-new session has no store row until a list
         // refresh scans its file, and `createSession` seeds it immediately —
@@ -379,11 +470,14 @@ impl RuntimeBackend {
         if let Some(host) = self.host() {
             host.seed_session(&seeded.thread_id, seeded.session.clone());
             host.seed_chat(&seeded.thread_id, session_id, seeded.chat.clone());
-            // A subagent child chat has a foldable journal but no thread of
-            // its own — no live feed to bridge. It is served snapshot-only:
-            // the fold above is the whole truth, and a re-subscribe refreshes
-            // it (a child's journal ends when its run ends).
-            if own_thread.is_some() {
+            // A live engine bridges through its thread feed; a running
+            // sub-agent child bridges through its registry feed (the run
+            // registers the child journal's broadcast at dispatch). A
+            // settled child has neither — it serves snapshot-only from its
+            // durable journal, and a re-subscribe refreshes it.
+            if own_thread.is_some()
+                || manox_harness::subagent::feeds::child_journal_feed(session_id).is_some()
+            {
                 self.ensure_bridge(session_id);
             }
         }
@@ -414,14 +508,25 @@ impl RuntimeBackend {
                 None => self.first_bridge_resume(session_id),
             },
         };
-        let Some(thread) = self.server.journal_feed(session_id) else {
-            // A cold session (no live engine) has no feed to bridge; its state
-            // still answers from the journal, and a submit materializes the
-            // engine, which re-runs this path. The entry (and the watermark it
-            // carries) stays, so that later start still resumes where this one
-            // meant to.
-            tracing::debug!(session = %session_id, "bridge: no live feed yet (cold session)");
-            return;
+        enum Feed {
+            Thread(manox_agent::thread::ThreadHandle),
+            Child(tokio::sync::broadcast::Receiver<manox_harness::session::jsonl::JournalEvent>),
+        }
+        let feed = match self.server.journal_feed(session_id) {
+            Some(thread) => Feed::Thread(thread),
+            None => match manox_harness::subagent::feeds::child_journal_feed(session_id) {
+                Some(child) => Feed::Child(child),
+                // A cold session (no live engine, no running child) has no
+                // feed to bridge; its state still answers from the journal,
+                // and a submit (or a dispatch) materializes one, which
+                // re-runs this path. The entry (and the watermark it
+                // carries) stays, so that later start still resumes where
+                // this one meant to.
+                None => {
+                    tracing::debug!(session = %session_id, "bridge: no live feed yet (cold session)");
+                    return;
+                }
+            },
         };
         let Some(host) = self.host() else {
             return;
@@ -434,9 +539,18 @@ impl RuntimeBackend {
         let watermark = Arc::new(AtomicU64::new(resume_from.saturating_sub(1)));
         let task_watermark = Arc::clone(&watermark);
         let task = manox_agent::runtime::handle().spawn(async move {
-            backend
-                .bridge(host, thread, id, resume_from, task_watermark)
-                .await;
+            match feed {
+                Feed::Thread(thread) => {
+                    backend
+                        .bridge(host, thread, id, resume_from, task_watermark)
+                        .await;
+                }
+                Feed::Child(child) => {
+                    backend
+                        .bridge_child(host, child, id, resume_from, task_watermark)
+                        .await;
+                }
+            }
         });
         // Whatever held the slot is superseded: a finished task is already
         // dead, and a live one can only be a concurrent restart's — two bridges
@@ -459,6 +573,85 @@ impl RuntimeBackend {
             .get(session_id)
             .map(|seeded| seeded.tail + 1)
             .unwrap_or_default()
+    }
+
+    /// The child-session bridge: the same replay-and-forward shape as
+    /// [`Self::bridge`], over a running sub-agent's journal broadcast
+    /// instead of a thread feed. The channel closes when the child session
+    /// drops at the run's settle — the bridge exits on `Closed`, and the
+    /// chat serves from its durable journal from then on, exactly as a
+    /// re-subscribe always did.
+    async fn bridge_child(
+        &self,
+        host: Arc<manox_ahp::Host>,
+        mut feed: tokio::sync::broadcast::Receiver<manox_harness::session::jsonl::JournalEvent>,
+        session_id: String,
+        resume_from: u64,
+        watermark: Arc<AtomicU64>,
+    ) {
+        let mut translator = Translator::new();
+        let mut cursor = Cursor {
+            tail: resume_from.saturating_sub(1),
+            watermark,
+        };
+        tracing::info!(session = %session_id, resume_from, "bridge: subscribed to the child journal feed");
+        self.replay_journal(
+            &session_id,
+            &host,
+            &mut translator,
+            &mut cursor,
+            resume_from,
+            false,
+        )
+        .await;
+        loop {
+            match feed.recv().await {
+                Ok(event) => {
+                    if event.seq <= cursor.tail {
+                        continue;
+                    }
+                    self.forward_entry(
+                        &host,
+                        &session_id,
+                        &mut translator,
+                        event.seq,
+                        &event.entry,
+                    )
+                    .await;
+                    cursor.accounted(event.seq);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Same resync discipline as the thread bridge: reset the
+                    // translator, replay the durable rows above the cursor,
+                    // keep going — a child flood must not hollow the chat.
+                    tracing::warn!(
+                        session = %session_id,
+                        "bridge: child feed lagged, resyncing over the gap"
+                    );
+                    translator = Translator::new();
+                    let replay_from = cursor.tail + 1;
+                    self.replay_journal(
+                        &session_id,
+                        &host,
+                        &mut translator,
+                        &mut cursor,
+                        replay_from,
+                        true,
+                    )
+                    .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    // The child session dropped: the run settled. Everything
+                    // above the cursor is in the durable journal a
+                    // re-subscribe folds.
+                    tracing::info!(
+                        session = %session_id,
+                        "bridge: child feed closed with the run, exiting"
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     /// Abort and restart the bridge unconditionally: the engine
@@ -906,8 +1099,17 @@ impl RuntimeBackend {
             let (workspaces, order) = manox_agent::thread_store::try_global()
                 .map(|store| {
                     store.read(|state| {
-                        let (groups, accounts) = state.sidebar_order();
-                        (groups.to_vec(), accounts.clone())
+                        let groups: Vec<serde_json::Value> = state
+                            .known_projects()
+                            .iter()
+                            .map(|path| {
+                                serde_json::json!({
+                                    "path": path,
+                                    "alias": state.project_alias(path),
+                                })
+                            })
+                            .collect();
+                        (groups, state.sidebar_order().1.clone())
                     })
                 })
                 .unwrap_or_default();
@@ -1324,6 +1526,24 @@ fn summary_from_row(
             None,
         ),
     };
+    // Belonging comes from the OBJECT STORE (the user's attach decision),
+    // never from any cwd: a conversation whose working directory wandered
+    // into a tool-created worktree keeps its project. The scan row's path
+    // is only the fallback for a conversation with no object row
+    // (pre-migration journals).
+    let objects = manox_agent::object_store::ObjectStore::try_global();
+    let project_path = objects
+        .as_ref()
+        .and_then(|store| store.conversation(&row.id))
+        .and_then(|conversation| {
+            conversation
+                .project_id
+                .and_then(|pid| objects.as_ref()?.project_path(&pid))
+        })
+        .unwrap_or_else(|| row.project.clone());
+    let project_alias = objects
+        .as_ref()
+        .and_then(|store| store.project_alias(&project_path));
     SessionSummary {
         provider: row.provider_id.clone().unwrap_or_default(),
         // The row's `display_title` already applied user-rename precedence; a
@@ -1335,9 +1555,11 @@ fn summary_from_row(
         status,
         activity,
         origin: None,
-        project: (!row.project.is_empty()).then(|| ahp_types::state::ProjectInfo {
-            uri: row.project.clone(),
-            display_name: row.project.clone(),
+        project: (!project_path.is_empty()).then(|| ahp_types::state::ProjectInfo {
+            uri: project_path.clone(),
+            // The user's alias is the project's display name; the raw path
+            // is the fallback.
+            display_name: project_alias.unwrap_or(project_path),
         }),
         working_directories: directories,
         annotations: None,
@@ -1392,9 +1614,6 @@ impl Backend for RuntimeBackend {
             state
                 .summaries()
                 .iter()
-                // A superseded predecessor is not the conversation's identity;
-                // its successor row is (the v2 list rules the same way).
-                .filter(|row| row.superseded_by.is_none())
                 .map(|row| summary_from_row(row, state, self.seeded_status(&row.id)))
                 .collect()
         })
@@ -1421,6 +1640,15 @@ impl Backend for RuntimeBackend {
     }
 
     fn session_state_for_chat(&self, chat_id: &str) -> Option<String> {
+        // A live session owns its chat from the moment `createSession`
+        // answered: the blank claim is lazily materialized (nothing durable
+        // exists until the first journal append), so the durable legs below
+        // resolve it only after the turn that wrote them. Without this leg
+        // the chat channel of a fresh session answers not-found — and the
+        // first dispatch on it is rejected before the runtime ever sees it.
+        if self.server.has_session(chat_id) {
+            return Some(chat_id.to_string());
+        }
         block_on(super::thread_of_session(chat_id))
     }
 
@@ -2132,6 +2360,32 @@ impl Backend for RuntimeBackend {
                     DispatchOutcome::Rejected(format!("unknown session: {session_id}"))
                 }
             }
+            StateAction::Unknown(tag)
+                if tag.get("type").and_then(Value::as_str)
+                    == Some(manox_ahp::ext::actions::ALIAS_CHANGED) =>
+            {
+                // The workspaces channel is the alias action's home: the
+                // project object is host state, not any one session's.
+                let Some(path) = tag.get("path").and_then(Value::as_str) else {
+                    return DispatchOutcome::Rejected(
+                        "x-manox/aliasChanged needs the project `path`".to_string(),
+                    );
+                };
+                let alias = match tag.get("alias") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(alias)) => Some(alias.as_str()),
+                    Some(_) => {
+                        return DispatchOutcome::Rejected(
+                            "x-manox/aliasChanged `alias` must be a string or null".to_string(),
+                        );
+                    }
+                };
+                if self.server.set_project_alias(path, alias) {
+                    DispatchOutcome::Accepted
+                } else {
+                    DispatchOutcome::Rejected(format!("unknown project: {path}"))
+                }
+            }
             StateAction::SessionIsArchivedChanged(changed) => {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
@@ -2826,6 +3080,10 @@ mod mcp_dispatch_tests {
     }
 
     impl SessionRuntime for McpOnlyRuntime {
+        fn set_project_alias(&self, _: &str, _: Option<&str>) -> bool {
+            false
+        }
+
         fn preflight_config(
             &self,
             _session_id: &str,
@@ -3225,12 +3483,7 @@ mod mcp_dispatch_tests {
     fn summaries_carry_the_pin_in_the_meta_slot() {
         // pin_thread's drained sidecar writes spawn on the process runtime.
         crate::test_support::init_globals();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = std::sync::Arc::new(
-            manox_agent::db::ThreadsDatabase::open(&dir.path().join("threads.db"))
-                .expect("open temp threads db"),
-        );
-        let store = manox_agent::thread_store::standalone_for_test(db);
+        let store = manox_agent::thread_store::standalone_for_test();
         store.with_mut(|st| {
             st.insert_summary_for_test("s-pinned", None);
             st.insert_summary_for_test("s-plain", None);
@@ -3260,12 +3513,7 @@ mod mcp_dispatch_tests {
     #[test]
     fn a_row_summary_carries_the_one_chat_catalogue() {
         crate::test_support::init_globals();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = std::sync::Arc::new(
-            manox_agent::db::ThreadsDatabase::open(&dir.path().join("threads.db"))
-                .expect("open temp threads db"),
-        );
-        let store = manox_agent::thread_store::standalone_for_test(db);
+        let store = manox_agent::thread_store::standalone_for_test();
         store.with_mut(|st| {
             st.insert_summary_for_test("s-cat", None);
         });
@@ -3338,14 +3586,19 @@ mod turn_cancel_ask_settlement_tests {
         crate::test_support::hermetic_home();
         crate::test_support::init_globals();
         manox_agent::runtime::handle().block_on(async {
-            // The sessions dir the cold seed resolves through.
-            let sessions = manox_agent::paths::sessions_dir().unwrap();
+            // The sessions dir the cold seed resolves through (the core
+            // layout: bucket over per-session directories).
+            let sessions = manox_agent::paths::core_root().unwrap().join("t");
             std::fs::create_dir_all(&sessions).unwrap();
+            let journal = |root: &std::path::Path, id: &str| {
+                root.join(id)
+                    .join(manox_harness::session::identity::JOURNAL_FILE)
+            };
 
             // A journal whose turn sits parked on an unanswered question — no
             // decision row, the shape the live cancel leaves mid-flight.
             let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
-                &sessions.join("s-1.jsonl"),
+                &journal(&sessions, "s-1"),
                 manox_harness::session::jsonl::JsonlSessionMetadata {
                     id: "s-1".to_string(),
                     cwd: "/".to_string(),

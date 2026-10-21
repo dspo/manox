@@ -189,3 +189,233 @@ impl manox_ahp::transport::Source for TextSource {
         })
     }
 }
+
+// ── The object store: typed bindings ───────────────────────────────────────────
+//
+// The raw AHP bridge above moves protocol frames; these exports are the
+// object API — projects and conversations as durable rows, managed by
+// direct synchronous calls (the same setters the desktop app uses
+// in-process). A TypeScript host needs no protocol vocabulary for user
+// will: create conversations, attach them to projects, pick models and
+// permission modes, persist drafts, and read the lists.
+
+/// One project row.
+#[napi(object)]
+pub struct JsProject {
+    pub id: String,
+    pub path: String,
+    pub alias: Option<String>,
+    pub position: i64,
+}
+
+/// One conversation row.
+#[napi(object)]
+pub struct JsConversation {
+    pub id: String,
+    pub project_id: Option<String>,
+    pub model_provider: Option<String>,
+    pub model_id: Option<String>,
+    pub permission_mode: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub draft: Option<String>,
+    pub title: Option<String>,
+    pub pinned: bool,
+    pub archived: bool,
+    pub unread: bool,
+    pub errored: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// Unix seconds of the last human-authored message; `null` until the
+    /// conversation actually happens (the draft-refill window).
+    pub last_human_message_at: Option<i64>,
+    pub config_version: i64,
+}
+
+fn objects() -> manox_agent::object_store::ObjectStore {
+    manox_agent::object_store::ObjectStore
+}
+
+fn js_project(row: manox_agent::object_store::ProjectRow) -> JsProject {
+    JsProject {
+        id: row.id,
+        path: row.path,
+        alias: row.alias,
+        position: row.position,
+    }
+}
+
+fn js_conversation(row: manox_agent::object_store::ConversationRow) -> JsConversation {
+    JsConversation {
+        id: row.id,
+        project_id: row.project_id,
+        model_provider: row.model_provider,
+        model_id: row.model_id,
+        permission_mode: row.permission_mode,
+        reasoning_effort: row.reasoning_effort,
+        draft: row.draft,
+        title: row.title,
+        pinned: row.pinned,
+        archived: row.archived,
+        unread: row.unread,
+        errored: row.errored,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        last_human_message_at: row.last_human_message_at,
+        config_version: row.config_version,
+    }
+}
+
+/// Register a project path (idempotent); newly registered projects take the
+/// head position. Returns the project id.
+#[napi]
+pub fn object_register_project(path: String) -> Result<String> {
+    ensure_objects()?;
+    Ok(objects().register_project(&path))
+}
+
+/// Set (or clear) a project's display alias.
+#[napi]
+pub fn object_set_project_alias(path: String, alias: Option<String>) -> Result<bool> {
+    ensure_objects()?;
+    Ok(objects().set_project_alias(&path, alias.as_deref()))
+}
+
+/// Move a project before another in the folder order (`null` = tail).
+#[napi]
+pub fn object_move_project(path: String, before: Option<String>) -> Result<bool> {
+    ensure_objects()?;
+    Ok(objects().move_project(&path, before.as_deref()))
+}
+
+/// All projects in committed folder order.
+#[napi]
+pub fn object_list_projects() -> Result<Vec<JsProject>> {
+    ensure_objects()?;
+    Ok(objects()
+        .list_projects()
+        .into_iter()
+        .map(js_project)
+        .collect())
+}
+
+/// Create a conversation row (idempotent on the id).
+#[napi]
+pub fn object_create_conversation(id: String, project_path: Option<String>) -> Result<bool> {
+    ensure_objects()?;
+    Ok(objects().create_conversation(&id, project_path.as_deref()))
+}
+
+/// Attach a conversation to a project. Belonging only — no cwd ever moves.
+#[napi]
+pub fn object_attach(id: String, project_path: String) -> Result<bool> {
+    ensure_objects()?;
+    Ok(objects().attach(&id, &project_path))
+}
+
+/// Detach: the conversation becomes project-less.
+#[napi]
+pub fn object_detach(id: String) -> Result<()> {
+    ensure_objects()?;
+    objects().detach(&id);
+    Ok(())
+}
+
+/// Set the model pick (bumps the config version the engine watches).
+#[napi]
+pub fn object_set_model(
+    id: String,
+    provider: Option<String>,
+    model_id: Option<String>,
+) -> Result<()> {
+    ensure_objects()?;
+    objects().set_model(&id, provider.as_deref(), model_id.as_deref());
+    Ok(())
+}
+
+/// Set the permission mode pick (read before every tool execution).
+#[napi]
+pub fn object_set_permission_mode(id: String, mode: Option<String>) -> Result<()> {
+    ensure_objects()?;
+    objects().set_permission_mode(&id, mode.as_deref());
+    Ok(())
+}
+
+/// Set the reasoning effort pick.
+#[napi]
+pub fn object_set_reasoning_effort(id: String, effort: Option<String>) -> Result<()> {
+    ensure_objects()?;
+    objects().set_reasoning_effort(&id, effort.as_deref());
+    Ok(())
+}
+
+/// Persist the composer draft (pure UI state; no config bump).
+#[napi]
+pub fn object_set_draft(id: String, draft: Option<String>) -> Result<()> {
+    ensure_objects()?;
+    objects().set_draft(&id, draft.as_deref());
+    Ok(())
+}
+
+/// Pin or unpin.
+#[napi]
+pub fn object_set_pinned(id: String, pinned: bool) -> Result<()> {
+    ensure_objects()?;
+    objects().set_pinned(&id, pinned);
+    Ok(())
+}
+
+/// Archive or unarchive.
+#[napi]
+pub fn object_set_archived(id: String, archived: bool) -> Result<()> {
+    ensure_objects()?;
+    objects().set_archived(&id, archived);
+    Ok(())
+}
+
+/// Rename (the display title).
+#[napi]
+pub fn object_set_title(id: String, title: Option<String>) -> Result<()> {
+    ensure_objects()?;
+    objects().set_title(&id, title.as_deref());
+    Ok(())
+}
+
+/// One conversation's row, if it exists.
+#[napi]
+pub fn object_get_conversation(id: String) -> Result<Option<JsConversation>> {
+    ensure_objects()?;
+    Ok(objects().conversation(&id).map(js_conversation))
+}
+
+/// The materialized conversations, newest human message first.
+#[napi]
+pub fn object_list_conversations() -> Result<Vec<JsConversation>> {
+    ensure_objects()?;
+    Ok(objects()
+        .list_conversations()
+        .into_iter()
+        .map(js_conversation)
+        .collect())
+}
+
+/// The most recent never-materialized conversation under a project (or
+/// project-less): the draft-refill candidate.
+#[napi]
+pub fn object_latest_draft(project_path: Option<String>) -> Result<Option<JsConversation>> {
+    ensure_objects()?;
+    Ok(objects()
+        .latest_draft(project_path.as_deref())
+        .map(js_conversation))
+}
+
+/// The object store needs the process runtime initialized — the same
+/// `manox_agent::init` the raw bridge runs at `start`. These bindings are
+/// callable before any AHP connection exists, so they initialize lazily.
+fn ensure_objects() -> Result<()> {
+    if manox_agent::object_store::ObjectStore::try_global().is_none() {
+        return Err(napi::Error::from_reason(
+            "object store not initialized; call start() first",
+        ));
+    }
+    Ok(())
+}

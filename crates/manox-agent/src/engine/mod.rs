@@ -468,6 +468,7 @@ pub fn spawn_engine(
     cwd: PathBuf,
     model: Option<HarnessModel>,
     sessions_dir: PathBuf,
+    session_file: Option<PathBuf>,
     initial_path: Option<PathBuf>,
     fresh: bool,
     project: Option<PathBuf>,
@@ -515,6 +516,11 @@ pub fn spawn_engine(
     let gate = Arc::new(ApprovalGate::new(
         notice_tx.clone(),
         Arc::clone(&model_slot),
+    ));
+    // The conversation's row is the mode's authority: the gate reads it per
+    // tool call, so a switch governs the next call rather than the next turn.
+    gate.set_config_source(crate::conversation_config::ObjectConfigSource::for_session(
+        thread_id.clone(),
     ));
     // K3: the user's verdict on a parked card is an observable state
     // change — the gate journals it as an `approval` decision entry through
@@ -592,6 +598,7 @@ pub fn spawn_engine(
             cwd,
             model,
             sessions_dir,
+            session_file,
             actor_initial_path,
             fresh,
             project,
@@ -995,6 +1002,7 @@ async fn run_actor(
     cwd: PathBuf,
     model: Option<HarnessModel>,
     sessions_dir: PathBuf,
+    session_file: Option<PathBuf>,
     initial_path: Option<PathBuf>,
     fresh: bool,
     project: Option<PathBuf>,
@@ -1111,6 +1119,7 @@ async fn run_actor(
         let (builder, background) = session_builder(
             &tool_cwd,
             &sessions_dir,
+            None,
             &runtime,
             None,
             &state.gate,
@@ -1129,7 +1138,7 @@ async fn run_actor(
                 attach_plan_hooks(&mut s, &state.plan);
                 attach_plugin_hooks(&mut s, &tool_cwd);
                 attach_prefix_gate(&mut s, &notice_tx, &thread_id);
-                adopt_session_model(&s, &mut harness_model, &state);
+                adopt_session_model(&mut s, &mut harness_model, &state, &thread_id).await;
                 restored = true;
                 // The restored file is the thread's active session.
                 crate::thread_registry::set_active(&thread_id, &header.id).await;
@@ -1146,6 +1155,7 @@ async fn run_actor(
             let (builder, background) = session_builder(
                 &cwd,
                 &sessions_dir,
+                session_file.as_deref(),
                 &runtime,
                 Some(&harness_model),
                 &state.gate,
@@ -1228,7 +1238,7 @@ async fn run_actor(
     // authority for every field §C.2 entries carry, the sidecar fills the
     // fields the chain has never seen, and a diverging cache is repaired
     // toward the journal.
-    let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
+    let restored_state = rebuild_restored_state(&session, &sessions_dir, &thread_id).await;
     let title_scheduler = TitleScheduler::new(
         runtime.clone(),
         Arc::clone(&state.model),
@@ -2015,14 +2025,6 @@ async fn run_actor(
                 if let Err(err) = session.set_thinking_level(level.clone()).await {
                     tracing::warn!("set_thinking_level failed: {err}");
                 }
-                // The facade's knob only sends "high"/"max"; persist the
-                // choice so a reopened session restores the same effort.
-                if let Some(effort) = level.as_deref().and_then(parse_reasoning_effort)
-                    && let Err(err) =
-                        write_reasoning_effort_sidecar(&sessions_dir, session.path(), effort).await
-                {
-                    tracing::warn!(error = %err, "failed to persist reasoning effort");
-                }
             }
             SessionCmd::Open { path } => {
                 // A re-open is a SECOND restore: drop the watch to false so
@@ -2049,7 +2051,8 @@ async fn run_actor(
                 // K2: the journal-first rebuild resolves the swapped-in
                 // session's observable state (authority: its active chain;
                 // gap-fill: its sidecar).
-                let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
+                let restored_state =
+                    rebuild_restored_state(&session, &sessions_dir, &thread_id).await;
                 title_scheduler.retarget(
                     path.clone(),
                     cwd.clone(),
@@ -2500,22 +2503,6 @@ async fn persist_title(
     .await
 }
 
-/// The permission mode persisted in a session's sidecar (wire field
-/// `approval_mode`); fresh sessions (missing sidecar or field) and unknown
-/// values land on the bounded default. Test face of the sidecar cache —
-/// production restores go through [`rebuild_restored_state`] (K2).
-#[cfg(test)]
-async fn load_approval_mode(sessions_dir: &Path, session_path: &Path) -> PermissionMode {
-    match manox_harness::session_meta::load(sessions_dir, session_path).await {
-        Ok(meta) => meta
-            .approval_mode
-            .as_deref()
-            .and_then(|raw| serde_json::from_value(serde_json::Value::String(raw.to_string())).ok())
-            .unwrap_or_default(),
-        Err(_) => PermissionMode::default(),
-    }
-}
-
 /// Render the plan-mode-active instructions (the actor renders them itself,
 /// so no facade round-trip is needed on restore or session switches).
 fn render_plan_instructions() -> Option<String> {
@@ -2620,52 +2607,6 @@ fn resync_plan_state(
         })),
         "plan mode changed notice",
     );
-}
-
-/// Persist the permission mode in the session sidecar (wire field
-/// `approval_mode`, kebab values) so the session reopens with the same
-/// gate policy.
-async fn write_approval_mode_sidecar(
-    sessions_dir: &Path,
-    session_path: &Path,
-    mode: PermissionMode,
-) -> Result<(), anyhow::Error> {
-    let raw = serde_json::to_value(mode)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .expect("PermissionMode serializes to its kebab wire name");
-    manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
-        meta.approval_mode = Some(raw);
-    })
-    .await
-}
-
-/// The reasoning effort persisted in a session's sidecar; fresh sessions
-/// (missing sidecar or field) default to High. Test face of the sidecar
-/// cache — production restores go through [`rebuild_restored_state`] (K2).
-#[cfg(test)]
-async fn load_reasoning_effort(sessions_dir: &Path, session_path: &Path) -> ReasoningEffort {
-    match manox_harness::session_meta::load(sessions_dir, session_path).await {
-        Ok(meta) => match meta.reasoning_effort.as_deref() {
-            Some("high") => ReasoningEffort::High,
-            Some("max") => ReasoningEffort::Max,
-            _ => ReasoningEffort::default(),
-        },
-        Err(_) => ReasoningEffort::default(),
-    }
-}
-
-/// Persist the reasoning effort in the session sidecar so the session
-/// reopens with the same effort.
-async fn write_reasoning_effort_sidecar(
-    sessions_dir: &Path,
-    session_path: &Path,
-    effort: ReasoningEffort,
-) -> Result<(), anyhow::Error> {
-    manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
-        meta.reasoning_effort = Some(effort.wire_value().to_string());
-    })
-    .await
 }
 
 /// Parse the facade's effort knob wire value; other levels (e.g. "off")
@@ -2795,29 +2736,41 @@ fn journal_plan_snapshot(
         .filter(|value| !value.as_array().is_some_and(|plan| plan.is_empty()))
 }
 
-/// Resolve the journal replay against the sidecar cache (the K2 merge):
-/// journal-backed fields win wherever the chain carries them; the sidecar
-/// fills exactly the fields the chain has never seen (legacy journals
-/// predate the decision-point entries). Pure and total — every restore
-/// face applies this resolution verbatim, and the replay-consistency
-/// regression asserts it across a disk round trip.
+/// Resolve the journal replay against the conversation's own configuration
+/// and the sidecar cache (the K2 merge): journal-backed fields win wherever
+/// the chain carries them; the sidecar fills exactly the fields the chain has
+/// never seen (legacy journals predate the decision-point entries). Pure and
+/// total — every restore face applies this resolution verbatim, and the
+/// replay-consistency regression asserts it across a disk round trip.
+///
+/// The permission mode and the reasoning effort come from `config` — the
+/// conversation's row — not from the chain and not from the sidecar. That is
+/// the same surface the request boundary reads and the permission gate reads
+/// per tool call, so a restore and a mid-run switch cannot disagree about
+/// what is in force. The journal's own rows for those two are legacy history:
+/// still parsed (a pre-store or hand-edited journal must not break the fold)
+/// and never consumed. The sidecar stays as the fallback for a conversation
+/// the store has never seen.
 fn merge_restored_state(
     replayed: &crate::replay::ReplayedThreadState,
     meta: &manox_harness::session_meta::SessionMeta,
+    config: &dyn manox_harness::ConversationConfigSource,
 ) -> RestoredThreadState {
-    let permission_mode = replayed.permission_mode.unwrap_or_else(|| {
-        meta.approval_mode
-            .as_deref()
-            .and_then(PermissionMode::from_wire)
-            .unwrap_or_default()
-    });
-    let reasoning_effort =
-        replayed
-            .reasoning_effort
-            .unwrap_or_else(|| match meta.reasoning_effort.as_deref() {
-                Some("max") => ReasoningEffort::Max,
-                _ => ReasoningEffort::default(),
-            });
+    let permission_mode = config
+        .permission_mode()
+        .or_else(|| {
+            meta.approval_mode
+                .as_deref()
+                .and_then(PermissionMode::from_wire)
+        })
+        .unwrap_or_default();
+    let reasoning_effort = config
+        .reasoning_effort()
+        .and_then(|raw| parse_reasoning_effort(&raw))
+        .or_else(|| {
+            (meta.reasoning_effort.as_deref() == Some("max")).then_some(ReasoningEffort::Max)
+        })
+        .unwrap_or_default();
     RestoredThreadState {
         permission_mode,
         reasoning_effort,
@@ -2851,6 +2804,7 @@ fn merge_restored_state(
 async fn rebuild_restored_state(
     session: &AgentSession,
     sessions_dir: &Path,
+    conversation_id: &str,
 ) -> RestoredThreadState {
     let records = session.journal_range(0, u64::MAX).await.unwrap_or_default();
     let replayed = crate::replay::replay_thread_state(&records);
@@ -2859,19 +2813,17 @@ async fn rebuild_restored_state(
     let meta = manox_harness::session_meta::load(sessions_dir, session.path())
         .await
         .unwrap_or_default();
-    let mut merged = merge_restored_state(&replayed, &meta);
+    let config = crate::conversation_config::ObjectConfigSource::for_session(conversation_id);
+    let mut merged = merge_restored_state(&replayed, &meta, config.as_ref());
     merged.unsettled_approvals = unsettled_approvals;
     merged.unsettled_questions = unsettled_questions;
 
     // Cache repair: re-stamp every journal-backed field whose sidecar copy
     // diverges from the authority, in one write. Fields the journal has
-    // never seen keep their sidecar value untouched.
-    let repair_mode = replayed
-        .permission_mode
-        .filter(|mode| meta.approval_mode.as_deref() != Some(mode.wire()));
-    let repair_effort = replayed
-        .reasoning_effort
-        .filter(|effort| meta.reasoning_effort.as_deref() != Some(effort.wire_value()));
+    // never seen keep their sidecar value untouched. The permission mode and
+    // the reasoning effort are absent here — the conversation's row owns
+    // them, and re-stamping a cache from the journal would put a second copy
+    // back in play.
     let repair_snapshot =
         journal_plan_snapshot(&replayed).filter(|value| meta.plan_snapshot.as_ref() != Some(value));
     let repair_title = replayed
@@ -2901,21 +2853,13 @@ async fn rebuild_restored_state(
         Some(None) if meta.project.is_some() => Some(None),
         _ => None,
     };
-    if repair_mode.is_some()
-        || repair_effort.is_some()
-        || repair_snapshot.is_some()
+    if repair_snapshot.is_some()
         || repair_flags.is_some()
         || repair_project.is_some()
         || repair_title.is_some()
     {
         let result =
             manox_harness::session_meta::update(sessions_dir, session.path(), move |meta| {
-                if let Some(mode) = repair_mode {
-                    meta.approval_mode = Some(mode.wire().to_string());
-                }
-                if let Some(effort) = repair_effort {
-                    meta.reasoning_effort = Some(effort.wire_value().to_string());
-                }
                 if let Some(snapshot) = repair_snapshot {
                     meta.plan_snapshot = Some(snapshot);
                 }
@@ -3217,22 +3161,19 @@ async fn handle_set_cwd(
     );
 }
 
-/// Apply the user's permission-mode decision (K3): gate + sidecar cache +
-/// the notice whose tap emission journals the `permission_mode_change`
-/// entry (L3 — the decision never lives in the cache alone). The facade
-/// already broadcast its own synchronous copy of this event; the echo is
-/// idempotent.
+/// Apply the user's permission-mode decision (K3): the gate mirror plus the
+/// notice the UI learns the switch from. Nothing durable is written here —
+/// the conversation's row is the mode's home, written by whoever made the
+/// pick, and the gate reads it live per tool call. The facade already
+/// broadcast its own synchronous copy of this event; the echo is idempotent.
 async fn apply_permission_mode(
     state: &Arc<EngineState>,
-    sessions_dir: &Path,
-    session_path: &Path,
+    _sessions_dir: &Path,
+    _session_path: &Path,
     mode: PermissionMode,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) {
     state.gate.set_mode(mode);
-    if let Err(err) = write_approval_mode_sidecar(sessions_dir, session_path, mode).await {
-        tracing::warn!(error = %err, "failed to persist approval mode");
-    }
     send_notice(
         notice_tx,
         BackendNotice::Event(Box::new(ThreadEvent::PermissionModeChanged { mode })),
@@ -3494,7 +3435,6 @@ fn session_info_to_summary(
     info: &manox_harness::session::repository::SessionInfo,
 ) -> ThreadSummary {
     ThreadSummary {
-        superseded_by: None,
         id: info.id.clone(),
         summary: info.first_message.clone(),
         title: None,

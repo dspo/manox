@@ -119,14 +119,8 @@ impl AhpRuntime {
         let Some(store) = manox_agent::thread_store::try_global() else {
             return;
         };
-        let rows: Vec<String> = store.read(|state| {
-            state
-                .summaries()
-                .iter()
-                .filter(|row| row.superseded_by.is_none())
-                .map(|row| row.id.clone())
-                .collect()
-        });
+        let rows: Vec<String> =
+            store.read(|state| state.summaries().iter().map(|row| row.id.clone()).collect());
         for session_id in rows {
             let Some(summary) = self.host.backend().session_summary(&session_id) else {
                 continue;
@@ -137,6 +131,14 @@ impl AhpRuntime {
                 host.session_added(summary);
             }
         }
+    }
+
+    /// Broadcast one session's removal: subscribers drop the row (the
+    /// faithful-mirror counterpart of `catalogue_changed`). A session that
+    /// never materialized leaves no journal — its disappearance is a fact
+    /// the client must see, not infer from a restart.
+    pub fn catalogue_removed(&self, session_id: &str) {
+        self.host().session_removed(session_id);
     }
 
     /// The session runtime behind the host.
@@ -332,6 +334,9 @@ mod accept_without_a_reactor_tests {
             false
         }
         fn order_session(&self, _: &str, _: Option<&str>) -> bool {
+            false
+        }
+        fn set_project_alias(&self, _: &str, _: Option<&str>) -> bool {
             false
         }
         fn compact(&self, _: &str, _: Option<String>) -> Result<(), crate::error::RuntimeError> {

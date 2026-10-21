@@ -152,6 +152,12 @@ pub struct JsonlSessionStorage {
 
 impl JsonlSessionStorage {
     /// The session file path.
+    /// The session's header metadata (the immutable line-0 facts: id, cwd,
+    /// parentage, free-form metadata such as the subagent lineage).
+    pub fn session_metadata(&self) -> &JsonlSessionMetadata {
+        &self.metadata
+    }
+
     pub fn path(&self) -> &Path {
         &self.jsonl_path
     }
@@ -666,6 +672,12 @@ impl JsonlSessionStorage {
     /// Subscribe to ordered journal appends. A lagging receiver sees
     /// [`broadcast::error::RecvError::Lagged`] and must resynchronize via a
     /// fresh chain read (L5 companion rule).
+    /// The journal broadcast's sender — for registries that hand out fresh
+    /// receivers on demand (`subscribe()` is always current-cursor-free).
+    pub fn journal_sender(&self) -> tokio::sync::broadcast::Sender<JournalEvent> {
+        self.journal_tx.clone()
+    }
+
     pub fn subscribe_journal(&self) -> broadcast::Receiver<JournalEvent> {
         self.journal_tx.subscribe()
     }

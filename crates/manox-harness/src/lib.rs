@@ -37,6 +37,7 @@ pub use core::types;
 // We explicitly re-export each module so `manox_harness::bash::BashTool` etc.
 // remain reachable without the `ext::` prefix.
 pub use ext::bash;
+pub use ext::conversation_config::ConversationConfigSource;
 pub use ext::model_ref;
 pub use ext::path_selector;
 pub use ext::prompt;

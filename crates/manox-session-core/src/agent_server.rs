@@ -13,7 +13,7 @@
 //! to be reported rather than swallowed — a silent no-op would leave every
 //! client converged on a session state that never took effect.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -27,6 +27,7 @@ use manox_agent::language_model::{MessageContent, ReasoningEffort};
 use manox_agent::thread::{PermissionMode, ThreadHandle};
 use manox_agent::thread_engine::BackendNotice;
 use manox_agent::{MessageUiMetadata, Thread, ThreadEvent, ThreadId};
+use manox_harness::session::claim::{self, ClaimOutcome, ClaimRequest, SessionFacts};
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 
 /// One live session: the strong `ThreadHandle` (the retention owner) and the
@@ -121,9 +122,9 @@ fn spawn_settle_watcher(
 #[cfg(feature = "terminal")]
 struct TerminalEntry {
     handle: manox_terminal::TerminalHandle,
-    /// The session this terminal was attached for: the cwd source and the db
-    /// row's owner.
+    /// The session this terminal was attached for: the cwd source.
     session_id: String,
+    #[allow(dead_code)] // kept for the terminal panel's future restore face
     cwd: String,
     exited: StdMutex<Option<i32>>,
 }
@@ -143,30 +144,8 @@ struct QueuedSubmit {
 /// The single gateway. Cloning shares the inner state.
 pub struct AgentServer(Arc<AgentServerInner>);
 
-/// Releases one transient session owner when its scope ends — success,
-/// failure or panic — so an internal open can never leave a ghost owner
-/// that defeats the orphaned-session reap (review r3 [sugg] 3).
-struct OwnerLease {
-    inner: Arc<AgentServerInner>,
-    owner: &'static str,
-    id: String,
-}
-
-impl Drop for OwnerLease {
-    fn drop(&mut self) {
-        self.inner.remove_owner(self.owner, &self.id);
-    }
-}
-
 pub(crate) struct AgentServerInner {
     cwd: PathBuf,
-    /// Bind redirect map (predecessor → successor session id): the live
-    /// half of the supersede contract; the sidecar marker is the
-    /// restart-surviving half (`ThreadStore::superseded_by`).
-    superseded: Mutex<HashMap<String, String>>,
-    /// Bind hand-offs in flight per predecessor: two quick `SetCwd` notes
-    /// must not mint two successors (review #805 [sugg] 6).
-    binding: Mutex<HashSet<String>>,
     sessions: Mutex<HashMap<String, ServerSession>>,
     /// session_id → client_ids that own (view) it. A session may have several
     /// owners; each receives its streamed notes.
@@ -491,24 +470,12 @@ impl AgentServerInner {
 
     #[cfg(feature = "terminal")]
     fn upsert_terminal_db(&self, entry: &TerminalEntry, exit: Option<i32>) {
-        let Ok(path) = manox_agent::db::default_db_path() else {
-            return;
-        };
-        let Ok(db) = manox_agent::db::ThreadsDatabase::open(&path) else {
-            return;
-        };
-        let id = entry.handle.read(|t| t.id.clone());
-        let title = entry.handle.read(|t| t.title.clone());
-        let now = chrono::Utc::now().timestamp_millis();
+        let store = manox_terminal::store::try_global();
         let _ = exit; // exit code rides the summary, not the row
-        let _ = db.upsert_terminal_session(&manox_agent::db::TerminalSession {
-            id,
-            cwd: entry.cwd.clone(),
-            env: Vec::new(),
-            title,
-            created_at: now,
-            updated_at: now,
-        });
+        let Some(store) = store else {
+            return;
+        };
+        store.save_terminal(&entry.handle);
     }
 }
 
@@ -601,8 +568,6 @@ impl AgentServer {
         manox_terminal::runtime::set_runtime(manox_agent::runtime::handle().clone());
         let inner = Arc::new(AgentServerInner {
             cwd,
-            superseded: Mutex::new(HashMap::new()),
-            binding: Mutex::new(HashSet::new()),
             sessions: Mutex::new(HashMap::new()),
             session_owners: Mutex::new(HashMap::new()),
             #[cfg(feature = "terminal")]
@@ -726,33 +691,11 @@ impl AgentServer {
 
 impl AgentServerInner {
     // ── Pure state accessors (no spawning). ─────────────────────────────────
-    /// Resolve the bind redirect chain: the live map first, the sidecar
-    /// `superseded_by` marker as the restart-surviving half (cached into
-    /// the live map on first hit). The superseded guard drops before the
-    /// store read (lock order), and the bounded walk caps cycles.
-    fn resolve_redirect(&self, session_id: &str) -> String {
-        let mut id = session_id.to_string();
-        for _ in 0..8 {
-            let next = { self.superseded.lock().get(&id).cloned() };
-            let next = next.or_else(|| {
-                let from_store = manox_agent::thread_store::try_global()
-                    .and_then(|store| store.read(|s| s.superseded_by(&id)));
-                if let Some(succ) = &from_store {
-                    self.superseded.lock().insert(id.clone(), succ.clone());
-                }
-                from_store
-            });
-            match next {
-                Some(next) if next != id => id = next,
-                _ => break,
-            }
-        }
-        id
-    }
-
     pub(crate) fn session_thread(&self, session_id: &str) -> Option<ThreadHandle> {
-        let id = self.resolve_redirect(session_id);
-        self.sessions.lock().get(&id).map(|s| s.thread.clone())
+        self.sessions
+            .lock()
+            .get(session_id)
+            .map(|s| s.thread.clone())
     }
 
     fn owners(&self, session_id: &str) -> Vec<String> {
@@ -868,7 +811,7 @@ pub(crate) async fn ensure_opened_for_settle(
     let thread = if let Some(thread) = inner.session_thread(session_id) {
         thread
     } else {
-        let id = inner.resolve_redirect(session_id);
+        let id = session_id.to_string();
         let owner = inner
             .owners(&id)
             .into_iter()
@@ -912,7 +855,7 @@ pub(crate) async fn ensure_opened_for_settle(
 /// any IO, and two racing opens of a cold id converge on one entry (the loser
 /// adopts the winner's `ThreadHandle` through the store's weak upgrade, so
 /// nothing is loaded twice).
-async fn open_session(
+pub(crate) async fn open_session(
     inner: &Arc<AgentServerInner>,
     owner: &str,
     session_id: &str,
@@ -976,6 +919,16 @@ async fn open_session(
 ///
 /// Shared by the runtime intents that refuse with `session/notFound`, so the
 /// code a client matches on does not depend on which intent refused.
+/// The project a conversation belongs to, as its path, resolved through the
+/// object store — the one place belonging lives. `None` covers both "no
+/// project" (the special project) and "no row yet"; both shard into the
+/// unfiled bucket, so the journal's shard key never has to tell them apart.
+fn object_project_of(session_id: &str) -> Option<PathBuf> {
+    manox_agent::object_store::ObjectStore::try_global()
+        .and_then(|store| store.project_of(session_id))
+        .map(PathBuf::from)
+}
+
 fn unknown_session(session_id: &str) -> manox_ahp_runtime::error::RuntimeError {
     manox_ahp_runtime::error::RuntimeError::new(format!("unknown session: {session_id}"))
         .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)
@@ -1161,7 +1114,12 @@ pub(crate) async fn fork_session(
     // Materialize the fork file immediately (never deferred — a non-empty
     // prefix must be visible to `list` and loadable cold).
     let session_id = target_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let Some(target_path) = manox_ahp_runtime::paths::persisted_session_file(&session_id) else {
+    // A fork shares the source's project, so it shards where the source
+    // does; the new id has no row of its own yet to ask.
+    let fork_project = object_project_of(&source_session_id);
+    let Some(target_path) =
+        manox_ahp_runtime::paths::session_file_under(&session_id, fork_project.as_deref())
+    else {
         return Err(manox_ahp_runtime::error::RuntimeError::new(
             "minted fork id failed the path gate",
         )
@@ -1257,11 +1215,101 @@ impl AgentServerInner {
     /// resolves through the single convergence point
     /// `resolve_model_ref` (L8) *before* anything is created — an
     /// unresolvable canonical ref answers `model/unresolvable` without a
-    /// side effect. Re-opening a live session id is idempotent: the
-    /// existing id answers and the live session is left untouched. An id
-    /// whose journal file already exists on disk is an existing COLD
-    /// session: it restores through the `OpenSession` path (§D.2
-    /// idempotency on disk, GW11) and is never re-minted over its file.
+    /// side effect.
+    ///
+    /// A session journal's header line: id, origin cwd, and the lineage
+    /// stamp the spawn wrote. `None` when the file is absent or its header is
+    /// unreadable — an unreadable header is the restore path's problem to
+    /// report, not the claim's.
+    fn journal_header(
+        path: &std::path::Path,
+    ) -> Option<manox_harness::session::jsonl::JsonlSessionMetadata> {
+        let bytes = std::fs::read(path).ok()?;
+        let line_end = bytes.iter().position(|b| *b == b'\n')?;
+        manox_harness::session::jsonl::parse_header_line(&bytes[..line_end])
+            .ok()
+            .map(|(meta, _)| meta)
+    }
+
+    /// The durable facts one claim decision runs on: the live table, the
+    /// journal's header line and whether any interaction row landed, and the
+    /// archived bit the sidecar carries. Facts fail toward "a real session":
+    /// an unreadable log counts as non-blank, so a claim never re-mints over
+    /// an id whose file exists.
+    async fn gather_claim_facts(inner: &Arc<AgentServerInner>, id: &str) -> SessionFacts {
+        let live = inner.sessions.lock().contains_key(id);
+        let path = manox_ahp_runtime::paths::persisted_session_file(id);
+        let materialized = path.as_deref().is_some_and(std::path::Path::exists);
+        let header = path.as_deref().and_then(Self::journal_header);
+        // Blank = the log carries no interaction-marking row (the same rule
+        // the sidebar hides never-used rows by); a session with no journal is
+        // blank by construction.
+        let blank = match path.as_deref().filter(|_| materialized) {
+            None => true,
+            Some(path) => !manox_harness::session::repository::scan_session(path)
+                .await
+                .map(|scanned| scanned.info.has_messages)
+                .unwrap_or(true),
+        };
+        let subagent = header
+            .as_ref()
+            .and_then(|meta| meta.metadata.as_ref())
+            .is_some_and(|meta| meta.get("subagent").is_some());
+        let archived = match manox_agent::thread_store::try_global()
+            .and_then(|store| store.read(|state| state.summary_by_id(id).map(|row| row.archived)))
+        {
+            Some(archived) => archived,
+            // No store row yet (a claim before the first list scan): the
+            // sidecar is the durable archived bit.
+            None => match path.as_deref() {
+                Some(path) => manox_harness::session_meta::load(
+                    path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+                    path,
+                )
+                .await
+                .map(|meta| meta.archived)
+                .unwrap_or(false),
+                None => false,
+            },
+        };
+        SessionFacts {
+            id: id.to_string(),
+            exists: live || materialized,
+            blank,
+            archived,
+            subagent,
+            origin_cwd: header.map(|meta| meta.cwd),
+        }
+    }
+
+    /// Drive a session the claim reused: a live session only gains an owner;
+    /// a cold one restores through the `OpenSession` path (§D.2 idempotency
+    /// on disk, GW11) with its id→path note seeded first, so the restore's
+    /// `load_thread` resolves the id even when no list refresh has ever run.
+    async fn reuse_claimed_session(
+        inner: &Arc<AgentServerInner>,
+        owner: &str,
+        id: &str,
+    ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
+        if inner.sessions.lock().contains_key(id) {
+            inner.add_owner(id, owner);
+            return Ok(json!({ "session_id": id }));
+        }
+        let Some(path) = manox_ahp_runtime::paths::persisted_session_file(id) else {
+            return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                "session {id} has no journal to restore"
+            ))
+            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+        };
+        manox_agent::thread_store::global().with_mut(|state| state.note_session_path(id, &path));
+        open_session(inner, owner, id).await?;
+        Ok(json!({ "session_id": id }))
+    }
+
+    /// Create a session from a client intent: gather the claim facts, let
+    /// [`claim::decide`] name the id, then build that id. Every arm is
+    /// terminal — the answer carries the id the client will drive, and it
+    /// never changes afterwards (§D.2 idempotency).
     pub(crate) async fn create_session_request(
         inner: &Arc<AgentServerInner>,
         owner: &str,
@@ -1331,32 +1379,52 @@ impl AgentServerInner {
                 parsed
             }
         };
-        // Idempotent re-open of a live session (§D.2).
-        if let Some(existing) = intent.session_id.as_deref()
-            && inner.sessions.lock().contains_key(existing)
-        {
-            inner.add_owner(existing, owner);
-            return Ok(json!({ "session_id": existing }));
-        }
-        // §D.2 idempotency on disk (GW11): an id whose journal file already
-        // exists is an existing COLD session — restore it through the
-        // OpenSession path instead of minting a fresh session over the id.
-        // The pre-fix fall-through reached `new_fresh` ("never restores the
-        // previous session"), whose deferred materialization rewrote the
-        // existing file wholesale on the first assistant message, erasing
-        // the cold session's history. The probe reads the canonical
-        // sessions-dir path directly rather than the store's scan-populated
-        // map, so it holds even when no list refresh has ever run;
-        // `note_session_path` seeds the identity map for the restore's
-        // `load_thread`.
-        if let Some(existing) = intent.session_id.as_deref()
-            && let Some(path) = manox_ahp_runtime::paths::persisted_session_file(existing)
-            && path.exists()
-        {
-            manox_agent::thread_store::global().with_mut(|s| s.note_session_path(existing, &path));
-            open_session(inner, owner, existing).await?;
-            return Ok(json!({ "session_id": existing }));
-        }
+        // The claim decision is the one creation rule: the answer names the
+        // session the client will drive, and that id never changes afterward.
+        // A live session this process drives owns its id whatever the disk
+        // says; a materialized session in the claimed directory restores
+        // through the `OpenSession` path (§D.2 idempotency on disk, GW11) and
+        // is never re-minted over its file — the pre-fix fall-through reached
+        // `new_fresh` ("never restores the previous session"), whose deferred
+        // materialization rewrote the existing file wholesale on the first
+        // assistant message, erasing the cold session's history. The probe
+        // reads the canonical core-root path directly rather than the store's
+        // scan-populated map, so it holds even when no list refresh has ever
+        // run.
+        let claimed_id = match intent.session_id.as_deref() {
+            Some(existing) => {
+                let facts = Self::gather_claim_facts(inner, existing).await;
+                match claim::decide(
+                    &ClaimRequest {
+                        desired_id: Some(existing.to_string()),
+                        cwd: intent.cwd.clone(),
+                    },
+                    &facts,
+                ) {
+                    ClaimOutcome::Reuse { id } => {
+                        return Self::reuse_claimed_session(inner, owner, &id).await;
+                    }
+                    ClaimOutcome::Mint { id } => id,
+                    ClaimOutcome::Conflict {
+                        id,
+                        requested_cwd,
+                        existing_cwd,
+                    } => {
+                        return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                            "session {id} lives in {existing_cwd}; the create named {requested_cwd}"
+                        ))
+                        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                    }
+                    ClaimOutcome::SubagentOwned { id } => {
+                        return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                            "session {id} belongs to its parent's run and cannot be claimed"
+                        ))
+                        .with_code(manox_ahp_runtime::error::codes::SESSION_ALREADY_OWNED));
+                    }
+                }
+            }
+            None => None,
+        };
         // Hidden-context seeding (`CreateSession.seed`): a seeded create
         // materializes the journal synchronously — header plus one
         // non-displaying `embedder_seed` custom row per block — and then
@@ -1365,19 +1433,24 @@ impl AgentServerInner {
         // the engine actor, and independent of its boot). An unseeded
         // create keeps the deferred-fresh flow untouched.
         if !seed_blocks.is_empty() {
-            let session_id = uuid::Uuid::new_v4().to_string();
-            let Some(path) = manox_ahp_runtime::paths::persisted_session_file(&session_id) else {
-                return Err(manox_ahp_runtime::error::RuntimeError::new(
-                    "minted session id failed the path gate",
-                )
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
-            };
+            let session_id = claimed_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let cwd = intent
                 .cwd
                 .clone()
                 .map(PathBuf::from)
                 .or_else(|| intent.project.clone().map(PathBuf::from))
                 .unwrap_or_else(|| inner.cwd.clone());
+            let project = object_project_of(&session_id);
+            let Some(path) =
+                manox_ahp_runtime::paths::session_file_under(&session_id, project.as_deref())
+            else {
+                return Err(manox_ahp_runtime::error::RuntimeError::new(
+                    "minted session id failed the path gate",
+                )
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+            };
             let storage = JsonlSessionStorage::create(
                 &path,
                 JsonlSessionMetadata {
@@ -1468,10 +1541,7 @@ impl AgentServerInner {
             return Ok(json!({ "session_id": session_id }));
         }
 
-        let session_id = intent
-            .session_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let session_id = claimed_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let project = intent.project.as_ref().map(PathBuf::from);
         let cwd = intent
             .cwd
@@ -1480,7 +1550,7 @@ impl AgentServerInner {
             .unwrap_or_else(|| project.clone().unwrap_or_else(|| inner.cwd.clone()));
         let thread = match &project {
             Some(p) => Thread::new_in_project(ThreadId(session_id.clone()), p.clone()),
-            None => Thread::new_fresh(ThreadId(session_id.clone()), cwd),
+            None => Thread::new_fresh(ThreadId(session_id.clone()), cwd.clone()),
         };
         // Multi-root: grant the extra working directories before the engine
         // materializes, so the gate's granted-root set admits them from the
@@ -1493,7 +1563,10 @@ impl AgentServerInner {
         // (the journal materializes lazily at the first turn) so the
         // sidecar write is addressable.
         if !intent.working_directories.is_empty()
-            && let Some(path) = manox_ahp_runtime::paths::persisted_session_file(&session_id)
+            && let Some(path) = manox_ahp_runtime::paths::session_file_under(
+                &session_id,
+                object_project_of(&session_id).as_deref(),
+            )
         {
             let dirs = intent.working_directories.clone();
             manox_agent::thread_store::global().with_mut(|s| {
@@ -1567,6 +1640,19 @@ impl AgentServerInner {
                 manox_agent::thread_store::global().with_mut(|s| s.mark_idle(session_id));
             }
         }
+        // A session that never materialized (no journal file) has no
+        // durable existence: dropping the last owner truly deletes it —
+        // the store row goes and the removal is broadcast, so the client's
+        // row book is a faithful mirror, not an append-only log.
+        let never_materialized = manox_agent::thread_store::try_global()
+            .and_then(|store| store.read(|s| s.journal_path(session_id)))
+            .is_none_or(|path| !path.exists());
+        if never_materialized {
+            manox_agent::thread_store::global().with_mut(|s| s.drop_session_row(session_id));
+            if let Some(runtime) = manox_ahp_runtime::ahp::runtime::try_runtime() {
+                runtime.catalogue_removed(session_id);
+            }
+        }
     }
 
     pub(crate) async fn submit(
@@ -1578,16 +1664,6 @@ impl AgentServerInner {
         client_id: Option<String>,
         origin_rpc: Option<String>,
     ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
-        // Bind redirect + restart window: submissions addressed to a
-        // superseded predecessor land on the successor, opened under its
-        // own id with this connection as owner. Only a real redirect
-        // auto-opens — a cold id keeps not-found semantics (review #805
-        // r2 [issue] B).
-        let effective = self.resolve_redirect(session_id);
-        if effective != session_id && !self.sessions.lock().contains_key(&effective) {
-            let _ = open_session(self, owner, &effective).await;
-        }
-        let session_id = effective.as_str();
         let receipt = |accepted: bool, message_id: Option<String>| {
             Ok(json!({ "accepted": accepted, "message_id": message_id }))
         };
@@ -1820,8 +1896,7 @@ impl AgentServerInner {
     }
 
     pub(crate) fn drop_queued(&self, session_id: &str, client_id: String) {
-        let resolved = self.resolve_redirect(session_id);
-        if let Some(session) = self.sessions.lock().get(&resolved) {
+        if let Some(session) = self.sessions.lock().get(session_id) {
             let pending = session.pending_submits.clone();
             pending.lock().retain(|q| q.client_id != client_id);
         }
@@ -1952,236 +2027,22 @@ impl AgentServerInner {
         Ok(())
     }
 
+    /// Move a session's working directory. Identity never follows the
+    /// directory: a not-yet-interacted session relocates in place (its
+    /// project binding moves with it, and the move lands as its first
+    /// durable row when it materializes), while an interacted session
+    /// records a `cwd_change` entry — one id, one log, at every
+    /// interaction state. A cold id keeps not-found semantics.
     pub(crate) async fn set_cwd(
         self: &Arc<Self>,
         session_id: &str,
         cwd: &str,
     ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
-        // Restart-window opens from a note carry no connection identity:
-        // use a transient owner and release it right after so it never
-        // defeats the orphaned-session reap (review #805 [sugg] 11).
-        const NOTE_OWNER: &str = "note-setcwd";
-        let effective = self.resolve_redirect(session_id);
-        // Only a real redirect auto-opens here (a cold id keeps not-found
-        // semantics, review #805 r2 [issue] B); the transient owner stays
-        // until the hand-off releases it so the session is never ownerless
-        // (r2 [sugg] G).
-        if effective != session_id && !self.sessions.lock().contains_key(&effective) {
-            let _ = open_session(self, NOTE_OWNER, &effective).await;
-        }
-        // The transient owner rides the OPENED id (never the id a bind
-        // may mint later), and every exit path releases it (review r3
-        // [problem] 2).
-        let opened_id = (effective != session_id && self.sessions.lock().contains_key(&effective))
-            .then(|| effective.clone());
-        let Some(thread) = self.session_thread(&effective) else {
-            if let Some(id) = &opened_id {
-                self.remove_owner(NOTE_OWNER, id);
-            }
+        let Some(thread) = self.session_thread(session_id) else {
             return Err(unknown_session(session_id));
         };
-        if thread.read(|t| t.has_interacted()) {
-            // The working-directory switch applies at ANY interaction
-            // state, through the same per-call cwd machinery the model's
-            // tools use: sticky advance + a durable `cwd_change` entry —
-            // never the header cwd, never a re-bind.
-            thread.with_mut(|t| t.set_cwd(cwd.into()));
-            if let Some(id) = &opened_id {
-                self.remove_owner(NOTE_OWNER, id);
-            }
-            return Ok(());
-        }
-        // Bind on a not-yet-interacted thread: identity follows the log —
-        // the directory becomes a SUCCESSOR session (fresh chain bound at
-        // creation), and this predecessor degrades into a redirect stub
-        // sharing the successor's engine (#802: no chain swap under a
-        // live identity, ever).
-        let inner = Arc::clone(self);
-        let session_id = session_id.to_string();
-        let cwd = cwd.to_string();
-        manox_agent::runtime::handle().spawn(async move {
-            if let Err(error) = inner.bind_successor(&session_id, &cwd).await {
-                tracing::warn!(session = %session_id, %error, "bind successor failed");
-            }
-            // Released AFTER the hand-off, on the id the owner was added
-            // to (review r3 [problem] 2).
-            if let Some(id) = opened_id {
-                inner.remove_owner(NOTE_OWNER, &id);
-            }
-        });
+        thread.with_mut(|t| t.set_cwd(cwd.into()));
         Ok(())
-    }
-
-    /// The bind hand-off (#802 / identity-follows-log): mint the successor
-    /// session bound to `cwd`, mark the predecessor superseded (sidecar +
-    /// live map), stub the predecessor entity onto the successor's engine
-    /// so live streams/ops addressed to it converge on the new log, and
-    /// publish the control-face hand-off (`SessionDisposed { successor }`).
-    async fn bind_successor(self: &Arc<Self>, pred_id: &str, cwd: &str) -> Result<(), String> {
-        // Dedupe keys on the RESOLVED id: a note may arrive on any
-        // predecessor of the same redirect chain, and inserting one id
-        // while removing another wedges the set forever (review #805 r2
-        // [issue] A).
-        let key = self.resolve_redirect(pred_id);
-        if !self.binding.lock().insert(key.clone()) {
-            return Err("bind already in flight".into());
-        }
-        let outcome = self.bind_successor_impl(pred_id, cwd).await;
-        self.binding.lock().remove(&key);
-        outcome
-    }
-
-    async fn bind_successor_impl(self: &Arc<Self>, pred_id: &str, cwd: &str) -> Result<(), String> {
-        // The lease is armed as soon as the successor exists and releases
-        // the internal owner on EVERY exit — including the narrow failure
-        // window after `create` (review r3 [sugg] 3).
-        let pred = self.session_thread(pred_id).ok_or("unknown session")?;
-        let (model, approval, effort) = pred.read(|t| {
-            (
-                t.model().map(|m| format!("{}/{}", m.provider, m.id)),
-                t.permission_mode().wire().to_string(),
-                match t.reasoning_effort() {
-                    manox_agent::language_model::ReasoningEffort::High => "high",
-                    manox_agent::language_model::ReasoningEffort::Max => "max",
-                }
-                .to_string(),
-            )
-        });
-        let created = Self::create_session_request(
-            self,
-            "server-bind",
-            SessionIntent {
-                session_id: None,
-                cwd: Some(cwd.to_string()),
-                project: Some(cwd.to_string()),
-                initial_model: model,
-                approval_mode: Some(approval),
-                reasoning_effort: Some(effort),
-                seed: None,
-                working_directories: Vec::new(),
-            },
-        )
-        .await
-        .map_err(|e| e.message)?;
-        let succ_id = created["session_id"]
-            .as_str()
-            .ok_or("create answered without a session id")?
-            .to_string();
-        let _bind_lease = OwnerLease {
-            inner: Arc::clone(self),
-            owner: "server-bind",
-            id: succ_id.clone(),
-        };
-        // Every fail-able step runs BEFORE the durable hand-off: past
-        // `mark_superseded` there is no rollback, so a failure below this
-        // line would strand a superseded predecessor with no alias (review
-        // #805 r2 [sugg] F).
-        let succ = self
-            .session_thread(&succ_id)
-            .ok_or("successor session missing after create")?;
-        let engine = succ
-            .read(|t| t.engine_clone())
-            .ok_or("successor engine not materialized")?;
-        // The hand-off audience: every client owning the id the note
-        // arrived on OR the id it resolved to — they differ once a
-        // predecessor has already handed off, whose own owner set is
-        // cleared by that earlier hand-off (plan §3.1 B-iv).
-        let effective = self.resolve_redirect(pred_id);
-        let mut audience: Vec<String> = self.owners(pred_id);
-        for owner in self.owners(&effective) {
-            if !audience.contains(&owner) {
-                audience.push(owner);
-            }
-        }
-        // Owner inheritance: the successor takes the predecessor's audience,
-        // so a client watching the predecessor keeps watching the session
-        // across the hand-off.
-        for owner in &audience {
-            // `add_owner(session_id, client_id)`: the successor takes the
-            // audience, not the other way around.
-            self.add_owner(&succ_id, owner);
-        }
-        // Stub the predecessor onto the successor's engine + mirrored header
-        // fields: its journal seam answers the successor's log from here on.
-        pred.with_mut(|t| t.adopt_successor(engine, PathBuf::from(cwd)));
-        // Both ids mark the successor: the id clients still address, and the
-        // id it resolved to.
-        manox_agent::thread_store::global().with_mut(|s| {
-            s.mark_superseded(pred_id, &succ_id);
-            if effective != pred_id {
-                s.mark_superseded(&effective, &succ_id);
-            }
-        });
-        self.superseded
-            .lock()
-            .insert(pred_id.to_string(), succ_id.clone());
-        self.superseded
-            .lock()
-            .insert(effective.clone(), succ_id.clone());
-        // The bound directory becomes (or joins) a workspace row, and the
-        // successor leads its account. A workspace-store failure is logged,
-        // not fatal: the session hand-off is the user's intent and the
-        // bookkeeping row is not worth failing it over.
-        match manox_workspace::WorkspaceStore::open() {
-            Ok(store) => match store.create(std::path::Path::new(cwd)) {
-                Ok((view, _)) => {
-                    if let Err(error) = store.attach_session(&view.workspace_id, &succ_id) {
-                        tracing::debug!(%error, "workspace attach after bind skipped");
-                    }
-                }
-                Err(error) => tracing::debug!(%error, "workspace create after bind skipped"),
-            },
-            Err(error) => tracing::debug!(%error, "workspace store unavailable after bind"),
-        }
-        // The hand-off is complete: the audience is inherited by the
-        // successor, so both predecessor ids drop their ownership here.
-        // Without this an entry could never satisfy the reap predicate while
-        // the client stays connected.
-        for owner in &audience {
-            self.remove_owner(owner, pred_id);
-            if effective != pred_id {
-                self.remove_owner(owner, &effective);
-            }
-        }
-        self.reap_superseded_if_idle(pred_id);
-        if effective != pred_id {
-            self.reap_superseded_if_idle(&effective);
-        }
-        // No explicit owner release here: `OwnerLease` covers the bind
-        // owner on every exit path, and the note-open owner belongs to
-        // `set_cwd`'s own scope (review r3 [problem] 2, [sugg] 3).
-        Ok(())
-    }
-
-    /// Drop a superseded predecessor's entry once nothing consumes it: without
-    /// this it stays resident for the process lifetime. A running turn keeps
-    /// its entry — there is still a settle path to reach.
-    fn reap_superseded_if_idle(&self, session_id: &str) {
-        if !self.superseded.lock().contains_key(session_id) {
-            return;
-        }
-        if !self.owners(session_id).is_empty() {
-            return;
-        }
-        // Check-and-remove under ONE hold: a turn turning active between two
-        // holds would otherwise be reaped mid-flight with nobody left to
-        // settle it.
-        let removed = {
-            let mut sessions = self.sessions.lock();
-            let running = sessions
-                .get(session_id)
-                .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
-            if running {
-                return;
-            }
-            sessions.remove(session_id)
-        };
-        if removed.is_some() {
-            // The registrations die with the entry, like every other removal
-            // path.
-            self.clear_embedder_tools(session_id);
-            tracing::debug!(session = %session_id, "reaped superseded predecessor");
-        }
     }
 
     pub(crate) fn compact(
@@ -2264,7 +2125,7 @@ impl AgentServerInner {
             return Err(unknown_session(session_id));
         };
         let objective = objective.unwrap_or_default();
-        let actor = manox_agent::db::GoalActor::User;
+        let actor = manox_agent::goal::GoalActor::User;
         let result = thread.with_mut(|t| match action {
             "create" => t.set_goal(objective),
             "edit" => t.edit_goal(objective, budget, max_rounds, actor),
@@ -2341,6 +2202,14 @@ impl AgentServerInner {
         manox_agent::thread_store::global()
             .with_mut(|store| store.insert_thread_before(session_id, before));
         true
+    }
+
+    /// Set (or clear) a project's display alias — the durable project
+    /// object's name half. Refused for an unregistered path: aliasing a
+    /// directory nobody registered would mint an object with no home.
+    pub(crate) fn set_project_alias(&self, path: &str, alias: Option<&str>) -> bool {
+        manox_agent::thread_store::global()
+            .with_mut(|store| store.set_project_alias(path, alias.map(str::to_string)))
     }
 
     /// Rename a session to a user-supplied title.

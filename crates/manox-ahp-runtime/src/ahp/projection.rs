@@ -213,6 +213,12 @@ pub(crate) fn target_of(entry: &SessionTreeEntry) -> Target {
         | E::ToolOutputChunk { .. }
         | E::SubagentChild { .. } => Target::Chat,
         E::SubagentProgress { .. } => Target::Work,
+        // Swarm lifecycle and disposal are chat-level facts (background work
+        // plus settlement notices); disposal itself is a session-level fact.
+        E::RunStarted { .. }
+        | E::RunSettled { .. }
+        | E::RunEscalated { .. }
+        | E::RunContinued { .. } => Target::Chat,
         // ── session state ────────────────────────────────────────────
         E::ModelChange { .. }
         | E::CwdChange { .. }
@@ -974,70 +980,160 @@ impl Translator {
                 // transcript with a card per spawn/exit the moment the bridge
                 // streamed again.
             }
-            SessionTreeEntry::SubagentProgress {
-                agent_id,
-                agent_type,
-                tool_uses,
-                latest_activity,
-                status,
+            SessionTreeEntry::RunStarted {
+                run_id,
+                kind,
+                label,
+                tool_call_id,
                 ..
             } => {
-                // AHP 1.0's own answer for running subagents: the run is
-                // background work on the parent chat, and its `chat` names
-                // the child's own channel (the child session id IS the run
-                // id, pinned at spawn). The first running tick opens the
-                // entry; a terminal status closes it — the ticks between
-                // only refresh nothing (the entry's fields are set-once by
-                // design: label and start, not per-tick activity).
-                // Terminal judgment rides the producer's own vocabulary:
-                // the journal's status strings are `ToolCallStatus`'s
-                // kebab-case names (`pending-approval | running | success |
-                // continued | error | denied | cancelled`), the same set
-                // `status_phase` maps — so a run settles exactly when its
-                // producer (`on_settled` -> Success/Cancelled/Error) says so.
-                let running = !matches!(
-                    status_phase(status),
-                    Phase::Finished | Phase::Failed | Phase::Aborted
-                );
-                let listed = self.subagents.contains_key(agent_id);
-                if running && !listed {
-                    self.subagents.insert(agent_id.clone(), ());
+                // The durable lifecycle rows are the whole background-work
+                // truth: one open at start, one close at settle — and the
+                // child's own state lives in its chat (`ahp-chat:/<run_id>`;
+                // the run id names the child session). No progress rides
+                // this pointer.
+                let listed = self.subagents.contains_key(run_id);
+                if !listed {
+                    self.subagents.insert(run_id.clone(), ());
                     out.push(Emitted::new(
                         &chat,
                         StateAction::ChatBackgroundWorkSet(
                             ahp_types::actions::ChatBackgroundWorkSetAction {
                                 work: ahp_types::state::BackgroundWork::Subagent(
                                     ahp_types::state::BackgroundSubagentWork {
-                                        id: agent_id.clone(),
-                                        label: agent_type.clone(),
+                                        id: run_id.clone(),
+                                        label: label.clone(),
                                         started_at: row.timestamp.clone(),
-                                        meta: Some(manox_meta(json!({
-                                            "agentType": agent_type,
-                                            "toolUses": tool_uses,
-                                            "latestActivity": latest_activity,
-                                        }))),
-                                        // Legacy rows (pre-#885 runs, whose child
-                                        // session ids were minted independently)
-                                        // name a channel no journal backs — the
-                                        // link is inert there, no regression:
-                                        // before this change no link existed.
-                                        chat: format!("ahp-chat:/{agent_id}"),
+                                        meta: None,
+                                        chat: format!("ahp-chat:/{run_id}"),
                                     },
                                 ),
                             },
                         ),
                     ));
-                } else if !running && listed {
-                    self.subagents.remove(agent_id);
+                }
+                // The spawning tool call's forward pointer — the same edge
+                // the child chat records in reverse through its ChatOrigin
+                // (the spec's MUST-keep-consistent pair). The tool call id
+                // is the join key the row has carried since it rode the
+                // start request.
+                if !tool_call_id.is_empty() {
+                    self.ensure_turn(&row, &chat, &mut out);
+                    let turn_id = self.turn_id();
                     out.push(Emitted::new(
                         &chat,
-                        StateAction::ChatBackgroundWorkRemoved(
-                            ahp_types::actions::ChatBackgroundWorkRemovedAction {
-                                id: agent_id.clone(),
+                        StateAction::ChatToolCallContentChanged(
+                            ahp_types::actions::ChatToolCallContentChangedAction {
+                                turn_id,
+                                tool_call_id: tool_call_id.clone(),
+                                meta: None,
+                                content: vec![ahp_types::state::ToolResultContent::Subagent(
+                                    ahp_types::state::ToolResultSubagentContent {
+                                        resource: format!("ahp-chat:/{run_id}"),
+                                        title: label.clone(),
+                                        agent_name: Some(kind.clone()),
+                                        description: Some(label.clone()),
+                                    },
+                                )],
                             },
                         ),
                     ));
                 }
+            }
+            SessionTreeEntry::RunSettled {
+                run_id,
+                verdict,
+                salvage,
+                turns,
+                tool_calls,
+                ..
+            } => {
+                let listed = self.subagents.contains_key(run_id);
+                if listed {
+                    self.subagents.remove(run_id);
+                    out.push(Emitted::new(
+                        &chat,
+                        StateAction::ChatBackgroundWorkRemoved(
+                            ahp_types::actions::ChatBackgroundWorkRemovedAction {
+                                id: run_id.clone(),
+                            },
+                        ),
+                    ));
+                }
+                // The settlement notice rides the standard face: the host's
+                // verdict, the salvaged output or the explicit line that
+                // there is none, and the counters. Visible to the agent and
+                // the user alike — a settlement is never silent.
+                let mut text = verdict.clone();
+                match salvage {
+                    Some(salvage) if !salvage.trim().is_empty() => {
+                        text.push_str("\n\n");
+                        text.push_str(salvage);
+                    }
+                    _ => text.push_str(" It left no closing message."),
+                }
+                text.push_str(&format!("\n\n({turns} turns, {tool_calls} tool calls)"));
+                self.push_note(
+                    &chat,
+                    &row,
+                    text,
+                    serde_json::json!({ "runSettled": { "runId": run_id } }),
+                    &mut out,
+                );
+            }
+            SessionTreeEntry::RunContinued {
+                run_id, follow_up, ..
+            } => {
+                // A continuation re-opens the run's roster entry: the same
+                // child chat, a fresh start line, every pointer intact.
+                let listed = self.subagents.contains_key(run_id);
+                if !listed {
+                    self.subagents.insert(run_id.clone(), ());
+                    out.push(Emitted::new(
+                        &chat,
+                        StateAction::ChatBackgroundWorkSet(
+                            ahp_types::actions::ChatBackgroundWorkSetAction {
+                                work: ahp_types::state::BackgroundWork::Subagent(
+                                    ahp_types::state::BackgroundSubagentWork {
+                                        id: run_id.clone(),
+                                        // The follow-up is the live topic
+                                        // of the reopened run.
+                                        label: follow_up.clone(),
+                                        started_at: row.timestamp.clone(),
+                                        meta: None,
+                                        chat: format!("ahp-chat:/{run_id}"),
+                                    },
+                                ),
+                            },
+                        ),
+                    ));
+                }
+            }
+            SessionTreeEntry::RunEscalated {
+                run_id, question, ..
+            } => {
+                // The child's clarifying question, attributed and visible to
+                // the agent and the user alike: the note names the run and
+                // coaches the continuation contract (the answer re-dispatches
+                // with `continue_run_id`; the child session keeps its
+                // context).
+                let text = format!(
+                    "Sub-agent `{run_id}` asks: {question}\n\nAnswer the user, then \
+                     continue the run with `continue_run_id = \"{run_id}\"` carrying the \
+                     answer as the prompt."
+                );
+                self.push_note(
+                    &chat,
+                    &row,
+                    text,
+                    serde_json::json!({ "runEscalated": { "runId": run_id } }),
+                    &mut out,
+                );
+            }
+            SessionTreeEntry::SubagentProgress { .. } => {
+                // Retired forwarding rows: run/* rows are the only
+                // background-work truth (no `_meta` payload, no per-tick
+                // refresh). Old journals still parse; they fold to nothing.
             }
             SessionTreeEntry::ActiveToolsChange {
                 active_tool_names, ..
@@ -3953,120 +4049,6 @@ mod preview_edits_tests {
 }
 
 #[cfg(test)]
-mod subagent_face_tests {
-    use super::*;
-
-    fn kernel(mut fields: Value) -> SessionTreeEntry {
-        let mut base = json!({
-            "id": "e-1",
-            "parentId": None::<String>,
-            "timestamp": "2026-10-09T00:00:00.000Z",
-        });
-        let object = base.as_object_mut().expect("base is an object");
-        if let Some(extra) = fields.as_object_mut() {
-            object.append(extra);
-        }
-        serde_json::from_value(base.clone())
-            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
-    }
-
-    fn progress(agent: &str, status: &str, seq: u64) -> SessionTreeEntry {
-        kernel(json!({
-            "type": "subagent_progress", "id": format!("e-{seq}"),
-            "agentId": agent, "agentType": "explore",
-            "toolUses": 3, "latestActivity": "grepping",
-            "status": status,
-        }))
-    }
-
-    /// The subagent face is AHP-native: a running tick opens background work
-    /// on the parent chat naming the child's own channel (the run id IS the
-    /// child session id), a terminal status closes it, and a cancelled turn
-    /// reports every still-listed run — the #812 silence lands as visible
-    /// removals, not as entries that never settle.
-    #[test]
-    fn subagent_runs_are_background_work_on_the_parent_chat() {
-        let mut t = Translator::new();
-        let mut out = Vec::new();
-        for (seq, entry) in [
-            (1, progress("sub-0", "running", 1)),
-            (2, progress("sub-0", "running", 2)),
-            (3, progress("sub-1", "running", 3)),
-        ] {
-            out.extend(t.on_entry("c-1", "s-1", seq, &entry));
-        }
-        let sets: Vec<_> = out
-            .iter()
-            .filter(|e| matches!(&e.action, StateAction::ChatBackgroundWorkSet(_)))
-            .collect();
-        assert_eq!(
-            sets.len(),
-            2,
-            "one Set per run, ticks between settle nothing: {out:?}"
-        );
-        let mut chat_state = manox_ahp::channels::chat::initial("c-1");
-        for e in &sets {
-            ahp::reducers::apply_action_to_chat(&mut chat_state, &e.action);
-        }
-        let work = chat_state
-            .background_work
-            .expect("the fold holds the entries");
-        assert_eq!(work.len(), 2);
-        match &work[0] {
-            ahp_types::state::BackgroundWork::Subagent(sub) => {
-                assert_eq!(sub.id, "sub-0");
-                assert_eq!(sub.chat, "ahp-chat:/sub-0", "the child channel is named");
-            }
-            other => panic!("the entry is a subagent: {other:?}"),
-        }
-
-        // A terminal status closes its run only — `success` is the word the
-        // producer actually writes (`on_settled` maps Completed to
-        // ToolCallStatus::Success, kebab-cased onto the row).
-        let mut out2 = Vec::new();
-        out2.extend(t.on_entry("c-1", "s-1", 4, &progress("sub-0", "success", 4)));
-        let removed: Vec<_> = out2
-            .iter()
-            .filter(|e| matches!(&e.action, StateAction::ChatBackgroundWorkRemoved(_)))
-            .collect();
-        assert_eq!(removed.len(), 1, "only sub-0 closes: {out2:?}");
-
-        // `denied` settles too — the round-1 vocabulary gap was exactly
-        // success/denied never closing their runs.
-        let mut out_denied = Vec::new();
-        out_denied.extend(t.on_entry("c-1", "s-1", 6, &progress("sub-9", "running", 6)));
-        out_denied.extend(t.on_entry("c-1", "s-1", 7, &progress("sub-9", "denied", 7)));
-        assert_eq!(
-            out_denied
-                .iter()
-                .filter(|e| matches!(&e.action, StateAction::ChatBackgroundWorkRemoved(_)))
-                .count(),
-            1,
-            "a denied run settles: {out_denied:?}"
-        );
-
-        // A cancelled turn settles every still-listed run — the AHP face
-        // reports what #812 said happened silently.
-        let mut out3 = Vec::new();
-        out3.extend(t.on_entry(
-            "c-1",
-            "s-1",
-            5,
-            &kernel(json!({"type": "turn_finish", "id": "e-5",
-                          "cancelled": true, "failed": false, "strandedSteerIds": []})),
-        ));
-        let cancelled_removals = out3
-            .iter()
-            .filter(|e| matches!(&e.action, StateAction::ChatBackgroundWorkRemoved(r) if r.id == "sub-1"))
-            .count();
-        assert_eq!(
-            cancelled_removals, 1,
-            "the cancelled turn reports sub-1's death: {out3:?}"
-        );
-    }
-}
-
-#[cfg(test)]
 mod annotations_tests {
     use super::*;
 
@@ -4134,6 +4116,59 @@ mod annotations_tests {
         assert_eq!(state.annotations.len(), 1);
         assert_eq!(state.annotations[0].id, "note-1");
         assert_eq!(state.annotations[0].entries.len(), 2);
+    }
+
+    /// A run/started row with a tool call id opens the background-work
+    /// pointer AND attaches the spawning tool call's forward pointer — a
+    /// `ToolResultSubagentContent` naming the child chat — so the card, the
+    /// row, and the drill-down correlate by spec vocabulary, with no
+    /// private payload riding either.
+    #[test]
+    fn run_started_attaches_the_subagent_pointer_to_the_owning_tool_call() {
+        let mut t = Translator::new();
+        let out = t.on_entry(
+            "c-1",
+            "s-1",
+            0,
+            &kernel(json!({
+                "type": "run/started",
+                "id": "e-1",
+                "parentId": null,
+                "timestamp": "1970-01-01T00:00:00Z",
+                "runId": "sub-9",
+                "kind": "Explore",
+                "label": "survey the fold",
+                "childSession": "sub-9",
+                "toolCallId": "tu_1",
+                "budgets": {},
+                "depth": 1,
+            })),
+        );
+        let chat = manox_ahp::channels::chat::uri("c-1");
+        let mut work = 0;
+        let mut pointer = None;
+        for emitted in &out {
+            if emitted.channel != chat {
+                continue;
+            }
+            match &emitted.action {
+                StateAction::ChatBackgroundWorkSet(_) => work += 1,
+                StateAction::ChatToolCallContentChanged(action) => pointer = Some(action.clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(work, 1, "the run opens exactly one background-work entry");
+        let pointer = pointer.expect("the spawning tool call gets its forward pointer");
+        assert_eq!(pointer.tool_call_id, "tu_1");
+        assert_eq!(pointer.content.len(), 1);
+        match &pointer.content[0] {
+            ahp_types::state::ToolResultContent::Subagent(sub) => {
+                assert_eq!(sub.resource, "ahp-chat:/sub-9");
+                assert_eq!(sub.title, "survey the fold");
+                assert_eq!(sub.agent_name.as_deref(), Some("Explore"));
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
     }
 
     /// A UI note card (an annotation carrying the `x-manox` note payload)
@@ -4363,6 +4398,7 @@ mod extension_gate_tests {
                 label: Some("x".to_string()),
                 session_info: Some(json!({"name": "agent"})),
                 leaf: Some("e-9".to_string()),
+                alias: None,
                 active_tools: Some(vec!["bash".to_string()]),
                 order: Some(json!({"s-1": 1})),
             },

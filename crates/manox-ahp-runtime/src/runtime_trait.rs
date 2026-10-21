@@ -259,6 +259,9 @@ pub trait SessionRuntime: Send + Sync + 'static {
 
     /// Move the session in the sidebar order.
     fn order_session(&self, session_id: &str, before: Option<&str>) -> bool;
+    /// Set (or clear) a project's display alias; false on an unregistered
+    /// path.
+    fn set_project_alias(&self, path: &str, alias: Option<&str>) -> bool;
 
     /// Compact the session's history.
     fn compact(&self, session_id: &str, instructions: Option<String>) -> Result<(), RuntimeError>;

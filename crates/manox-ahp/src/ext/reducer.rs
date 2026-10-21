@@ -75,6 +75,10 @@ pub struct XManoxState {
     /// Manual thread/workspace ordering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Value>,
+    /// The workspaces-channel fold of `x-manox/aliasChanged` (a project
+    /// alias upsert; the durable authority is the host's projects file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<Value>,
 }
 
 /// What one extension action did to the state.
@@ -194,6 +198,9 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
         }
         super::actions::ORDER_CHANGED => {
             state.order = action.get("order").cloned();
+        }
+        super::actions::ALIAS_CHANGED => {
+            state.alias = action.get("alias").cloned();
         }
         _ => return Outcome::Unrecognised,
     }
