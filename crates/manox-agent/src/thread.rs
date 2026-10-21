@@ -2914,8 +2914,21 @@ pub(crate) mod tests {
         phase: HistoryPhase,
         engine: Arc<dyn ThreadEngine>,
     ) -> ThreadHandle {
+        thread_with_engine_id(phase, engine, "test-thread")
+    }
+
+    /// [`thread_with_engine`] with the conversation id spelled out. The
+    /// object-store handshake reads its row by the thread's own id out of a
+    /// PROCESS-GLOBAL store, so a test that writes a config row must own an
+    /// id no sibling test's thread shares — otherwise a parallel test's turn
+    /// picks the row up and reports a change it never made.
+    pub(crate) fn thread_with_engine_id(
+        phase: HistoryPhase,
+        engine: Arc<dyn ThreadEngine>,
+        id: &str,
+    ) -> ThreadHandle {
         ThreadHandle::new(Thread {
-            id: ThreadId("test-thread".to_string()),
+            id: ThreadId(id.to_string()),
             cwd: PathBuf::from("/tmp"),
             project: None,
             model: None,
@@ -3284,8 +3297,8 @@ pub(crate) mod tests {
             steers: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
-        let sid = "test-thread".to_string();
+        let thread = thread_with_engine_id(HistoryPhase::Ready, engine.clone(), "cfg-handshake");
+        let sid = "cfg-handshake".to_string();
 
         // Restating nothing (no row): the insert path is inert.
         thread.with_mut(|t| {
