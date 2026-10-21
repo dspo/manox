@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+rustpython.workspace = true
 async-channel.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["fs", "process", "time", "sync", "io-util", "macros", "rt-multi-thread"] }

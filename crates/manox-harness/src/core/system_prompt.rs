@@ -23,6 +23,7 @@ pub const DEFAULT_BASE_PROMPT: &str = "You are an expert coding assistant operat
 const TOOL_SNIPPETS: &[(&str, &str)] = &[
     ("Read", "Read a file from the filesystem"),
     ("Bash", "Run a shell command"),
+    ("Py", "Run a short Python script (standard library only)"),
     ("Edit", "Edit a file with a patch"),
     ("Write", "Write a file"),
     ("Grep", "Search file contents"),
@@ -66,6 +67,20 @@ pub fn build_harness_prompt(
                 .any(|t| active_tools.contains(&t.to_string()))
         {
             prompt.push_str("\nUse bash for file operations like ls, rg, find\n");
+        }
+        // The Py promotion: a short script beats a shell pipeline for
+        // anything computational, and the model reaches for `python3 -c`
+        // through Bash exactly when it should not.
+        if active_tools.contains(&"Py".to_string()) {
+            prompt.push_str(
+                "\nPrefer the Py tool for short scripts — computation, data\n\
+                 reshaping, JSON/text processing, or a quick file inspection. It runs a\n\
+                 single Python 3 script string on an embedded interpreter with the\n\
+                 standard library only (no site-packages, no shell, no TLS networking),\n\
+                 prints are returned as the result, and it needs no quoting or escaping.\n\
+                 Reach for Bash instead when the work needs shell features, installed\n\
+                 packages, long-running processes, or programs other than Python.\n",
+            );
         }
     }
     if !context_files.is_empty() {
@@ -127,7 +142,7 @@ mod tests {
             location: "/proj/skills/review.md".into(),
             content: "Check the diff.".into(),
         }];
-        let tools = vec!["Read".to_string(), "Bash".to_string()];
+        let tools = vec!["Read".to_string(), "Bash".to_string(), "Py".to_string()];
         let prompt = build_harness_prompt(
             DEFAULT_BASE_PROMPT,
             std::path::Path::new("/proj"),
@@ -139,6 +154,11 @@ mod tests {
         assert!(prompt.contains("Current working directory: /proj"));
         assert!(prompt.contains("- Read: Read a file from the filesystem"));
         assert!(prompt.contains("- Bash: Run a shell command"));
+        assert!(prompt.contains("- Py: Run a short Python script (standard library only)"));
+        assert!(
+            prompt.contains("Prefer the Py tool for short scripts"),
+            "the Py promotion is part of the prompt: {prompt}"
+        );
         assert!(prompt.contains(
             "<project_instructions path=\"/proj/CLAUDE.md\">\nKeep changes minimal.\n</project_instructions>"
         ));

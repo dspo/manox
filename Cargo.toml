@@ -93,6 +93,16 @@ serde_json = "1"
 serde_yaml = "0.9"
 schemars = { version = "0.8", features = ["derive"] }
 jsonschema = "0.18"
+# RustPython — the Py tool's embedded interpreter (stdlib only, frozen into
+# the binary; ssl stays out on purpose: a short-script tool needs no TLS).
+rustpython = { version = "=0.5.0", default-features = false, features = [
+    "stdlib",
+    "freeze-stdlib",
+    "threading",
+    "stdio",
+    "importlib",
+    "host_env",
+] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 zstd = "0.13"
