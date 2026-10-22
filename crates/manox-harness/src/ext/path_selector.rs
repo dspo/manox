@@ -90,11 +90,9 @@ fn try_parse_selector(sel: &str) -> Option<Selector> {
         let trimmed = chunk.trim();
         if is_raw(trimmed) {
             has_raw = true;
-        } else if let Some(parsed) = try_parse_ranges(trimmed) {
-            ranges = Some(parsed);
         } else {
-            // Unknown chunk — not a valid selector.
-            return None;
+            let parsed = try_parse_ranges(trimmed)?;
+            ranges = Some(parsed);
         }
     }
 

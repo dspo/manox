@@ -59,7 +59,7 @@ cargo fmt --all
 script/gates.sh                      # 唯一门禁权威（fmt/clippy/test-real/test-clean；--quick 仅迭代用）
 ```
 
-Rust **1.95.0**（`rust-toolchain.toml`），edition **2024**，需 `clippy`/`rustfmt`/`rust-src`。本仓库 headless，CI 无图形系统依赖。
+Rust **1.97.1**（`rust-toolchain.toml`），edition **2024**，需 `clippy`/`rustfmt`/`rust-src`。本仓库 headless，CI 无图形系统依赖。
 
 ## 字符串与语言（重要：开发时勿忘）
 
