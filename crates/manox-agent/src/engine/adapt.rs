@@ -508,7 +508,7 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
         "Code" => "Code".to_string(),
         // Py carries a script body: the header names its first line so the
         // card shows intent instead of a wall of code.
-        "Py" => {
+        crate::tools::PY => {
             let first = arg("script").and_then(|script| {
                 script
                     .lines()

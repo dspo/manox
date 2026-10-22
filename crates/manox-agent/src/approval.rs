@@ -657,13 +657,17 @@ impl ApprovalGatedTool {
                 }
                 Ok(())
             }
-            // Py: a script's write targets are not statically knowable, so
-            // containment cannot be proven the way Write/Edit prove a path.
-            // The session mode is the contract — workspace-write admits the
-            // call (the script inherits the same trust as a Bash call without
-            // a seatbelt to confine it), and read-only never reaches this
-            // arm: `run_gated` refuses the whole call before the verdict.
-            "Py" => Ok(()),
+            // Py: a script's write targets are decided at runtime, so
+            // containment cannot be proven the way Write/Edit prove a path —
+            // and unlike sandbox-confined Bash there is no OS fence to stand
+            // in (the interpreter runs in-process, with the app's full user
+            // privileges). The call fails closed with the escalation hint;
+            // the assembly line arms this wrapper with the escalation
+            // config, so an approved `sandbox_permissions`+`justification`
+            // grant widens the mode for exactly that call. Read-only never
+            // reaches this arm: `run_gated` refuses the whole call before
+            // the verdict.
+            crate::tools::PY => deny(),
             // Session/repo-scoped coordination (task tools) was removed in
             // the tools-optimization cycle — they were retired with the
             // Steer-based team architecture.
@@ -960,26 +964,34 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
-    /// Py has no statically knowable target set — a script decides at runtime
-    /// what it touches. The session mode is the verdict: workspace-write
-    /// admits the call, read-only refuses the whole call.
+    /// Py has no statically knowable target set — a script decides at
+    /// runtime what it touches — and no OS sandbox stands in (the
+    /// interpreter runs in-process), so every fenced mode fails it closed:
+    /// workspace-write denies with the escalation hint (the assembly line
+    /// arms the wrapper with the escalation config, so an approved
+    /// `sandbox_permissions` grant is the one wider road), read-only denies
+    /// outright, and only full access runs the script.
     #[tokio::test]
-    async fn py_is_admitted_by_mode_not_by_a_target_path() {
+    async fn py_fails_closed_in_every_fenced_mode() {
         let (gate, _rx) = gate_with_events();
         gate.set_mode(PermissionMode::WorkspaceWrite);
-        let (tool, ran) = gated_named("Py", false, false, Arc::clone(&gate));
+        let (tool, ran) = gated_named("Py", true, false, Arc::clone(&gate));
         let ctx = tool_ctx();
         let params = serde_json::json!({"script": "print(1)", "cwd": [""]});
-        let result = tool
+        let err = tool
             .execute("c1", params.clone(), CancellationToken::new(), &ctx)
             .await
-            .unwrap();
-        assert!(!result.is_error);
-        assert_eq!(ran.load(Ordering::SeqCst), 1);
+            .unwrap_err();
+        match err {
+            ToolError::Other(message) => {
+                assert!(message.contains("workspace-write"), "{message}");
+            }
+            other => panic!("expected the workspace-write refusal, got {other:?}"),
+        }
 
         gate.set_mode(PermissionMode::ReadOnly);
         let err = tool
-            .execute("c2", params, CancellationToken::new(), &ctx)
+            .execute("c2", params.clone(), CancellationToken::new(), &ctx)
             .await
             .unwrap_err();
         match err {
@@ -988,7 +1000,15 @@ mod tests {
             }
             other => panic!("expected the read-only refusal, got {other:?}"),
         }
-        assert_eq!(ran.load(Ordering::SeqCst), 1, "the script never ran");
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "the script never ran");
+
+        gate.set_mode(PermissionMode::DangerFullAccess);
+        let result = tool
+            .execute("c3", params, CancellationToken::new(), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     /// An escalation-approved root widens the fs fence for the rest of the

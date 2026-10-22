@@ -13,5 +13,5 @@ futures.workspace = true
 tracing.workspace = true
 libc.workspace = true
 
-[lints.clippy]
-dbg_macro = "deny"
+[lints]
+workspace = true

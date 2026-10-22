@@ -7,6 +7,13 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 rustpython.workspace = true
+# Pin-only companions of `rustpython` (see the workspace manifest): pulled in
+# so the parser-crate version constraint lives in a manifest, not the lock.
+rustpython-ruff_python_ast.workspace = true
+rustpython-ruff_python_parser.workspace = true
+rustpython-ruff_python_trivia.workspace = true
+rustpython-ruff_source_file.workspace = true
+rustpython-ruff_text_size.workspace = true
 async-channel.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["fs", "process", "time", "sync", "io-util", "macros", "rt-multi-thread"] }
@@ -40,5 +47,5 @@ tempfile = "3"
 tokio = { workspace = true, features = ["rt", "macros", "fs", "net", "io-util"] }
 tempfile = "3"
 
-[lints.clippy]
-dbg_macro = "deny"
+[lints]
+workspace = true

@@ -10,8 +10,8 @@
 // face (formatted traceback plus whatever was printed before it), and
 // `sys.exit(n)` is the script's exit status rather than a traceback.
 
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value as JsonValue;
@@ -31,42 +31,82 @@ const MAX_SCRIPT_LINES: usize = 120;
 
 /// The preamble every script runs behind: stdout and stderr reroute into an
 /// in-interpreter buffer (the process streams are never written — a print in
-/// a script must land in the tool result, not the host's log), and `argv`
-/// names the script exactly as the traceback does.
+/// a script must land in the tool result, not the host's log), `argv` names
+/// the script exactly as the traceback does, and the recursion limit is
+/// frozen where the interpreter left it — raising it is the one script-side
+/// lever onto the interpreter's stack, and an overflow is a guard-page SIGILL
+/// that takes the whole process, not a catchable `RecursionError`.
 fn capture_preamble() -> String {
-    "import sys, io as _manox_io\n\
-     sys.argv = [\"<py>\"]\n\
-     _manox_out = _manox_io.StringIO()\n\
-     sys.stdout = _manox_out\n\
-     sys.stderr = _manox_out\n"
-        .to_string()
+    let mut source = [
+        "import sys, io as _manox_io",
+        "sys.argv = [\"<py>\"]",
+        "_manox_out = _manox_io.StringIO()",
+        "sys.stdout = _manox_out",
+        "sys.stderr = _manox_out",
+        "_manox_setrecursionlimit = sys.setrecursionlimit",
+        "def _manox_recursionlimit(limit):",
+        "    if limit > sys.getrecursionlimit():",
+        "        raise RuntimeError('the recursion limit is capped; keep recursion shallow')",
+        "    _manox_setrecursionlimit(limit)",
+        "sys.setrecursionlimit = _manox_recursionlimit",
+    ]
+    .join("\n");
+    source.push('\n');
+    source
 }
 
 /// Serializes every Py call: the embedded interpreter's `os.chdir` is a
 /// PROCESS-wide syscall (there is no per-interpreter directory), so the
 /// call's working directory is applied by actually moving the process and
 /// restoring it afterwards — two scripts running concurrently would stomp
-/// each other, and the restore races nothing because the lock is held
-/// across the whole script.
-static PY_CALL_LOCK: Mutex<()> = Mutex::new(());
+/// each other. The slot is claimed by the caller *before* any thread is
+/// spawned and released by the script's thread when it ends (including on
+/// a panic unwind), so it stays claimed for the script's whole lifetime
+/// *including a timeout abandonment*: a new call arriving while any script
+/// is live fails fast instead of piling another stack-hungry thread onto a
+/// mutex — a wedged script cannot be preempted, and the tool answers "a
+/// previous script is still running" until its thread ends.
+///
+/// The process cwd points at the script's directory for as long as the
+/// script runs (including the abandoned tail). A per-interpreter cwd would
+/// need every relative-path primitive (`open`, `listdir`, `Path`) patched
+/// to resolve against a per-call base — shimming only `os.getcwd`/`os.chdir`
+/// would split what `getcwd()` reports from where `open('rel')` actually
+/// reads — so the process move stays, and process-cwd readers (e.g. MCP
+/// project-config discovery) see the script's directory during that window
+/// by design of this tool.
+static SCRIPT_SLOT: AtomicBool = AtomicBool::new(false);
 
-/// Restores the process working directory when the call ends, including on a
-/// panic or an early return — the script may have moved it, and the host's
-/// other tools resolve their own absolute paths but must not inherit a
-/// half-finished script's directory.
-struct CwdGuard {
-    previous: Option<PathBuf>,
+/// Releases the call slot when the script's thread ends, on return or on a
+/// panic unwind alike.
+struct SlotRelease;
+
+impl Drop for SlotRelease {
+    fn drop(&mut self) {
+        SCRIPT_SLOT.store(false, Ordering::Release);
+    }
 }
 
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        let restored = self
-            .previous
-            .as_ref()
-            .and_then(|dir| std::env::set_current_dir(dir).ok())
-            .or_else(|| std::env::set_current_dir("/").ok());
-        if restored.is_none() {
-            tracing::warn!("the py tool could not restore the process working directory");
+/// Puts the process working directory back where the call found it. Only a
+/// call that entered without a readable `previous` (getcwd itself failed)
+/// falls back to `/`; a failed restore of a real directory keeps its
+/// warning — silently relocating the process to `/` after the script
+/// deleted its own directory would misdirect every later process-cwd
+/// consumer without a trace.
+fn restore_process_cwd(previous: Option<PathBuf>) {
+    match previous {
+        Some(dir) => {
+            if let Err(e) = std::env::set_current_dir(&dir) {
+                tracing::warn!(
+                    error = %e,
+                    dir = %dir.display(),
+                    "the py tool could not restore the process working directory; falling back to /"
+                );
+                let _ = std::env::set_current_dir("/");
+            }
+        }
+        None => {
+            let _ = std::env::set_current_dir("/");
         }
     }
 }
@@ -102,21 +142,27 @@ fn system_exit_status(
     }
 }
 
-/// One script, start to finish. Returns the captured output and the exit
-/// status, or the error face — a compile error, an uncaught exception, or an
-/// interpreter failure — as text with a failing status.
-fn run_script(source: &str, cwd: &Path) -> (String, i32) {
+/// One script, start to finish, on the caller's terms: the caller has
+/// already claimed the call slot and entered the working directory (the
+/// slot's release rides this thread). Returns the captured output and the
+/// exit status, or the error face — a compile error, an uncaught exception,
+/// or an interpreter failure — as text with a failing status.
+fn run_script(source: &str) -> (String, i32) {
     // The frozen importlib bootstrap recurses deeply before a single user
     // statement runs, and a user script can recurse deeper still; the
     // overflow surfaces as a guard-page SIGILL — not a catchable error — on
     // whatever stack the caller offered. The interpreter gets its own thread
     // with an explicit, generous stack (a virtual reservation, not commit).
+    // The preamble caps the script-side recursion limit, so raising it is
+    // not a lever; a pathological deeply-nested *parse* still overflows
+    // here and takes the process — the accepted residual of an in-process
+    // interpreter (a child process is the only hard bound).
+    let _release = SlotRelease;
     let source = source.to_string();
-    let cwd = cwd.to_path_buf();
     let spawned = std::thread::Builder::new()
         .name("py-tool".into())
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || run_interpreted(&source, &cwd));
+        .spawn(move || run_on_interpreter(&source));
     match spawned {
         Ok(handle) => handle
             .join()
@@ -126,24 +172,6 @@ fn run_script(source: &str, cwd: &Path) -> (String, i32) {
             1,
         ),
     }
-}
-
-fn run_interpreted(source: &str, cwd: &Path) -> (String, i32) {
-    // A panic in a previous script poisons the lock; the directory restore it
-    // guards already ran on unwind, so recovering the guard is safe and keeps
-    // one bad script from disabling the tool.
-    let _serialized = PY_CALL_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = std::env::current_dir().ok();
-    if let Err(e) = std::env::set_current_dir(cwd) {
-        return (
-            format!("internal: the working directory could not be entered: {e}"),
-            1,
-        );
-    }
-    let _cwd = CwdGuard { previous };
-    run_on_interpreter(source)
 }
 
 fn run_on_interpreter(source: &str) -> (String, i32) {
@@ -263,13 +291,40 @@ impl PyTool {
             )));
         }
         let script = script.to_string();
-        let run = tokio::task::spawn_blocking(move || run_script(&script, &cwd));
-        let (output, exit_code) = tokio::time::timeout(timeout, run)
-            .await
+        // One script at a time: the slot is claimed here, before any thread
+        // is spawned, and released by the script's thread when it ends — an
+        // abandoned script keeps it claimed, so a call arriving behind a
+        // wedged script fails here instead of stacking another 64MB-stack
+        // thread that would only burn its own budget waiting.
+        if SCRIPT_SLOT.swap(true, Ordering::AcqRel) {
+            return Err(ToolError::ExecutionFailed(
+                "a previous script is still running (a timed-out script cannot be \
+                 preempted); the tool stays unavailable until it finishes — move the \
+                 work to Bash"
+                    .into(),
+            ));
+        }
+        let previous = std::env::current_dir().ok();
+        if let Err(e) = std::env::set_current_dir(&cwd) {
+            return Err(ToolError::InvalidArguments(format!(
+                "the working directory could not be entered: {e}"
+            )));
+        }
+        let run = tokio::task::spawn_blocking(move || run_script(&script));
+        let joined = tokio::time::timeout(timeout, run).await;
+        // The directory is restored the moment the budget ends, not when the
+        // abandoned script eventually finishes — a wedged script must not
+        // keep the process parked in its directory. (Its own `os.chdir`
+        // during the abandoned tail can still move the process; the slot
+        // stays claimed until that tail ends, so no later Py call builds on
+        // the mess.)
+        restore_process_cwd(previous);
+        let (output, exit_code) = joined
             .map_err(|_| {
                 ToolError::ExecutionFailed(format!(
-                    "the script exceeded its {}s budget and was abandoned — it may still be \
-                     running in the background; keep Py scripts short and move long work to Bash",
+                    "the script exceeded its {}s budget and was abandoned — it cannot be \
+                     preempted and still holds the tool, so later Py calls are refused until \
+                     it finishes; keep Py scripts short and move long work to Bash",
                     timeout.as_secs()
                 ))
             })?
@@ -334,6 +389,16 @@ impl AgentTool for PyTool {
         false
     }
 
+    fn requires_approval(&self, _params: &JsonValue) -> bool {
+        // A script's effects are decided at runtime — there is no
+        // params-aware fence to consult (unlike Bash's sandbox/confined
+        // split). The declarative hint is what the subagent `never` gate
+        // rejects on: an in-process interpreter with no OS sandbox cannot
+        // ride a child session, so a subagent's Py call settles to the
+        // denial instead of executing unfenced.
+        true
+    }
+
     fn execution_mode(&self) -> ExecutionMode {
         // The call moves the process's working directory and holds the
         // interpreter lock; a parallel batch would interleave with it.
@@ -361,7 +426,10 @@ impl AgentTool for PyTool {
                     "description": "Timeout in milliseconds (default: 120000)"
                 }
             },
-            "required": ["script", "cwd"]
+            // `cwd` is deliberately not required: a missing cwd passes schema
+            // validation and is rejected at resolution with the instructional
+            // CWD_REQUIRED_DOC text (the shared contract of every cwd tool).
+            "required": ["script"]
         })
     }
 

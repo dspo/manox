@@ -28,12 +28,8 @@ serde_json.workspace = true
 [build-dependencies]
 napi-build = "2"
 
-# ld64 reports "`__eh_frame` section too large" for a debug addon that links the
-# embedded interpreter: compact-unwind encoding runs out of capacity, which
-# costs unwind-table compactness, not correctness. A linker note, not a defect.
-[lints.rust]
-linker_messages = "allow"
-
+[lints]
+workspace = true
 [features]
 # Full runtime by default — the same capability set as the gpui app. Embedders
 # that want a lean addon (the VS Code extension: no MCP, no terminal

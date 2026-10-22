@@ -44,6 +44,5 @@ hyperlinks.workspace = true
 # teardown. Mirrors agent's `test-support` feature.
 test-support = []
 
-[lints.clippy]
-dbg_macro = "deny"
-
+[lints]
+workspace = true

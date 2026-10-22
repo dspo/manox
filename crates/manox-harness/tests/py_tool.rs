@@ -2,9 +2,18 @@
 // purpose: the tool moves the PROCESS working directory for the duration of a
 // script (the embedded interpreter has no per-instance cwd), so running them
 // beside the persistent-shell tests would leak a cwd into unrelated tests.
-// A separate process per test binary keeps that effect contained.
+// A separate process per test binary keeps that effect contained; within the
+// binary the tests serialize on ONE_AT_A_TIME, because a live script —
+// including a timed-out one's abandoned tail — makes the next Py call fail
+// fast, which parallel siblings would trip on each other.
+//
+// The serialization guard is held across await points on purpose: each test
+// owns the tool for its whole body on a current-thread runtime, where holding
+// the guard cannot block another worker.
+#![allow(clippy::await_holding_lock)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use manox_harness::env::TokioExecutionEnv;
 use manox_harness::tool::{
@@ -24,6 +33,37 @@ fn ctx() -> (LocalToolContext, tempfile::TempDir) {
     (context, dir)
 }
 
+/// Serializes this binary's tests for their whole body (see the header note):
+/// the call slot fails fast while any script is live.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap()
+}
+
+/// Waits out an abandoned script's tail so the next test starts with the
+/// call slot free — polled rather than slept, because under load the
+/// abandoned thread (interpreter init + the script's own sleep) can outlive
+/// any nominal margin.
+async fn wait_for_the_script_to_end() {
+    for _ in 0..200 {
+        let (context, _dir) = ctx();
+        let probe = PyTool
+            .execute(
+                "probe",
+                serde_json::json!({"script": "pass", "cwd": [""], "timeout": 10_000}),
+                CancellationToken::new(),
+                &context,
+            )
+            .await;
+        if probe.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("an abandoned script never released the call slot");
+}
+
 fn text(result: &AgentToolResult) -> String {
     match &result.content[0] {
         ContentBlock::Text { text, .. } => text.clone(),
@@ -32,6 +72,7 @@ fn text(result: &AgentToolResult) -> String {
 }
 
 async fn run(script: &str) -> AgentToolResult {
+    let _serial = serial();
     let (context, _dir) = ctx();
     PyTool
         .execute(
@@ -92,6 +133,7 @@ async fn an_exception_fails_with_a_traceback_and_partial_output() {
 
 #[tokio::test]
 async fn missing_script_is_an_argument_error() {
+    let _serial = serial();
     let (context, _dir) = ctx();
     let err = PyTool
         .execute(
@@ -137,6 +179,7 @@ async fn the_standard_library_and_sqlite_are_available() {
 /// never learns the limit by losing a turn.
 #[tokio::test]
 async fn scripts_over_the_line_limit_are_rejected() {
+    let _serial = serial();
     let (context, _dir) = ctx();
     let script = "x = 1\n".repeat(121);
     let err = PyTool
@@ -161,6 +204,7 @@ async fn scripts_over_the_line_limit_are_rejected() {
 /// assertions are the script's own.
 #[tokio::test]
 async fn a_batch_rewrite_reads_and_writes_many_files_in_one_call() {
+    let _serial = serial();
     let (context, dir) = ctx();
     for name in ["a.txt", "b.txt", "c.txt"] {
         std::fs::write(dir.path().join(name), "old-name\nkeep\n").unwrap();
@@ -192,17 +236,18 @@ async fn a_batch_rewrite_reads_and_writes_many_files_in_one_call() {
 }
 
 /// A script that outlives its budget is abandoned at the wall clock; the tool
-/// says so instead of hanging. The interpreter cannot be preempted, so the
-/// script finishes in the background and releases the lock — this pins the
-/// message, not a kill.
+/// says so — the script keeps the call lock until it finishes, so the
+/// message names the wedge instead of understating it. This pins the
+/// message, not a kill (the interpreter cannot be preempted).
 #[tokio::test]
 async fn a_script_past_its_budget_is_abandoned() {
+    let _serial = serial();
     let (context, _dir) = ctx();
     let err = PyTool
         .execute(
             "c1",
             serde_json::json!({
-                "script": "import time\ntime.sleep(2)",
+                "script": "import time\ntime.sleep(1)",
                 "cwd": [""],
                 "timeout": 100
             }),
@@ -214,19 +259,151 @@ async fn a_script_past_its_budget_is_abandoned() {
     match err {
         ToolError::ExecutionFailed(message) => {
             assert!(message.contains("budget"), "{message}");
-            assert!(message.contains("still be running"), "{message}");
+            assert!(message.contains("still holds the tool"), "{message}");
         }
         other => panic!("expected a timeout failure, got {other:?}"),
     }
+    wait_for_the_script_to_end().await;
 }
 
-/// The tool is a plain executor: gated by the host mode, not by itself, and
-/// never run in parallel with other calls (it moves the process cwd).
+/// An abandoned script keeps the call lock for as long as its thread lives:
+/// a call arriving behind it fails fast instead of stacking another
+/// budget-burning thread on the mutex.
+#[tokio::test]
+async fn a_call_behind_a_live_script_fails_fast() {
+    let _serial = serial();
+    let (context, _dir) = ctx();
+    let abandoned = PyTool
+        .execute(
+            "c1",
+            serde_json::json!({
+                "script": "import time\ntime.sleep(1)",
+                "cwd": [""],
+                "timeout": 100
+            }),
+            CancellationToken::new(),
+            &context,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(abandoned, ToolError::ExecutionFailed(ref m) if m.contains("budget")),
+        "{abandoned:?}"
+    );
+    let err = PyTool
+        .execute(
+            "c2",
+            serde_json::json!({"script": "print(1)", "cwd": [""]}),
+            CancellationToken::new(),
+            &context,
+        )
+        .await
+        .unwrap_err();
+    match err {
+        ToolError::ExecutionFailed(message) => {
+            assert!(
+                message.contains("a previous script is still running"),
+                "{message}"
+            );
+        }
+        other => panic!("expected the fail-fast refusal, got {other:?}"),
+    }
+    wait_for_the_script_to_end().await;
+}
+
+/// The process working directory is restored the moment the budget ends, not
+/// when the abandoned script eventually finishes — a wedged script must not
+/// park the process in its directory.
+#[tokio::test]
+async fn an_abandoned_script_does_not_keep_the_process_cwd() {
+    let _serial = serial();
+    let before = std::env::current_dir().unwrap();
+    let (context, _dir) = ctx();
+    let _ = PyTool
+        .execute(
+            "c1",
+            serde_json::json!({
+                "script": "import time\ntime.sleep(1)",
+                "cwd": [""],
+                "timeout": 100
+            }),
+            CancellationToken::new(),
+            &context,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        std::env::current_dir().unwrap(),
+        before,
+        "the cwd is restored at the wall clock, not at the script's end"
+    );
+    wait_for_the_script_to_end().await;
+}
+
+/// The preamble freezes the recursion limit: raising it is the one
+/// script-side lever onto the interpreter's stack, and an overflow is a
+/// process-killing SIGILL, not a catchable RecursionError. Lowering or
+/// re-setting the current value stays legal.
+#[tokio::test]
+async fn raising_the_recursion_limit_is_refused() {
+    let kept =
+        run("import sys\nsys.setrecursionlimit(sys.getrecursionlimit())\nprint('kept')").await;
+    assert!(
+        !kept.is_error,
+        "re-setting the limit is fine: {}",
+        text(&kept)
+    );
+
+    let result = run("import sys\nsys.setrecursionlimit(10**9)\nprint('raised')").await;
+    let out = text(&result);
+    assert!(result.is_error, "out: {out}");
+    assert!(
+        out.contains("the recursion limit is capped"),
+        "the refusal is in: {out}"
+    );
+}
+
+/// `cwd` is deliberately not a required property: a missing cwd passes
+/// schema validation and is rejected at resolution with the instructional
+/// text every cwd tool shares (the anchor/route shape), not a bare
+/// jsonschema "required property" error.
+#[tokio::test]
+async fn a_missing_cwd_is_the_instructional_error() {
+    let _serial = serial();
+    let (context, _dir) = ctx();
+    let err = PyTool
+        .execute(
+            "c1",
+            serde_json::json!({"script": "print(1)"}),
+            CancellationToken::new(),
+            &context,
+        )
+        .await
+        .unwrap_err();
+    match err {
+        ToolError::InvalidArguments(message) => {
+            assert!(
+                message.starts_with("cwd is required"),
+                "the instructional text leads: {message}"
+            );
+            assert!(
+                message.contains("[anchor, ...route]"),
+                "the shape is taught: {message}"
+            );
+        }
+        other => panic!("expected an argument error, got {other:?}"),
+    }
+}
+
+/// The tool is a plain executor on the host's terms: it declares itself
+/// approval-bearing (the subagent `never` gate rejects on that hint — an
+/// in-process interpreter cannot ride a child session) and never runs in
+/// parallel with other calls (it moves the process cwd).
 #[test]
-fn the_tool_is_sequential_and_declares_no_approval() {
+fn the_tool_is_sequential_and_declares_approval() {
     assert_eq!(PyTool.name(), "Py");
     assert!(!PyTool.is_read_only());
-    assert!(!PyTool.requires_approval(&serde_json::json!({"script": "1"})));
+    assert!(PyTool.requires_approval(&serde_json::json!({"script": "1"})));
     assert_eq!(PyTool.execution_mode(), ExecutionMode::Sequential);
     let schema = PyTool.parameters_schema();
     let required: Vec<&str> = schema["required"]
@@ -235,5 +412,5 @@ fn the_tool_is_sequential_and_declares_no_approval() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(required, vec!["script", "cwd"]);
+    assert_eq!(required, vec!["script"]);
 }

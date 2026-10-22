@@ -109,6 +109,19 @@ rustpython = { version = "=0.6.0", default-features = false, features = [
     "host_env",
     "sqlite",
 ] }
+# Version pins only — the code never links these directly. They are
+# rustpython's parser/AST crates, and 0.16.10 moved the AST APIs under
+# rustpython-codegen 0.6.0 and stopped compiling inside rustpython 0.6.0.
+# Declaring them here (pulled in by manox-harness next to `rustpython`
+# itself) writes the constraint into the manifest, so a `cargo update` of an
+# unrelated dependency cannot float them past 0.16.5 and break the build
+# with no hint at the cause — the checked-in lock alone carried that
+# knowledge before.
+rustpython-ruff_python_ast = "=0.16.5"
+rustpython-ruff_python_parser = "=0.16.5"
+rustpython-ruff_python_trivia = "=0.16.5"
+rustpython-ruff_source_file = "=0.16.5"
+rustpython-ruff_text_size = "=0.16.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 zstd = "0.13"
@@ -164,3 +177,13 @@ sysinfo = "0.39"
 rustix = "0.38"
 
 tokio-tungstenite = { version = "0.24", features = ["connect", "native-tls"] }
+
+# Shared lint set, inherited by every crate declaring `[lints] workspace = true`.
+[workspace.lints.rust]
+# ld64 reports "`__eh_frame` section too large" when a debug test binary links
+# the embedded interpreter: compact-unwind encoding runs out of capacity, which
+# costs unwind-table compactness, not correctness. A linker note, not a defect.
+linker_messages = "allow"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
