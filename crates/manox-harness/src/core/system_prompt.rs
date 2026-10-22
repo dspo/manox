@@ -68,18 +68,17 @@ pub fn build_harness_prompt(
         {
             prompt.push_str("\nUse bash for file operations like ls, rg, find\n");
         }
-        // The Py promotion: a short script beats a shell pipeline for
-        // anything computational, and the model reaches for `python3 -c`
-        // through Bash exactly when it should not.
+        // The Py positioning: more expressive than the file tools, less
+        // ceremony than Bash — and explicitly not a file tool.
         if active_tools.contains(&"Py".to_string()) {
             prompt.push_str(
-                "\nPrefer the Py tool for short scripts — computation, data\n\
-                 reshaping, JSON/text processing, or a quick file inspection. It runs a\n\
-                 single Python 3 script string on an embedded interpreter with the\n\
-                 standard library only (no site-packages, no shell, no TLS networking),\n\
-                 prints are returned as the result, and it needs no quoting or escaping.\n\
-                 Reach for Bash instead when the work needs shell features, installed\n\
-                 packages, long-running processes, or programs other than Python.\n",
+                "\nWhen a task needs more expressiveness than Read/Write/Edit/Grep/Glob/Ls\n\
+                 but less ceremony than Bash, use the Py tool. Ordinary reads, writes, and\n\
+                 searches still go to Read/Write/Edit/Grep/Glob/Ls first.\n\
+                 For safety, Py exposes only a subset of the Python 3 standard library —\n\
+                 no third-party packages and restricted network access. When you need more\n\
+                 complex expression or the full Python runtime, use Bash with `python3` on\n\
+                 the OS.\n",
             );
         }
     }
@@ -156,8 +155,10 @@ mod tests {
         assert!(prompt.contains("- Bash: Run a shell command"));
         assert!(prompt.contains("- Py: Run a short Python script (standard library only)"));
         assert!(
-            prompt.contains("Prefer the Py tool for short scripts"),
-            "the Py promotion is part of the prompt: {prompt}"
+            prompt.contains(
+                "When a task needs more expressiveness than Read/Write/Edit/Grep/Glob/Ls"
+            ),
+            "the Py positioning is part of the prompt: {prompt}"
         );
         assert!(prompt.contains(
             "<project_instructions path=\"/proj/CLAUDE.md\">\nKeep changes minimal.\n</project_instructions>"
