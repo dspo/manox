@@ -46,12 +46,14 @@ pub fn drop_provider_for_test() {
     *PROVIDER.lock().unwrap() = None;
 }
 
-/// The model-facing name for an embedder tool: `client_<sanitized>`, the
-/// same sanitizing idea as the MCP `mcp__<server>__<tool>` ids — the wire
-/// name stays recognizable while never colliding with built-in tools.
-pub fn client_tool_name(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
+/// The model-facing name for an embedder tool: the registration name
+/// sanitized into the wire charset, no prefix. App-layer registrations
+/// follow lower_snake_case by convention while native built-ins are
+/// UpCamelCase (MCP tools ride the `mcp__` prefix), so the namespaces
+/// stay disjoint by construction; a colliding registration is a caller
+/// breach and the engine skips it loudly at mount time.
+pub fn embedder_tool_name(name: &str) -> String {
+    name.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' {
                 c
@@ -59,8 +61,7 @@ pub fn client_tool_name(name: &str) -> String {
                 '_'
             }
         })
-        .collect();
-    format!("client_{sanitized}")
+        .collect()
 }
 
 #[cfg(test)]
@@ -68,9 +69,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names_are_sanitized_and_prefixed() {
-        assert_eq!(client_tool_name("get_selection"), "client_get_selection");
-        assert_eq!(client_tool_name("a b/c"), "client_a_b_c");
+    fn names_are_sanitized_without_a_prefix() {
+        assert_eq!(embedder_tool_name("get_selection"), "get_selection");
+        assert_eq!(embedder_tool_name("a b/c"), "a_b_c");
     }
 
     #[test]

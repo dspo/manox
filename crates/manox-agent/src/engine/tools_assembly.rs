@@ -663,11 +663,43 @@ pub(super) fn build_tools(
     // RegisterSessionTools): the provider is the AgentServer's registry;
     // each tool rides the same approval gate as MCP tools (an embedder
     // tool is a remote call into the host, mutating by default). A context
-    // with no embedder provider contributes nothing.
+    // with no embedder provider contributes nothing. A registration naming
+    // an already-mounted tool — or one of the fixed names mounted after
+    // this block — is skipped loudly: by convention app-layer names are
+    // lower_snake_case and native names UpCamelCase, so a collision is a
+    // caller breach, never a shadowing. Delegation definitions
+    // collision-check themselves against this table when they assemble
+    // below. The mounted names are recorded: the record is what the
+    // per-prompt refresh strips the old set by (the bare names carry no
+    // prefix to match on).
+    let mut embedder_mounted: Vec<String> = Vec::new();
     if let Some(provider) = crate::embedder_tools::provider() {
         for tool in provider.tools_for(session_id) {
-            tools.push(Arc::new(ApprovalGatedTool::new(tool, Arc::clone(gate))));
+            let gated = Arc::new(ApprovalGatedTool::new(tool, Arc::clone(gate)));
+            let name = gated.name().to_string();
+            let taken = tools.iter().any(|t| t.name() == name)
+                || embedder_mounted.contains(&name)
+                || matches!(
+                    name.as_str(),
+                    "Steer"
+                        | crate::subagent::ListAgentsTool::NAME
+                        | crate::subagent::InterruptAgentTool::NAME
+                );
+            if taken {
+                tracing::warn!(
+                    tool = %name,
+                    session = %session_id,
+                    "embedder tool registration collides with a mounted name; skipped"
+                );
+                continue;
+            }
+            embedder_mounted.push(name);
+            tools.push(gated);
         }
+        EMBEDDER_MOUNTED_NAMES
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), embedder_mounted);
     }
     // Steer bus: engine-scoped (created in `spawn_engine`), mounted here so
     // the model always has the TeamMember messaging + spawn tool.
@@ -841,20 +873,19 @@ pub(super) fn build_tools(
 /// i.e. after Open/Create has already spawned this engine — so the
 /// assembly-time snapshot is stale by construction: the client adapters
 /// reach neither the model's schema nor `execute_one`'s dispatch table,
-/// and a model call fails with `Tool not found: client_<name>`. The
+/// and a model call fails with `Tool not found: <name>`. The
 /// handler's own comment promised "the NEXT tool assembly" sees a
 /// registration; for a long-lived session that assembly never came.
 ///
 /// Called on every `Prompt` before the run starts (idle boundary, like
 /// the `Open`/`NewSession` re-binds this mirrors), it replaces the
-/// previously mounted `client_*` adapters with the provider's current
+/// previously mounted embedder adapters with the provider's current
 /// set — preserving their position in the tool order so a narrow active
 /// selection keeps matching by name — and widens an existing selection
 /// to cover a fresh registration (new adapters were active at first
 /// assembly through `default_active_tool_names`, so a never-narrowed
 /// session keeps that behavior without persisting anything). Fail-soft:
-/// a rejected re-mount (e.g. a host registration colliding with a
-/// built-in name) logs and the turn runs on the existing table.
+/// a rejected re-mount logs and the turn runs on the existing table.
 pub(super) async fn refresh_embedder_tools(
     session: &mut AgentSession,
     session_id: &str,
@@ -864,10 +895,18 @@ pub(super) async fn refresh_embedder_tools(
         return;
     };
     let mounted = session.mounted_tools();
-    // The provider's adapters all carry the `client_` prefix; that is the
-    // same name contract `build_tools` mounted them under and the model
-    // dispatches against, so stripping the previous embedder set by
-    // prefix cannot disturb a built-in.
+    // The embedder set currently mounted, by name: the record the last
+    // accepted mount (assembly or refresh) left. The bare names carry no
+    // prefix to match on, so the record IS the discriminator — stripping
+    // the recorded set cannot disturb a built-in.
+    let old_embedder: Vec<String> = EMBEDDER_MOUNTED_NAMES
+        .lock()
+        .unwrap()
+        .get(session_id)
+        .cloned()
+        .unwrap_or_default();
+    let old_set: std::collections::HashSet<&str> =
+        old_embedder.iter().map(String::as_str).collect();
     let fresh: Vec<Arc<dyn HarnessAgentTool>> = provider
         .tools_for(session_id)
         .into_iter()
@@ -875,19 +914,37 @@ pub(super) async fn refresh_embedder_tools(
             Arc::new(ApprovalGatedTool::new(tool, Arc::clone(gate))) as Arc<dyn HarnessAgentTool>
         })
         .collect();
-    let old_client: Vec<String> = mounted
-        .iter()
-        .filter(|t| t.name().starts_with("client_"))
-        .map(|t| t.name().to_string())
-        .collect();
-    let new_client: Vec<String> = fresh.iter().map(|t| t.name().to_string()).collect();
-    if old_client.is_empty() && new_client.is_empty() {
+    // Collision backstop: a fresh name a non-embedder mount (or an
+    // earlier sibling of the same fresh set) already owns is skipped
+    // loudly. The naming convention (app-layer lower_snake_case vs
+    // native UpCamelCase) makes this a caller breach, never a shadowing.
+    let mut fresh_names: Vec<String> = Vec::with_capacity(fresh.len());
+    let mut fresh_mounted: Vec<Arc<dyn HarnessAgentTool>> = Vec::with_capacity(fresh.len());
+    for tool in fresh {
+        let name = tool.name().to_string();
+        let taken = mounted
+            .iter()
+            .any(|t| t.name() == name.as_str() && !old_set.contains(t.name()))
+            || fresh_names.contains(&name);
+        if taken {
+            tracing::warn!(
+                tool = %name,
+                session = %session_id,
+                "embedder tool registration collides with a mounted name; skipped"
+            );
+            continue;
+        }
+        fresh_names.push(name);
+        fresh_mounted.push(tool);
+    }
+    let fresh = fresh_mounted;
+    if old_embedder.is_empty() && fresh.is_empty() {
         // The host-less / host-idle case: nothing embedder-shaped mounted
         // and nothing registered — skip the rebuild so a plain CLI prompt
         // pays no per-prompt allocation or prompt rebuild.
         return;
     }
-    if old_client == new_client {
+    if old_embedder == fresh_names {
         // Identical registration (the extension re-sends the same set on
         // activation): the mounted adapters already route to the current
         // store state — no re-mount needed.
@@ -896,7 +953,7 @@ pub(super) async fn refresh_embedder_tools(
     let mut tools = Vec::with_capacity(mounted.len() + fresh.len());
     let mut injected = false;
     for tool in mounted {
-        if tool.name().starts_with("client_") {
+        if old_set.contains(tool.name()) {
             // Drop every old adapter and inject the fresh set at the old
             // set's first slot, preserving tool order.
             if !injected {
@@ -908,7 +965,7 @@ pub(super) async fn refresh_embedder_tools(
         }
     }
     if !injected && !fresh.is_empty() {
-        // No client tools mounted yet (registration landed after the
+        // No embedder tools mounted yet (registration landed after the
         // assembly): append at the end, mirroring build_tools' order.
         tools.extend(fresh);
     }
@@ -916,19 +973,25 @@ pub(super) async fn refresh_embedder_tools(
         tracing::warn!(error = %err, "embedder tool refresh rejected; using the existing table");
         return;
     }
+    // The record only moves on an accepted mount — a rejected table
+    // leaves it pointing at the set the turn actually runs on.
+    EMBEDDER_MOUNTED_NAMES
+        .lock()
+        .unwrap()
+        .insert(session_id.to_string(), fresh_names.clone());
     // A narrowed active selection was computed against the OLD set: carry
-    // the non-client names over verbatim and replace the client names
-    // with the fresh ones — mirroring the all-active behavior
+    // the non-embedder names over verbatim and replace the embedder
+    // names with the fresh ones — mirroring the all-active behavior
     // `default_active_tool_names` gave a registration at first assembly.
     // Persisted only on a real change; a never-narrowed session reports
     // `None` and needs nothing.
     if let Some(active) = session.active_tool_names() {
         let mut next: Vec<String> = active
             .iter()
-            .filter(|n| !n.starts_with("client_"))
+            .filter(|n| !old_set.contains(n.as_str()))
             .cloned()
             .collect();
-        next.extend(new_client.iter().cloned());
+        next.extend(fresh_names.iter().cloned());
         let mut cur_sorted = active.clone();
         let mut next_sorted = next.clone();
         cur_sorted.sort_unstable();
@@ -938,11 +1001,19 @@ pub(super) async fn refresh_embedder_tools(
         {
             tracing::warn!(
                 error = %err,
-                "embedder tool active-selection update rejected; model may not see a client tool"
+                "embedder tool active-selection update rejected; model may not see an embedder tool"
             );
         }
     }
 }
+
+/// Per-session record of the embedder tool names currently mounted — the
+/// discriminator `refresh_embedder_tools` strips the previous set by (the
+/// bare names follow the app-layer lower_snake_case convention and carry
+/// no prefix to match on). Updated only on accepted mounts, so a rejected
+/// table never strands the record ahead of what the session runs on.
+static EMBEDDER_MOUNTED_NAMES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<String>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Per-session snapshot of the per-slot generations at the last MCP tool
 /// mount/rebuild. Generations are **per slot**, so a single max is not a
