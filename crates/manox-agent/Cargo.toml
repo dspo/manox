@@ -10,10 +10,6 @@ default = ["mcp"]
 # the cx CLI keep it; lean embedders may opt out — sessions then run without
 # MCP tools (the registry simply never initializes).
 mcp = ["dep:rmcp"]
-# ChromeUse: the in-process rustwright CDP engine + ChromeUse* tools. The
-# gpui app enables it; lean embedders build without it so the engine never
-# links the CDP driver.
-chrome-use = ["dep:rustwright_core"]
 # Exposes `thread_store::init_for_test` / `drop_for_test` (and the `TEST_OVERRIDE`
 # slot they mutate) to downstream crates' test suites. Production builds keep
 # these hidden so the global `ThreadStore` path is the only one reachable.
@@ -58,7 +54,6 @@ supervisor.workspace = true
 toml.workspace = true
 http.workspace = true
 tera.workspace = true
-rustwright_core = { workspace = true, optional = true }
 htmd = "0.5.6"
 markup5ever_rcdom = "0.38"
 encoding_rs = "0.8"
@@ -69,8 +64,7 @@ tempfile = "3"
 # Self-reference with `test-support`: integration tests (`tests/`) compile the
 # lib without `cfg(test)`, so the test seams (`init_for_test` /
 # `drop_for_test` / `drop_global_for_test`) must come from the feature.
-# `chrome-use` keeps the chrome_use module and its live tests in the suite.
-manox-agent = { path = ".", features = ["test-support", "chrome-use"] }
+manox-agent = { path = ".", features = ["test-support"] }
 
 [lints.clippy]
 dbg_macro = "deny"

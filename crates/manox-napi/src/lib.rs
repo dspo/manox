@@ -56,11 +56,6 @@ pub fn ping() -> String {
 /// (the VS Code host vs. the desktop one) — it is not a protocol-level login.
 #[napi]
 pub fn start(client_id: String, event_cb: JsFunction) -> Result<()> {
-    // The built-in Chrome engine (rustwright-core, via ChromeUse) is NOT
-    // linked into this host: the agent is built without the `chrome-use`
-    // feature on this edge, so nothing here can launch it. DISABLE_TELEMETRY
-    // is set as defence in depth in case the engine is ever enabled.
-    unsafe { std::env::set_var("DISABLE_TELEMETRY", "1") };
     let mut slot = conn_slot();
     if slot.is_some() {
         return Err(napi::Error::from_reason("actor already started"));

@@ -7,8 +7,6 @@
 pub mod agent_defs;
 pub mod background_task;
 pub mod capability;
-#[cfg(feature = "chrome-use")]
-pub mod chrome_use;
 pub mod claude_md;
 pub mod collaboration_mode;
 pub mod command;

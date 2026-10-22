@@ -1875,7 +1875,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.8",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2487,7 +2487,6 @@ dependencies = [
  "reqwest 0.12.28",
  "rmcp",
  "rusqlite",
- "rustwright-core",
  "schemars",
  "serde",
  "serde_json",
@@ -3955,7 +3954,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.4.2",
  "web-sys",
- "webpki-roots 1.0.8",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4164,23 +4163,6 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
-
-[[package]]
-name = "rustwright-core"
-version = "0.2.0"
-source = "git+https://github.com/Skyvern-AI/rustwright.git?rev=af71449ea25ad45b1028581edefab1f523f9550d#af71449ea25ad45b1028581edefab1f523f9550d"
-dependencies = [
- "base64",
- "futures-util",
- "libc",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.29.0",
-]
 
 [[package]]
 name = "ryu"
@@ -4927,7 +4909,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tungstenite 0.29.0",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -5538,15 +5519,6 @@ dependencies = [
  "phf_codegen 0.13.1",
  "string_cache",
  "string_cache_codegen",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.8",
 ]
 
 [[package]]
