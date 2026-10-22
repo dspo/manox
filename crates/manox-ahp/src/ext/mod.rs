@@ -125,6 +125,12 @@ pub mod actions {
     pub const ORDER_CHANGED: &str = "x-manox/orderChanged";
     /// Thread pinned flag changed (client-dispatchable; AHP has no pin bit).
     pub const PINNED_CHANGED: &str = "x-manox/pinnedChanged";
+    /// Session archive flags changed, in one payload (client-dispatchable;
+    /// AHP has no archive bit). The ids ride the payload, so a client
+    /// dispatches the batch on any subscribed channel — the catalogue root,
+    /// which it always holds — and never pays a per-row session-channel
+    /// subscription (each one folds the row's whole journal).
+    pub const ARCHIVED_CHANGED: &str = "x-manox/archivedChanged";
     /// A project's display alias changed (client-dispatchable on the
     /// workspaces channel; the durable authority is the projects file).
     pub const ALIAS_CHANGED: &str = "x-manox/aliasChanged";
@@ -154,6 +160,7 @@ pub mod actions {
         WORKSPACES_REMOVED,
         ORDER_CHANGED,
         PINNED_CHANGED,
+        ARCHIVED_CHANGED,
         ALIAS_CHANGED,
         LABEL_CHANGED,
         SESSION_INFO_CHANGED,
