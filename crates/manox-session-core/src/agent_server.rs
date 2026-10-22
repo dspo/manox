@@ -491,7 +491,7 @@ impl AgentServerInner {
 /// `start`) builds its server through `AgentServer::new` and never routes
 /// through `global` — so the VS Code host kept `provider() == None` and
 /// client-registered tools stayed invisible to the model (reproduced with a
-/// headless addon probe: `{registered: 1}` yet no `client_*` tool in the
+/// headless addon probe: `{registered: 1}` yet no registered tool in the
 /// model's tool enumeration). The original carve-out — a private-server
 /// embedder "keeping ownership of the provider slot" — never described a
 /// shipping host: every in-repo embedder needs the provider, and one now
@@ -2413,7 +2413,7 @@ impl manox_agent::embedder_tools::EmbedderToolProvider for AgentServerEmbedderTo
                 tools.iter().map(move |spec| {
                     std::sync::Arc::new(EmbedderToolAdapter {
                         client_id: client_id.clone(),
-                        client_name: manox_agent::embedder_tools::client_tool_name(&spec.name),
+                        wire_name: manox_agent::embedder_tools::embedder_tool_name(&spec.name),
                         spec: spec.clone(),
                     }) as std::sync::Arc<dyn manox_harness::tool::AgentTool>
                 })
@@ -2432,13 +2432,13 @@ struct EmbedderToolAdapter {
     /// `name()` borrows it, so nothing leaks (review #779 replaced a
     /// `Box::leak` here; per-adapter Strings are bounded by the
     /// registration set and die with it).
-    client_name: String,
+    wire_name: String,
 }
 
 #[async_trait::async_trait]
 impl manox_harness::tool::AgentTool for EmbedderToolAdapter {
     fn name(&self) -> &str {
-        &self.client_name
+        &self.wire_name
     }
     fn description(&self) -> &str {
         &self.spec.description

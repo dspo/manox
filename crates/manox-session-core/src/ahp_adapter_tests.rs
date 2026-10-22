@@ -3744,12 +3744,12 @@ mod dispatch {
         );
 
         // The runtime half: the engine-facing provider now hands out the tool,
-        // under the `client_` model-facing name v2 uses for the same fact.
+        // under the sanitized model-facing name the engine mounts it as.
         let provider = crate::agent_server::AgentServerEmbedderTools::new(&server);
         use manox_agent::embedder_tools::EmbedderToolProvider as _;
         let mounted = provider.tools_for("s-dispatch");
         assert_eq!(mounted.len(), 1, "the registration reached the provider");
-        assert_eq!(mounted[0].name(), "client_get_selection");
+        assert_eq!(mounted[0].name(), "get_selection");
         assert_eq!(mounted[0].description(), "the get_selection tool");
         assert_eq!(
             mounted[0].parameters_schema(),
@@ -3783,7 +3783,7 @@ mod dispatch {
         let mounted = provider.tools_for("s-dispatch");
         assert_eq!(
             mounted.iter().map(|t| t.name()).collect::<Vec<_>>(),
-            vec!["client_new"],
+            vec!["new"],
             "the previous set is replaced, not merged"
         );
         uninstall();
@@ -3813,7 +3813,7 @@ mod dispatch {
             .map(|t| t.name().to_string())
             .collect();
         names.sort();
-        assert_eq!(names, vec!["client_alpha", "client_beta"]);
+        assert_eq!(names, vec!["alpha", "beta"]);
         uninstall();
     }
 

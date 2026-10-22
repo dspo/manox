@@ -4659,7 +4659,7 @@ async fn initial_title_decision_journals_through_the_tap() {
 // — so the one-time `build_tools` snapshot is stale by construction:
 // the adapters reach neither the model's schema nor `execute_one`'s
 // dispatch table, and the model's call fails with
-// `Tool not found: client_<name>`. These tests pin the per-Prompt
+// `Tool not found: <name>`. These tests pin the per-Prompt
 // refresh (`refresh_embedder_tools`, the call the actor makes before
 // every run) at the exact breakage point: a real AgentSession, the
 // real process provider slot, and a stub model that streams a
@@ -4684,7 +4684,7 @@ struct ProbeClientTool {
 #[async_trait::async_trait]
 impl manox_harness::tool::AgentTool for ProbeClientTool {
     fn name(&self) -> &str {
-        "client_probe"
+        "probe"
     }
     fn description(&self) -> &str {
         "registered after the session was assembled"
@@ -4731,7 +4731,7 @@ impl crate::embedder_tools::EmbedderToolProvider for ProbeProvider {
     }
 }
 
-/// Scripted provider: round 1 emits a `client_probe` tool_use (and
+/// Scripted provider: round 1 emits a `probe` tool_use (and
 /// records whether the mounted schema advertised the tool); round 2
 /// settles with plain text.
 struct ProbeRoundStream {
@@ -4743,7 +4743,7 @@ fn probe_tool_use(context: &manox_harness::types::AgentContext) -> AgentMessage 
     AgentMessage::Assistant {
         content: vec![ContentBlock::ToolUse {
             id: "probe-1".into(),
-            name: "client_probe".into(),
+            name: "probe".into(),
             input: serde_json::json!({}),
             thought_signature: None,
         }],
@@ -4775,7 +4775,7 @@ impl manox_harness::agent_loop::StreamFn for ProbeRoundStream {
     ) -> Result<AgentMessage, anyhow::Error> {
         let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n == 0 {
-            if context.tools.iter().any(|t| t.name() == "client_probe") {
+            if context.tools.iter().any(|t| t.name() == "probe") {
                 self.advertised
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -4833,7 +4833,7 @@ async fn embedder_tool_registered_after_assembly_reaches_schema_and_dispatch() {
     // landed, so the mounted table carries no client adapter — the
     // model never sees it and its call fails with `Tool not found`.
     assert!(
-        !session.tools().iter().any(|n| n == "client_probe"),
+        !session.tools().iter().any(|n| n == "probe"),
         "precondition: assembly must NOT contain the late registration"
     );
 
@@ -4845,7 +4845,7 @@ async fn embedder_tool_registered_after_assembly_reaches_schema_and_dispatch() {
     // What the actor does at the start of every `Prompt`.
     refresh_embedder_tools(&mut session, "embedder-after", &state.gate).await;
     assert!(
-        session.tools().iter().any(|n| n == "client_probe"),
+        session.tools().iter().any(|n| n == "probe"),
         "refresh must surface the late registration in the tool table: {:?}",
         session.tools()
     );
@@ -4859,7 +4859,7 @@ async fn embedder_tool_registered_after_assembly_reaches_schema_and_dispatch() {
         .expect("the stub run completes");
     assert!(
         advertised.load(std::sync::atomic::Ordering::SeqCst),
-        "the provider request schema must advertise client_probe"
+        "the provider request schema must advertise probe"
     );
     assert_eq!(
         invocations.load(std::sync::atomic::Ordering::SeqCst),
@@ -4929,13 +4929,13 @@ async fn late_registration_lands_in_the_active_selection_of_a_narrowed_session()
     refresh_embedder_tools(&mut session, "embedder-narrowed", &state.gate).await;
 
     assert!(
-        session.tools().iter().any(|n| n == "client_probe"),
+        session.tools().iter().any(|n| n == "probe"),
         "the adapter must be mounted: {:?}",
         session.tools()
     );
     let active = session.active_tool_names().expect("selection stays Some");
     assert!(
-        active.iter().any(|n| n == "client_probe"),
+        active.iter().any(|n| n == "probe"),
         "the narrowed selection must widen to the fresh registration: {active:?}"
     );
 
@@ -4945,7 +4945,7 @@ async fn late_registration_lands_in_the_active_selection_of_a_narrowed_session()
         .expect("the stub run completes");
     assert!(
         advertised.load(std::sync::atomic::Ordering::SeqCst),
-        "the provider request schema must advertise client_probe"
+        "the provider request schema must advertise probe"
     );
     assert_eq!(
         invocations.load(std::sync::atomic::Ordering::SeqCst),
@@ -4956,6 +4956,79 @@ async fn late_registration_lands_in_the_active_selection_of_a_narrowed_session()
     assert!(
         !serialized.contains("Tool not found"),
         "dispatch must not answer with the not-found error: {serialized}"
+    );
+
+    crate::embedder_tools::drop_provider_for_test();
+}
+
+/// A withdrawn registration must leave the table AND a narrowed active
+/// selection: the refresh replaces the recorded old set with the fresh
+/// one, and an empty fresh set is a full removal. This pins the
+/// record-based discriminator — with no name prefix to match on, the
+/// removal path is exactly the record drifting to empty.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn withdrawn_registration_leaves_the_table_and_the_active_selection() {
+    let _slot = EMBEDDER_SLOT_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("proj");
+    tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+    let registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    crate::embedder_tools::set_provider(Arc::new(ProbeProvider {
+        registered: Arc::clone(&registered),
+        tool: ProbeClientTool {
+            invocations: Arc::clone(&invocations),
+        },
+        session_id: "embedder-withdraw",
+    }));
+
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &HarnessModel| {
+        Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+    });
+    let mut session = create_agent_session()
+        .with_cwd(&cwd)
+        .with_session_dir(dir.path().join("sessions"))
+        .with_model_runtime(ModelRuntime::new(resolver))
+        .with_model(test_model())
+        .with_system_prompt("You are a test assistant.")
+        .build()
+        .await
+        .unwrap();
+
+    registered.store(true, std::sync::atomic::Ordering::SeqCst);
+    let state = test_engine_state();
+    refresh_embedder_tools(&mut session, "embedder-withdraw", &state.gate).await;
+    assert!(
+        session.tools().iter().any(|n| n == "probe"),
+        "the registration must mount: {:?}",
+        session.tools()
+    );
+    // Narrow WITH the embedder name in the selection, then withdraw.
+    session
+        .set_active_tools(vec!["Read".into(), "probe".into()])
+        .await
+        .unwrap();
+
+    registered.store(false, std::sync::atomic::Ordering::SeqCst);
+    refresh_embedder_tools(&mut session, "embedder-withdraw", &state.gate).await;
+
+    assert!(
+        !session.tools().iter().any(|n| n == "probe"),
+        "the withdrawal must remove the adapter: {:?}",
+        session.tools()
+    );
+    let active = session.active_tool_names().expect("selection stays Some");
+    assert_eq!(
+        active,
+        vec!["Read"],
+        "the narrowed selection must drop the withdrawn name: {active:?}"
+    );
+    assert_eq!(
+        invocations.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the probe was never dispatched in this test"
     );
 
     crate::embedder_tools::drop_provider_for_test();
