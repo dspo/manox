@@ -13,7 +13,7 @@
 //!   implementation of the turn loop. Anything not wired yet is refused loudly, as
 //!   the trait contract requires: a refused write must never look accepted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -1475,6 +1475,32 @@ fn command_catalogue() -> Value {
     serde_json::json!({ "commands": commands })
 }
 
+/// The `sessions` payload of `x-manox/archivedChanged`: a non-empty array of
+/// session ids, or `None` for any other shape.
+fn session_ids_of(value: Option<&Value>) -> Option<Vec<String>> {
+    let ids = value?.as_array()?;
+    if ids.is_empty() {
+        return None;
+    }
+    ids.iter()
+        .map(|id| id.as_str().map(str::to_string))
+        .collect()
+}
+
+/// The ceiling on one `x-manox/archivedChanged` batch. Every id costs the
+/// host a journal entry, a sidecar write and a dispose, and the payload rides
+/// one dispatch frame; a sidebar selection is an order of magnitude below this.
+/// Refused by name rather than truncated, so no caller believes a prefix
+/// landed.
+const MAX_ARCHIVED_BATCH: usize = 1024;
+
+/// Whether the store accounts a row for `session_id`, in either partition —
+/// the same existence the pin write checks.
+fn store_has_row(session_id: &str) -> bool {
+    manox_agent::thread_store::try_global()
+        .is_some_and(|store| store.read(|state| state.summary_by_id(session_id).is_some()))
+}
+
 /// The mutable half of a session summary, as an AHP delta.
 ///
 /// Only fields a store change can move are carried: the channel URI keys the
@@ -2332,6 +2358,50 @@ impl Backend for RuntimeBackend {
                 } else {
                     DispatchOutcome::Rejected(format!("unknown session: {session_id}"))
                 }
+            }
+            StateAction::Unknown(tag)
+                if tag.get("type").and_then(Value::as_str)
+                    == Some(manox_ahp::ext::actions::ARCHIVED_CHANGED) =>
+            {
+                // The batch-capable archive write. The ids ride the payload —
+                // the native `session/isArchivedChanged` resolves its target
+                // from the channel, which would cost one session-channel
+                // subscription (a whole-journal fold) per row — so a client
+                // dispatches the batch on the catalogue root it already
+                // holds. All ids are validated before the first write: a
+                // half-applied batch is the worst of both worlds.
+                let Some(mut ids) = session_ids_of(tag.get("sessions")) else {
+                    return DispatchOutcome::Rejected(
+                        "x-manox/archivedChanged needs a non-empty `sessions` id array".to_string(),
+                    );
+                };
+                let Some(archived) = tag.get("archived").and_then(Value::as_bool) else {
+                    return DispatchOutcome::Rejected(
+                        "x-manox/archivedChanged needs a boolean `archived`".to_string(),
+                    );
+                };
+                // The payload is a set: one id named twice is one row and one
+                // decision, not two journal entries for the same flag.
+                let mut seen = HashSet::new();
+                ids.retain(|id| seen.insert(id.clone()));
+                if ids.len() > MAX_ARCHIVED_BATCH {
+                    return DispatchOutcome::Rejected(format!(
+                        "x-manox/archivedChanged accepts at most {MAX_ARCHIVED_BATCH} sessions \
+                         per dispatch"
+                    ));
+                }
+                let unknown: Vec<&str> = ids
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| !store_has_row(id))
+                    .collect();
+                if !unknown.is_empty() {
+                    return DispatchOutcome::Rejected(format!("unknown sessions: {unknown:?}"));
+                }
+                for id in &ids {
+                    self.server.archive_session(&origin.client_id, id, archived);
+                }
+                DispatchOutcome::Accepted
             }
             StateAction::Unknown(tag)
                 if tag.get("type").and_then(Value::as_str)
