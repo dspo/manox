@@ -69,7 +69,7 @@ use ahp_types::state::{
     PendingMessageKind, ReasoningResponsePart, ResponsePart, SessionInputRequest,
     SessionToolConfirmationRequest, SystemNotificationResponsePart, ToolCallCancellationReason,
     ToolCallConfirmationReason, ToolCallConfirmationState, ToolCallPendingConfirmationState,
-    ToolCallResult, ToolCallState, ToolResultContent, ToolResultTextContent, UsageInfo,
+    ToolCallResult, ToolCallState, ToolInput, ToolResultContent, ToolResultTextContent, UsageInfo,
 };
 use manox_harness::session::{SessionTreeEntry, plan_review_request_id};
 use manox_harness::types::{AgentMessage, ContentBlock};
@@ -353,8 +353,16 @@ struct CallBook {
     tool_name: String,
     title: String,
     /// The call's journaled parameters (latest row wins) — the source the
-    /// edit-preview face is derived from when the approval gate opens.
+    /// edit-preview face is derived from when the approval gate opens, and
+    /// the payload every `toolInput`-bearing emission forwards.
     input: Option<Value>,
+    /// The parameters have reached the wire on a `ChatToolCallReady` (the
+    /// only action whose reducer lands `toolInput` on every state after
+    /// `streaming`). A `chat/toolCallDelta` parks its content on the
+    /// streaming part's `partialInput`, which the ready transition drops —
+    /// so this flag, not the delta, is what keeps the parameters from being
+    /// published twice.
+    input_published: bool,
     /// A `chat/toolCallStart` created the part.
     started: bool,
     /// The part sits in `pending-confirmation`.
@@ -363,6 +371,19 @@ struct CallBook {
     working: bool,
     /// A terminal action settled the part (`completed` or `cancelled`).
     settled: bool,
+    /// The gate's `authId` while the part is parked in `pending-confirmation`:
+    /// the identity a refreshed session mirror must carry.
+    auth_id: Option<String>,
+    /// The confirmation text the gate opened with. A ready action restates the
+    /// invocation message rather than leaving it in place, so the catch-up
+    /// republishes this exact prompt instead of rebuilding it from a title the
+    /// approval-first order has not learned yet.
+    pending_prompt: Option<String>,
+    /// The confirmation reason the current running state was published with
+    /// (`UserAction` after an approval, `NotNeeded` otherwise). Every ready
+    /// action rewrites the field, so a later parameter publication restates
+    /// this rather than flattening an explicit approval to `NotNeeded`.
+    confirmed: Option<ToolCallConfirmationReason>,
     /// Live output accumulated for `chat/toolCallContentChanged`, which replaces
     /// the content array rather than appending to it.
     output: String,
@@ -374,10 +395,14 @@ impl CallBook {
             tool_name: tool_name.to_string(),
             title: title.to_string(),
             input: None,
+            input_published: false,
             started: false,
             awaiting: false,
             working: false,
             settled: false,
+            auth_id: None,
+            pending_prompt: None,
+            confirmed: None,
             output: String::new(),
         }
     }
@@ -392,9 +417,24 @@ impl CallBook {
         match state {
             ToolCallState::Streaming(_) => {}
             ToolCallState::PendingConfirmation(_) => book.awaiting = true,
-            ToolCallState::Running(_) | ToolCallState::AuthRequired(_) => book.working = true,
-            ToolCallState::PendingResultConfirmation(_) => book.working = true,
-            ToolCallState::Completed(_) | ToolCallState::Cancelled(_) => {
+            ToolCallState::Running(s) => {
+                book.working = true;
+                book.confirmed = Some(s.confirmed.clone());
+            }
+            ToolCallState::AuthRequired(s) => {
+                book.working = true;
+                book.confirmed = Some(s.confirmed.clone());
+            }
+            ToolCallState::PendingResultConfirmation(s) => {
+                book.working = true;
+                book.confirmed = Some(s.confirmed.clone());
+            }
+            ToolCallState::Completed(state) => {
+                book.working = true;
+                book.settled = true;
+                book.confirmed = Some(state.confirmed.clone());
+            }
+            ToolCallState::Cancelled(_) => {
                 book.working = true;
                 book.settled = true;
             }
@@ -918,7 +958,9 @@ impl Translator {
                 ..
             } => {
                 let input = input.clone().unwrap_or(Value::Null);
-                self.on_tool_call(&chat, &row, call_id, name, title, status, &input, &mut out);
+                self.on_tool_call(
+                    &chat, &session, &row, call_id, name, title, status, &input, &mut out,
+                );
             }
             SessionTreeEntry::ToolResult {
                 call_id,
@@ -1771,6 +1813,7 @@ impl Translator {
     fn on_tool_call(
         &mut self,
         chat: &str,
+        session: &str,
         entry: &Envelope,
         call_id: &str,
         name: &str,
@@ -1790,6 +1833,26 @@ impl Translator {
                     .insert(call_id.to_string(), CallBook::new(name, title));
             }
             if let Some(book) = turn.calls.get_mut(call_id) {
+                // The approval-first order creates the book from the gate's
+                // payload, which knows neither the row's title nor (when the
+                // gate names no tool) its name. The first row that lands fills
+                // the blanks; a later status row must not overwrite them with
+                // its own generic title.
+                if book.tool_name.is_empty() {
+                    book.tool_name = name.to_string();
+                }
+                if book.title.is_empty() {
+                    book.title = title.to_string();
+                }
+                // A status-update row repeating the published parameters keeps
+                // the publication; a row whose parameters differ (and are not
+                // absent) re-arms it so the catch-up can deliver them.
+                if book.input_published
+                    && book.input.as_ref().is_some_and(|prev| prev != input)
+                    && !input.is_null()
+                {
+                    book.input_published = false;
+                }
                 book.input = Some(input.clone());
             }
             fresh
@@ -1810,7 +1873,9 @@ impl Translator {
         }
         // The journal carries complete parameters, so they stream out as one delta:
         // `partialInput` is where a client shows arguments while the call is still
-        // `streaming`.
+        // `streaming`. The durable publication is the phase transition below (or
+        // the catch-up): the ready transition drops `partialInput`, so a ready
+        // action is what must carry them.
         if let Some(content) = inline_input(input) {
             out.push(Emitted::new(
                 chat,
@@ -1822,6 +1887,12 @@ impl Translator {
                     invocation_message: Some(StringOrMarkdown::Plain(title.to_string())),
                 }),
             ));
+        }
+        // A call the wire already moved past `streaming` (the gate opened before
+        // this row, or an earlier phase transition published nothing — the
+        // parameters were not yet journaled) takes them through the catch-up.
+        if !first {
+            self.publish_input(chat, session, &turn_id, call_id, out);
         }
         match status_phase(status) {
             Phase::Announced => {}
@@ -1936,6 +2007,10 @@ impl Translator {
                 self.open_call_named(chat, &turn_id, call_id, tool_name, out);
                 let title = self.title_of(call_id);
                 let prompt = confirmation_prompt(&title, tool_name.unwrap_or(call_id));
+                // The parameters ride the gate when their row has already
+                // landed (the common order): the pending card is where a
+                // client shows what it is being asked to approve.
+                let tool_input = self.take_unpublished_input(call_id);
                 out.push(Emitted::new(
                     chat,
                     StateAction::ChatToolCallReady(ChatToolCallReadyAction {
@@ -1945,10 +2020,8 @@ impl Translator {
                         contributor: None,
                         intention: Some(title.clone()),
                         invocation_message: StringOrMarkdown::Plain(prompt.clone()),
-                        // No `toolInput`: the parameters reached the wire through
-                        // the call's own row, and an approval row carries none.
-                        tool_input: None,
-                        confirmation_title: Some(StringOrMarkdown::Plain(prompt)),
+                        tool_input: tool_input.map(ToolInput::Inline),
+                        confirmation_title: Some(StringOrMarkdown::Plain(prompt.clone())),
                         risk_assessment: None,
                         edits: None,
                         editable: None,
@@ -1956,7 +2029,7 @@ impl Translator {
                         options: Some(approval_options()),
                     }),
                 ));
-                self.mark_awaiting(call_id);
+                self.mark_awaiting(call_id, auth_id, &prompt);
                 out.push(Emitted::new(
                     session,
                     StateAction::SessionInputNeededSet(Box::new(SessionInputNeededSetAction {
@@ -2337,8 +2410,10 @@ impl Translator {
             }),
         ));
         let turn = self.open.as_mut().expect("a turn is open");
-        turn.calls
-            .insert(call_id.to_string(), CallBook::new("", ""));
+        turn.calls.insert(
+            call_id.to_string(),
+            CallBook::new(tool_name.unwrap_or_default(), ""),
+        );
     }
 
     fn publish_running(
@@ -2349,6 +2424,19 @@ impl Translator {
         title: &str,
         out: &mut Vec<Emitted>,
     ) {
+        // The call's journaled parameters ride the ready action — the one
+        // place whose reducer lands `toolInput` on the running state. A
+        // delta alone cannot: it parks on the streaming part and the ready
+        // transition drops it, so a client folding the wire never saw the
+        // command it was asked to display.
+        let tool_input = self.take_unpublished_input(call_id);
+        // An approval-first call already carries the verdict's reason; the
+        // journal's "it ran" row must not flatten an explicit approval to
+        // `NotNeeded`.
+        let confirmed = self
+            .call(call_id)
+            .and_then(|call| call.confirmed.clone())
+            .unwrap_or(ToolCallConfirmationReason::NotNeeded);
         out.push(Emitted::new(
             chat,
             StateAction::ChatToolCallReady(ChatToolCallReadyAction {
@@ -2358,20 +2446,144 @@ impl Translator {
                 contributor: None,
                 intention: Some(title.to_string()),
                 invocation_message: StringOrMarkdown::Plain(title.to_string()),
-                tool_input: None,
+                tool_input: tool_input.map(ToolInput::Inline),
                 confirmation_title: None,
                 risk_assessment: None,
                 edits: None,
                 editable: None,
-                // The journal says it ran, so confirmation was not needed — or it
-                // landed on an approval row, which owns that path.
-                confirmed: Some(ToolCallConfirmationReason::NotNeeded),
+                // The journal says it ran, so confirmation was not needed — or
+                // the gate's verdict already named the reason.
+                confirmed: Some(confirmed.clone()),
                 options: None,
             }),
         ));
         if let Some(call) = self.call_mut(call_id) {
             call.working = true;
             call.awaiting = false;
+            call.confirmed = Some(confirmed);
+        }
+    }
+
+    /// Deliver the call's parameters to a call the wire already moved past
+    /// `streaming` — the approval-first order, where the gate opened before the
+    /// `toolCall` row arrived, or a row that learned its parameters after its
+    /// phase transition published. The reducer updates a pending confirmation
+    /// in place (the ready stays `confirmed: None`) and refreshes a running
+    /// call without moving it; a settled call is left alone.
+    fn publish_input(
+        &mut self,
+        chat: &str,
+        session: &str,
+        turn_id: &str,
+        call_id: &str,
+        out: &mut Vec<Emitted>,
+    ) {
+        let Some((awaiting, working, settled)) = self
+            .call(call_id)
+            .map(|call| (call.awaiting, call.working, call.settled))
+        else {
+            return;
+        };
+        if settled || awaiting == working {
+            return;
+        }
+        let Some(inline) = self.take_unpublished_input(call_id) else {
+            return;
+        };
+        let Some((title, tool_name, output, auth_id, prompt, confirmed)) =
+            self.call(call_id).map(|call| {
+                (
+                    call.title.clone(),
+                    call.tool_name.clone(),
+                    call.output.clone(),
+                    call.auth_id.clone(),
+                    call.pending_prompt.clone(),
+                    call.confirmed.clone(),
+                )
+            })
+        else {
+            return;
+        };
+        // Every ready rebuilds the invocation message from the action, so the
+        // catch-up restates it: the gate's own prompt while the card is parked
+        // (a blank title here would replace what the user is reading), the
+        // title once the call runs.
+        let invocation = if awaiting {
+            prompt.unwrap_or_else(|| {
+                confirmation_prompt(
+                    &title,
+                    if tool_name.is_empty() {
+                        call_id
+                    } else {
+                        tool_name.as_str()
+                    },
+                )
+            })
+        } else if !title.is_empty() {
+            title.clone()
+        } else if !tool_name.is_empty() {
+            tool_name.clone()
+        } else {
+            call_id.to_string()
+        };
+        out.push(Emitted::new(
+            chat,
+            StateAction::ChatToolCallReady(ChatToolCallReadyAction {
+                turn_id: turn_id.to_string(),
+                tool_call_id: call_id.to_string(),
+                meta: None,
+                contributor: None,
+                // The gate opened before the row, so the pending card's
+                // intention was blank; the row's title fills it.
+                intention: (awaiting && !title.is_empty()).then(|| title.clone()),
+                invocation_message: StringOrMarkdown::Plain(invocation.clone()),
+                tool_input: Some(ToolInput::Inline(inline)),
+                confirmation_title: None,
+                risk_assessment: None,
+                edits: None,
+                editable: None,
+                confirmed: (!awaiting)
+                    .then(|| confirmed.unwrap_or(ToolCallConfirmationReason::NotNeeded)),
+                options: None,
+            }),
+        ));
+        // A running part's content is rebuilt empty by the ready transition;
+        // replay what the journal already delivered so the catch-up cannot
+        // blank the output.
+        if working && !output.is_empty() {
+            out.push(Emitted::new(
+                chat,
+                StateAction::ChatToolCallContentChanged(ChatToolCallContentChangedAction {
+                    turn_id: turn_id.to_string(),
+                    tool_call_id: call_id.to_string(),
+                    meta: None,
+                    content: text_blocks(&output),
+                }),
+            ));
+        }
+        // The gate's session mirror is the surface a client may read instead of
+        // the chat card; restate it so the approval-first catch-up lands on
+        // both (the reducer replaces the request with the same id in place).
+        if awaiting && let Some(auth_id) = auth_id {
+            let mut request = self.pending_confirmation(
+                call_id,
+                (!tool_name.is_empty()).then_some(tool_name.as_str()),
+                &auth_id,
+            );
+            request.invocation_message = StringOrMarkdown::Plain(invocation);
+            out.push(Emitted::new(
+                session,
+                StateAction::SessionInputNeededSet(Box::new(SessionInputNeededSetAction {
+                    request: SessionInputRequest::ToolConfirmation(
+                        SessionToolConfirmationRequest {
+                            id: auth_id,
+                            chat: chat.to_string(),
+                            turn_id: turn_id.to_string(),
+                            tool_call: ToolCallConfirmationState::PendingConfirmation(request),
+                        },
+                    ),
+                })),
+            ));
         }
     }
 
@@ -2444,18 +2656,23 @@ impl Translator {
         }
     }
 
-    fn mark_awaiting(&mut self, call_id: &str) {
+    fn mark_awaiting(&mut self, call_id: &str, auth_id: &str, prompt: &str) {
         if let Some(call) = self.call_mut(call_id) {
             call.awaiting = true;
             call.working = false;
+            call.auth_id = Some(auth_id.to_string());
+            call.pending_prompt = Some(prompt.to_string());
         }
     }
 
     fn mark_resolved(&mut self, call_id: &str, approved: bool) {
         if let Some(call) = self.call_mut(call_id) {
             call.awaiting = false;
+            call.auth_id = None;
+            call.pending_prompt = None;
             if approved {
                 call.working = true;
+                call.confirmed = Some(ToolCallConfirmationReason::UserAction);
             } else {
                 call.settled = true;
             }
@@ -2481,7 +2698,11 @@ impl Translator {
             contributor: None,
             meta: Some(manox_meta(approval_meta(auth_id, &title))),
             invocation_message: StringOrMarkdown::Plain(confirmation_prompt(&title, name)),
-            tool_input: None,
+            tool_input: self
+                .call(call_id)
+                .and_then(|call| call.input.clone())
+                .and_then(|input| inline_input(&input))
+                .map(ToolInput::Inline),
             confirmation_title: None,
             risk_assessment: None,
             // The AHP 1.0 edit-preview face: the call's journaled parameters
@@ -2500,6 +2721,22 @@ impl Translator {
 
     fn call_mut(&mut self, call_id: &str) -> Option<&mut CallBook> {
         self.open.as_mut()?.calls.get_mut(call_id)
+    }
+
+    /// The call's parameters for their one wire publication, marking them
+    /// published: a `ChatToolCallReady` is the only emission whose reducer
+    /// lands `toolInput` past the streaming state, so each parameter set
+    /// publishes at most once. A call with nothing to publish (no row yet,
+    /// or parameters absent) stays unpublished — the row that carries them
+    /// publishes through here.
+    fn take_unpublished_input(&mut self, call_id: &str) -> Option<String> {
+        let call = self.call_mut(call_id)?;
+        if call.input_published {
+            return None;
+        }
+        let inline = call.input.as_ref().and_then(inline_input)?;
+        call.input_published = true;
+        Some(inline)
     }
 
     fn title_of(&self, call_id: &str) -> String {
@@ -4403,6 +4640,384 @@ mod extension_gate_tests {
                 order: Some(json!({"s-1": 1})),
             },
             "every extension-state field must be reachable from a live producer"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_input_publication_tests {
+    use super::*;
+
+    fn kernel(mut fields: Value) -> SessionTreeEntry {
+        let mut base = json!({
+            "id": "e-1",
+            "parentId": None::<String>,
+            "timestamp": "2026-10-21T00:00:00.000Z",
+        });
+        let object = base.as_object_mut().expect("base is an object");
+        if let Some(extra) = fields.as_object_mut() {
+            object.append(extra);
+        }
+        serde_json::from_value(base.clone())
+            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
+    }
+
+    /// Fold the records through the shared translator + reducer, exactly as a
+    /// subscriber's baseline does, on both channels a client folds.
+    fn fold_both(records: &[SessionTreeEntry]) -> (ChatState, ahp_types::state::SessionState) {
+        let mut translator = Translator::new();
+        let mut chat = manox_ahp::channels::chat::initial("c-1");
+        let mut session = manox_ahp::channels::session::initial("manox", None, None);
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                ahp::reducers::apply_action_to_chat(&mut chat, &emitted.action);
+                ahp::reducers::apply_action_to_session(&mut session, &emitted.action);
+            }
+        }
+        (chat, session)
+    }
+
+    fn fold(records: &[SessionTreeEntry]) -> ChatState {
+        fold_both(records).0
+    }
+
+    /// The turn's pending card, for the text/fill assertions.
+    fn pending_part(state: &ChatState) -> &ToolCallPendingConfirmationState {
+        let parts = &state
+            .active_turn
+            .as_ref()
+            .expect("an active turn")
+            .response_parts;
+        parts
+            .iter()
+            .find_map(|part| match part {
+                ahp_types::state::ResponsePart::ToolCall(call) => match &call.tool_call {
+                    ToolCallState::PendingConfirmation(pending) => Some(pending),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a pending confirmation part")
+    }
+
+    /// The turn's running part, for the catch-up assertions.
+    fn running_part(state: &ChatState) -> &ahp_types::state::ToolCallRunningState {
+        let parts = &state
+            .active_turn
+            .as_ref()
+            .expect("an active turn")
+            .response_parts;
+        parts
+            .iter()
+            .find_map(|part| match part {
+                ahp_types::state::ResponsePart::ToolCall(call) => match &call.tool_call {
+                    ToolCallState::Running(running) => Some(running),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a running part")
+    }
+
+    /// The folded params of every tool call in the state, keyed by call id.
+    fn folded_inputs(state: &ChatState) -> Vec<(String, Option<Value>)> {
+        let mut inputs = Vec::new();
+        let scan = |parts: &Vec<ahp_types::state::ResponsePart>, inputs: &mut Vec<_>| {
+            for part in parts {
+                if let ahp_types::state::ResponsePart::ToolCall(call) = part {
+                    let input = match call.tool_call.clone() {
+                        ToolCallState::Running(r) => r.tool_input,
+                        ToolCallState::PendingConfirmation(p) => p.tool_input,
+                        ToolCallState::Completed(c) => c.tool_input,
+                        other => panic!("unexpected state: {other:?}"),
+                    };
+                    let input = match input {
+                        Some(ToolInput::Inline(raw)) => Some(serde_json::from_str(&raw).unwrap()),
+                        other => panic!("params must ride inline JSON: {other:?}"),
+                    };
+                    inputs.push((tool_call_handle(&call.tool_call).to_string(), input));
+                }
+            }
+        };
+        if let Some(active) = &state.active_turn {
+            scan(&active.response_parts, &mut inputs);
+        }
+        for turn in &state.turns {
+            scan(&turn.response_parts, &mut inputs);
+        }
+        inputs
+    }
+
+    fn params() -> Value {
+        json!({"command": "cargo test -p manox-ahp-runtime"})
+    }
+
+    /// The plain run: the toolCall row's parameters must be on the wire by
+    /// the time the call runs — the ready transition is where a delta's
+    /// `partialInput` dies, so the ready action itself carries them.
+    #[test]
+    fn a_running_call_carries_its_parameters() {
+        let state = fold(&[
+            kernel(json!({"type": "turn_start"})),
+            kernel(json!({
+                "type": "tool_call", "id": "e-2", "callId": "t-1",
+                "name": "Bash", "title": "test", "status": "running",
+                "input": params(),
+            })),
+        ]);
+        assert_eq!(
+            folded_inputs(&state),
+            vec![("t-1".to_string(), Some(params()))],
+            "the running state shows the command the model asked for"
+        );
+    }
+
+    /// The settled call keeps the parameters: the completion preserves what
+    /// the ready action landed.
+    #[test]
+    fn a_completed_call_still_carries_its_parameters() {
+        let state = fold(&[
+            kernel(json!({"type": "turn_start"})),
+            kernel(json!({
+                "type": "tool_call", "id": "e-2", "callId": "t-1",
+                "name": "Bash", "title": "test", "status": "running",
+                "input": params(),
+            })),
+            kernel(json!({
+                "type": "tool_result", "id": "e-3", "callId": "t-1",
+                "output": "ok", "isError": false,
+            })),
+        ]);
+        assert_eq!(
+            folded_inputs(&state),
+            vec![("t-1".to_string(), Some(params()))]
+        );
+    }
+
+    /// The common approval order — the call row, then the gate: the pending
+    /// card carries the parameters (what the user is asked to approve), and
+    /// the verdict's running state keeps them.
+    #[test]
+    fn an_approval_after_the_call_row_carries_the_parameters_through_the_verdict() {
+        let state = fold(&[
+            kernel(json!({"type": "turn_start"})),
+            kernel(json!({
+                "type": "tool_call", "id": "e-2", "callId": "t-1",
+                "name": "Bash", "title": "test", "status": "pending-approval",
+                "input": params(),
+            })),
+            kernel(json!({
+                "type": "approval", "id": "e-3", "kind": "request", "authId": "a-1",
+                "payload": {"toolName": "Bash", "toolCallId": "t-1"},
+            })),
+            kernel(json!({
+                "type": "approval", "id": "e-4", "kind": "decision", "authId": "a-1",
+                "payload": {"toolCallId": "t-1", "verdict": "allow_once"},
+            })),
+        ]);
+        assert_eq!(
+            folded_inputs(&state),
+            vec![("t-1".to_string(), Some(params()))]
+        );
+    }
+
+    /// The gate opening before the call row (approval-first): the catch-up
+    /// delivers the parameters once the row lands, and the verdict keeps
+    /// them into the running state.
+    #[test]
+    fn the_approval_first_order_catches_up_when_the_call_row_lands() {
+        let state = fold(&[
+            kernel(json!({"type": "turn_start"})),
+            kernel(json!({
+                "type": "approval", "id": "e-2", "kind": "request", "authId": "a-1",
+                "payload": {"toolName": "Bash", "toolCallId": "t-1"},
+            })),
+            kernel(json!({
+                "type": "tool_call", "id": "e-3", "callId": "t-1",
+                "name": "Bash", "title": "test", "status": "pending-approval",
+                "input": params(),
+            })),
+            kernel(json!({
+                "type": "approval", "id": "e-4", "kind": "decision", "authId": "a-1",
+                "payload": {"toolCallId": "t-1", "verdict": "allow_once"},
+            })),
+            kernel(json!({
+                "type": "tool_result", "id": "e-5", "callId": "t-1",
+                "output": "ok", "isError": false,
+            })),
+        ]);
+        assert_eq!(
+            folded_inputs(&state),
+            vec![("t-1".to_string(), Some(params()))]
+        );
+    }
+
+    /// Status-update rows repeating the same parameters never re-publish
+    /// them: one ready emission carries the payload, the rest are plain.
+    #[test]
+    fn repeated_parameter_rows_publish_once() {
+        let mut translator = Translator::new();
+        let mut readies_with_input = 0usize;
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let records = [
+            kernel(json!({"type": "turn_start"})),
+            kernel(json!({
+                "type": "tool_call", "id": "e-2", "callId": "t-1",
+                "name": "Bash", "title": "test", "status": "running",
+                "input": params(),
+            })),
+            kernel(json!({
+                "type": "tool_call", "id": "e-3", "callId": "t-1",
+                "name": "Bash", "title": "test", "status": "running",
+                "input": params(),
+            })),
+            kernel(json!({
+                "type": "tool_result", "id": "e-4", "callId": "t-1",
+                "output": "ok", "isError": false,
+            })),
+        ];
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatToolCallReady(ready) = &emitted.action
+                    && ready.tool_input.is_some()
+                {
+                    readies_with_input += 1;
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        assert_eq!(readies_with_input, 1, "one publication, not one per row");
+        assert_eq!(
+            folded_inputs(&state),
+            vec![("t-1".to_string(), Some(params()))]
+        );
+    }
+
+    /// The approval-first catch-up must not rewrite the text the user is
+    /// reading: the gate's prompt survives the row that teaches the book its
+    /// title, and the row fills the intention the gate could not name.
+    #[test]
+    fn the_approval_first_catch_up_keeps_the_confirmation_text() {
+        let records = [
+            kernel(json!({"type": "turn_start"})),
+            kernel(json!({
+                "type": "approval", "id": "e-2", "kind": "request", "authId": "a-1",
+                "payload": {"toolName": "Bash", "toolCallId": "t-1"},
+            })),
+            kernel(json!({
+                "type": "tool_call", "id": "e-3", "callId": "t-1",
+                "name": "Bash", "title": "test", "status": "pending-approval",
+                "input": params(),
+            })),
+        ];
+        let gate = fold(&records[..2]);
+        let prompt = pending_part(&gate).invocation_message.clone();
+        assert_eq!(
+            prompt,
+            StringOrMarkdown::Plain("Bash — awaiting confirmation".into())
+        );
+        let state = fold(&records);
+        let pending = pending_part(&state);
+        assert_eq!(
+            pending.invocation_message, prompt,
+            "the catch-up restates the gate's own prompt"
+        );
+        assert_eq!(
+            pending.intention.as_deref(),
+            Some("test"),
+            "the row's title fills the blank intention"
+        );
+    }
+
+    /// The session mirror is a surface a client may read instead of the chat
+    /// card; the same catch-up must teach it the parameters.
+    #[test]
+    fn the_pending_mirror_learns_the_parameters_when_the_row_lands() {
+        let records = [
+            kernel(json!({"type": "turn_start"})),
+            kernel(json!({
+                "type": "approval", "id": "e-2", "kind": "request", "authId": "a-1",
+                "payload": {"toolName": "Bash", "toolCallId": "t-1"},
+            })),
+            kernel(json!({
+                "type": "tool_call", "id": "e-3", "callId": "t-1",
+                "name": "Bash", "title": "test", "status": "pending-approval",
+                "input": params(),
+            })),
+        ];
+        let (_, session) = fold_both(&records);
+        let mirror = session
+            .input_needed
+            .as_ref()
+            .and_then(|requests| {
+                requests.iter().find_map(|request| match request {
+                    SessionInputRequest::ToolConfirmation(confirmation) => {
+                        match &confirmation.tool_call {
+                            ToolCallConfirmationState::PendingConfirmation(pending) => {
+                                Some(pending)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+            })
+            .expect("the gate's mirror");
+        assert_eq!(
+            mirror.tool_input,
+            Some(ToolInput::Inline(params().to_string()))
+        );
+    }
+
+    /// A parameter row that lands after the verdict and after output must keep
+    /// the running part's approval reason and streamed output: the catch-up
+    /// restates both instead of rebuilding the part empty.
+    #[test]
+    fn a_late_parameter_row_keeps_the_verdict_and_the_output() {
+        let records = [
+            kernel(json!({"type": "turn_start"})),
+            kernel(json!({
+                "type": "approval", "id": "e-2", "kind": "request", "authId": "a-1",
+                "payload": {"toolName": "Bash", "toolCallId": "t-1"},
+            })),
+            kernel(json!({
+                "type": "approval", "id": "e-3", "kind": "decision", "authId": "a-1",
+                "payload": {"toolCallId": "t-1", "verdict": "allow_once"},
+            })),
+            kernel(json!({
+                "type": "tool_call", "id": "e-4", "callId": "t-1",
+                "name": "Bash", "title": "test", "status": "running",
+            })),
+            kernel(json!({
+                "type": "tool_output_chunk", "id": "e-5", "callId": "t-1", "chunk": "hello",
+            })),
+            kernel(json!({
+                "type": "tool_call", "id": "e-6", "callId": "t-1",
+                "name": "Bash", "title": "test", "status": "running",
+                "input": params(),
+            })),
+        ];
+        let state = fold(&records);
+        let running = running_part(&state);
+        assert_eq!(
+            running.confirmed,
+            ToolCallConfirmationReason::UserAction,
+            "the verdict survives the row that lands after it"
+        );
+        assert_eq!(
+            running.tool_input,
+            Some(ToolInput::Inline(params().to_string()))
+        );
+        assert_eq!(
+            running.content,
+            Some(vec![ToolResultContent::Text(ToolResultTextContent {
+                text: "hello".into()
+            })]),
+            "the catch-up restores the streamed output"
+        );
+        assert_eq!(
+            running.invocation_message,
+            StringOrMarkdown::Plain("test".into())
         );
     }
 }
