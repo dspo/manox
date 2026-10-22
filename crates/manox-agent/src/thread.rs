@@ -578,6 +578,23 @@ impl ThreadHandle {
                 if let Some(reg) = thread_registry() {
                     reg.refresh();
                 }
+                // The registry answers id→thread lookups; the SIDEBAR list
+                // is thread_store's scanned rows, and a materialized session
+                // joins it only once a scan publishes the row (the
+                // SummariesUpdated broadcast rides the same pass). Without
+                // this ask, a running conversation stayed invisible until an
+                // unrelated sidecar write happened to request a scan — the
+                // turn-final title stamp — not when its journal landed. The
+                // ask is narrowed to the unknown-row case: the notice fires
+                // on every user message, and a store whose scan already
+                // carries this thread's row needs no re-walk (its broadcast
+                // would ripple to every client).
+                if let Some(store) = crate::thread_store::try_global() {
+                    let known = self.read(|t| store.read(|s| s.summary_by_id(&t.id.0).is_some()));
+                    if !known {
+                        store.refresh();
+                    }
+                }
             }
             other => self.with_mut(|t| t.handle_notice_inner(other)),
         }
@@ -4191,5 +4208,52 @@ pub(crate) mod tests {
         thread.read(|t| {
             assert_eq!(t.project(), Some(&PathBuf::from("/store/project")));
         });
+    }
+
+    /// `SessionListDirty` must ask the SIDEBAR store to rescan, not only the
+    /// thread registry: a materialized session joins every client's list
+    /// through the scan's row publish (the `SummariesUpdated` broadcast
+    /// rides it). Pinned against the orphaned-refresh regression where a
+    /// running conversation stayed out of the list until an unrelated
+    /// sidecar write (the turn-final title stamp) happened to ask for a
+    /// scan — the sidebar row appeared only when the LLM's final answer
+    /// landed, not when the journal did.
+    #[test]
+    fn session_list_dirty_asks_the_sidebar_store_to_rescan() {
+        crate::runtime::init_hermetic_for_test();
+        crate::provider_glue::init_for_test();
+        let _guard = crate::thread_store::store_test_lock().lock().unwrap();
+        crate::thread_store::init_for_test();
+        let store = crate::thread_store::global();
+        let dir = crate::thread_store::global_sessions_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dirty-scan.jsonl"),
+            "{\"type\":\"session\",\"version\":4,\"id\":\"dirty-scan\",\"timestamp\":\"\
+             2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{\"host\":\"manox\",\
+             \"thread\":\"dirty-scan\"}}\n{\"type\":\"message\",\"id\":\"m1\",\"parentId\"\
+             :null,\"timestamp\":\"2026-09-13T00:00:01Z\",\"seq\":0,\"message\":{\"role\"\
+             :\"user\",\"content\":[{\"type\":\"text\",\"text\":\"first message\"}],\"timestamp\"\
+             :1770000000000}}\n",
+        )
+        .unwrap();
+
+        let handle = Thread::landing_with_id(ThreadId("dirty-scan".into()), PathBuf::from("/proj"));
+        handle.handle_notice(BackendNotice::SessionListDirty);
+
+        // The scan runs on the process runtime; poll for the row it
+        // publishes. Without the store ask in the handler this never lands.
+        let listed = (0..100).any(|_| {
+            if store.read(|s| s.summary_by_id("dirty-scan").is_some()) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            false
+        });
+        crate::thread_store::drop_for_test();
+        assert!(
+            listed,
+            "SessionListDirty must land the materialized session in the sidebar list"
+        );
     }
 }
