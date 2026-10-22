@@ -3552,6 +3552,109 @@ mod dispatch {
                 "malformed payload refused: {payload}"
             );
         }
+        // One frame cannot ask the host for unbounded journal + dispose work:
+        // the batch has a ceiling and it is refused by name, never truncated.
+        let oversized: Vec<String> = (0..1025).map(|i| format!("s-bulk-{i}")).collect();
+        match backend.dispatch(
+            root::URI,
+            &StateAction::Unknown(json!({
+                "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
+                "sessions": oversized,
+                "archived": true,
+            })),
+            &origin(),
+        ) {
+            // The refusal must name the ceiling: every id here is also
+            // unknown, so a reason about sessions would let a missing cap
+            // pass this assertion.
+            DispatchOutcome::Rejected(reason) => assert!(
+                reason.contains("at most 1024"),
+                "the oversized batch is refused by the cap, not by the ids: {reason}"
+            ),
+            other => panic!("a batch past the ceiling must be refused: {other:?}"),
+        }
+        uninstall();
+    }
+
+    /// The batch write's reason to exist is its *route*: the native
+    /// `session/isArchivedChanged` resolves its target from the session
+    /// channel, and the router refuses a dispatch on a channel the connection
+    /// does not hold — the sidebar archive that silently did nothing. The
+    /// desktop holds only the catalogue root at initialize, so the batch must
+    /// land from there through the real router, not just through the backend's
+    /// dispatch seam.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_batch_archive_lands_from_the_root_through_the_router() {
+        let _guards = install();
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        manox_agent::thread_store::global().with_mut(|store| {
+            store.insert_summary_for_test("s-root-a", None);
+            store.insert_summary_for_test("s-root-b", None);
+        });
+
+        let client = ahp::Client::connect(runtime.inproc(), ahp::ClientConfig::default())
+            .await
+            .expect("the in-process client connects");
+        client
+            .initialize(
+                "desktop".to_string(),
+                vec![PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes holding only the catalogue root");
+        let mut root_sub = client
+            .attach_subscription(ahp_types::common::ROOT_RESOURCE_URI)
+            .await;
+
+        client
+            .dispatch(
+                ahp_types::common::ROOT_RESOURCE_URI.to_string(),
+                StateAction::Unknown(json!({
+                    "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
+                    "sessions": ["s-root-a", "s-root-b"],
+                    "archived": true,
+                })),
+            )
+            .await
+            .expect("the batch rides the root");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let echo = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, root_sub.recv())
+                .await
+                .expect("the root echo arrives")
+                .expect("the subscription stays open");
+            if let ahp::SubscriptionEvent::Action(envelope) = event
+                && manox_ahp::wire::action_tag(&envelope.action)
+                    == manox_ahp::ext::actions::ARCHIVED_CHANGED
+            {
+                break envelope;
+            }
+        };
+        assert!(
+            echo.rejection_reason.is_none(),
+            "the router accepts the batch on the root every client holds: {:?}",
+            echo.rejection_reason
+        );
+
+        let archived: Vec<String> = manox_agent::thread_store::global().read(|state| {
+            state
+                .archived_summaries()
+                .iter()
+                .map(|row| row.id.clone())
+                .collect()
+        });
+        for id in ["s-root-a", "s-root-b"] {
+            assert!(
+                archived.iter().any(|row| row == id),
+                "every named row crossed partitions through the wire: {archived:?}"
+            );
+        }
         uninstall();
     }
 

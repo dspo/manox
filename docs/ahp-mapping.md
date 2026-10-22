@@ -80,7 +80,7 @@ turn id 方案。结论如下，三条证据相互印证：
 | `CwdChange` | `session/workingDirectorySet` | A |
 | `ProjectChange` | `session/configChanged`（`project` 值）+ `SessionState.project` | A |
 | `Title` | `session/titleChanged` | A |
-| `PinnedArchived` | `session/isArchivedChanged`（原生位）+ `x-manox/pinnedChanged`（AHP 无 pin 位；行落在 `x-manox-thread:/<session>`，#842） | A + X |
+| `PinnedArchived` | `session/isArchivedChanged`（原生位，仅限已附着会话；未附着行会被 subscribed-gate 拒掉）+ `x-manox/archivedChanged`（客户端批量写：ids 入 payload、落 catalogue root，侧栏归档/批量归档走这里，#936）+ `x-manox/pinnedChanged`（AHP 无 pin 位；行落在 `x-manox-thread:/<session>`，#842） | A + X |
 | `Leaf` | `createChat{source}` 的 fork 语义；游标本身 → `x-manox/leafChanged`（`x-manox-thread:/<session>`，#842） | A + X |
 | `SubagentChild` | `chat/responsePart{toolCall}` 指向子 `ahp-chat:/`（`ToolResultSubagentContent`） | A |
 | `SubagentProgress` | `chat/backgroundWorkSet{subagent}` + `chat/backgroundWorkRemoved`（1.0 原生面，`chat` 指向子通道；run id 即子会话 id，#874） | A |
@@ -141,7 +141,7 @@ turn id 方案。结论如下，三条证据相互印证：
 `SetBrowserSuite`→无 `session/configChanged` 落点（宿主只认 schema 声明的 session-mutable 三键，浏览器套件不是其中之一；状态行由 `x-manox-work/browserSuitesChanged` 承载）；
 `Compact`→`x-manox/compact`（命令）；`Goal`→`x-manox/goal`（命令；状态落 `x-manox-work/goalChanged`）；
 `StopBackgroundTask`→无落点（曾声明的 `x-manox-work/backgroundTaskStopped` 从未接派发臂、宿主从不发，已随声明面 v5 删除；`not-on-wire`）；
-`ArchiveThread`→`session/isArchivedChanged`；
+`ArchiveThread`→`session/isArchivedChanged`（已附着会话）/ `x-manox/archivedChanged`（批量，catalogue root，#936）；
 `PinThread`→`x-manox/pinnedChanged`；`InsertThreadBefore`/`InsertGroupBefore`→`x-manox/orderChanged`；
 `TerminalInput`/`TerminalResize`→`terminal/input`·`terminal/resized`；`AppendUserMessage`→
 `chat/pendingMessageSet{kind:"queued"}`；`AppendUiNote`→`chat/responsePart{systemNotification}`；

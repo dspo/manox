@@ -13,7 +13,7 @@
 //!   implementation of the turn loop. Anything not wired yet is refused loudly, as
 //!   the trait contract requires: a refused write must never look accepted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -1487,6 +1487,13 @@ fn session_ids_of(value: Option<&Value>) -> Option<Vec<String>> {
         .collect()
 }
 
+/// The ceiling on one `x-manox/archivedChanged` batch. Every id costs the
+/// host a journal entry, a sidecar write and a dispose, and the payload rides
+/// one dispatch frame; a sidebar selection is an order of magnitude below this.
+/// Refused by name rather than truncated, so no caller believes a prefix
+/// landed.
+const MAX_ARCHIVED_BATCH: usize = 1024;
+
 /// Whether the store accounts a row for `session_id`, in either partition —
 /// the same existence the pin write checks.
 fn store_has_row(session_id: &str) -> bool {
@@ -2363,7 +2370,7 @@ impl Backend for RuntimeBackend {
                 // dispatches the batch on the catalogue root it already
                 // holds. All ids are validated before the first write: a
                 // half-applied batch is the worst of both worlds.
-                let Some(ids) = session_ids_of(tag.get("sessions")) else {
+                let Some(mut ids) = session_ids_of(tag.get("sessions")) else {
                     return DispatchOutcome::Rejected(
                         "x-manox/archivedChanged needs a non-empty `sessions` id array".to_string(),
                     );
@@ -2373,6 +2380,16 @@ impl Backend for RuntimeBackend {
                         "x-manox/archivedChanged needs a boolean `archived`".to_string(),
                     );
                 };
+                // The payload is a set: one id named twice is one row and one
+                // decision, not two journal entries for the same flag.
+                let mut seen = HashSet::new();
+                ids.retain(|id| seen.insert(id.clone()));
+                if ids.len() > MAX_ARCHIVED_BATCH {
+                    return DispatchOutcome::Rejected(format!(
+                        "x-manox/archivedChanged accepts at most {MAX_ARCHIVED_BATCH} sessions \
+                         per dispatch"
+                    ));
+                }
                 let unknown: Vec<&str> = ids
                     .iter()
                     .map(String::as_str)
