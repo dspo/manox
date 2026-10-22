@@ -347,7 +347,7 @@ impl AgentTool for PyTool {
                 "script": {
                     "type": "string",
                     "description": "The Python 3 source to run (at most 120 lines). Standard \
-                                    library only — no site-packages, no shell, no TLS. print() \
+                                    library only — no site-packages, no TLS. print() \
                                     is how output is returned."
                 },
                 "cwd": {

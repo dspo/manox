@@ -95,7 +95,9 @@ schemars = { version = "0.8", features = ["derive"] }
 jsonschema = "0.18"
 # RustPython — the Py tool's embedded interpreter (standard library frozen
 # into the binary). TLS stays out on purpose: the tool is for short scripts,
-# and an HTTPS client belongs in Bash. `sqlite3` rides `host_env`.
+# and an HTTPS client belongs in Bash. `sqlite3` is an explicit feature, and it
+# forces `rusqlite` 0.40: rustpython's `libsqlite3-sys` 0.38 cannot share the
+# graph with 0.30 (`links = "sqlite3"`).
 # Cargo.lock pins the republished `rustpython-ruff_*` crates to 0.16.5: 0.16.10
 # moved the AST APIs under rustpython-codegen 0.6.0 and stopped compiling.
 rustpython = { version = "=0.6.0", default-features = false, features = [
