@@ -23,6 +23,7 @@ pub const DEFAULT_BASE_PROMPT: &str = "You are an expert coding assistant operat
 const TOOL_SNIPPETS: &[(&str, &str)] = &[
     ("Read", "Read a file from the filesystem"),
     ("Bash", "Run a shell command"),
+    ("Py", "Run a short Python script (standard library only)"),
     ("Edit", "Edit a file with a patch"),
     ("Write", "Write a file"),
     ("Grep", "Search file contents"),
@@ -66,6 +67,19 @@ pub fn build_harness_prompt(
                 .any(|t| active_tools.contains(&t.to_string()))
         {
             prompt.push_str("\nUse bash for file operations like ls, rg, find\n");
+        }
+        // The Py positioning: more expressive than the file tools, less
+        // ceremony than Bash — and explicitly not a file tool.
+        if active_tools.contains(&"Py".to_string()) {
+            prompt.push_str(
+                "\nWhen a task needs more expressiveness than Read/Write/Edit/Grep/Glob/Ls\n\
+                 but less ceremony than Bash, use the Py tool. Ordinary reads, writes, and\n\
+                 searches still go to Read/Write/Edit/Grep/Glob/Ls first.\n\
+                 For safety, Py exposes only a subset of the Python 3 standard library —\n\
+                 no third-party packages and restricted network access. When you need more\n\
+                 complex expression or the full Python runtime, use Bash with `python3` on\n\
+                 the OS.\n",
+            );
         }
     }
     if !context_files.is_empty() {
@@ -127,7 +141,7 @@ mod tests {
             location: "/proj/skills/review.md".into(),
             content: "Check the diff.".into(),
         }];
-        let tools = vec!["Read".to_string(), "Bash".to_string()];
+        let tools = vec!["Read".to_string(), "Bash".to_string(), "Py".to_string()];
         let prompt = build_harness_prompt(
             DEFAULT_BASE_PROMPT,
             std::path::Path::new("/proj"),
@@ -139,6 +153,13 @@ mod tests {
         assert!(prompt.contains("Current working directory: /proj"));
         assert!(prompt.contains("- Read: Read a file from the filesystem"));
         assert!(prompt.contains("- Bash: Run a shell command"));
+        assert!(prompt.contains("- Py: Run a short Python script (standard library only)"));
+        assert!(
+            prompt.contains(
+                "When a task needs more expressiveness than Read/Write/Edit/Grep/Glob/Ls"
+            ),
+            "the Py positioning is part of the prompt: {prompt}"
+        );
         assert!(prompt.contains(
             "<project_instructions path=\"/proj/CLAUDE.md\">\nKeep changes minimal.\n</project_instructions>"
         ));

@@ -66,5 +66,5 @@ tempfile = "3"
 # `drop_for_test` / `drop_global_for_test`) must come from the feature.
 manox-agent = { path = ".", features = ["test-support"] }
 
-[lints.clippy]
-dbg_macro = "deny"
+[lints]
+workspace = true

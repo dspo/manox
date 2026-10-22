@@ -114,6 +114,8 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`；�
 - **crates/manox-harness/src/ext 扩展**：只经内核拓展点扩展业务能力（provider 自治注册、bash 编排、子代理、session sidecar、model_ref 等），不反向依赖宿主。
 - **manox-agent 宿主**：装配 + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、Plan 模式等）。manox-harness 是唯一 harness 后端（harness 选择 feature 已移除）。
 
+`Py`（内建工具，`core/tools/py.rs`）用 RustPython 在进程内跑短脚本（frozen stdlib、无第三方包、无 TLS、≤120 行）。它**不是文件工具**——常规读写搜归 Read/Write/Edit/Grep/Glob/Ls，提示词与 `description()` 都这么写；它**不自带沙箱**：权限门控在宿主（read-only 整调用拒绝、workspace-write 放行），超时不可抢占（脚本线程被放弃后可能仍在跑），cwd 经进程级 `chdir` 串行设置并在 drop 时恢复。`sqlite` feature 开启（多一份 bundled `libsqlite3-sys`，`rusqlite` 已因此对齐到 0.40）。
+
 ### 能力定层判定（每条新能力开工前必做）
 
 按三分法定层：

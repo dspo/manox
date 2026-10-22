@@ -30,3 +30,6 @@ chrono.workspace = true
 [dev-dependencies]
 ahp-ws.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

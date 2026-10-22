@@ -18,6 +18,7 @@
 
 pub const ASK_USER_QUESTION: &str = "AskUserQuestion";
 pub const BASH: &str = "Bash";
+pub const PY: &str = "Py";
 pub const BASH_OUTPUT: &str = "BashOutput";
 pub const EDIT: &str = "Edit";
 pub const GLOB: &str = "Glob";
