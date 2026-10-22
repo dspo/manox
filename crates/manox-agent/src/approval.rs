@@ -657,6 +657,13 @@ impl ApprovalGatedTool {
                 }
                 Ok(())
             }
+            // Py: a script's write targets are not statically knowable, so
+            // containment cannot be proven the way Write/Edit prove a path.
+            // The session mode is the contract — workspace-write admits the
+            // call (the script inherits the same trust as a Bash call without
+            // a seatbelt to confine it), and read-only never reaches this
+            // arm: `run_gated` refuses the whole call before the verdict.
+            "Py" => Ok(()),
             // Session/repo-scoped coordination (task tools) was removed in
             // the tools-optimization cycle — they were retired with the
             // Steer-based team architecture.
@@ -951,6 +958,37 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    /// Py has no statically knowable target set — a script decides at runtime
+    /// what it touches. The session mode is the verdict: workspace-write
+    /// admits the call, read-only refuses the whole call.
+    #[tokio::test]
+    async fn py_is_admitted_by_mode_not_by_a_target_path() {
+        let (gate, _rx) = gate_with_events();
+        gate.set_mode(PermissionMode::WorkspaceWrite);
+        let (tool, ran) = gated_named("Py", false, false, Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let params = serde_json::json!({"script": "print(1)", "cwd": [""]});
+        let result = tool
+            .execute("c1", params.clone(), CancellationToken::new(), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+        gate.set_mode(PermissionMode::ReadOnly);
+        let err = tool
+            .execute("c2", params, CancellationToken::new(), &ctx)
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::Other(message) => {
+                assert!(message.contains("read-only"), "{message}");
+            }
+            other => panic!("expected the read-only refusal, got {other:?}"),
+        }
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the script never ran");
     }
 
     /// An escalation-approved root widens the fs fence for the rest of the

@@ -459,6 +459,11 @@ pub(super) fn build_tools(
         Arc::new(manox_harness::tools::grep::GrepTool),
         Arc::new(manox_harness::tools::glob::GlobTool),
         Arc::new(manox_harness::tools::ls::LsTool),
+        // Py: a short Python script on the embedded interpreter. It is not a
+        // file tool — the prompt sends ordinary reads/writes/searches to
+        // Read/Write/Edit/Grep/Glob/Ls — and it owns no sandbox: the host
+        // gate's mode is its only fence, exactly like a Bash call.
+        Arc::new(manox_harness::tools::py::PyTool),
         Arc::new(bash),
         Arc::new(BashOutputTool::new(background.clone())),
         Arc::new(HostTaskList {
@@ -502,7 +507,7 @@ pub(super) fn build_tools(
             {
                 wrapper = wrapper.with_auto_allow(Arc::clone(allow));
             }
-            if matches!(name.as_str(), "Write" | "Edit" | "TaskStop") {
+            if matches!(name.as_str(), "Write" | "Edit" | "TaskStop" | "Py") {
                 wrapper = wrapper.with_escalation(
                     Arc::clone(&escalation_approver),
                     Arc::clone(&standing_resolver),
@@ -754,6 +759,10 @@ pub(super) fn build_tools(
         Arc::new(manox_harness::tools::grep::GrepTool),
         Arc::new(manox_harness::tools::glob::GlobTool),
         Arc::new(manox_harness::tools::ls::LsTool),
+        // A subagent's Py is the same in-process script runner: it declares
+        // no approval of its own, so the delegated auto-deny gate lets it
+        // through and the child's snapshot stays at parity with the Captain.
+        Arc::new(manox_harness::tools::py::PyTool),
         Arc::new(SubagentBashTool {
             inner: Arc::new(
                 manox_harness::bash::BashTool::new(

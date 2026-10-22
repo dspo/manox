@@ -506,6 +506,22 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
         // Code carries a code body as its argument: the bare name keeps the
         // body out of the header.
         "Code" => "Code".to_string(),
+        // Py carries a script body: the header names its first line so the
+        // card shows intent instead of a wall of code.
+        "Py" => {
+            let first = arg("script").and_then(|script| {
+                script
+                    .lines()
+                    .next()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+            });
+            match first {
+                Some(line) => format!("Py {}", short_value(&line, 40)),
+                None => "Py".to_string(),
+            }
+        }
         "ProposePlan" => match arg("title").or_else(|| arg("slug")) {
             Some(label) => format!("ProposePlan {label}"),
             None => "ProposePlan".to_string(),
@@ -923,6 +939,16 @@ mod tests {
         assert_eq!(tool_title("Skill", &json!({"skill": "gpui"})), "Skill gpui");
         // Code keeps the bare name — its argument is a code body.
         assert_eq!(tool_title("Code", &json!({"code": "let x = 1;"})), "Code");
+        // Py names its first line; the body never rides the card header.
+        assert_eq!(
+            tool_title(
+                "Py",
+                &json!({"script": "import json\nprint(json.dumps({}))"})
+            ),
+            "Py import json"
+        );
+        assert_eq!(tool_title("Py", &json!({"script": "\n  "})), "Py");
+        assert_eq!(tool_title("Py", &json!({})), "Py");
 
         assert_eq!(
             tool_title("ProposePlan", &json!({"slug": "s", "title": "My Plan"})),
