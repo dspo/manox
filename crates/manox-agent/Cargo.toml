@@ -72,5 +72,5 @@ tempfile = "3"
 # `chrome-use` keeps the chrome_use module and its live tests in the suite.
 manox-agent = { path = ".", features = ["test-support", "chrome-use"] }
 
-[lints.clippy]
-dbg_macro = "deny"
+[lints]
+workspace = true

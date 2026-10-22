@@ -80,3 +80,6 @@ ws-gateway = ["dep:axum", "manox-ahp/axum-ws"]
 # request. Opting out turns the requests into refusals and keeps rmcp out of
 # lean builds entirely.
 mcp = ["manox-agent/mcp", "manox-ahp-runtime/mcp"]
+
+[lints]
+workspace = true

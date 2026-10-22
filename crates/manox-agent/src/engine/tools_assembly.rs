@@ -459,6 +459,13 @@ pub(super) fn build_tools(
         Arc::new(manox_harness::tools::grep::GrepTool),
         Arc::new(manox_harness::tools::glob::GlobTool),
         Arc::new(manox_harness::tools::ls::LsTool),
+        // Py: a short Python script on the embedded interpreter. It is not a
+        // file tool — the prompt sends ordinary reads/writes/searches to
+        // Read/Write/Edit/Grep/Glob/Ls — and it owns no sandbox: unlike
+        // sandbox-confined Bash it has no OS fence to ride, so the gate
+        // fails it closed in workspace-write and an approved escalation is
+        // its only wider road.
+        Arc::new(manox_harness::tools::py::PyTool),
         Arc::new(bash),
         Arc::new(BashOutputTool::new(background.clone())),
         Arc::new(HostTaskList {
@@ -502,7 +509,13 @@ pub(super) fn build_tools(
             {
                 wrapper = wrapper.with_auto_allow(Arc::clone(allow));
             }
-            if matches!(name.as_str(), "Write" | "Edit" | "TaskStop") {
+            if matches!(
+                name.as_str(),
+                crate::tools::WRITE
+                    | crate::tools::EDIT
+                    | crate::tools::TASK_STOP
+                    | crate::tools::PY
+            ) {
                 wrapper = wrapper.with_escalation(
                     Arc::clone(&escalation_approver),
                     Arc::clone(&standing_resolver),
@@ -754,6 +767,12 @@ pub(super) fn build_tools(
         Arc::new(manox_harness::tools::grep::GrepTool),
         Arc::new(manox_harness::tools::glob::GlobTool),
         Arc::new(manox_harness::tools::ls::LsTool),
+        // Py is deliberately absent from the child snapshot: the interpreter
+        // runs in-process with no OS sandbox, so the only fence is the
+        // host-side escalation round trip — which a subagent cannot make
+        // (its `never` gate auto-denies approval-bearing calls, and its
+        // tools carry no escalation fields). A Py the child could see but
+        // only ever lose a turn on is worse than no Py at all.
         Arc::new(SubagentBashTool {
             inner: Arc::new(
                 manox_harness::bash::BashTool::new(

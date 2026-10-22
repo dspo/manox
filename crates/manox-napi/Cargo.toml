@@ -27,6 +27,9 @@ serde_json.workspace = true
 
 [build-dependencies]
 napi-build = "2"
+
+[lints]
+workspace = true
 [features]
 # Full runtime by default — the same capability set as the gpui app. Embedders
 # that want a lean addon (the VS Code extension: no MCP, no terminal

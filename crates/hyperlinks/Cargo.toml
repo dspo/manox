@@ -6,5 +6,5 @@ publish.workspace = true
 
 [dependencies]
 
-[lints.clippy]
-dbg_macro = "deny"
+[lints]
+workspace = true
