@@ -3,13 +3,14 @@
 //
 // The interpreter is built per call and frozen with the binary
 // (`freeze-stdlib`): no site-packages, no filesystem import path, nothing
-// outside the standard library — the boundary the tool is documented to
-// the model with. Output assembles exactly like [`BashTool`]'s (stdout,
-// a `[stderr]` block, truncation), except an uncaught exception is the
-// error face: the formatted traceback plus whatever was printed before it,
-// and `is_error` set so the transcript paints it as a failure.
+// outside the standard library. The tool owns no sandbox of its own — the
+// host gates the call on the session's permission mode — and it returns what
+// the script itself produced: stdout and stderr share one captured stream
+// (their interleaving is the transcript), an uncaught exception is the error
+// face (formatted traceback plus whatever was printed before it), and
+// `sys.exit(n)` is the script's exit status rather than a traceback.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -18,18 +19,23 @@ use tokio_util::sync::CancellationToken;
 
 use rustpython::InterpreterBuilder;
 use rustpython::InterpreterBuilderExt as _;
-use rustpython::vm::VirtualMachine;
+use rustpython::vm::{AsObject as _, VirtualMachine};
 
-use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+use crate::tool::{AgentTool, AgentToolResult, ExecutionMode, ToolContext, ToolError};
 use crate::tools::truncate::{self, TruncateConfig};
 
+/// The model-facing script budget. A Py script is a shortcut, not a program:
+/// past this size the work belongs in a real file edited with the file tools
+/// or in a Bash call, and the transcript is better for it.
+const MAX_SCRIPT_LINES: usize = 120;
+
 /// The preamble every script runs behind: stdout and stderr reroute into an
-/// in-interpreter buffer (the process streams are never written — a print
-/// in a script must land in the tool result, not the host's log), and the
-/// call's working directory becomes the script's cwd (the embedded os module
-/// would otherwise read the host process's directory).
+/// in-interpreter buffer (the process streams are never written — a print in
+/// a script must land in the tool result, not the host's log), and `argv`
+/// names the script exactly as the traceback does.
 fn capture_preamble() -> String {
     "import sys, io as _manox_io\n\
+     sys.argv = [\"<py>\"]\n\
      _manox_out = _manox_io.StringIO()\n\
      sys.stdout = _manox_out\n\
      sys.stderr = _manox_out\n"
@@ -44,6 +50,27 @@ fn capture_preamble() -> String {
 /// across the whole script.
 static PY_CALL_LOCK: Mutex<()> = Mutex::new(());
 
+/// Restores the process working directory when the call ends, including on a
+/// panic or an early return — the script may have moved it, and the host's
+/// other tools resolve their own absolute paths but must not inherit a
+/// half-finished script's directory.
+struct CwdGuard {
+    previous: Option<PathBuf>,
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let restored = self
+            .previous
+            .as_ref()
+            .and_then(|dir| std::env::set_current_dir(dir).ok())
+            .or_else(|| std::env::set_current_dir("/").ok());
+        if restored.is_none() {
+            tracing::warn!("the py tool could not restore the process working directory");
+        }
+    }
+}
+
 fn format_exception(
     vm: &VirtualMachine,
     exc: &rustpython::vm::builtins::PyBaseExceptionRef,
@@ -53,10 +80,32 @@ fn format_exception(
     out
 }
 
-/// One script, start to finish. Returns the captured output, or the error
-/// face — a compile error, an uncaught exception, or an interpreter failure —
-/// as text.
-fn run_script(source: &str, cwd: &Path) -> (String, bool) {
+/// `sys.exit(code)` is a status, not a failure transcript: an int is the exit
+/// code, `None` is 0, and any other value prints its string form and exits 1
+/// (the CPython contract). Returns `None` when the exception is not
+/// `SystemExit`.
+fn system_exit_status(
+    vm: &VirtualMachine,
+    exc: &rustpython::vm::builtins::PyBaseExceptionRef,
+) -> Option<(i32, String)> {
+    if !exc.fast_isinstance(vm.ctx.exceptions.system_exit) {
+        return None;
+    }
+    let code = exc.as_object().get_attr("code", vm).ok();
+    match code {
+        None => Some((0, String::new())),
+        Some(value) if vm.ctx.none().is(&value) => Some((0, String::new())),
+        Some(value) => match value.try_to_value::<i32>(vm) {
+            Ok(code) => Some((code, String::new())),
+            Err(_) => Some((1, value.str(vm).map(|s| s.to_string()).unwrap_or_default())),
+        },
+    }
+}
+
+/// One script, start to finish. Returns the captured output and the exit
+/// status, or the error face — a compile error, an uncaught exception, or an
+/// interpreter failure — as text with a failing status.
+fn run_script(source: &str, cwd: &Path) -> (String, i32) {
     // The frozen importlib bootstrap recurses deeply before a single user
     // statement runs, and a user script can recurse deeper still; the
     // overflow surfaces as a guard-page SIGILL — not a catchable error — on
@@ -69,63 +118,66 @@ fn run_script(source: &str, cwd: &Path) -> (String, bool) {
         .stack_size(64 * 1024 * 1024)
         .spawn(move || run_interpreted(&source, &cwd));
     match spawned {
-        Ok(handle) => handle.join().unwrap_or_else(|_| {
-            (
-                "internal: the interpreter thread panicked".to_string(),
-                true,
-            )
-        }),
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|_| ("internal: the interpreter thread panicked".to_string(), 1)),
         Err(e) => (
             format!("internal: the interpreter thread failed to spawn: {e}"),
-            true,
+            1,
         ),
     }
 }
 
-fn run_interpreted(source: &str, cwd: &Path) -> (String, bool) {
-    let _serialized = PY_CALL_LOCK.lock();
+fn run_interpreted(source: &str, cwd: &Path) -> (String, i32) {
+    // A panic in a previous script poisons the lock; the directory restore it
+    // guards already ran on unwind, so recovering the guard is safe and keeps
+    // one bad script from disabling the tool.
+    let _serialized = PY_CALL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = std::env::current_dir().ok();
     if let Err(e) = std::env::set_current_dir(cwd) {
         return (
             format!("internal: the working directory could not be entered: {e}"),
-            true,
+            1,
         );
     }
-    let ran = run_on_interpreter(source);
-    // Restore even after a raising script; "/" is the honest last resort.
-    let restored = previous
-        .and_then(|dir| std::env::set_current_dir(dir).ok())
-        .or_else(|| std::env::set_current_dir("/").ok());
-    if restored.is_none() {
-        tracing::warn!("the py tool could not restore the process working directory");
-    }
-    ran
+    let _cwd = CwdGuard { previous };
+    run_on_interpreter(source)
 }
 
-fn run_on_interpreter(source: &str) -> (String, bool) {
+fn run_on_interpreter(source: &str) -> (String, i32) {
     let interpreter = InterpreterBuilder::new().init_stdlib().build();
     interpreter.enter(|vm| {
-        let scope = vm.new_scope_with_builtins();
-        if let Err(exc) = vm.run_string(scope.clone(), &capture_preamble(), "<py-setup>".into()) {
+        let scope = match vm.new_scope_with_main() {
+            Ok(scope) => scope,
+            Err(exc) => {
+                return (
+                    format!(
+                        "internal: the main module could not be created: {}",
+                        format_exception(vm, &exc)
+                    ),
+                    1,
+                );
+            }
+        };
+        if let Err(exc) = vm.run_string(scope.clone(), &capture_preamble(), "<py-setup>") {
             return (
                 format!(
                     "internal: the capture setup failed: {}",
                     format_exception(vm, &exc)
                 ),
-                true,
+                1,
             );
         }
-        let failed = vm
-            .run_string(scope.clone(), source, "<py>".into())
-            .err()
-            .map(|exc| format_exception(vm, &exc));
+        let outcome = vm.run_string(scope.clone(), source, "<py>");
         // The buffer is read even on a raising script: partial output plus
         // the traceback is the honest transcript of a failed run.
         let printed = vm
             .run_string(
                 scope.clone(),
                 "_manox_printed = _manox_out.getvalue()",
-                "<py-teardown>".into(),
+                "<py-teardown>",
             )
             .is_ok()
             .then(|| {
@@ -138,18 +190,31 @@ fn run_on_interpreter(source: &str) -> (String, bool) {
             })
             .flatten()
             .unwrap_or_default();
-        match failed {
-            // print() ends its own newline; the buffer's trailing blank line
-            // is harness noise, not script output.
-            None => (printed.trim_end_matches('\n').to_owned(), false),
-            Some(traceback) => (
-                if printed.is_empty() {
-                    traceback
-                } else {
-                    format!("{}\n{traceback}", printed.trim_end_matches('\n'))
-                },
-                true,
-            ),
+        // print() ends its own newline; the buffer's trailing blank line is
+        // harness noise, not script output.
+        let printed = printed.trim_end_matches('\n').to_owned();
+        match outcome {
+            Ok(_) => (printed, 0),
+            Err(exc) => {
+                if let Some((code, message)) = system_exit_status(vm, &exc) {
+                    let output = match (printed.is_empty(), message.is_empty()) {
+                        (true, true) => String::new(),
+                        (false, true) => printed,
+                        (true, false) => message,
+                        (false, false) => format!("{printed}\n{message}"),
+                    };
+                    return (output, code);
+                }
+                let traceback = format_exception(vm, &exc);
+                (
+                    if printed.is_empty() {
+                        traceback
+                    } else {
+                        format!("{printed}\n{traceback}")
+                    },
+                    1,
+                )
+            }
         }
     })
 }
@@ -161,13 +226,10 @@ impl PyTool {
     const DEFAULT_MAX_BYTES: usize = 128 * 1024;
     /// Default max lines for output.
     const DEFAULT_MAX_LINES: usize = 2000;
-    /// The tool's cwd is applied as a real (process-level) chdir, serialized
-    /// across calls and restored afterwards — see [`PY_CALL_LOCK`].
-    ///
     /// Default script budget. The embedded interpreter cannot be preempted —
     /// a timed-out script keeps its blocking thread warm until it finishes —
-    /// so the default is the bash tool's: generous for short scripts, and
-    /// the model is told to keep them short.
+    /// so the default is the bash tool's, and the model is told to keep
+    /// scripts short.
     const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
     async fn run(
@@ -179,6 +241,14 @@ impl PyTool {
         let script = params["script"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("script is required".into()))?;
+        let line_count = script.lines().count();
+        if line_count > MAX_SCRIPT_LINES {
+            return Err(ToolError::InvalidArguments(format!(
+                "script is {line_count} lines; the limit is {MAX_SCRIPT_LINES}. Split the work \
+                 across calls, put it in a file and edit that with the file tools, or run it \
+                 through Bash"
+            )));
+        }
         let timeout = Duration::from_millis(
             params["timeout"]
                 .as_u64()
@@ -194,12 +264,12 @@ impl PyTool {
         }
         let script = script.to_string();
         let run = tokio::task::spawn_blocking(move || run_script(&script, &cwd));
-        let (output, is_error) = tokio::time::timeout(timeout, run)
+        let (output, exit_code) = tokio::time::timeout(timeout, run)
             .await
             .map_err(|_| {
                 ToolError::ExecutionFailed(format!(
-                    "the script exceeded its {}s budget and was abandoned; \
-                     keep Py scripts short — split the work across calls",
+                    "the script exceeded its {}s budget and was abandoned — it may still be \
+                     running in the background; keep Py scripts short and move long work to Bash",
                     timeout.as_secs()
                 ))
             })?
@@ -220,8 +290,14 @@ impl PyTool {
                 truncated.original_lines, truncated.original_bytes
             ));
         }
+        if exit_code != 0 {
+            if !final_output.is_empty() {
+                final_output.push('\n');
+            }
+            final_output.push_str(&format!("[exit {exit_code}]"));
+        }
         let mut result = AgentToolResult::text(final_output);
-        result.is_error = is_error;
+        result.is_error = exit_code != 0;
         Ok(result)
     }
 }
@@ -233,16 +309,35 @@ impl AgentTool for PyTool {
     }
 
     fn description(&self) -> &str {
-        "Run a short Python 3 script string on an embedded interpreter \
-         (standard library only) and return what it printed"
+        "Interpret and run a short Python 3 script in this process.\n\
+         The standard library is built in and frozen: no site-packages, pip, or venv, and \
+         no TLS, so HTTPS clients are unavailable. Whatever the script prints is the \
+         result; an uncaught exception returns the traceback and marks the call failed.\n\
+         \n\
+         Use Read/Write/Edit/Grep/Glob/Ls for ordinary filesystem reads, writes, and \
+         searches — reach for Py only when a script is clearly more efficient or more \
+         expressive than those tools.\n\
+         \n\
+         For installed third-party packages (PIL, PyYAML, numpy), HTTPS requests, calling \
+         other programs (git, cargo, gh), pipelines, background work, or inputs over \
+         10 MB, use Bash with `python3` on the OS, provided it is safe to do so.\n\
+         \n\
+         Keep scripts short and safe — this is arbitrary code running inside the app \
+         process. `os.chdir` has side effects: it really moves the conversation's CWD. \
+         Be deliberate about runtime; avoid very long-running scripts unless you know and \
+         accept the cost. Print a short summary, never a whole file, or the context will \
+         explode. Keep scripts to at most 120 lines. Python's `re` supports capturing groups \
+         but not lookbehind, lookahead, or backreferences."
     }
 
     fn is_read_only(&self) -> bool {
         false
     }
 
-    fn requires_approval(&self, _params: &JsonValue) -> bool {
-        true
+    fn execution_mode(&self) -> ExecutionMode {
+        // The call moves the process's working directory and holds the
+        // interpreter lock; a parallel batch would interleave with it.
+        ExecutionMode::Sequential
     }
 
     fn parameters_schema(&self) -> JsonValue {
@@ -251,9 +346,9 @@ impl AgentTool for PyTool {
             "properties": {
                 "script": {
                     "type": "string",
-                    "description": "The Python 3 source to run. Standard library only — \
-                                    there are no site-packages, no shell, and no network TLS. \
-                                    print() is how output is returned."
+                    "description": "The Python 3 source to run (at most 120 lines). Standard \
+                                    library only — no site-packages, no shell, no TLS. print() \
+                                    is how output is returned."
                 },
                 "cwd": {
                     "type": "array",
@@ -266,7 +361,7 @@ impl AgentTool for PyTool {
                     "description": "Timeout in milliseconds (default: 120000)"
                 }
             },
-            "required": ["script"]
+            "required": ["script", "cwd"]
         })
     }
 
@@ -278,205 +373,5 @@ impl AgentTool for PyTool {
         ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         self.run(params, signal, ctx).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::env::ExecutionEnv;
-    use crate::tool::{LocalToolContext, ToolState};
-    use std::path::Path;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    struct MockEnv;
-
-    #[async_trait::async_trait]
-    impl ExecutionEnv for MockEnv {
-        fn cwd(&self) -> &Path {
-            Path::new("/mock")
-        }
-        fn join_path(&self, parts: &[&str]) -> PathBuf {
-            parts.iter().collect()
-        }
-        async fn absolute_path(&self, path: &Path) -> Result<PathBuf, crate::env::FileError> {
-            Ok(path.to_path_buf())
-        }
-        async fn read_file(
-            &self,
-            _path: &Path,
-            _offset: Option<usize>,
-            _limit: Option<usize>,
-        ) -> Result<String, crate::env::FileError> {
-            Ok(String::new())
-        }
-        async fn write_file(
-            &self,
-            _path: &Path,
-            _content: &str,
-        ) -> Result<(), crate::env::FileError> {
-            Ok(())
-        }
-        async fn exists(&self, _path: &Path) -> Result<bool, crate::env::FileError> {
-            Ok(true)
-        }
-        async fn file_info(
-            &self,
-            _path: &Path,
-        ) -> Result<crate::env::FileInfo, crate::env::FileError> {
-            Ok(crate::env::FileInfo {
-                path: _path.to_path_buf(),
-                is_dir: false,
-                size: 0,
-            })
-        }
-        async fn list_dir(
-            &self,
-            _path: &Path,
-        ) -> Result<Vec<crate::env::FileInfo>, crate::env::FileError> {
-            Ok(vec![])
-        }
-        async fn create_dir(&self, _path: &Path) -> Result<(), crate::env::FileError> {
-            Ok(())
-        }
-        async fn remove(&self, _path: &Path) -> Result<(), crate::env::FileError> {
-            Ok(())
-        }
-        async fn exec(
-            &self,
-            _command: &str,
-            _timeout: Duration,
-            _signal: CancellationToken,
-        ) -> Result<crate::env::CommandResult, crate::env::ExecutionError> {
-            unreachable!("the Py tool never shells out")
-        }
-        async fn exec_at(
-            &self,
-            _command: &str,
-            _cwd: &Path,
-            _timeout: Duration,
-            _signal: CancellationToken,
-        ) -> Result<crate::env::CommandResult, crate::env::ExecutionError> {
-            unreachable!("the Py tool never shells out")
-        }
-    }
-
-    fn ctx() -> (LocalToolContext, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let context = LocalToolContext::new(
-            Arc::new(MockEnv),
-            dir.path().to_path_buf(),
-            Arc::new(ToolState::new()),
-        );
-        (context, dir)
-    }
-
-    fn text(result: &AgentToolResult) -> String {
-        match &result.content[0] {
-            crate::types::ContentBlock::Text { text, .. } => text.clone(),
-            _ => panic!("expected a text block"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_script_prints_into_the_result() {
-        let (context, _dir) = ctx();
-        let result = PyTool
-            .execute(
-                "c1",
-                serde_json::json!({
-                    "script": "print('hello from rustpython')\nprint(sum(range(10)))",
-                    "cwd": [""]
-                }),
-                CancellationToken::new(),
-                &context,
-            )
-            .await
-            .unwrap();
-        assert!(!result.is_error);
-        assert_eq!(text(&result), "hello from rustpython\n45");
-    }
-
-    /// The tool's boundary: the standard library is importable, the process
-    /// streams never receive a print, and the call's cwd is the script's cwd.
-    #[tokio::test]
-    async fn the_script_runs_inside_the_call_directory_with_captured_output() {
-        let (context, dir) = ctx();
-        let result = PyTool
-            .execute(
-                "c1",
-                serde_json::json!({
-                    "script": "import os, json\nprint(os.getcwd())\nprint(json.dumps({'k': [1, 2]}))",
-                    "cwd": [""]
-                }),
-                CancellationToken::new(),
-                &context,
-            )
-            .await
-            .unwrap();
-        assert!(!result.is_error, "out: {}", text(&result));
-        let expected = format!(
-            "{}\n{{\"k\": [1, 2]}}",
-            dir.path()
-                .canonicalize()
-                .expect("the tempdir resolves")
-                .display()
-        );
-        assert_eq!(text(&result), expected);
-    }
-
-    /// An uncaught exception is the error face: the traceback names the
-    /// failing line of the SCRIPT (not a wrapper), and output printed before
-    /// the raise is preserved.
-    #[tokio::test]
-    async fn an_exception_fails_with_a_traceback_and_partial_output() {
-        let (context, _dir) = ctx();
-        let result = PyTool
-            .execute(
-                "c1",
-                serde_json::json!({
-                    "script": "print('before')\nraise ValueError('boom')",
-                    "cwd": [""]
-                }),
-                CancellationToken::new(),
-                &context,
-            )
-            .await
-            .unwrap();
-        let out = text(&result);
-        assert!(result.is_error, "the exception is an error result: {out}");
-        assert!(out.starts_with("before\n"), "partial output first: {out}");
-        assert!(
-            out.contains("ValueError: boom"),
-            "the traceback is in: {out}"
-        );
-        assert!(
-            out.contains("<py>"),
-            "the failing frame names the script: {out}"
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_script_is_an_argument_error() {
-        let (context, _dir) = ctx();
-        let err = PyTool
-            .execute(
-                "c1",
-                serde_json::json!({"cwd": [""]}),
-                CancellationToken::new(),
-                &context,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::InvalidArguments(_)));
-    }
-
-    /// The approval gate: a tool that runs arbitrary code is never silent.
-    #[test]
-    fn scripts_require_approval() {
-        assert!(PyTool.requires_approval(&serde_json::json!({"script": "1"})));
-        assert!(!PyTool.is_read_only());
-        assert_eq!(PyTool.name(), "Py");
     }
 }

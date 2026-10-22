@@ -80,3 +80,8 @@ ws-gateway = ["dep:axum", "manox-ahp/axum-ws"]
 # request. Opting out turns the requests into refusals and keeps rmcp out of
 # lean builds entirely.
 mcp = ["manox-agent/mcp", "manox-ahp-runtime/mcp"]
+
+# ld64's "`__eh_frame` section too large" is a compact-unwind capacity note for
+# debug binaries that link the embedded interpreter — not a code defect.
+[lints.rust]
+linker_messages = "allow"

@@ -46,3 +46,8 @@ ws-gateway = ["dep:axum", "manox-ahp/axum-ws"]
 manox-terminal.workspace = true
 manox-agent = { workspace = true, features = ["test-support"] }
 tempfile = "3"
+
+# ld64's "`__eh_frame` section too large" is a compact-unwind capacity note for
+# debug binaries that link the embedded interpreter — not a code defect.
+[lints.rust]
+linker_messages = "allow"

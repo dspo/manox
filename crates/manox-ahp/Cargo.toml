@@ -30,3 +30,8 @@ chrono.workspace = true
 [dev-dependencies]
 ahp-ws.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+# ld64's "`__eh_frame` section too large" is a compact-unwind capacity note for
+# debug binaries that link the embedded interpreter — not a code defect.
+[lints.rust]
+linker_messages = "allow"
