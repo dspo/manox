@@ -19,7 +19,7 @@
 //!
 //! This tool carries no cookies, no login state, and no JS execution — for
 //! anything behind auth or rendered by client-side JS, use the browser tools
-//! (`ChromeUse*`, when enabled). Fetched content is external, untrusted data;
+//! (`WebExplore*`, when enabled). Fetched content is external, untrusted data;
 //! the rendered output says so on its first line.
 
 mod core;
@@ -90,7 +90,7 @@ impl AgentTool for WebFetchTool {
          deployment policy. Pass `prompt` to have the content distilled into a \
          one-shot answer instead of reading the full body. No JS execution, no \
          cookies or login state — for JS-rendered or auth-gated pages use the \
-         browser tools (ChromeUse*, when enabled)."
+         browser tools (WebExplore*, when enabled)."
     }
 
     fn is_read_only(&self) -> bool {

@@ -2048,7 +2048,7 @@ impl Thread {
         }
     }
 
-    /// Toggle an opt-in browser tool suite (ChromeUse / WebExplore) on or off.
+    /// Toggle an opt-in browser tool suite (WebExplore) on or off.
     pub fn set_browser_suite(&mut self, suite: crate::engine::BrowserSuite, enable: bool) {
         self.browser_suites_explicitly_set = true;
         let changed = if enable {
@@ -3946,12 +3946,12 @@ pub(crate) mod tests {
         crate::provider_glue::init_for_test();
         let thread = Thread::landing(PathBuf::from("/tmp"));
         thread.with_mut(|t| {
-            t.set_browser_suite(crate::engine::BrowserSuite::ChromeUse, true);
+            t.set_browser_suite(crate::engine::BrowserSuite::WebExplore, true);
         });
         thread.read(|t| {
             assert_eq!(
                 t.browser_suites().to_vec(),
-                vec![crate::engine::BrowserSuite::ChromeUse]
+                vec![crate::engine::BrowserSuite::WebExplore]
             );
         });
     }
@@ -3967,7 +3967,7 @@ pub(crate) mod tests {
             model: None,
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
-            browser_suites: vec![crate::engine::BrowserSuite::ChromeUse],
+            browser_suites: vec![crate::engine::BrowserSuite::WebExplore],
             plan_mode: false,
             plan_file: None,
             plan_review_pending: false,
@@ -3980,7 +3980,7 @@ pub(crate) mod tests {
         thread.read(|t| {
             assert_eq!(
                 t.browser_suites().to_vec(),
-                vec![crate::engine::BrowserSuite::ChromeUse]
+                vec![crate::engine::BrowserSuite::WebExplore]
             );
         });
     }
@@ -3988,6 +3988,8 @@ pub(crate) mod tests {
     /// A toggle since construction outranks the `Ready` projection: the
     /// queued engine command has not settled when Ready lands, so the
     /// projection cannot know about it and must not clobber the mirror.
+    /// The projection carries the empty set — the only value distinct from
+    /// the toggled suite — to prove the mirror wins.
     #[tokio::test]
     async fn explicit_browser_suite_toggle_outranks_ready_projection() {
         let thread = thread_with_engine(HistoryPhase::Ready, Arc::new(FakeEngine::new()));
@@ -4000,7 +4002,7 @@ pub(crate) mod tests {
             model: None,
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
-            browser_suites: vec![crate::engine::BrowserSuite::ChromeUse],
+            browser_suites: vec![],
             plan_mode: false,
             plan_file: None,
             plan_review_pending: false,

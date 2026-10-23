@@ -170,7 +170,7 @@ pub trait ThreadEngine: Send + Sync {
     /// Toggle plan mode (persisted sidecar + hooks + instructions).
     fn set_plan_mode(&self, _enabled: bool) {}
 
-    /// Toggle an opt-in browser tool suite (ChromeUse / WebExplore) on or off.
+    /// Toggle an opt-in browser tool suite (WebExplore) on or off.
     fn set_browser_suite(&self, _suite: crate::engine::BrowserSuite, _enable: bool) {}
 
     /// Persist whether a plan review card is pending (restore re-surfaces it).

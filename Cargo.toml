@@ -121,16 +121,6 @@ lsp-types = "0.97"
 toml = "0.8"
 http = "1"
 
-# rustwright-core — ChromeUse's in-process Chromium CDP engine (Rust rewrite
-# of Playwright's automation core; no driver subprocess, fits the
-# single-binary deliverable). default-features = false strips the `python`
-# feature (PyO3). The dep key carries the crate's Rust identifier: its lib
-# target is `_rustwright` (the PyO3 module name), so `rustwright-core` would
-# be unusable as a path prefix. Alpha crate: pinned by rev, upgraded
-# deliberately; switch back to the crates.io index version once a release
-# catches up with main.
-rustwright_core = { package = "rustwright-core", git = "https://github.com/Skyvern-AI/rustwright.git", rev = "af71449ea25ad45b1028581edefab1f523f9550d", default-features = false }
-
 # tera —— prompt 模板引擎。所有模型可见提示词以纯文本 .tera.md 维护，仅在
 # 统一边界（prompt::render）一次性渲染。业务流程只构造强类型 data/draft，不拼字符串。
 tera = "2"

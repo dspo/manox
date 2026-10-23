@@ -4,15 +4,12 @@
 use super::*;
 
 #[test]
-fn default_active_tool_names_excludes_browser_suites() {
-    // The default active set keeps every non-browser tool and drops both
-    // opt-in suites, so browser tools never ride the default system prompt.
-    let tools: Vec<Arc<dyn HarnessAgentTool>> = vec![
-        Arc::new(crate::chrome_use::ChromeUseOpenTool) as Arc<dyn HarnessAgentTool>,
-        Arc::new(crate::web_tools::WebExploreOpenTool::new(
-            tokio::sync::mpsc::unbounded_channel().0,
-        )),
-    ];
+fn default_active_tool_names_excludes_the_browser_suite() {
+    // The default active set keeps every non-browser tool and drops the
+    // opt-in suite, so browser tools never ride the default system prompt.
+    let tools: Vec<Arc<dyn HarnessAgentTool>> = vec![Arc::new(
+        crate::web_tools::WebExploreOpenTool::new(tokio::sync::mpsc::unbounded_channel().0),
+    ) as Arc<dyn HarnessAgentTool>];
     let default_names = default_active_tool_names(&tools);
     assert!(default_names.is_empty(), "{default_names:?}");
 }
@@ -21,17 +18,20 @@ fn default_active_tool_names_excludes_browser_suites() {
 fn toggle_browser_suite_enable_merges_into_default_set() {
     // P0 regression: activating a suite against the default set must ADD
     // the suite's tools, not replace the defaults. Starting from the
-    // default (non-browser) set, enabling ChromeUse yields defaults + the
-    // ChromeUse suite — the defaults survive.
+    // default (non-browser) set, enabling WebExplore yields defaults + the
+    // WebExplore suite — the defaults survive.
     let defaults = vec!["Read".to_string(), "Bash".to_string(), "Edit".to_string()];
-    let merged =
-        toggle_browser_suite_names(defaults.clone(), BrowserSuite::ChromeUse.tool_names(), true);
+    let merged = toggle_browser_suite_names(
+        defaults.clone(),
+        BrowserSuite::WebExplore.tool_names(),
+        true,
+    );
     // Every default survives.
     for name in &defaults {
         assert!(merged.contains(name), "default {name} lost: {merged:?}");
     }
-    // Every ChromeUse tool is present.
-    for name in BrowserSuite::ChromeUse.tool_names() {
+    // Every WebExplore tool is present.
+    for name in BrowserSuite::WebExplore.tool_names() {
         assert!(
             merged.iter().any(|n| n == name),
             "suite tool {name} missing: {merged:?}"
@@ -39,7 +39,7 @@ fn toggle_browser_suite_enable_merges_into_default_set() {
     }
     assert_eq!(
         merged.len(),
-        defaults.len() + BrowserSuite::ChromeUse.tool_names().len()
+        defaults.len() + BrowserSuite::WebExplore.tool_names().len()
     );
 }
 
@@ -56,20 +56,16 @@ fn toggle_browser_suite_enable_is_idempotent() {
 }
 
 #[test]
-fn toggle_browser_suite_disable_strips_only_that_suite() {
-    // Start with defaults + both suites; disabling ChromeUse removes only
-    // the ChromeUse tools, leaving defaults + WebExplore intact.
+fn toggle_browser_suite_disable_strips_exactly_the_suite() {
+    // Disabling the suite removes exactly its tools; non-suite tools in the
+    // resolved set survive.
     let mut names = vec!["Read".to_string(), "Bash".to_string()];
-    names = toggle_browser_suite_names(names, BrowserSuite::ChromeUse.tool_names(), true);
     names = toggle_browser_suite_names(names, BrowserSuite::WebExplore.tool_names(), true);
-    let stripped = toggle_browser_suite_names(names, BrowserSuite::ChromeUse.tool_names(), false);
+    let stripped = toggle_browser_suite_names(names, BrowserSuite::WebExplore.tool_names(), false);
     assert!(stripped.contains(&"Read".to_string()));
     assert!(stripped.contains(&"Bash".to_string()));
-    for name in BrowserSuite::ChromeUse.tool_names() {
-        assert!(!stripped.iter().any(|n| n == name), "{name} should be gone");
-    }
     for name in BrowserSuite::WebExplore.tool_names() {
-        assert!(stripped.iter().any(|n| n == name), "{name} should survive");
+        assert!(!stripped.iter().any(|n| n == name), "{name} should be gone");
     }
 }
 
@@ -80,21 +76,13 @@ fn project_browser_suites_requires_the_full_suite_active() {
     let defaults = vec!["Read".to_string(), "Bash".to_string()];
     assert!(project_browser_suites(&defaults).is_empty());
 
-    let partial: Vec<String> = BrowserSuite::ChromeUse.tool_names()[..3]
+    let partial: Vec<String> = BrowserSuite::WebExplore.tool_names()[..3]
         .iter()
         .map(|s| s.to_string())
         .collect();
     assert!(project_browser_suites(&partial).is_empty());
 
     let mut full = defaults.clone();
-    full.extend(
-        BrowserSuite::ChromeUse
-            .tool_names()
-            .iter()
-            .map(|s| s.to_string()),
-    );
-    assert_eq!(project_browser_suites(&full), vec![BrowserSuite::ChromeUse]);
-
     full.extend(
         BrowserSuite::WebExplore
             .tool_names()
@@ -103,7 +91,7 @@ fn project_browser_suites_requires_the_full_suite_active() {
     );
     assert_eq!(
         project_browser_suites(&full),
-        vec![BrowserSuite::ChromeUse, BrowserSuite::WebExplore]
+        vec![BrowserSuite::WebExplore]
     );
 }
 
@@ -975,7 +963,7 @@ fn durable_journal_mapping_round_trips_every_journaled_event() {
         ThreadEvent::GoalChanged { goal: None },
         ThreadEvent::TitleChanged { title: "t".into() },
         ThreadEvent::BrowserSuitesChanged {
-            suites: vec![crate::engine::BrowserSuite::ChromeUse],
+            suites: vec![crate::engine::BrowserSuite::WebExplore],
         },
         // BackgroundTaskUpdated omitted: TaskSnapshot has no cheap test
         // constructor; its mapping is a mechanical to_value into a
@@ -3639,7 +3627,12 @@ fn scripted_state_rows() -> Vec<(&'static str, serde_json::Value)> {
         ),
         ("goal", json!({ "goal": { "objective": "replay" } })),
         ("title", json!({ "title": "replayed title" })),
-        ("browser_suites", json!({ "suites": ["chrome_use"] })),
+        // The retired `chromeuse` slug rides along: journal rows are
+        // string-typed, so pre-removal sessions replay without a compat read.
+        (
+            "browser_suites",
+            json!({ "suites": ["webexplore", "chromeuse"] }),
+        ),
         (
             "background_task",
             json!({ "snapshot": { "taskId": "task-1", "status": "running" } }),

@@ -242,16 +242,19 @@ mod tests {
             Outcome::Applied
         );
         assert_eq!(state.pinned, Some(true));
+        // The suites list is opaque to the reducer (the agent owns the
+        // vocabulary); the fixture still pins a real slug, not a plausible
+        //-looking typo.
         assert_eq!(
             apply(
                 &mut state,
-                &json!({"type": "x-manox-work/browserSuitesChanged", "suites": ["chrome"]})
+                &json!({"type": "x-manox-work/browserSuitesChanged", "suites": ["webexplore"]})
             ),
             Outcome::Applied
         );
         assert_eq!(
             state.browser_suites.as_deref(),
-            Some(["chrome".to_string()].as_slice())
+            Some(["webexplore".to_string()].as_slice())
         );
     }
 

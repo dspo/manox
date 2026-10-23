@@ -239,25 +239,6 @@ impl manox_harness::tool::AgentTool for HostTaskStop {
     }
 }
 
-/// ChromeUse tool names — opt-in via the composer `+` menu, never in the
-/// default active set, and never offered to subagents.
-pub const CHROMEUSE_TOOL_NAMES: &[&str] = &[
-    "ChromeUseOpen",
-    "ChromeUseNavigate",
-    "ChromeUseHover",
-    "ChromeUseClick",
-    "ChromeUseType",
-    "ChromeUsePressKey",
-    "ChromeUseSelectOption",
-    "ChromeUseScroll",
-    "ChromeUseSnapshot",
-    "ChromeUseWaitFor",
-    "ChromeUseScreenshot",
-    "ChromeUseTabs",
-    "ChromeUseEvaluate",
-    "ChromeUseClose",
-    "ChromeUseFindChromiumExecutable",
-];
 /// WebExplore (internal webview browser) tool names — opt-in, not default,
 /// and never offered to subagents.
 pub const WEBEXPLORE_TOOL_NAMES: &[&str] = &[
@@ -274,14 +255,10 @@ pub const WEBEXPLORE_TOOL_NAMES: &[&str] = &[
 ];
 
 /// The default active tool subset: every mounted tool except the browser
-/// tool suites (ChromeUse + WebExplore), which stay dormant until the user
-/// opts in via the composer `+` menu.
+/// tool suite (WebExplore), which stays dormant until the user opts in via
+/// the composer `+` menu.
 pub(super) fn default_active_tool_names(tools: &[Arc<dyn HarnessAgentTool>]) -> Vec<String> {
-    let browser: std::collections::HashSet<&str> = CHROMEUSE_TOOL_NAMES
-        .iter()
-        .chain(WEBEXPLORE_TOOL_NAMES)
-        .copied()
-        .collect();
+    let browser: std::collections::HashSet<&str> = WEBEXPLORE_TOOL_NAMES.iter().copied().collect();
     tools
         .iter()
         .map(|t| t.name().to_string())
@@ -295,7 +272,6 @@ pub(super) fn default_active_tool_names(tools: &[Arc<dyn HarnessAgentTool>]) -> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BrowserSuite {
-    ChromeUse,
     WebExplore,
 }
 
@@ -303,7 +279,6 @@ impl BrowserSuite {
     /// The tool names belonging to this suite.
     pub fn tool_names(self) -> &'static [&'static str] {
         match self {
-            Self::ChromeUse => CHROMEUSE_TOOL_NAMES,
             Self::WebExplore => WEBEXPLORE_TOOL_NAMES,
         }
     }
@@ -313,16 +288,18 @@ impl BrowserSuite {
     /// representation the journal and ReadyInfo already serialize).
     pub fn wire(self) -> &'static str {
         match self {
-            Self::ChromeUse => "chromeuse",
             Self::WebExplore => "webexplore",
         }
     }
 
     /// Parse a wire suite name; `None` for anything outside the closed
-    /// vocabulary (the gateway answers an error note, never a panic).
+    /// vocabulary (the gateway answers an error note, never a panic). This
+    /// is the host-facing parse of the name the §D.3 setter carries: hosts
+    /// that keep the suite as a plain string (the desktop app mirrors) run
+    /// it per item and skip the `None`s, so retired slugs in restored state
+    /// drop out without a compat read.
     pub fn from_wire(name: &str) -> Option<Self> {
         match name {
-            "chromeuse" => Some(Self::ChromeUse),
             "webexplore" => Some(Self::WebExplore),
             _ => None,
         }
@@ -593,38 +570,6 @@ pub(super) fn build_tools(
                     Arc::clone(&standing_resolver),
                 ),
         ));
-    }
-    // ChromeUse (real Chrome via the in-process rustwright CDP engine): same
-    // trust axes as WebExplore — reads stay ungated; writes ride the approval
-    // gate. Plan mode's ToolCall hook blocks both (fixed allowlist). Compiled
-    // only with the `chrome-use` feature: the VS Code host builds the agent
-    // without it, so the engine is never linked into the extension.
-    #[cfg(feature = "chrome-use")]
-    {
-        tools.push(Arc::new(crate::chrome_use::ChromeUseSnapshotTool));
-        tools.push(Arc::new(crate::chrome_use::ChromeUseWaitForTool));
-        tools.push(Arc::new(crate::chrome_use::ChromeUseScreenshotTool));
-        tools.push(Arc::new(
-            crate::chrome_use::ChromeUseFindChromiumExecutableTool,
-        ));
-        for tool in [
-            Arc::new(crate::chrome_use::ChromeUseOpenTool) as Arc<dyn HarnessAgentTool>,
-            Arc::new(crate::chrome_use::ChromeUseNavigateTool),
-            Arc::new(crate::chrome_use::ChromeUseHoverTool),
-            Arc::new(crate::chrome_use::ChromeUseClickTool),
-            Arc::new(crate::chrome_use::ChromeUseTypeTool),
-            Arc::new(crate::chrome_use::ChromeUsePressKeyTool),
-            Arc::new(crate::chrome_use::ChromeUseSelectOptionTool),
-            Arc::new(crate::chrome_use::ChromeUseScrollTool),
-            Arc::new(crate::chrome_use::ChromeUseTabsTool),
-            Arc::new(crate::chrome_use::ChromeUseEvaluateTool),
-            Arc::new(crate::chrome_use::ChromeUseCloseTool),
-        ] {
-            tools.push(Arc::new(
-                ApprovalGatedTool::new(tool, Arc::clone(gate))
-                    .with_plan_policy(Arc::clone(&plan_policy)),
-            ));
-        }
     }
     // MCP servers (mcp.json + project/plugin .mcp.json): each advertised tool rides
     // behind the same permission gate as built-ins (remote calls are mutating
