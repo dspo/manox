@@ -22,9 +22,7 @@ use crate::goal::{GoalStatus, ThreadGoal};
 
 pub const TITLE_MAX_CHARS: usize = 40;
 pub const MESSAGE_SAMPLE_CHARS: usize = 800;
-pub const PLAN_SAMPLE_CHARS: usize = 16_000;
 const TITLE_TIMEOUT: Duration = Duration::from_secs(20);
-const OMITTED: &str = "\n\n[... omitted for safety ...]\n\n";
 const SYSTEM_PROMPT: &str = include_str!("title_agent_prompt.md");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +31,6 @@ pub enum TitleWakeReason {
     ThirdResponse,
     Stop,
     ToolTerminate,
-    PlanStarted,
     GoalStarted,
 }
 
@@ -95,7 +92,6 @@ impl TitleWakeState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TitleSource {
     Goal(String),
-    Plan(String),
     Conversation(Vec<TitleTurn>),
 }
 
@@ -138,19 +134,9 @@ pub fn valid_title(raw: &str) -> Option<String> {
     Some(title.to_string())
 }
 
-pub fn select_source(
-    goal: Option<&ThreadGoal>,
-    plan_file: Option<&str>,
-    messages: &[AgentMessage],
-) -> TitleSource {
+pub fn select_source(goal: Option<&ThreadGoal>, messages: &[AgentMessage]) -> TitleSource {
     if let Some(goal) = goal.filter(|goal| goal.status != GoalStatus::Complete) {
         return TitleSource::Goal(goal.objective.clone());
-    }
-    if let Some(plan) = plan_file
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .filter(|plan| !plan.trim().is_empty())
-    {
-        return TitleSource::Plan(truncate_head_tail(&plan, PLAN_SAMPLE_CHARS));
     }
     TitleSource::Conversation(sample_conversation(messages))
 }
@@ -192,7 +178,6 @@ pub fn request_prompt(request: &TitleRequest) -> String {
     let current = request.current_title.as_deref().unwrap_or("(none)");
     let evidence = match &request.source {
         TitleSource::Goal(objective) => format!("SOURCE: ACTIVE GOAL\n{objective}"),
-        TitleSource::Plan(markdown) => format!("SOURCE: REVIEWED PLAN\n{markdown}"),
         TitleSource::Conversation(turns) => {
             let transcript = turns
                 .iter()
@@ -371,27 +356,6 @@ fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
     format!("{}…", text.chars().take(keep).collect::<String>())
 }
 
-fn truncate_head_tail(text: &str, max_chars: usize) -> String {
-    let count = text.chars().count();
-    if count <= max_chars {
-        return text.to_string();
-    }
-    let marker = OMITTED.chars().count();
-    let available = max_chars.saturating_sub(marker);
-    let head = available / 2;
-    let tail = available - head;
-    let start: String = text.chars().take(head).collect();
-    let end: String = text
-        .chars()
-        .rev()
-        .take(tail)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    format!("{start}{OMITTED}{end}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,31 +531,14 @@ mod tests {
     }
 
     #[test]
-    fn plan_truncation_keeps_head_tail_and_marker() {
-        let plan = format!("HEAD{}TAIL", "x".repeat(PLAN_SAMPLE_CHARS));
-        let truncated = truncate_head_tail(&plan, PLAN_SAMPLE_CHARS);
-        assert_eq!(truncated.chars().count(), PLAN_SAMPLE_CHARS);
-        assert!(truncated.starts_with("HEAD"));
-        assert!(truncated.ends_with("TAIL"));
-        assert!(truncated.contains("omitted for safety"));
-    }
-
-    #[test]
-    fn source_priority_is_goal_then_plan_then_conversation() {
-        let dir = tempfile::tempdir().unwrap();
-        let plan = dir.path().join("plan.md");
-        std::fs::write(&plan, "# Plan").unwrap();
+    fn source_priority_is_goal_then_conversation() {
         let goal = ThreadGoal::new("thread".into(), "Ship Title Agent".into(), None, None).unwrap();
         assert!(matches!(
-            select_source(Some(&goal), plan.to_str(), &[user("chat")]),
+            select_source(Some(&goal), &[user("chat")]),
             TitleSource::Goal(_)
         ));
         assert!(matches!(
-            select_source(None, plan.to_str(), &[user("chat")]),
-            TitleSource::Plan(_)
-        ));
-        assert!(matches!(
-            select_source(None, None, &[user("chat")]),
+            select_source(None, &[user("chat")]),
             TitleSource::Conversation(_)
         ));
     }

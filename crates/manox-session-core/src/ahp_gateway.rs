@@ -366,10 +366,6 @@ impl SessionRuntime for GatewayRuntime {
         self.server.ahp_inner().compact(session_id, instructions)
     }
 
-    fn plan_seed(&self, session_id: &str, plan_file: &str) -> Result<(), RuntimeError> {
-        self.server.ahp_inner().plan_seed(session_id, plan_file)
-    }
-
     fn goal(
         &self,
         session_id: &str,

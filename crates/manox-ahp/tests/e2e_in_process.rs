@@ -546,8 +546,8 @@ async fn extension_channels_fold_their_own_state() {
     let envelope = host.publish(
         uri,
         action(serde_json::json!({
-            "type": "x-manox-plan/planModeChanged",
-            "enabled": true,
+            "type": "x-manox-plan/planChanged",
+            "snapshot": {"steps": []},
         })),
         None,
     );
@@ -563,7 +563,7 @@ async fn extension_channels_fold_their_own_state() {
     }
     assert_eq!(envelope.server_seq, 1);
     let state = host.extension_state(uri).expect("folded extension state");
-    assert_eq!(state.plan_mode, Some(true));
+    assert_eq!(state.plan, Some(serde_json::json!({"steps": []})));
 
     // An action this build does not know leaves the state alone.
     host.publish(

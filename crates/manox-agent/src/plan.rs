@@ -1,11 +1,9 @@
 //! Execution-time plan snapshot: the structured task list the model maintains
 //! through the [`UpdatePlan`](crate::tools::update_plan) tool.
 //!
-//! This is distinct from the `<proposed_plan>` review block
-//! ([`proposed_plan`](crate::proposed_plan)): the proposed plan is free-form
-//! Markdown a human approves before work starts, whereas a [`PlanSnapshot`] is
-//! the model's own machine-readable account of what it is doing right now. The
-//! Context Rail renders the snapshot; nothing infers task state from prose.
+//! A [`PlanSnapshot`] is the model's own machine-readable account of what it
+//! is doing right now. The Context Rail renders the snapshot; nothing infers
+//! task state from prose.
 //!
 //! Snapshots are never persisted separately — each successful `UpdatePlan` call
 //! is an ordinary `ToolUse`/`ToolResult` pair in the message history, so
@@ -191,8 +189,7 @@ impl PlanSnapshot {
 /// tool call feeds [`rebuild_from_messages`] on reload.
 ///
 /// Publishing a task list mutates nothing on disk, so the tool rides ungated
-/// (no approval); plan mode's `ToolCall` hook blocks it while planning
-/// (execution tracking starts after approval).
+/// (no approval).
 pub struct UpdatePlanTool {
     notice_tx: tokio::sync::mpsc::UnboundedSender<crate::thread_engine::BackendNotice>,
 }

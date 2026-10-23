@@ -167,23 +167,13 @@ pub trait ThreadEngine: Send + Sync {
     /// Backends without a permission gate ignore this.
     fn set_permission_mode(&self, _mode: PermissionMode) {}
 
-    /// Toggle plan mode (persisted sidecar + hooks + instructions).
-    fn set_plan_mode(&self, _enabled: bool) {}
-
     /// Toggle an opt-in browser tool suite (WebExplore) on or off.
     fn set_browser_suite(&self, _suite: crate::engine::BrowserSuite, _enable: bool) {}
-
-    /// Persist whether a plan review card is pending (restore re-surfaces it).
-    fn set_plan_review_pending(&self, _pending: bool) {}
 
     /// Persist the latest `UpdatePlan` snapshot so the rail's plan survives
     /// compaction (the transcript's plan tool calls are summarized away).
     /// `None` clears it. Backends without sidecar persistence no-op.
     fn persist_plan_snapshot(&self, _snapshot: Option<serde_json::Value>) {}
-
-    /// Mark an approved plan as the active execution title source and wake
-    /// the private Title agent immediately.
-    fn start_plan_execution(&self, _plan_file: String) {}
 
     /// Wake the private Title agent after a user-created/replaced Goal starts.
     fn goal_started(&self) {}
@@ -191,16 +181,6 @@ pub trait ThreadEngine: Send + Sync {
     /// Wake the goal gate after a user resumes an active Goal while the
     /// agent is idle, so automatic continuation rounds resume.
     fn goal_gate(&self) {}
-
-    /// Execute an approved plan: optional compaction toward the plan file,
-    /// then the execution seed turn.
-    fn approve_plan(
-        &self,
-        _compact: bool,
-        _compact_instructions: Option<String>,
-        _seed_text: String,
-    ) {
-    }
 
     /// `run` with the client's origin RPC id pinned onto this turn's first
     /// user message (§F.2) and — K5 — the journal entry id the Submit was
@@ -287,14 +267,6 @@ pub struct ReadyInfo {
     /// the authoritative active-tool set); the facade mirrors it so the
     /// composer chips derive from the thread's state.
     pub browser_suites: Vec<crate::engine::BrowserSuite>,
-    /// Plan mode restored from the session sidecar (fresh sessions
-    /// default to off); the facade re-syncs rendered instructions.
-    pub plan_mode: bool,
-    /// Last plan file recorded in the sidecar, if any.
-    pub plan_file: Option<String>,
-    /// A plan review card was pending when the session last settled;
-    /// the facade re-emits `PlanReady` so the card re-surfaces.
-    pub plan_review_pending: bool,
     /// The journal-authoritative goal snapshot (goal migration stage ②):
     /// the K2 rebuild's replayed last `goal` entry. `None` = the chain
     /// never saw a goal (the bridge's db fold stands — the migration-window
@@ -357,7 +329,7 @@ pub enum BackendNotice {
     },
     /// An answered `AskUserQuestion` closed the held turn: the facade
     /// inserts `seed` as a harness-authored user message and launches the
-    /// seed turn (the plan-review `plan_seed` shape, generalized to asks).
+    /// seed turn.
     QuestionAnswered { seed: String },
     /// The display-only preview streamed another batch of the session
     /// transcript into the mirrored history (the authoritative restore is

@@ -9,7 +9,7 @@
 //! channel, and the tool awaits the reply on its tokio thread.
 //!
 //! Read tools (`ReadText` / `ReadDom` / `Screenshot`) are ungated and
-//! `is_read_only` so plan mode exposes them. Write tools declare
+//! `is_read_only`. Write tools declare
 //! `requires_approval` and ride the owning thread's `PermissionMode` (the
 //! engine wraps them in `ApprovalGatedTool`), so the outbound trust axis is
 //! governed by the same mode that gates `Bash` / `Write`.
@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn approval_flags_match_trust_axes() {
         let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
-        // Read axis: approval-free + read-only (plan mode exposes them).
+        // Read axis: approval-free + read-only.
         assert!(
             !WebExploreReadTextTool::new(notice_tx.clone())
                 .requires_approval(&serde_json::json!({}))

@@ -7,7 +7,7 @@ use super::*;
 /// payload)`. `None` means the event is not journaled — because it is
 /// already persisted by its owning flow (`model_change`, `thinking_level`,
 /// `cwd_change`, `compaction`, messages) or is snapshot-semantics
-/// (`HistoryProgress/Restored`, `PlanReady`) or not in the vocabulary
+/// (`HistoryProgress/Restored`) or not in the vocabulary
 /// (`PeerMessage`, steer bookkeeping — steer rides messages).
 ///
 /// This is the single mapping point the notice tap consumes; payload keys
@@ -111,9 +111,6 @@ pub(super) fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde
         // reads it live before every tool call. Journaling a second copy is
         // what made "which one is in force" unanswerable.
         ThreadEvent::PermissionModeChanged { .. } => return None,
-        ThreadEvent::PlanModeChanged { enabled } => {
-            ("plan_mode_change".into(), json!({ "enabled": enabled }))
-        }
         ThreadEvent::PlanUpdated { snapshot } => (
             "plan_update".into(),
             json!({ "snapshot": serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null) }),
@@ -190,23 +187,6 @@ pub(super) fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde
             json!({
                 "metricType": "main_call",
                 "data": serde_json::to_value(metric).unwrap_or(serde_json::Value::Null),
-            }),
-        ),
-        // The plan-review edge is journal-first (§C.2): the review card's
-        // durable authority is the `plan_review` row (replay + the AHP
-        // translation both fold from it), so the proposal itself must journal
-        // here rather than ride a sidecar that replay would forget.
-        ThreadEvent::PlanReady {
-            plan_file,
-            title,
-            content,
-        } => (
-            "plan_review".into(),
-            json!({
-                "state": "proposed",
-                "planFile": plan_file,
-                "title": title,
-                "content": content,
             }),
         ),
         // Already durable through their owning flows / not journaled.

@@ -5,7 +5,7 @@ use super::*;
 
 /// Drive one session run to completion while still servicing mid-run
 /// commands (abort/steer/cancel/shutdown) through the session handle.
-/// Shared by user prompts, idle-wakeups, and plan-approval seeds.
+/// Shared by user prompts, idle-wakeups, and answer-seeded turns.
 /// Returns the run result and whether an abort was requested.
 ///
 /// While the run is in flight, a periodic tick refreshes the engine's
@@ -30,13 +30,6 @@ where
     F: std::future::Future<Output = anyhow::Result<Vec<AgentMessage>>>,
 {
     tokio::pin!(run);
-    // W4 boundary: a pending plan-mode selection commits at the start of
-    // whatever run comes next — a user prompt, a drained steer, a goal round
-    // or an idle wake-up — so no run can execute under the old mode while
-    // the projection already shows the selection pending. It lands before the
-    // run future is polled, hence before request assembly or the injected
-    // instructions can observe the old state.
-    commit_requested_plan_mode(session_path, sessions_dir, state, notice_tx).await;
     // Live journal appends run on a dedicated serializer task, never inline
     // in this select. The `run` branch below shares THIS task, and its
     // persistence middleware holds the session's append lock across file-I/O
@@ -224,24 +217,6 @@ where
                     // PageHistory — the Q face AND the follow streams' gap
                     // repair — for the entire duration of a running turn.
                     reply_journal_snapshot(appender, reply).await;
-                }
-                Some(SessionCmd::RequestPlanMode { enabled }) => {
-                    // Mid-run selection: record the intent and journal it
-                    // LIVE (the serializer path — never an inline session
-                    // append, see the AppendJournal arm's deadlock note).
-                    // The commit stays on the next turn boundary, which is
-                    // what makes `plan_mode_pending` observable and the
-                    // selection revocable before it takes effect. The request
-                    // row is best-effort here: a permanent serializer failure
-                    // parks a loss record and drops the row while the
-                    // selection still commits at the boundary (the idle arm
-                    // appends synchronously and therefore drops the selection
-                    // instead of committing without its request).
-                    state.plan.set_requested(Some(enabled));
-                    let _ = live_row_tx.send((
-                        "plan_mode_request".into(),
-                        serde_json::json!({ "enabled": enabled }),
-                    ));
                 }
                 Some(SessionCmd::SetBrowserSuite { suite, enable }) => {
                     // The run owns the session; park the toggle so the idle

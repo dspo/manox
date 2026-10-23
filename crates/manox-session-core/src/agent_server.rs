@@ -1748,25 +1748,6 @@ impl AgentServerInner {
         if text.trim().is_empty() && images.is_empty() {
             return receipt(false, None);
         }
-        // U6b②/④: the implicit dismissal — a Submit landing while a plan
-        // review is pending means the user is discussing or revising, not
-        // accepting (the desktop consumes its card locally; the durable
-        // half lives HERE, where the session facade has the engine that
-        // journals the `resolved` plan_review edge). Both planes clear:
-        // the session facade (engine cmd → journal + sidecar) and the
-        // store badge flag; this turn's own §D.5 deltas then carry the
-        // cleared flag to every client.
-        if manox_agent::thread_store::try_global()
-            .map(|store| store.read(|s| s.pending_plan_contains(session_id)))
-            .unwrap_or(false)
-        {
-            if let Some(thread) = self.session_thread(session_id) {
-                thread.with_mut(|t| t.set_plan_review_pending(false));
-            }
-            if let Some(store) = manox_agent::thread_store::try_global() {
-                store.with_mut(|s| s.mark_pending_plan(session_id, false));
-            }
-        }
         // K5 (accepted ⟹ logged): persist the user entry BEFORE the
         // receipt. Skipped when residual pending prompts would make
         // run_turn's merged prompt differ from this text — the actor's
@@ -2068,45 +2049,6 @@ impl AgentServerInner {
             return Err(unknown_session(session_id));
         };
         thread.with_mut(|t| t.compact(instructions));
-        Ok(())
-    }
-
-    pub(crate) fn plan_seed(
-        &self,
-        session_id: &str,
-        plan_file: &str,
-    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
-        let Some(thread) = self.session_thread(session_id) else {
-            return Err(unknown_session(session_id));
-        };
-        let plan_file = plan_file.to_string();
-        let seed_text = match manox_agent::collaboration_mode::render_plan_mode_approved(&plan_file)
-        {
-            Ok(text) => text,
-            Err(error) => {
-                return Err(
-                    manox_ahp_runtime::error::RuntimeError::new(error.to_string())
-                        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST),
-                );
-            }
-        };
-        thread.with_mut(|t| {
-            let ui = MessageUiMetadata {
-                model_id: t.model().map(|m| m.id.clone()),
-                approval_mode: Some(t.permission_mode().as_i64()),
-                // The expanded plan directive is written by the harness on
-                // the user's behalf, so the bubble header names the harness
-                // (the desktop's local seed path always did; U6b③ aligns
-                // the gateway path as both migrate onto it).
-                author: Some(manox_agent::MessageAuthor::Harness),
-                ..Default::default()
-            };
-            // The verdict is now landed: clear the pending review so a
-            // restarted session does not re-surface a card the user already
-            // answered (the `resolved` plan_review edge journals here).
-            t.set_plan_review_pending(false);
-            t.seed_plan_execution(plan_file, seed_text, Some(ui));
-        });
         Ok(())
     }
 

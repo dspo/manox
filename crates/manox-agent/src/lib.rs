@@ -8,7 +8,6 @@ pub mod agent_defs;
 pub mod background_task;
 pub mod capability;
 pub mod claude_md;
-pub mod collaboration_mode;
 pub mod command;
 pub mod conversation_config;
 pub mod db;
@@ -32,14 +31,12 @@ pub mod path_policy;
 pub mod paths;
 pub mod permission;
 pub mod plan;
-pub mod plan_mode;
 pub mod plugin;
 pub mod plugin_hooks;
 /// Prefix-cache stability gate: read-only observation of the provider
 /// request payloads of a thread run (no payload mutation).
 pub mod prefix_gate;
 pub mod prompt;
-pub mod proposed_plan;
 pub mod provider;
 pub mod provider_glue;
 pub mod questions;

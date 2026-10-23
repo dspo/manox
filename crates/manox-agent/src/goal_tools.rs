@@ -668,8 +668,8 @@ impl AgentTool for GetGoalTool {
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<EmptyInput>()
     }
-    // Kept out of Plan mode together with the mutating Goal tools; Default's
-    // registered tool list remains stable across every Goal state.
+    // Grouped with the mutating Goal tools; Default's registered tool list
+    // remains stable across every Goal state.
     fn is_read_only(&self) -> bool {
         false
     }

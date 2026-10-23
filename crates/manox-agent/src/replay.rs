@@ -37,20 +37,9 @@ pub struct ReplayedThreadState {
     /// Project binding from the last `project_change` entry;
     /// `Some(None)` is an explicit unbind.
     pub project: Option<Option<String>>,
-    /// Plan-mode flag from the last `plan_mode_change` entry.
-    pub plan_mode: Option<bool>,
     /// Snapshot value from the last `plan_update` entry (an empty snapshot
     /// is the model's cleared plan, not an absent one).
     pub plan_snapshot: Option<serde_json::Value>,
-    /// Pending flag from the last `plan_review` entry (`"proposed"` raises,
-    /// any verdict clears). `None` = the chain never saw one — the sidecar
-    /// hint stands (the pre-vocabulary hole-fill).
-    pub plan_review_pending: Option<bool>,
-    /// The open review's request id, minted from the last `proposed` row's
-    /// own entry id (the request id IS `plan-review:<proposal entry id>`); a
-    /// resolved row clears it. The journal is the carrier, so the restore
-    /// survives a host restart without a sidecar.
-    pub plan_review_request_id: Option<String>,
     /// Goal value from the last `goal` entry; `Some(Null)` is an explicit
     /// clear.
     pub goal: Option<serde_json::Value>,
@@ -171,29 +160,8 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             SessionTreeEntry::ProjectChange { path, .. } => {
                 state.project = Some(path.clone());
             }
-            SessionTreeEntry::PlanModeChange { enabled, .. } => {
-                state.plan_mode = Some(*enabled);
-            }
             SessionTreeEntry::PlanUpdate { snapshot, .. } => {
                 state.plan_snapshot = Some(snapshot.clone());
-            }
-            SessionTreeEntry::PlanReview {
-                state: review,
-                id,
-                request_id,
-                ..
-            } => {
-                let proposed = review == "proposed";
-                state.plan_review_pending = Some(proposed);
-                state.plan_review_request_id = if proposed {
-                    Some(
-                        request_id
-                            .clone()
-                            .unwrap_or_else(|| manox_harness::session::plan_review_request_id(id)),
-                    )
-                } else {
-                    None
-                };
             }
             SessionTreeEntry::Goal { goal, .. } => {
                 state.goal = Some(goal.clone().unwrap_or(serde_json::Value::Null));
@@ -241,7 +209,6 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             | SessionTreeEntry::BrowserSuites { .. }
             | SessionTreeEntry::BackgroundTask { .. }
             | SessionTreeEntry::Approval { .. }
-            | SessionTreeEntry::PlanModeRequest { .. }
             | SessionTreeEntry::Question { .. }
             | SessionTreeEntry::Label { .. }
             | SessionTreeEntry::SessionInfo { .. }
@@ -407,12 +374,6 @@ mod tests {
                 timestamp: ts,
                 thinking_level: "max".into(),
             }),
-            record(E::PlanModeChange {
-                id: id(),
-                parent_id: None,
-                timestamp: ts,
-                enabled: true,
-            }),
             record(E::PlanUpdate {
                 id: id(),
                 parent_id: None,
@@ -434,7 +395,6 @@ mod tests {
         ];
         let state = replay_thread_state(&records);
         assert_eq!(state.project, Some(Some("/proj".into())));
-        assert_eq!(state.plan_mode, Some(true));
         assert!(state.plan_snapshot.is_some());
         assert_eq!(state.goal, Some(serde_json::json!({"objective": "ship"})));
         assert_eq!(state.cwd.as_deref(), Some("/work"));

@@ -266,9 +266,6 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// Compact the session's history.
     fn compact(&self, session_id: &str, instructions: Option<String>) -> Result<(), RuntimeError>;
 
-    /// Seed plan execution after a verdict.
-    fn plan_seed(&self, session_id: &str, plan_file: &str) -> Result<(), RuntimeError>;
-
     /// Apply one goal lifecycle action (`create`/`edit`/`replace`/`clear`/
     /// `pause`/`resume`), the `x-manox/goal` seam.
     fn goal(

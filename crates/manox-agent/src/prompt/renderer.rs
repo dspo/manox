@@ -49,8 +49,6 @@ const TPL_WRAPPER_TOOL_DENIED: &str = include_str!("templates/wrapper/tool_denie
 const TPL_TITLE_FIRST: &str = include_str!("templates/title/first.tera.md");
 const TPL_TITLE_TOPIC_SHIFT: &str = include_str!("templates/title/topic_shift.tera.md");
 const TPL_SKILL_BODY: &str = include_str!("templates/wrapper/skill_body.tera.md");
-const TPL_PLAN_MODE_ACTIVE: &str = include_str!("templates/mode/plan_mode_active.tera.md");
-const TPL_PLAN_MODE_APPROVED: &str = include_str!("templates/mode/plan_mode_approved.tera.md");
 
 /// `(PromptTemplate, source)` for every built-in template: the single source of
 /// truth for what gets parsed into the Tera registry.
@@ -89,8 +87,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str)] = &[
         TPL_TITLE_TOPIC_SHIFT,
     ),
     (PromptTemplate::SkillBody, TPL_SKILL_BODY),
-    (PromptTemplate::ModePlanActive, TPL_PLAN_MODE_ACTIVE),
-    (PromptTemplate::ModePlanApproved, TPL_PLAN_MODE_APPROVED),
 ];
 
 /// The lazily-initialized global Tera registry. Holds every built-in template
@@ -284,8 +280,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 15);
-        assert_eq!(REGISTRATIONS.len(), 15);
+        assert_eq!(template::ALL.len(), 13);
+        assert_eq!(REGISTRATIONS.len(), 13);
     }
 
     /// Every data-bearing template must fully substitute its variables against
@@ -456,56 +452,6 @@ mod tests {
         assert_eq!(
             render_command_body(broken, "args"),
             broken.replace("{{ arguments }}", "args")
-        );
-    }
-
-    /// W1 byte-freeze: the exact bytes plan mode puts in front of the model.
-    /// The active briefing is re-injected every turn, so any drift re-bills the
-    /// prompt; a later work package may only move these bytes by updating what
-    /// is pinned here.
-    #[test]
-    fn plan_mode_templates_bytes_are_frozen() {
-        // Active briefing: the embedded template is the frozen prose and the
-        // only dynamic seam is `plans_dir`, which must appear exactly four
-        // times and nowhere else. A renderer that adds, trims or rewrites bytes
-        // around the substitution fails here even though the prose itself is
-        // maintained in the `.tera.md`.
-        let active = crate::collaboration_mode::render_plan_mode_active("/p/plans")
-            .expect("plan-mode briefing renders");
-        assert_eq!(
-            active,
-            TPL_PLAN_MODE_ACTIVE.replace("{{ plans_dir }}", "/p/plans"),
-            "the active briefing drifted from its template, or the placeholder vocabulary moved"
-        );
-        assert_eq!(
-            active.matches("/p/plans").count(),
-            4,
-            "exactly the four declared plan-dir references"
-        );
-        assert!(
-            active.starts_with("<critical>\nPlan mode is active."),
-            "opening bytes are frozen: {}",
-            &active[..40]
-        );
-        assert!(
-            active.ends_with(
-                "Keep researching until the plan is decision-complete, then propose\n\
-                 it or ask.\n</critical>\n"
-            ),
-            "closing bytes (including the trailing newline) are frozen"
-        );
-
-        let approved = crate::collaboration_mode::render_plan_mode_approved("/p/auth-plan.md")
-            .expect("approved briefing renders");
-        assert_eq!(
-            approved,
-            r##"The plan at `/p/auth-plan.md` has been approved by the user. Read the plan file, then implement it top to bottom exactly as written:
-
-- The plan is decision-complete — execute it, do NOT re-plan, re-design, or reopen settled choices.
-- If a step is ambiguous in a way the plan could not have anticipated, pick the smallest interpretation consistent with the plan's Context and Verification sections, and note the choice in your final summary.
-- Verify each load-bearing step as the plan's Verification section prescribes before reporting done.
-- Publish and track your execution progress with `UpdatePlan`: right after starting, publish the complete step list, then update it whenever progress changes (mark steps completed as you finish, keep at most one in_progress, all completed before you end). This drives the plan overview shown to the user.
-"##
         );
     }
 

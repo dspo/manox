@@ -184,10 +184,6 @@ pub struct RuntimeBackend {
     /// journal seq forwarded to the host). The watermark survives a restart so
     /// the fresh bridge can replay exactly the rows the dead one missed.
     bridges: Mutex<HashMap<String, BridgeTask>>,
-    /// The plan file each open review card names, keyed by its request id. The
-    /// card's `chat/inputCompleted` carries only the request id and the verdict,
-    /// so the approve path recovers the file from here.
-    plan_reviews: Mutex<HashMap<String, String>>,
     /// The bridge task needs an `Arc` of this backend while the host holds only
     /// `&self` through the trait, so the backend keeps a weak handle to itself.
     me: OnceLock<Weak<RuntimeBackend>>,
@@ -207,7 +203,6 @@ impl RuntimeBackend {
             host: OnceLock::new(),
             seeds: Mutex::new(HashMap::new()),
             bridges: Mutex::new(HashMap::new()),
-            plan_reviews: Mutex::new(HashMap::new()),
             me: OnceLock::new(),
             resources,
             #[cfg(feature = "terminal")]
@@ -825,8 +820,8 @@ impl RuntimeBackend {
     }
 
     /// Project one kernel record and publish everything it emits: lifecycle
-    /// skips, the plan-review file ledger, the streamed parts, and the Q-face
-    /// aggregate refresh after an assistant row.
+    /// skips, the streamed parts, and the Q-face aggregate refresh after an
+    /// assistant row.
     async fn forward_entry(
         &self,
         host: &Arc<manox_ahp::Host>,
@@ -902,22 +897,6 @@ impl RuntimeBackend {
         ) || matches!(entry, SessionTreeEntry::TurnStart { .. })
         {
             return;
-        }
-        // Track the plan file behind each review card so the approve path
-        // (which arrives as a bare `chat/inputCompleted`) can recover it
-        // without re-reading the thread.
-        if let SessionTreeEntry::PlanReview {
-            state, plan_file, ..
-        } = entry
-        {
-            let request_id = manox_harness::session::plan_review_request_id(entry.id());
-            if state == "resolved" {
-                self.plan_reviews.lock().remove(&request_id);
-            } else if let Some(plan_file) = plan_file {
-                self.plan_reviews
-                    .lock()
-                    .insert(request_id, plan_file.clone());
-            }
         }
         // Resume the turn bookkeeping against the active turn the client
         // opened, so streamed parts carry its id (and never publish a
@@ -1248,36 +1227,6 @@ impl RuntimeBackend {
             .server
             .answer_question(session_id, request_id, response, answers)
         {
-            Ok(()) => DispatchOutcome::Accepted,
-            Err(error) => DispatchOutcome::Rejected(error.message),
-        }
-    }
-
-    /// Resolve a plan-review verdict (a `chat/inputCompleted` against a
-    /// `plan-review:` card). Approve seeds plan execution; any other answer is
-    /// the refine path — plan mode stays active and the user's next message
-    /// carries the feedback.
-    fn resolve_plan_review(
-        &self,
-        channel: &str,
-        completed: &ahp_types::actions::ChatInputCompletedAction,
-    ) -> DispatchOutcome {
-        let Some(session_id) = chat::id(channel) else {
-            return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
-        };
-        let approved = map_answers(&completed.answers)
-            .iter()
-            .any(|a| a.selected.iter().any(|s| s.eq_ignore_ascii_case("approve")));
-        if !approved {
-            return DispatchOutcome::Accepted;
-        }
-        let plan_file = self.plan_reviews.lock().get(&completed.request_id).cloned();
-        let Some(plan_file) = plan_file else {
-            return DispatchOutcome::Rejected(
-                "plan review answered without a known plan file".to_string(),
-            );
-        };
-        match self.server.plan_seed(session_id, &plan_file) {
             Ok(()) => DispatchOutcome::Accepted,
             Err(error) => DispatchOutcome::Rejected(error.message),
         }
@@ -2126,16 +2075,12 @@ impl Backend for RuntimeBackend {
                     ahp_types::state::ChatInputResponseKind::Decline => QuestionResponse::Dismiss,
                     ahp_types::state::ChatInputResponseKind::Cancel => QuestionResponse::Cancel,
                 };
-                let outcome = if completed.request_id.starts_with("plan-review:") {
-                    self.resolve_plan_review(channel, completed)
-                } else {
-                    self.answer_question(
-                        channel,
-                        &completed.request_id,
-                        response,
-                        map_answers(&completed.answers),
-                    )
-                };
+                let outcome = self.answer_question(
+                    channel,
+                    &completed.request_id,
+                    response,
+                    map_answers(&completed.answers),
+                );
                 if matches!(
                     outcome,
                     DispatchOutcome::Accepted | DispatchOutcome::AcceptedThen(_)
@@ -2784,21 +2729,6 @@ impl Backend for RuntimeBackend {
                     .map_err(|error| HostError::Backend(error.message))?;
                 Ok(Value::Null)
             }
-            manox_ahp::ext::commands::PLAN_EXECUTE => {
-                let session_id = extension_session(params)?;
-                let Some(plan_file) = params.get("planFile").and_then(Value::as_str) else {
-                    return Err(HostError::InvalidParams(
-                        "x-manox/planExecute needs planFile".to_string(),
-                    ));
-                };
-                if !self.server.has_session(&session_id) {
-                    return Err(HostError::SessionNotFound(session_id));
-                }
-                self.server
-                    .plan_seed(&session_id, plan_file)
-                    .map_err(|error| HostError::Backend(error.message))?;
-                Ok(Value::Null)
-            }
             manox_ahp::ext::commands::OPEN_TURN => {
                 // A read-only journal fact, not a hosted-session operation:
                 // the owner stamp sits in the shared journal file, so the
@@ -3072,31 +3002,6 @@ mod answer_mapping_tests {
     fn no_answers_at_all_is_an_empty_list() {
         assert!(map_answers(&None).is_empty());
     }
-
-    /// The approve path keys on the option's **identifier**, which is what a
-    /// client echoes back in `selected` (`ChatInputOption::id` is documented as
-    /// the stable option identifier). The plan-review card's option id and the
-    /// runtime's comparison have to stay the same string or an approved plan
-    /// silently fails to seed — a mismatch here is invisible, because the
-    /// dispatch still answers `Accepted`.
-    #[test]
-    fn an_approved_plan_selection_is_recognised_by_option_id() {
-        let mapped = map_answers(&answers(vec![(
-            "plan-review:e-1:q",
-            submitted(ChatInputAnswerValue::Selected(
-                ChatInputSelectedAnswerValue {
-                    value: "approve".to_string(),
-                    freeform_values: None,
-                },
-            )),
-        )]));
-        assert!(
-            mapped
-                .iter()
-                .any(|a| a.selected.iter().any(|s| s.eq_ignore_ascii_case("approve"))),
-            "the runtime's approve test must match what the card offers: {mapped:?}"
-        );
-    }
 }
 
 /// The dispatch arms for MCP start/stop answer from the runtime seam, so the
@@ -3275,9 +3180,6 @@ mod mcp_dispatch_tests {
             _session_id: &str,
             _instructions: Option<String>,
         ) -> Result<(), RuntimeError> {
-            Err(RuntimeError::new("unused"))
-        }
-        fn plan_seed(&self, _session_id: &str, _plan_file: &str) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
         fn goal(

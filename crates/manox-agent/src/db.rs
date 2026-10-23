@@ -70,9 +70,6 @@ pub enum UiNoteKind {
     Error,
     /// A neutral system notice — slash-command acks, mode-change chips, etc.
     Notice,
-    /// A plan the user dismissed without implementing — kept as a collapsed
-    /// read-only record so the dismissed plan survives a reload.
-    PlanReview,
 }
 
 /// One UI annotation card. `data` carries the render payload — currently

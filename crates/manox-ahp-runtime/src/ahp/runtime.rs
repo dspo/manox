@@ -342,9 +342,6 @@ mod accept_without_a_reactor_tests {
         fn compact(&self, _: &str, _: Option<String>) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
-        fn plan_seed(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
-            Ok(())
-        }
         fn goal(
             &self,
             _: &str,

@@ -141,7 +141,7 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
             parent_id: p,
             ..
         }
-        | E::PlanModeChange {
+        | E::PlanUpdate {
             id: i,
             parent_id: p,
             ..
@@ -1726,8 +1726,7 @@ mod dispatch {
         // declaration with nothing behind them.
         //
         // "Performed" means the runtime reached its own params validation, not
-        // that these *borrowed* params happened to satisfy it: `planExecute`
-        // requires a `planFile` this call does not supply, and `InvalidParams`
+        // that these *borrowed* params happened to satisfy it: `InvalidParams`
         // is it working. `Unimplemented` is the tell for a name with nothing
         // behind it.
         for command in manox_ahp::ext::commands::ALL {
@@ -3135,11 +3134,11 @@ mod dispatch {
             vec![
                 (
                     "e-1",
-                    E::PlanModeChange {
+                    E::PlanUpdate {
                         id: String::new(),
                         parent_id: None,
                         timestamp: super::stamp(),
-                        enabled: true,
+                        snapshot: serde_json::json!({"steps": []}),
                     },
                 ),
                 (
@@ -3167,7 +3166,8 @@ mod dispatch {
             .extension_baseline(&channel)
             .expect("the plan channel answers");
         assert_eq!(
-            payload["planMode"], true,
+            payload["plan"],
+            serde_json::json!({"steps": []}),
             "the baseline is the journal's fold, not an empty placeholder: {payload}"
         );
         uninstall();

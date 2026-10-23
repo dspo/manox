@@ -277,7 +277,7 @@ pub fn writable_roots(mode: PermissionMode, workspace_root: &Path) -> Vec<PathBu
 
 /// The conventional scratch locations distinct from `$TMPDIR` (the per-user
 /// temp dir is already in [`writable_roots`]; these are the shared `/tmp`
-/// spools plan mode admits alongside the plans dir).
+/// spools).
 pub fn temp_scratch_roots() -> [PathBuf; 2] {
     [PathBuf::from("/tmp"), PathBuf::from("/private/tmp")]
 }

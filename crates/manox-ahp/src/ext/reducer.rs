@@ -26,21 +26,15 @@ use std::collections::btree_map::Entry;
 
 /// Everything manox carries that AHP has no native slot for, per session.
 ///
-/// One bag per extension channel: a channel for one session's plan mode, another
-/// for its background work, and so on all fold into the same shape, so the host
-/// needs one fold rather than one per channel kind.
+/// One bag per extension channel: a channel for one session's plan document,
+/// another for its background work, and so on all fold into the same shape, so
+/// the host needs one fold rather than one per channel kind.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct XManoxState {
-    /// Plan mode toggle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_mode: Option<bool>,
     /// The plan document (kernel snapshot shape, opaque here).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<Value>,
-    /// Plan review lifecycle: `proposed` / `resolved` plus the reviewed file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_review: Option<Value>,
     /// Session goal (`null` clears).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<Value>,
@@ -125,17 +119,8 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
     let before = (!keyed).then(|| state.clone());
     let mut registry_changed = false;
     match tag {
-        super::actions::PLAN_MODE_CHANGED => {
-            state.plan_mode = action.get("enabled").and_then(Value::as_bool);
-        }
         super::actions::PLAN_CHANGED => {
             state.plan = action.get("snapshot").cloned();
-        }
-        super::actions::PLAN_VERDICT_REQUESTED | super::actions::PLAN_REVIEW_SETTLED => {
-            // Both edges land in the same field: the review's lifecycle is one
-            // fact (a proposal, then its settlement), and a client renders the
-            // difference from the action type.
-            state.plan_review = Some(action.clone());
         }
         super::actions::WORK_GOAL_CHANGED => {
             state.goal = action.get("goal").cloned();
@@ -229,11 +214,11 @@ mod tests {
         assert_eq!(
             apply(
                 &mut state,
-                &json!({"type": "x-manox-plan/planModeChanged", "enabled": true})
+                &json!({"type": "x-manox-plan/planChanged", "snapshot": {"steps": []}})
             ),
             Outcome::Applied
         );
-        assert_eq!(state.plan_mode, Some(true));
+        assert_eq!(state.plan, Some(json!({"steps": []})));
         assert_eq!(
             apply(
                 &mut state,
@@ -261,7 +246,7 @@ mod tests {
     #[test]
     fn restating_the_same_fact_is_a_noop_and_the_state_survives_round_trips() {
         let mut state = XManoxState::default();
-        let action = json!({"type": "x-manox-plan/planModeChanged", "enabled": true});
+        let action = json!({"type": "x-manox-plan/planChanged", "snapshot": {}});
         assert_eq!(apply(&mut state, &action), Outcome::Applied);
         assert_eq!(apply(&mut state, &action), Outcome::NoOp);
         let encoded = serde_json::to_value(&state).expect("serializes");

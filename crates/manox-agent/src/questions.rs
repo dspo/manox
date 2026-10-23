@@ -8,8 +8,8 @@
 //! it end to end: the tool parses and validates the model's questions,
 //! delivers one card per call on [`UserQuestionGate`], and ends the turn
 //! (`terminate`) — the model never waits on the answer. The user's answer
-//! arrives out-of-band as the seed of the NEXT turn (the plan-review card's
-//! established shape), routed by card id through the gateway. The gate is
+//! arrives out-of-band as the seed of the NEXT turn, routed by card id
+//! through the gateway. The gate is
 //! this seam's settlement registry; the approval gate and its mode policy
 //! live in `approval` and are not involved.
 
@@ -163,8 +163,7 @@ impl HarnessAgentTool for AskUserQuestionTool {
          Mark the recommended default with recommended=true when one exists. The \
          user may also answer a question with free text or explicitly skip it. \
          Calling this tool ENDS your turn: the card is the last thing you emit, \
-         and the user's answers arrive as their next message. Do not use this \
-         tool to ask for plan approval — submit plans with ProposePlan."
+         and the user's answers arrive as their next message. "
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -243,9 +242,8 @@ impl HarnessAgentTool for AskUserQuestionTool {
             usage: None,
             added_tool_names: None,
             // The turn ends at the delivery: the card stays the
-            // conversation's last item and the answer seeds the NEXT turn
-            // (the plan-review card's established shape) — the model never
-            // waits on a parked result.
+            // conversation's last item and the answer seeds the NEXT turn —
+            // the model never waits on a parked result.
             terminate: true,
         })
     }
@@ -955,8 +953,7 @@ mod tests {
              Mark the recommended default with recommended=true when one exists. The \
              user may also answer a question with free text or explicitly skip it. \
              Calling this tool ENDS your turn: the card is the last thing you emit, \
-             and the user's answers arrive as their next message. Do not use this \
-             tool to ask for plan approval — submit plans with ProposePlan."
+             and the user's answers arrive as their next message. "
         );
         assert_eq!(
             serde_json::to_string(&tool.parameters_schema()).unwrap(),
