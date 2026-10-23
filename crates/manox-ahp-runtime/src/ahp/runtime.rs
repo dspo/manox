@@ -279,6 +279,9 @@ mod accept_without_a_reactor_tests {
         fn has_session(&self, _: &str) -> bool {
             false
         }
+        fn open_session(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+            unreachable!("unused")
+        }
         fn submit(
             &self,
             _: &str,

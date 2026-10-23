@@ -219,6 +219,12 @@ pub(crate) struct JournalFold {
     /// the fold consumed. A live bridge forwards feed events strictly above it,
     /// which is what keeps a seeded snapshot and the following actions disjoint.
     pub(crate) tail: u64,
+    /// The pending plan reviews (`request id` → plan file) the journal still
+    /// owes a verdict on. A restored session's card outlives the process that
+    /// proposed it, and the approve path (`chat/inputCompleted`) arrives
+    /// without the file — the bridge's live ledger never saw a row below the
+    /// seed's tail, so the fold is where the cold ledger comes from.
+    pub(crate) plan_reviews: Vec<(String, String)>,
 }
 
 /// Fold one session's journal through the shared translator + reducers.
@@ -263,7 +269,28 @@ pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<Journ
     let mut extension_actions: Vec<(String, StateAction)> = Vec::new();
     let mut model_ref: Option<String> = None;
     let mut last_timestamp: Option<String> = None;
+    let mut plan_reviews: Vec<(String, String)> = Vec::new();
     for record in &snapshot.records {
+        // The pending-review ledger, kept in the same one pass: a proposal
+        // names itself (`plan-review:<entry id>`) and a resolution names its
+        // proposal (the row's back-reference, absent on older rows). A fold
+        // that never saw the proposal still drops the matching entry because
+        // the settled row carries that back-reference.
+        if let SessionTreeEntry::PlanReview {
+            state,
+            plan_file,
+            request_id,
+            ..
+        } = &record.entry
+        {
+            let proposal = manox_harness::session::plan_review_request_id(record.entry.id());
+            if state == "resolved" {
+                let settled = request_id.clone().unwrap_or(proposal);
+                plan_reviews.retain(|(id, _)| id != &settled);
+            } else if let Some(plan_file) = plan_file {
+                plan_reviews.push((proposal, plan_file.clone()));
+            }
+        }
         // The canonical `provider/model` reference (L8): the kernel row
         // carries provider and model id separately, and the session fold
         // reads the provider out of the composed value when the store row
@@ -307,6 +334,7 @@ pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<Journ
         model_ref,
         last_timestamp,
         tail: snapshot.cursor,
+        plan_reviews,
     })
 }
 
