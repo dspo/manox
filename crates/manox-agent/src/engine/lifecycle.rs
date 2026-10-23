@@ -148,7 +148,7 @@ pub(super) async fn apply_browser_suite(
 /// The opt-in suites whose tool names are all present in a resolved
 /// active-tool set; a suite is active only when fully selected.
 pub(super) fn project_browser_suites(active: &[String]) -> Vec<BrowserSuite> {
-    [BrowserSuite::ChromeUse, BrowserSuite::WebExplore]
+    [BrowserSuite::WebExplore]
         .into_iter()
         .filter(|suite| {
             suite

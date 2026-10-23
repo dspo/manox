@@ -1992,6 +1992,29 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.rebuild_system_prompt();
     }
 
+    /// Drop selection names the mounted set no longer carries, logging what
+    /// went. Selections recorded by earlier builds can name retired tools (a
+    /// removed tool suite, an uninstalled MCP server); the runtime view
+    /// filtered them out silently, but the stored list kept them — and any
+    /// later `set_active_tools` validates the whole merged list against the
+    /// mounted set, so one stale name made every subsequent selection change
+    /// fail forever. Pruning happens on the in-memory selection only; the
+    /// journal entry stays untouched.
+    fn prune_unmounted_tool_names(
+        names: Vec<String>,
+        all_tools: &[Arc<dyn crate::tool::AgentTool>],
+    ) -> Vec<String> {
+        let mounted = |n: &String| all_tools.iter().any(|t| t.name() == n);
+        let removed: Vec<String> = names.iter().filter(|n| !mounted(n)).cloned().collect();
+        if !removed.is_empty() {
+            tracing::warn!(
+                ?removed,
+                "restored active-tool selection names unmounted tools; pruning the selection"
+            );
+        }
+        names.into_iter().filter(mounted).collect()
+    }
+
     /// Register a hook handler.
     pub fn on(&mut self, hook: HookPoint, handler: HookHandler) {
         self.hooks.lock().unwrap().push((hook, handler));
@@ -2970,9 +2993,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.agent.clear_transcript_state();
         self.agent.replace_transcript(context.messages);
         self.agent.set_thinking_level(context.thinking_level);
-        self.active_tool_names = context
+        let restored = context
             .active_tool_names
             .or_else(|| self.restore_active_tool_default.clone());
+        self.active_tool_names =
+            restored.map(|names| Self::prune_unmounted_tool_names(names, &self.all_tools));
         self.apply_active_tools();
         self.rebuild_system_prompt();
         if let (Some(resolver), Some(model_ref)) = (&self.model_resolver, &context.model)
@@ -8324,6 +8349,63 @@ pub(crate) mod tests {
         // The next run's pre-prompt runtime sync must not revert the toggle.
         harness.apply_turn_runtime();
         assert_eq!(mounted_names(&harness), ["echo"]);
+    }
+
+    /// A selection recorded by an earlier build can name tools this build no
+    /// longer mounts (the retired ChromeUse suite is the canonical case).
+    /// Restore prunes those names, so the next selection change — a browser
+    /// suite toggle merges against the restored list and validates the whole
+    /// thing against the mounted set — lands, and the newly persisted row is
+    /// clean. Without the prune, every subsequent selection change fails
+    /// validation on the stale name forever.
+    #[tokio::test]
+    async fn test_restore_prunes_unmounted_names_so_selections_stick() {
+        let session = Session::new(MemStorage::new());
+        // The poisoned row, as a build that still mounted ChromeUseOpen
+        // wrote it.
+        session
+            .append_active_tools_change(&["ChromeUseOpen".to_string(), "other".to_string()])
+            .await
+            .unwrap();
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        )
+        .with_tools(two_tools());
+
+        harness.restore().await.unwrap();
+        assert_eq!(
+            harness.active_tool_names(),
+            Some(&["other".to_string()][..]),
+            "the stale name is pruned from the restored selection"
+        );
+
+        // The suite-toggle merge path: apply_browser_suite reads the
+        // restored selection, extends it with the suite's names, and
+        // persists the whole list — build the merge the same way. Without
+        // the prune the stale name rides along and validation fails here.
+        let mut merged = harness.active_tool_names().unwrap().to_vec();
+        merged.push("echo".to_string());
+        harness.set_active_tools(merged).await.unwrap();
+        assert_eq!(mounted_names(&harness), ["echo", "other"]);
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
+        match entries.last() {
+            Some(SessionTreeEntry::ActiveToolsChange {
+                active_tool_names, ..
+            }) => assert_eq!(
+                active_tool_names,
+                &["other".to_string(), "echo".to_string()],
+                "the persisted row carries no stale name"
+            ),
+            other => panic!("expected a trailing ActiveToolsChange, got {other:?}"),
+        }
     }
 
     #[tokio::test]
