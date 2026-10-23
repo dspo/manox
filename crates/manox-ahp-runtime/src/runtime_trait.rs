@@ -188,6 +188,27 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// Whether the runtime currently drives this session.
     fn has_session(&self, session_id: &str) -> bool;
 
+    /// Open a cold session (journal on disk, no live engine in this process)
+    /// so its runtime face is addressable — the same cold-open the
+    /// submit/cancel/settle paths take. A genuinely unknown id answers
+    /// not-found from the open itself.
+    fn open_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError>;
+
+    /// Ensure the runtime drives `session_id`, cold-opening it when the
+    /// journal proves it exists but this process has no live engine.
+    ///
+    /// A restored session serves folded state without an engine until
+    /// something needs one. Every client-initiated persistent write still
+    /// owes its client an answer, so writing paths call this first instead
+    /// of refusing a session the journal proves exists. A genuinely unknown
+    /// id keeps its not-found refusal, answered by the open itself.
+    fn ensure_live(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError> {
+        if self.has_session(session_id) {
+            return Ok(());
+        }
+        self.open_session(owner, session_id)
+    }
+
     /// The conversation-info Q face for a live session: per-model usage,
     /// cumulative totals and cost, folded from the journal (the retired v2
     /// `GetConversationInfo`). `None` for a cold session — a session without

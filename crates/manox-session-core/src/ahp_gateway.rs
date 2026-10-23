@@ -224,6 +224,13 @@ impl SessionRuntime for GatewayRuntime {
         self.server.ahp_inner().session_thread(session_id).is_some()
     }
 
+    fn open_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError> {
+        let inner = Arc::clone(self.server.ahp_inner());
+        let owner = owner.to_string();
+        let id = session_id.to_string();
+        block_on(crate::agent_server::open_session(&inner, &owner, &id))
+    }
+
     fn submit(&self, owner: &str, session_id: &str, text: String) -> Result<Value, RuntimeError> {
         let server = Arc::clone(&self.server);
         let inner = Arc::clone(server.ahp_inner());
@@ -255,29 +262,14 @@ impl SessionRuntime for GatewayRuntime {
 
     fn cancel_turn(&self, session_id: &str) -> Result<(), RuntimeError> {
         tracing::info!(session = %session_id, "gateway: cancelling the turn");
-        let inner = Arc::clone(self.server.ahp_inner());
         // A cold session (restored journal, no live engine in THIS process)
         // still owes the cancel an answer: open it first, so the cancel
         // either lands on its just-loaded thread (a no-op settle — the
         // engine that owed the turn died elsewhere) or reports the foreign
         // write lease honestly. Refusing "unknown session" left a restored
         // dead turn unstoppable (real-device round, 2026-10-20).
-        if inner.session_thread(session_id).is_none() {
-            let owner = "ahp".to_string();
-            let id = session_id.to_string();
-            return block_on(async move {
-                crate::agent_server::open_session(&inner, &owner, &id).await?;
-                match inner.session_thread(&id) {
-                    Some(thread) => {
-                        thread.with_mut(|t| t.cancel());
-                        Ok(())
-                    }
-                    None => Err(RuntimeError::new(format!("unknown session {id}"))
-                        .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)),
-                }
-            });
-        }
-        match inner.session_thread(session_id) {
+        self.ensure_live("ahp", session_id)?;
+        match self.server.ahp_inner().session_thread(session_id) {
             Some(thread) => {
                 thread.with_mut(|t| t.cancel());
                 Ok(())
@@ -288,6 +280,7 @@ impl SessionRuntime for GatewayRuntime {
     }
 
     fn set_model(&self, session_id: &str, model: &str) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id)?;
         self.server.ahp_inner().set_model(session_id, model)
     }
 
@@ -298,22 +291,26 @@ impl SessionRuntime for GatewayRuntime {
         effort: Option<&str>,
         mode: Option<&str>,
     ) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id)?;
         self.server
             .ahp_inner()
             .preflight_config(session_id, model, effort, mode)
     }
 
     fn set_reasoning_effort(&self, session_id: &str, effort: &str) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id)?;
         self.server
             .ahp_inner()
             .set_reasoning_effort(session_id, effort)
     }
 
     fn set_approval_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id)?;
         self.server.ahp_inner().set_approval_mode(session_id, mode)
     }
 
     fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id)?;
         let server = Arc::clone(&self.server);
         let inner = Arc::clone(server.ahp_inner());
         let session_id = session_id.to_string();
@@ -363,10 +360,12 @@ impl SessionRuntime for GatewayRuntime {
     }
 
     fn compact(&self, session_id: &str, instructions: Option<String>) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id)?;
         self.server.ahp_inner().compact(session_id, instructions)
     }
 
     fn plan_seed(&self, session_id: &str, plan_file: &str) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id)?;
         self.server.ahp_inner().plan_seed(session_id, plan_file)
     }
 
@@ -378,6 +377,7 @@ impl SessionRuntime for GatewayRuntime {
         budget: Option<u64>,
         max_rounds: Option<u64>,
     ) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id)?;
         self.server
             .ahp_inner()
             .goal(session_id, action, objective, budget, max_rounds)
