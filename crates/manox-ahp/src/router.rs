@@ -252,6 +252,16 @@ fn dispatch_action(inner: &Arc<Inner>, conn: &Arc<Conn>, params: DispatchActionP
         crate::backend::DispatchOutcome::Accepted | crate::backend::DispatchOutcome::Ignored => {
             inner.publish(uri, params.action, Some(origin));
         }
+        crate::backend::DispatchOutcome::AcceptedThen(derived) => {
+            // The echo leads, the derived actions follow in order: clients
+            // fold a single numbered stream, so a derived action that raced
+            // ahead of the echo would fold against the state the accepted
+            // action had not yet produced (#945's removal-before-Set).
+            inner.publish(uri, params.action, Some(origin));
+            for action in derived {
+                inner.publish(uri, action, None);
+            }
+        }
     }
 }
 

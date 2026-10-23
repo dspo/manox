@@ -3863,6 +3863,91 @@ mod fold_semantics_tests {
         );
     }
 
+    /// An idle steer's wake retires the steering slot by id, not by inference.
+    ///
+    /// The `steer` intent on an idle thread opens its own turn: the receipt
+    /// says `injected: false`, so the host publishes no removal — the woken
+    /// turn IS the consumption. What retires the client's card is the wake
+    /// itself, and it can only do that by id: the run's opening user row
+    /// carries the steer id as its `originRpc` (the server pins it), the
+    /// initiating re-issue names it as `queuedMessageId`, and the reducer
+    /// matches that against the steering slot (#945).
+    #[test]
+    fn an_idle_wake_stamps_the_opening_row_with_the_client_id() {
+        let steer = |state: &mut ahp_types::state::ChatState| {
+            ahp::reducers::apply_action_to_chat(
+                state,
+                &StateAction::ChatPendingMessageSet(ChatPendingMessageSetAction {
+                    kind: PendingMessageKind::Steering,
+                    id: "steer-1".to_string(),
+                    message: Message {
+                        text: "wake up".to_string(),
+                        origin: MessageOrigin {
+                            kind: MessageKind::User,
+                        },
+                        attachments: None,
+                        model: None,
+                        agent: None,
+                        meta: None,
+                    },
+                }),
+            );
+        };
+        let wake = |origin: Option<&str>| {
+            let mut row = json!({
+                "type": "message",
+                "id": "sentry-1",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "wake up"}]},
+            });
+            if let Some(origin) = origin {
+                row["origin"] = json!(origin);
+            }
+            [
+                kernel(json!({"type": "turn_start", "id": "sentry-0"})),
+                kernel(row),
+            ]
+        };
+
+        // The stamped wake: the slot retires and the turn opens with the text.
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        steer(&mut state);
+        for (seq, entry) in wake(Some("steer-1")).into_iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, &entry) {
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        let turn = state.active_turn.as_ref().expect("the wake opened a turn");
+        assert_eq!(
+            turn.message.text, "wake up",
+            "the woken turn opens with the steer's text"
+        );
+        assert!(
+            state.steering_message.is_none(),
+            "the wake consumed the steer by id: {:?}",
+            state.steering_message
+        );
+
+        // The anonymous row this pin exists to remove: no client id, so the
+        // re-issue mints `m-{entry}`, matches nothing, and the slot survives
+        // the wake — the residue a later turn would inherit and clients could
+        // only retire by matching row text.
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        steer(&mut state);
+        for (seq, entry) in wake(None).into_iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, &entry) {
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        assert_eq!(
+            state.steering_message.as_ref().map(|m| m.id.as_str()),
+            Some("steer-1"),
+            "without the id the wake retires nothing"
+        );
+    }
+
     /// An agentic tool loop: every assistant message is followed by a `stop`
     /// record carrying the model's stop reason, and the turn only really
     /// ends at its `turn_finish`. The stops are per-message metadata — no

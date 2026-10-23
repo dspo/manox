@@ -2036,17 +2036,20 @@ impl Backend for RuntimeBackend {
                 // removal the moment the injection is confirmed; without it the
                 // client keeps rendering a steer that is already in the
                 // transcript, and a later turn inherits the residue.
-                if receipt.get("injected").and_then(Value::as_bool) == Some(true)
-                    && let Some(host) = self.host()
-                {
-                    host.publish(
-                        channel,
+                //
+                // The removal rides `AcceptedThen`, not a mid-dispatch
+                // publish: the router echoes the accepted Set before it, so
+                // clients fold [Set → Removed] and the receipt matches the
+                // slot the echo just filled. Published inside dispatch, it
+                // stamped ahead of the echo and every fold answered NoOp
+                // against the still-empty slot (#945).
+                if receipt.get("injected").and_then(Value::as_bool) == Some(true) {
+                    return DispatchOutcome::AcceptedThen(vec![
                         StateAction::ChatPendingMessageRemoved(ChatPendingMessageRemovedAction {
                             kind: ahp_types::state::PendingMessageKind::Steering,
                             id: set.id.clone(),
                         }),
-                        None,
-                    );
+                    ]);
                 }
                 DispatchOutcome::Accepted
             }

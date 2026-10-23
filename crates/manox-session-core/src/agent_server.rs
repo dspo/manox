@@ -1835,14 +1835,16 @@ impl AgentServerInner {
     /// Inject a steer into a running turn, answering with the receipt
     /// `{accepted, message_id?}`. The steer id IS the echo correlation: the
     /// client retires its optimistic bubble when its own injection settles.
+    /// On the idle path the same id is pinned as the woken turn's origin, so
+    /// the opening row and the retirement share it end to end.
     pub(crate) fn steer(
         &self,
         session_id: &str,
         message_id: String,
         text: String,
         images: Vec<ImageAttachment>,
-        // The steer id IS the echo correlation (the client retires its
-        // echo when the steer's own injection settles); no origin pin.
+        // The steer id (`message_id`) is the only correlation the protocol
+        // needs; an origin rpc would name the same thing twice.
         _origin_rpc: Option<String>,
     ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
         let images: Vec<(String, String)> = images
@@ -1866,6 +1868,9 @@ impl AgentServerInner {
                 approval_mode: Some(t.permission_mode().as_i64()),
                 ..Default::default()
             };
+            // A bodyless steer starts no run; the body check must precede
+            // `to_message_content`, which consumes both.
+            let has_body = !text.trim().is_empty() || !images.is_empty();
             let content = to_message_content(text, images);
             if t.is_running() {
                 // S3 stable-id: thread the client's `Steer` message id through
@@ -1874,6 +1879,15 @@ impl AgentServerInner {
                 t.enqueue_steer(content, Some(ui), Some(message_id.clone()));
                 true
             } else {
+                // The steer opens its own turn. Pin the steer id as the turn's
+                // origin so the woken run's user row carries it: the projection
+                // stamps the opening `turnStarted` with it (`queuedMessageId`),
+                // which retires the steering slot by id — without the pin the
+                // row carries no client id, the projection mints `m-{entry}`,
+                // and clients are back to matching row text (#945).
+                if has_body {
+                    t.set_pending_turn_origin(Some(message_id.clone()));
+                }
                 t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
                 t.run_turn();
                 false
