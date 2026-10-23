@@ -130,7 +130,7 @@ pub(crate) enum SessionCmd {
     SetThinkingLevel(Option<String>),
     /// Switch the permission mode and persist it in the session sidecar.
     SetPermissionMode(PermissionMode),
-    /// Toggle an opt-in browser tool suite (ChromeUse / WebExplore) on or
+    /// Toggle an opt-in browser tool suite (WebExplore) on or
     /// off; the engine merges/removes the suite names atomically.
     SetBrowserSuite { suite: BrowserSuite, enable: bool },
     /// Manual compaction (`/compact`), optionally steering the summary.

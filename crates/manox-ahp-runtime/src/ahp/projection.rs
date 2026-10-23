@@ -4528,7 +4528,7 @@ mod extension_gate_tests {
                 "x-manox-work:/s-1",
             ),
             (
-                kernel(json!({"type": "browser_suites", "suites": ["chrome"]})),
+                kernel(json!({"type": "browser_suites", "suites": ["webexplore"]})),
                 ext_actions::WORK_BROWSER_SUITES,
                 "x-manox-work:/s-1",
             ),
@@ -4625,7 +4625,7 @@ mod extension_gate_tests {
                 plan: Some(json!({})),
                 plan_review: plan_review_action,
                 goal: Some(json!({"text": "ship"})),
-                browser_suites: Some(vec!["chrome".to_string()]),
+                browser_suites: Some(vec!["webexplore".to_string()]),
                 background_tasks: Some(
                     [("bg_7".to_string(), json!({"task_id": "bg_7"}))]
                         .into_iter()
