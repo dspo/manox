@@ -60,8 +60,10 @@ pub struct ApprovalGate {
     /// cell — no object row, no sidecar field — so a restored session
     /// starts closed again; the AHP `session/configChanged` write is the
     /// only thing that opens it. The per-call resolvers (the bash
-    /// seatbelt's route picker, the denial classifier) read this live.
+    /// seatbelt's route picker, the denial classifier) read this live; the
+    /// policy beside it owns the managed proxy the route may name.
     network: Mutex<manox_harness::sandbox::NetworkAccess>,
+    network_policy: crate::sandbox::netpolicy::NetworkPolicy,
     /// The conversation's configuration authority. When installed it answers
     /// [`Self::mode`], so every per-call reader — this gate's own tool
     /// wrapper, the bash seatbelt's standing resolver, the Write/Edit
@@ -94,6 +96,7 @@ impl ApprovalGate {
         Self {
             mode: Mutex::new(AccessMode::default()),
             network: Mutex::new(manox_harness::sandbox::NetworkAccess::default()),
+            network_policy: crate::sandbox::netpolicy::NetworkPolicy::new(),
             config_source: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             notice_tx,
@@ -156,10 +159,18 @@ impl ApprovalGate {
         *self.network.lock().unwrap() = access;
     }
 
-    /// The network face one confined call runs under: the switch mapped to
-    /// its route (the managed-proxy face joins when a proxy is running).
+    /// The network face one confined call runs under: the switch (read
+    /// synchronously — a route answer never lags the switch) mapped through
+    /// the policy's proxy state.
     pub fn network_route(&self) -> crate::sandbox::NetworkRoute {
-        crate::sandbox::NetworkRoute::from_access(self.network_access())
+        self.network_policy.route_for(self.network_access())
+    }
+
+    /// The network policy — the switch's proxy half is applied here (the
+    /// engine spawns the lifecycle call), and the amendment approver
+    /// installs on it.
+    pub fn network_policy(&self) -> &crate::sandbox::netpolicy::NetworkPolicy {
+        &self.network_policy
     }
 
     pub fn model(&self) -> Option<HarnessModel> {

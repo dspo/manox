@@ -123,6 +123,61 @@ pub struct Settings {
     /// apply to new threads.
     #[serde(default)]
     pub edit: EditSettings,
+
+    /// Sandbox switches. The network allowlist is read per enable (not
+    /// cached), so a session's network switch picks up edits immediately,
+    /// and it is the one sandbox key written at runtime (approved-host
+    /// amendments persist there).
+    #[serde(default)]
+    pub sandbox: SandboxSettings,
+}
+
+/// Sandbox switches: the network domain allowlist for the managed-proxy
+/// route. Semantics: exact hosts, `*.example.com` (any subdomain),
+/// `**.example.com` (apex plus subdomains), and IP literals; a hostname
+/// that resolves into the host's own address space is refused even when
+/// allowlisted. Deliberately serialized even when empty — a cleared
+/// allowlist must reach disk.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SandboxSettings {
+    #[serde(default)]
+    pub network: SandboxNetworkSettings,
+}
+
+/// The `[sandbox.network]` table: `allow = ["crates.io", "*.example.com"]`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SandboxNetworkSettings {
+    pub allow: Vec<String>,
+}
+
+/// The configured network allowlist, read fresh (no cache): the managed
+/// route compiles it per enable, so a hand edit between switches applies
+/// without a restart.
+pub fn sandbox_network_allow() -> Vec<String> {
+    load().sandbox.network.allow
+}
+
+/// Append one host to the allowlist and persist it (the approved-host
+/// amendment path). Read-modify-write serialized behind a process lock, the
+/// same discipline as the MCP toggle: two concurrent amendments must not
+/// drop each other's entry.
+pub fn add_sandbox_network_allow(host: &str) -> Result<()> {
+    static MODIFY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = MODIFY_LOCK.lock();
+    let mut settings = load();
+    if settings
+        .sandbox
+        .network
+        .allow
+        .iter()
+        .any(|h| h.trim().eq_ignore_ascii_case(host.trim()))
+    {
+        return Ok(());
+    }
+    settings.sandbox.network.allow.push(host.to_string());
+    save(&settings)
 }
 
 /// Hashline Edit tool switches. `enforce_seen_lines` opts a host into the
@@ -703,6 +758,39 @@ default_model = "kept"
         assert_eq!(r.max_output_tokens, 128);
         assert!(r.enabled);
         assert!(r.model.is_empty()); // preset's model is also empty
+    }
+
+    #[test]
+    fn sandbox_network_allowlist_round_trips() {
+        let raw = r#"
+ui_language = "en"
+
+[sandbox.network]
+allow = ["crates.io", "*.example.com"]
+"#;
+        let s: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(
+            s.sandbox.network.allow,
+            vec!["crates.io".to_string(), "*.example.com".to_string()]
+        );
+        // An absent table defaults to an empty (still-serialized) list.
+        let empty: Settings = toml::from_str("ui_language = \"en\"").unwrap();
+        assert!(empty.sandbox.network.allow.is_empty());
+    }
+
+    #[test]
+    fn saving_an_empty_allowlist_clears_it_on_disk() {
+        let existing = "[sandbox.network]\nallow = [\"old.example.com\"]\n";
+        let cleared = Settings::default();
+        let out = merge_into_existing(&cleared, Some(existing)).unwrap();
+        let parsed: toml::Value = toml::from_str(&out).unwrap();
+        let allow = parsed
+            .get("sandbox")
+            .and_then(|t| t.get("network"))
+            .and_then(|t| t.get("allow"))
+            .and_then(|v| v.as_array())
+            .map(Vec::len);
+        assert_eq!(allow, Some(0), "clearing the allowlist did not reach disk:\n{out}");
     }
 
     #[test]

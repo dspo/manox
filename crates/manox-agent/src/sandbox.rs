@@ -44,6 +44,11 @@ pub use manox_harness::sandbox::canonicalize_best_effort;
 #[cfg(target_os = "linux")]
 mod linux;
 
+/// The managed-network half: the domain allowlist, the loopback CONNECT
+/// proxy, and the route the profile renders. macOS-only in effect — the
+/// Linux managed path needs a netns loopback bridge (a later stage).
+pub mod netpolicy;
+
 /// The network face one confined call runs under: the session's
 /// `networkAccess` switch plus, when the managed proxy is running (macOS,
 /// allowlist configured), the loopback port it listens on. `full-access`

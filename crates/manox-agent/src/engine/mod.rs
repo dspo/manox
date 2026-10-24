@@ -827,9 +827,11 @@ impl ThreadEngine for Engine {
     fn set_network_access(&self, access: manox_harness::sandbox::NetworkAccess) {
         // Same live-authority shape as `set_access_mode`: the gate's network
         // cell answers the per-call resolvers, so the switch governs the
-        // very next confined call. The actor command re-stamps it
-        // idempotently (and, with the managed proxy, owns its start/stop).
+        // very next confined call. The spawned pass applies the managed
+        // proxy's start/stop; the actor command re-stamps idempotently.
         self.state.gate.set_network_access(access);
+        let policy = self.state.gate.network_policy().clone();
+        tokio::spawn(async move { policy.set_enabled(access).await });
         let _ = self.cmd_tx.send(SessionCmd::SetNetworkAccess(access));
     }
 
@@ -2818,6 +2820,10 @@ async fn apply_network_access(
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) {
     state.gate.set_network_access(access);
+    // The actor's awaited pass: by the time the echo notice lands, the
+    // managed proxy's end-state matches the switch (the facade's spawned
+    // call is an idempotent head start).
+    state.gate.network_policy().set_enabled(access).await;
     send_notice(
         notice_tx,
         BackendNotice::Event(Box::new(ThreadEvent::NetworkAccessChanged { access })),
