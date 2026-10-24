@@ -283,26 +283,26 @@ const DENIED_SYSCALLS: &[i64] = &[
 ];
 
 /// The syscalls the socket-restricted face additionally refuses when the
-/// route is closed: the connect/accept/bind/listen lifecycle, the
-/// address-inspection calls, and the send/receive bulk. `recvfrom` stays
-/// allowed so socketpair-based subprocess management (`cargo clippy` and
-/// friends) keeps working, and the `socket`/`socketpair` families get a
-/// conditional rule (AF_UNIX only) rather than a blanket deny.
+/// route is closed: the data-plane verbs that survive the single-phase
+/// design. The socket-family gate on `socket`/`socketpair` already makes an
+/// inet socket uncreatable; these denials are the second layer against
+/// stray inherited fds (std spawn closes them anyway). `bind`/`sendto`/
+/// `sendmsg`/`recvmsg`/`getsockname` and the option calls stay ALLOWED
+/// because bwrap itself raises the netns loopback over a NETLINK_ROUTE
+/// socket (`socket`→`bind`→`sendto` of RTM_NEWADDR/RTM_NEWLINK) — our
+/// filter installs before bwrap execs (no inner helper), so bwrap's
+/// in-band setup must ride through, and netlink inside an unshared netns
+/// reaches no host state. A codex-shaped two-phase design could deny
+/// `sendto` outright because its filter lands after bwrap's setup; ours
+/// cannot express that split. `recvfrom` stays allowed for socketpair-based
+/// subprocess management (`cargo clippy` and friends).
 const NETWORK_DENIED_SYSCALLS: &[i64] = &[
     libc::SYS_connect,
     libc::SYS_accept,
     libc::SYS_accept4,
-    libc::SYS_bind,
     libc::SYS_listen,
-    libc::SYS_getpeername,
-    libc::SYS_getsockname,
-    libc::SYS_shutdown,
-    libc::SYS_sendto,
-    libc::SYS_sendmsg,
     libc::SYS_sendmmsg,
     libc::SYS_recvmmsg,
-    libc::SYS_getsockopt,
-    libc::SYS_setsockopt,
 ];
 
 /// The unconditional deny rules: one entry per denied syscall, each with an
