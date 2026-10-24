@@ -941,12 +941,10 @@ mod tests {
         params.iter().map(|(_, p)| p.clone()).collect()
     }
 
-    #[cfg(target_os = "macos")]
     fn resolver(mode: AccessMode) -> Arc<dyn Fn() -> AccessMode + Send + Sync> {
         Arc::new(move || mode)
     }
 
-    #[cfg(target_os = "macos")]
     fn route_resolver(route: NetworkRoute) -> Arc<dyn Fn() -> NetworkRoute + Send + Sync> {
         Arc::new(move || route)
     }
