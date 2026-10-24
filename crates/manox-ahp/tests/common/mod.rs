@@ -182,6 +182,9 @@ pub struct RecordingBackend {
     dispatched: parking_lot::Mutex<Vec<(String, StateAction)>>,
     /// The outcome `dispatch` answers; `None` means "accept everything".
     refusal: parking_lot::Mutex<Option<String>>,
+    /// Host actions `dispatch` answers with after the accepted echo
+    /// (`AcceptedThen`); empty means "accept with no follow-ups".
+    derived: parking_lot::Mutex<Vec<StateAction>>,
 }
 
 impl RecordingBackend {
@@ -196,6 +199,7 @@ impl RecordingBackend {
             inner,
             dispatched: parking_lot::Mutex::new(Vec::new()),
             refusal: parking_lot::Mutex::new(None),
+            derived: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -219,6 +223,13 @@ impl RecordingBackend {
     /// Make every subsequent `dispatch` answer `Rejected(reason)`.
     pub fn refuse_with(&self, reason: &str) {
         *self.refusal.lock() = Some(reason.to_string());
+    }
+
+    /// Make every subsequent accepted `dispatch` answer
+    /// `AcceptedThen(derived)` — the handler-derived actions the router owes
+    /// an echo-then-follows ordering.
+    pub fn derive_with(&self, derived: Vec<StateAction>) {
+        *self.derived.lock() = derived;
     }
 }
 
@@ -284,9 +295,11 @@ impl Backend for RecordingBackend {
         self.dispatched
             .lock()
             .push((channel.to_string(), action.clone()));
+        let derived = self.derived.lock().clone();
         match self.refusal.lock().clone() {
             Some(reason) => DispatchOutcome::Rejected(reason),
-            None => DispatchOutcome::Accepted,
+            None if derived.is_empty() => DispatchOutcome::Accepted,
+            None => DispatchOutcome::AcceptedThen(derived),
         }
     }
     fn extension(&self, method: &str, params: &Value) -> Result<Value, HostError> {

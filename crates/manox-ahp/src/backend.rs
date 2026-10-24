@@ -22,10 +22,18 @@ use crate::error::HostError;
 use crate::resource::ResourcePlane;
 
 /// What the runtime did with an accepted action.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DispatchOutcome {
     /// The runtime took the action; the envelope goes out.
     Accepted,
+    /// Accepted, and the handler derived host actions from it. The router
+    /// publishes the accepted envelope FIRST, then each action in order on
+    /// the same channel: a client folding the wire must meet the state the
+    /// accepted action leaves before anything derived from it — a consumption
+    /// receipt can only match the slot the echo just filled (#945). Actions a
+    /// handler wants folded BEFORE the echo stay plain mid-dispatch
+    /// publishes.
+    AcceptedThen(Vec<StateAction>),
     /// Accepted by the reducer but nothing to do (idempotent replay).
     Ignored,
     /// The runtime cannot honour it; the host echoes a rejection instead.

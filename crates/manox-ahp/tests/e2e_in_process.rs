@@ -19,7 +19,7 @@ use manox_ahp::channels::root;
 use manox_ahp::transport::inproc;
 use manox_ahp::{Host, StateAction};
 
-use common::{TestBackend, action};
+use common::{RecordingBackend, TestBackend, action};
 
 fn connect(host: &Host) -> impl std::future::Future<Output = Client> {
     let (host_side, client_side) = inproc::pair();
@@ -173,6 +173,103 @@ async fn dispatch_action_is_echoed_back_with_origin() {
     assert_eq!(origin.client_id, "desktop");
     assert_eq!(origin.client_seq, handle.client_seq);
     assert!(envelope.rejection_reason.is_none());
+}
+
+/// A handler that derives host actions from an accepted dispatch gets them
+/// published AFTER the accepted echo, in order (`DispatchOutcome::AcceptedThen`).
+///
+/// The steer shape is the one that found the gap (dspo/manox#945): the host
+/// confirms the injection inside `dispatch` and owes a
+/// `pendingMessageRemoved` for it. Published mid-dispatch, the removal stamped
+/// ahead of the Set echo, so every fold — the host's own included — met it
+/// against an empty `steeringMessage` slot, answered NoOp, and kept the Set
+/// the echo then landed: a consumed steer rendered as pending forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn derived_actions_follow_the_accepted_echo() {
+    use ahp_types::actions::{ChatPendingMessageRemovedAction, ChatPendingMessageSetAction};
+    use ahp_types::state::{Message, MessageKind, MessageOrigin, PendingMessageKind};
+
+    let backend = RecordingBackend::new();
+    let host = Host::new(backend.clone() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![TestBackend::chat_uri()],
+        )
+        .await
+        .expect("initializes");
+    let mut sub = client.attach_subscription(&TestBackend::chat_uri()).await;
+
+    backend.derive_with(vec![StateAction::ChatPendingMessageRemoved(
+        ChatPendingMessageRemovedAction {
+            kind: PendingMessageKind::Steering,
+            id: "steer-1".to_string(),
+        },
+    )]);
+    client
+        .dispatch(
+            TestBackend::chat_uri(),
+            StateAction::ChatPendingMessageSet(ChatPendingMessageSetAction {
+                kind: PendingMessageKind::Steering,
+                id: "steer-1".to_string(),
+                message: Message {
+                    text: "use the fast suite".to_string(),
+                    origin: MessageOrigin {
+                        kind: MessageKind::User,
+                    },
+                    attachments: None,
+                    model: None,
+                    agent: None,
+                    meta: None,
+                },
+            }),
+        )
+        .await
+        .expect("dispatches");
+
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("envelope arrives")
+            .expect("subscription open");
+        let envelope = match event {
+            ahp::SubscriptionEvent::Action(envelope) => envelope,
+            other => panic!("expected an action envelope, got {other:?}"),
+        };
+        assert!(envelope.rejection_reason.is_none());
+        seen.push((
+            manox_ahp::wire::action_tag(&envelope.action),
+            envelope.server_seq,
+            envelope.origin.is_some(),
+        ));
+    }
+    let tags: Vec<(&str, bool)> = seen
+        .iter()
+        .map(|(tag, _, origin)| (tag.as_str(), *origin))
+        .collect();
+    assert_eq!(
+        tags,
+        [
+            ("chat/pendingMessageSet", true),
+            ("chat/pendingMessageRemoved", false),
+        ],
+        "the originator's echo leads, the host-derived removal follows: {seen:?}"
+    );
+    assert_eq!(
+        seen[1].1,
+        seen[0].1 + 1,
+        "the two stamps are consecutive on the one numbered stream: {seen:?}"
+    );
+    // The fold agrees: the removal met the slot the echo had filled.
+    let chat = host.chat_state("c-1").expect("the chat is seeded");
+    assert!(
+        chat.steering_message.is_none(),
+        "the receipt consumed the steer instead of stranding it: {:?}",
+        chat.steering_message
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

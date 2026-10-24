@@ -1817,6 +1817,9 @@ mod dispatch {
         cancelled: std::sync::atomic::AtomicUsize,
         /// Every prompt the facade handed to a run, in order.
         prompts: parking_lot::Mutex<Vec<String>>,
+        /// The origin pinned on each run, in `prompts` order (`None` when
+        /// the facade pinned nothing).
+        run_origins: parking_lot::Mutex<Vec<Option<String>>>,
         questions: parking_lot::Mutex<Vec<(String, String)>>,
         auth: parking_lot::Mutex<Vec<(String, bool)>>,
         cwds: parking_lot::Mutex<Vec<std::path::PathBuf>>,
@@ -1838,6 +1841,9 @@ mod dispatch {
         /// facade's `steer` argument, which carries the client's id).
         fn steer_ids(&self) -> Vec<String> {
             self.steers.lock().clone()
+        }
+        fn run_origins(&self) -> Vec<Option<String>> {
+            self.run_origins.lock().clone()
         }
     }
 
@@ -1884,6 +1890,16 @@ mod dispatch {
         }
         fn run(&self, prompt: String, _content: Vec<manox_harness::types::ContentBlock>) {
             self.prompts.lock().push(prompt);
+        }
+        fn run_with_origin(
+            &self,
+            prompt: String,
+            content: Vec<manox_harness::types::ContentBlock>,
+            origin: Option<String>,
+            _accepted_entry: Option<String>,
+        ) {
+            self.run_origins.lock().push(origin);
+            self.run(prompt, content);
         }
         fn steer(
             &self,
@@ -2171,6 +2187,11 @@ mod dispatch {
     /// `chat/pendingMessageSet` must park the steer under the id the client
     /// chose — that id is what the journal row and the echo retirement share,
     /// so a mismatch would leave a phantom pending message behind.
+    ///
+    /// The injection's consumption receipt rides the outcome
+    /// (`AcceptedThen`), not a mid-dispatch publish: the router echoes the
+    /// accepted Set first, so the removal folds against the slot the echo
+    /// filled instead of NoOp-ing against an empty one (dspo/manox#945).
     #[tokio::test(flavor = "multi_thread")]
     async fn pending_message_set_parks_the_steer_under_its_id() {
         let _guards = install();
@@ -2191,7 +2212,13 @@ mod dispatch {
             });
         assert_eq!(
             backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
-            DispatchOutcome::Accepted
+            DispatchOutcome::AcceptedThen(vec![StateAction::ChatPendingMessageRemoved(
+                ChatPendingMessageRemovedAction {
+                    kind: PendingMessageKind::Steering,
+                    id: "steer-1".to_string(),
+                }
+            )]),
+            "an injected steer is consumed by the running turn: the removal follows the echo"
         );
         // The injected steer carries the client's id through to the engine.
         let steer_ids = engine.steer_ids();
@@ -2245,6 +2272,64 @@ mod dispatch {
             opened["injected"],
             serde_json::json!(false),
             "a steer that opens its own turn is not an injection: {opened}"
+        );
+        // The woken run carries the steer id as its origin: that is what
+        // lands on the opening user row, so the projection's `turnStarted`
+        // names the steer (`queuedMessageId`) and the client retires it by
+        // id rather than by matching row text (#945). A steer dispatched to
+        // an idle session is otherwise indistinguishable from a submit whose
+        // row carries no client id.
+        assert_eq!(
+            engine.prompts.lock().as_slice(),
+            ["start fresh"],
+            "the idle steer ran as its own turn"
+        );
+        assert_eq!(
+            engine.run_origins(),
+            vec![Some("steer-3".to_string())],
+            "the woken run is pinned to the steer id"
+        );
+
+        // A bodyless steer starts no run and must not leave the pin armed:
+        // the next run the facade starts on its own carries no origin.
+        server
+            .ahp_inner()
+            .session_thread("s-dispatch")
+            .expect("live session")
+            .with_mut(|t| t.set_running_for_test(false));
+        let empty = server
+            .ahp_inner()
+            .steer(
+                "s-dispatch",
+                "steer-4".to_string(),
+                "   ".to_string(),
+                Vec::new(),
+                None,
+            )
+            .expect("a bodyless steer is accepted");
+        assert_eq!(empty["injected"], serde_json::json!(false));
+        assert_eq!(
+            engine.prompts.lock().len(),
+            1,
+            "a bodyless steer starts no run"
+        );
+        server
+            .ahp_inner()
+            .session_thread("s-dispatch")
+            .expect("live session")
+            .with_mut(|t| {
+                t.insert_user_message_with_content_and_ui_metadata(
+                    vec![manox_agent::language_model::MessageContent::Text(
+                        "unpinned".to_string(),
+                    )],
+                    None,
+                );
+                t.run_turn();
+            });
+        assert_eq!(
+            engine.run_origins(),
+            vec![Some("steer-3".to_string()), None],
+            "the bodyless steer left no origin behind for the next run to inherit"
         );
         uninstall();
     }
