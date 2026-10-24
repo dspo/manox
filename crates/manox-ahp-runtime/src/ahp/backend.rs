@@ -141,7 +141,7 @@ impl Cursor {
 }
 
 /// Whether a journal row carries state a client cannot afford to miss in a
-/// lag-resync: asks, tool calls/results, plan reviews, lifecycle and config
+/// lag-resync: asks, tool calls/results, lifecycle and config
 /// facts. Delta rows (streamed text/thinking/output chunks) are consciously
 /// dropped from a gap — replaying them at flood rate re-lags the bridge.
 /// `BackgroundTask` and `run/*` rows are NOT droppable: they are the
@@ -770,7 +770,7 @@ impl RuntimeBackend {
     /// Read the durable journal rows at and above `from` and forward them
     /// through the translator — the replay leg shared by bridge startup and
     /// lag recovery. `state_only` forwards just the state-bearing rows (asks,
-    /// tool calls, plan reviews): a lag recovery uses it to jump the gap
+    /// tool calls): a lag recovery uses it to jump the gap
     /// without replaying a delta flood, which would re-lag the bridge into a
     /// live-lock (each full replay falling further behind the flood).
     ///

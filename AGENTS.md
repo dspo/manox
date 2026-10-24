@@ -85,7 +85,6 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 - 外部会话：`~/.manox/external-sessions/`（外部 CLI 会话由 manox-app 侧的 cx 驱动，目录约定在本仓库文档维护）
 - 设置：`~/.manox/settings.toml`；主题：`~/.manox/themes/`
 - 子 agent：`~/.claude/agents/*.md`（frontmatter name/description/tools/model + 正文；每个定义装配为一个独立委派工具：`ext/subagent/` 的 SubagentRuntime/SubagentProvider/能力协商/descriptor）；MCP：`~/.manox/mcp.json`（Claude Code `mcpServers` schema，stdio 或 HTTP；项目级 `.mcp.json` 与插件 `.mcp.json` 同 schema，合并序 plugin < global < project）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
-- Plan 文件：`~/.manox/plans/`
 - WS 网关端点（`cx web`，CLI 在 manox-app）：`~/.manox/gateway-ws.json`（0600；启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ws?token=…`；每次启动覆盖，进程退出后过期）。网关每机单例：`ws::start` 以非阻塞 flock 持 `~/.manox/gateway.lock`，他进程已持锁时本次 start 不绑定不发布（loud no-op）。
 - cx CLI 状态：`~/.manox/cx.db`、IPC socket `~/.manox/sessions/`（该目录自 v1.0.0 起只承载 cx 的 socket 与注册 JSON，不再是会话 journal 目录）、codex 注入目录 `~/.manox/.codex/`、`~/.manox/.patch_source`（CLI 本体在 manox-app，状态目录与本仓库共享）
 - API key 源：macOS Keychain（`keychain:SERVICE`）/ env（`env:VAR`）/ 字面量（`literal:...`）/ shell（`$(shell ...)`）
@@ -112,7 +111,7 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`；�
 
 - **crates/manox-harness/src/core 内核**：只承载通用 agent 内核能力（循环、压缩、会话、内建工具）+ 提供拓展点与拓展机制；宿主/业务逻辑一律不进内核。
 - **crates/manox-harness/src/ext 扩展**：只经内核拓展点扩展业务能力（provider 自治注册、bash 编排、子代理、session sidecar、model_ref 等），不反向依赖宿主。
-- **manox-agent 宿主**：装配 + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、Plan 模式等）。manox-harness 是唯一 harness 后端（harness 选择 feature 已移除）。
+- **manox-agent 宿主**：装配 + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、内建 skills 等）。manox-harness 是唯一 harness 后端（harness 选择 feature 已移除）。
 
 `Py`（内建工具，`core/tools/py.rs`）用 RustPython 在进程内跑短脚本（frozen stdlib、无第三方包、无 TLS、≤120 行）。它**不是文件工具**——常规读写搜归 Read/Write/Edit/Grep/Glob/Ls，提示词与 `description()` 都这么写；它**不自带沙箱**：权限门控在宿主（read-only 整调用拒绝、workspace-write 放行），超时不可抢占（脚本线程被放弃后可能仍在跑），cwd 经进程级 `chdir` 串行设置并在 drop 时恢复。`sqlite` feature 开启（多一份 bundled `libsqlite3-sys`，`rusqlite` 已因此对齐到 0.40）。
 
@@ -134,7 +133,7 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`；�
 
 ### 退役代码处置
 
-- 老 manox harness 曾退役为 `crates/harness-manox` 归档 crate；其中有价值的 harness 无关模块已迁入 agent 共享层（permission / approval_review / skill / command / frontmatter / proposed_plan / collaboration_mode / mcp 核心 / image / title）。归档 crate 本体已完全删除——需要参考老实现时查 git 历史或 `origin/Manox` 备份分支。
+- 老 manox harness 曾退役为 `crates/harness-manox` 归档 crate；其中有价值的 harness 无关模块已迁入 agent 共享层（permission / approval_review / skill / command / frontmatter / mcp 核心 / image / title）。归档 crate 本体已完全删除——需要参考老实现时查 git 历史或 `origin/Manox` 备份分支。
 
 ### 安全语义
 

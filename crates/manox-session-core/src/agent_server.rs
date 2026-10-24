@@ -1001,7 +1001,7 @@ fn publish_root_agents(host: &Arc<manox_ahp::Host>, agents: Vec<ahp_types::state
 /// active-chain rows are re-appended through the storage's own append path
 /// (ids and parent links preserved; seq re-derived along the chain, which
 /// for a dense prefix reproduces the source seqs exactly). Engine state
-/// carried by the journal — model, cwd, goal, plan review, the subagent
+/// carried by the journal — model, cwd, goal, the subagent
 /// rail — restores from the copied rows on load; nothing else is rewritten
 /// (threads.db is not on the session-creation path). The source is read
 /// straight off its persisted file (the cold path): appends are durable at
