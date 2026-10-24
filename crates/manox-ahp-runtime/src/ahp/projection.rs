@@ -81,15 +81,15 @@ use manox_ahp::ext;
 ///
 /// The runtime's `ConfigSchema` declares the same keys: this is the naming
 /// authority for the values that ride `session/configChanged` — the spec's config
-/// model (model / effort / approval mode) plus the session facts AHP has no field
+/// model (model / effort / access mode) plus the session facts AHP has no field
 /// for.
 pub mod config_keys {
     /// Canonical `provider/model` reference (L8).
     pub const MODEL: &str = "model";
     /// Reasoning-effort vocabulary string.
     pub const REASONING_EFFORT: &str = "reasoningEffort";
-    /// Permission / approval-mode vocabulary string.
-    pub const APPROVAL_MODE: &str = "approvalMode";
+    /// Access-mode vocabulary string.
+    pub const ACCESS_MODE: &str = "accessMode";
     /// Server-owned project path (`null` clears).
     pub const PROJECT: &str = "project";
     /// Effective working directory of this journal.
@@ -101,7 +101,7 @@ pub mod config_keys {
     /// travel this seat host→client only: `workingDirectory` writes ride
     /// the dedicated `session/workingDirectorySet` action, so their arrival
     /// through a config dispatch is a client bug, not a fold.
-    pub const MUTABLE: &[&str] = &[MODEL, REASONING_EFFORT, APPROVAL_MODE];
+    pub const MUTABLE: &[&str] = &[MODEL, REASONING_EFFORT, ACCESS_MODE];
 }
 
 /// The journal-row facts the projection mints identities from: one kernel
@@ -223,7 +223,6 @@ pub(crate) fn target_of(entry: &SessionTreeEntry) -> Target {
         E::ModelChange { .. }
         | E::CwdChange { .. }
         | E::ProjectChange { .. }
-        | E::PermissionModeChange { .. }
         | E::ThinkingLevelChange { .. }
         | E::Title { .. }
         // `PinnedArchived` lands here for its native archived half; the
@@ -1254,10 +1253,6 @@ impl Translator {
             SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => out.push(Emitted::new(
                 &session,
                 config_changed(json!({config_keys::REASONING_EFFORT: thinking_level})),
-            )),
-            SessionTreeEntry::PermissionModeChange { mode, .. } => out.push(Emitted::new(
-                &session,
-                config_changed(json!({config_keys::APPROVAL_MODE: mode})),
             )),
             SessionTreeEntry::PinnedArchived {
                 pinned, archived, ..

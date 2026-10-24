@@ -55,8 +55,8 @@ pub enum Whitelist {
     Compaction,
     /// The model changed: the cache key changes with it.
     ModelSwitch,
-    /// The permission mode changed, re-rendering a mode line.
-    PermissionMode,
+    /// The access mode changed, re-rendering a mode line.
+    AccessMode,
     /// The `today` date rolled over inside the system prompt.
     TodayRollover,
     /// A tool became visible or invisible: the catalog changed shape, not
@@ -370,10 +370,10 @@ fn classify(prev: &PayloadView, cur: &PayloadView) -> PrefixSample {
         {
             // The system text moved only through the volatile lines.
             attributed = Some(
-                if prev.system_text.contains("permission mode")
-                    || cur.system_text.contains("permission mode")
+                if prev.system_text.contains("Access mode")
+                    || cur.system_text.contains("Access mode")
                 {
-                    Whitelist::PermissionMode
+                    Whitelist::AccessMode
                 } else {
                     Whitelist::TodayRollover
                 },

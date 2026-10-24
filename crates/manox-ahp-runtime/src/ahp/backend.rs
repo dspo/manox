@@ -479,10 +479,40 @@ impl RuntimeBackend {
         Some(seeded)
     }
 
+    /// Ensure a `x-manox` command's session is live, cold-opening it when the
+    /// journal proves it exists.
+    ///
+    /// A restored session serves folded state without an engine, so the
+    /// command face would otherwise refuse work the dispatch actions accept.
+    /// The not-found code keeps its host-level shape rather than degrading to
+    /// `Backend`: a client that branches on the code cannot tell a cold miss
+    /// from an unknown id.
+    fn ensure_command_session(&self, session_id: &str) -> Result<(), HostError> {
+        match self.server.ensure_live("ahp", session_id) {
+            Ok(()) => Ok(()),
+            Err(error) if error.code.as_deref() == Some(crate::error::codes::SESSION_NOT_FOUND) => {
+                Err(HostError::SessionNotFound(session_id.to_string()))
+            }
+            Err(error) => Err(HostError::Backend(error.message)),
+        }
+    }
+
     /// Start the live bridge for `session_id` (idempotent; restarts a bridge
     /// that already exited, resuming from its last forwarded seq).
     fn ensure_bridge(&self, session_id: &str) {
         self.start_bridge(session_id, None);
+    }
+
+    /// [`Self::ensure_bridge`] for a command face that may run unseeded.
+    ///
+    /// A command can arrive over a connection that never subscribed to the
+    /// session. Without a seed there is no fold to resume above, and starting
+    /// the bridge would replay the whole journal into the host for nobody —
+    /// the later subscription seeds and starts it from its own tail.
+    fn ensure_bridge_if_seeded(&self, session_id: &str) {
+        if self.seeds.lock().contains_key(session_id) {
+            self.ensure_bridge(session_id);
+        }
     }
 
     /// Start the live bridge for `session_id` from `resume` — the first seq it
@@ -1028,7 +1058,12 @@ impl RuntimeBackend {
     /// Fail-closed on every input the runtime cannot honour: a session with no
     /// live engine would otherwise accept the registration, answer `Accepted`,
     /// fold the tools into the state every subscriber reads — and never mount
-    /// them, so the model would be offered a tool that cannot run.
+    /// them, so the model would be offered a tool that cannot run. A cold
+    /// session (restored journal, subscribed but never submitted) still owes
+    /// its clients' claims an answer, so it is opened first — the same
+    /// cold-open the submit/cancel/settle paths take — and only a genuinely
+    /// unknown id (the open answers it not-found) or a failed open keeps the
+    /// refusal, in the `message [code]` shape the dispatch refusals use.
     fn register_client_tools(
         &self,
         session_id: &str,
@@ -1037,10 +1072,11 @@ impl RuntimeBackend {
         if client.client_id.is_empty() {
             return Err("an active client needs a clientId".to_string());
         }
-        if !self.server.has_session(session_id) {
-            return Err(format!(
-                "unknown session: {session_id} (no live engine to register tools on)"
-            ));
+        if let Err(error) = self.server.ensure_live("ahp", session_id) {
+            return Err(match &error.code {
+                Some(code) => format!("{} [{code}]", error.message),
+                None => error.message,
+            });
         }
         let mut specs = Vec::with_capacity(client.tools.len());
         for tool in &client.tools {
@@ -1303,9 +1339,7 @@ impl RuntimeBackend {
             config
                 .get(config_keys::REASONING_EFFORT)
                 .and_then(Value::as_str),
-            config
-                .get(config_keys::APPROVAL_MODE)
-                .and_then(Value::as_str),
+            config.get(config_keys::ACCESS_MODE).and_then(Value::as_str),
         ) {
             return DispatchOutcome::Rejected(refusal(error));
         }
@@ -1319,9 +1353,9 @@ impl RuntimeBackend {
                 .and_then(Value::as_str)
                 .map(|effort| self.server.set_reasoning_effort(session_id, effort)),
             config
-                .get(config_keys::APPROVAL_MODE)
+                .get(config_keys::ACCESS_MODE)
                 .and_then(Value::as_str)
-                .map(|mode| self.server.set_approval_mode(session_id, mode)),
+                .map(|mode| self.server.set_access_mode(session_id, mode)),
         ];
         for outcome in applied.into_iter().flatten() {
             if let Err(error) = outcome {
@@ -1722,7 +1756,7 @@ impl Backend for RuntimeBackend {
             cwd: working_directories.first().cloned(),
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
             seed: None,
             working_directories,
@@ -1808,7 +1842,7 @@ impl Backend for RuntimeBackend {
                     cwd: None,
                     project: None,
                     initial_model: None,
-                    approval_mode: None,
+                    access_mode: None,
                     reasoning_effort: None,
                 };
                 self.server
@@ -1882,7 +1916,7 @@ impl Backend for RuntimeBackend {
             cwd: None,
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
         };
         self.server
@@ -2721,12 +2755,14 @@ impl Backend for RuntimeBackend {
                     .get("instructions")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                if !self.server.has_session(&session_id) {
-                    return Err(HostError::SessionNotFound(session_id));
-                }
+                self.ensure_command_session(&session_id)?;
                 self.server
                     .compact(&session_id, instructions)
                     .map_err(|error| HostError::Backend(error.message))?;
+                // The cold-open gave the command an engine the seed never
+                // bridged: the summary row it writes must still reach the
+                // subscribers that folded the session cold.
+                self.ensure_bridge_if_seeded(&session_id);
                 Ok(Value::Null)
             }
             manox_ahp::ext::commands::OPEN_TURN => {
@@ -2748,9 +2784,7 @@ impl Backend for RuntimeBackend {
                         "x-manox/goal needs action".to_string(),
                     ));
                 };
-                if !self.server.has_session(&session_id) {
-                    return Err(HostError::SessionNotFound(session_id));
-                }
+                self.ensure_command_session(&session_id)?;
                 let objective = params
                     .get("objective")
                     .and_then(Value::as_str)
@@ -2760,6 +2794,10 @@ impl Backend for RuntimeBackend {
                 self.server
                     .goal(&session_id, action, objective, budget, max_rounds)
                     .map_err(|error| HostError::Backend(error.message))?;
+                // Goal state is journal-derived: the `x-manox-work` action
+                // that announces it rides the bridge, which the cold seed
+                // left without a feed.
+                self.ensure_bridge_if_seeded(&session_id);
                 Ok(Value::Null)
             }
             // A client asked for a surface this build declares but does not
@@ -3119,6 +3157,9 @@ mod mcp_dispatch_tests {
         fn has_session(&self, _session_id: &str) -> bool {
             false
         }
+        fn open_session(&self, _owner: &str, _session_id: &str) -> Result<(), RuntimeError> {
+            unreachable!("unused")
+        }
         fn submit(
             &self,
             _owner: &str,
@@ -3153,7 +3194,7 @@ mod mcp_dispatch_tests {
         ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn set_approval_mode(&self, _session_id: &str, _mode: &str) -> Result<(), RuntimeError> {
+        fn set_access_mode(&self, _session_id: &str, _mode: &str) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
         fn set_cwd(&self, _session_id: &str, _cwd: &str) -> Result<(), RuntimeError> {

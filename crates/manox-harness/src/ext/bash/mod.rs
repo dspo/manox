@@ -16,8 +16,8 @@ use std::time::Duration;
 use crate::core::BackgroundTaskRegistry;
 use crate::core::env::CommandResult;
 use crate::sandbox::{
-    ESCALATION_TARGETS, EscalationApprover, EscalationRequest, NO_GRANT, PermissionMode,
-    approve_escalation, validate_escalation_args,
+    AccessMode, EscalationApprover, EscalationRequest, NO_GRANT, approve_escalation,
+    validate_escalation_args,
 };
 
 use crate::core::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
@@ -50,8 +50,8 @@ macro_rules! description_tail {
          Use `head_lines`/`tail_lines` to keep a selection of the output instead of \
          piping through `head`/`tail`. Commands run under a file sandbox; a blocked file operation \
          is reported as `[sandbox: file access denied under <mode> mode]` — a policy denial, not a \
-         bug. When a command is denied and a wider mode would let it succeed, retry the exact same \
-         command once with `sandbox_permissions` (the narrowest wider mode that suffices) plus a \
+         bug. When a command is denied and full access would let it succeed, retry the exact same \
+         command once with `require_escalated: true` plus a \
          one-sentence `justification`; the approval prompt asks the user. Never escalate \
          speculatively — ground the request in a real denial."
     };
@@ -155,10 +155,9 @@ impl Drop for ForegroundTask {
 
 /// The bash tool with the manox product surface: array-form `cwd`,
 /// background execution via the registry, head/tail line filters, and a
-/// `sandbox_permissions` escalation slot. The per-call effective mode
-/// (read-only / workspace-write / danger-full-access) selects the backend:
-/// `danger-full-access` runs through `unsandboxed_operations` (no
-/// confinement); `read-only` / `workspace-write` ride the sandboxed
+/// `require_escalated` escalation slot. The per-call effective access mode
+/// (sandbox / full-access) selects the backend: `full-access` runs through
+/// `unsandboxed_operations` (no confinement); `sandbox` rides the sandboxed
 /// `operations`, whose seatbelt profile the mode resolves. A one-shot
 /// escalation widens the effective mode for a single call after a
 /// host-injected approval round-trip.
@@ -169,14 +168,14 @@ pub struct BashTool {
     /// Optional orchestrator: when bound, background tasks are registered,
     /// watched, and their completions steered into the agent session.
     manager: Option<Arc<BackgroundManager>>,
-    /// Backend used when the effective mode is `danger-full-access`
+    /// Backend used when the effective mode is `full-access`
     /// (host-forced, or an approved escalation grant). Absent, such calls
     /// fall back to the default backend.
     unsandboxed_operations: Option<Arc<dyn BashOperations>>,
     /// Host-injected session-mode resolver. Returns the standing mode the
     /// call runs under absent an escalation grant.
-    mode_resolver: Option<Arc<dyn Fn() -> PermissionMode + Send + Sync>>,
-    /// Host-injected approval channel for a `sandbox_permissions` escalation.
+    mode_resolver: Option<Arc<dyn Fn() -> AccessMode + Send + Sync>>,
+    /// Host-injected approval channel for a `require_escalated` escalation.
     /// Absent, escalation fails closed ("no approval service composed").
     escalation_approver: Option<Arc<dyn EscalationApprover + Send + Sync>>,
     /// Shared per-call grant cell: a one-shot escalation stamp the sandboxed
@@ -214,7 +213,7 @@ impl BashTool {
     }
 
     /// Bind the unsandboxed backend: calls whose effective mode is
-    /// `danger-full-access` run through this backend instead of the
+    /// `full-access` run through this backend instead of the
     /// sandboxed one. When the host installs no second backend, such calls
     /// keep the default backend.
     pub fn with_unsandboxed_operations(mut self, ops: Arc<dyn BashOperations>) -> Self {
@@ -226,14 +225,14 @@ impl BashTool {
     /// escalation grant). Hosts wire this to their `ApprovalGate::mode()`.
     pub fn with_mode_resolver(
         mut self,
-        resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync>,
+        resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
     ) -> Self {
         self.mode_resolver = Some(resolver);
         self
     }
 
     /// Bind the escalation approval channel. Required when a sandbox backend
-    /// is mounted and the model may pass `sandbox_permissions`; absent,
+    /// is mounted and the model may pass `require_escalated`; absent,
     /// escalation fails closed.
     pub fn with_escalation_approver(
         mut self,
@@ -285,9 +284,9 @@ impl AgentTool for BashTool {
     }
 
     /// `false`: bash mutates (it is not a read-only tool). Note this is the
-    /// *tool* classification, not the *mode* effect — under read-only the
-    /// seatbelt still lets bash run, it just denies every file write; the
-    /// two notions are distinct.
+    /// *tool* classification, not the *mode* effect — under sandbox the
+    /// seatbelt still lets bash run, it just denies file writes outside the
+    /// writable roots; the two notions are distinct.
     fn is_read_only(&self) -> bool {
         false
     }
@@ -296,7 +295,7 @@ impl AgentTool for BashTool {
         // No OS sandbox (Linux/Windows) → no confinement to stand in for
         // the gate: every call needs approval. With a seatbelt, confined
         // calls ride the OS confinement (no approval); only a
-        // `sandbox_permissions` escalation needs the approval round-trip —
+        // `require_escalated` escalation needs the approval round-trip —
         // the escalation itself is the sensitive act.
         //
         // On macOS+seatbelt this returning `true` for an escalation is only a
@@ -307,9 +306,9 @@ impl AgentTool for BashTool {
             return true;
         }
         params
-            .get("sandbox_permissions")
-            .and_then(|v| v.as_str())
-            .is_some()
+            .get("require_escalated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 
     /// The persistent shell is stateful: a batch of parallel bash calls
@@ -358,16 +357,15 @@ impl AgentTool for BashTool {
         // can only fail closed.
         if self.sandbox_available {
             properties.insert(
-                "sandbox_permissions".into(),
+                "require_escalated".into(),
                 serde_json::json!({
-                    "type": "string",
-                    "enum": ESCALATION_TARGETS.iter().map(|m| m.wire()).collect::<Vec<_>>(),
-                    "description": "The wider sandbox mode this command needs. Only valid as a one-shot retry of a command the sandbox just denied; requires justification and user approval."
+                    "type": "boolean",
+                    "description": "Set true to retry this exact command with full access (no sandbox). Only valid as a one-shot retry of a command the sandbox just denied; requires justification and user approval."
                 }),
             );
             properties.insert(
                 "justification".into(),
-                serde_json::json!({"type": "string", "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact command needs the wider access."}),
+                serde_json::json!({"type": "string", "description": "Required with require_escalated: one sentence for the user explaining why this exact command needs full access."}),
             );
         }
         serde_json::json!({
@@ -448,9 +446,9 @@ impl BashTool {
 
         if run_in_background {
             // Background tasks route through the same confinement decision
-            // as foreground calls: danger-full-access → bare spawn, else
+            // as foreground calls: full-access → bare spawn, else
             // sandboxed. Without a seatbelt there is no wrapper either way.
-            let sandboxed = self.sandbox_available && effective != PermissionMode::DangerFullAccess;
+            let sandboxed = self.sandbox_available && effective != AccessMode::FullAccess;
             let shape = OutputShape {
                 head_lines,
                 tail_lines,
@@ -487,7 +485,7 @@ impl BashTool {
                 .await;
         }
 
-        let backend = if effective == PermissionMode::DangerFullAccess {
+        let backend = if effective == AccessMode::FullAccess {
             self.unsandboxed_operations
                 .as_deref()
                 .unwrap_or(&*self.operations)
@@ -536,14 +534,14 @@ impl BashTool {
         timeout_ms: u64,
         head_lines: Option<usize>,
         tail_lines: Option<usize>,
-        effective: PermissionMode,
+        effective: AccessMode,
         signal: CancellationToken,
         on_data: Option<crate::core::tools::bash::BashDataCallback<'_>>,
         ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         // Same confinement decision as the backend dispatch: an escalated
         // call runs unconfined, everything else through the seatbelt.
-        let sandboxed = effective != PermissionMode::DangerFullAccess;
+        let sandboxed = effective != AccessMode::FullAccess;
         let registry = &manager.registry;
         let (id, mut chunks) = registry
             .spawn_foreground(command, cwd, sandboxed)
@@ -636,17 +634,17 @@ impl BashTool {
     }
 
     /// The standing session mode (absent any per-call grant).
-    fn standing_mode(&self) -> PermissionMode {
+    fn standing_mode(&self) -> AccessMode {
         self.mode_resolver.as_ref().map(|r| r()).unwrap_or_default()
     }
 
     /// The per-call effective mode: an approved escalation grant stamped on
     /// the shared cell, else the standing session mode.
-    fn effective_mode(&self) -> PermissionMode {
+    fn effective_mode(&self) -> AccessMode {
         if let Some(cell) = &self.grant_cell {
             let g = cell.load(Ordering::SeqCst);
             if g != NO_GRANT {
-                return PermissionMode::from_i64(g);
+                return AccessMode::from_i64(g);
             }
         }
         self.standing_mode()
@@ -673,25 +671,18 @@ impl<'a> EscalationGrant<'a> {
         tool_call_id: &str,
         signal: &CancellationToken,
         params: &JsonValue,
-        standing: PermissionMode,
+        standing: AccessMode,
     ) -> Result<Self, ToolError> {
-        let sp = params.get("sandbox_permissions").and_then(|v| v.as_str());
+        let escalate = params
+            .get("require_escalated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let just = params.get("justification").and_then(|v| v.as_str());
-        validate_escalation_args(sp, just).map_err(ToolError::InvalidArguments)?;
+        validate_escalation_args(escalate, just).map_err(ToolError::InvalidArguments)?;
         let guard = Self {
             cell: tool.grant_cell.as_ref(),
         };
-        if let Some(requested) = sp {
-            let requested = PermissionMode::from_wire(requested).ok_or_else(|| {
-                ToolError::InvalidArguments(format!(
-                    "sandbox_permissions must be one of: {}",
-                    ESCALATION_TARGETS
-                        .iter()
-                        .map(|m| m.wire())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-            })?;
+        if escalate {
             let approver = tool.escalation_approver.as_ref().ok_or_else(|| {
                 ToolError::Other(
                     "sandbox escalation requires approval, but no approval service is composed"
@@ -700,7 +691,7 @@ impl<'a> EscalationGrant<'a> {
             })?;
             let grant = approve_escalation(
                 EscalationRequest {
-                    requested_mode: requested,
+                    requested_mode: AccessMode::FullAccess,
                     justification: just.unwrap().to_string(),
                     effective_mode: standing,
                     subject: "command".into(),
@@ -791,7 +782,7 @@ fn nudge_tool_preference(command: &str, ctx: &dyn ToolContext) -> String {
         "Ls"
     };
     format!(
-        "\n\n[tip: prefer the `{native}` tool over raw `{}` — no sandbox, no approval in read-only mode]",
+        "\n\n[tip: prefer the `{native}` tool over raw `{}` — no sandbox, no approval]",
         trimmed.split_whitespace().next().unwrap_or("cmd")
     )
 }
@@ -1437,7 +1428,7 @@ mod tests {
         let tool = BashTool::new(Arc::new(EchoOps), Arc::new(NoopRegistry))
             .with_manager(manager)
             .with_sandbox_available(true)
-            .with_mode_resolver(Arc::new(|| PermissionMode::DangerFullAccess));
+            .with_mode_resolver(Arc::new(|| AccessMode::FullAccess));
         let text = run_tracked(
             &tool,
             serde_json::json!({
@@ -1688,7 +1679,7 @@ mod tests {
     }
 
     fn escalation_tool(
-        standing: PermissionMode,
+        standing: AccessMode,
         approver: Option<Arc<CannedApprover>>,
     ) -> (BashTool, Arc<std::sync::atomic::AtomicUsize>) {
         let sandboxed = Arc::new(TaggedOps {
@@ -1702,9 +1693,9 @@ mod tests {
         let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let grant_cell = Arc::new(AtomicI64::new(NO_GRANT));
         let standing_cell = Arc::new(AtomicI64::new(standing.as_i64()));
-        let resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> = {
+        let resolver: Arc<dyn Fn() -> AccessMode + Send + Sync> = {
             let sc = Arc::clone(&standing_cell);
-            Arc::new(move || PermissionMode::from_i64(sc.load(Ordering::SeqCst)))
+            Arc::new(move || AccessMode::from_i64(sc.load(Ordering::SeqCst)))
         };
         let mut tool = BashTool::new(sandboxed, Arc::new(NoopRegistry))
             .with_unsandboxed_operations(unsandboxed)
@@ -1718,20 +1709,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_permissions_grants_a_wider_mode_for_one_call() {
-        // Standing read-only; an approved escalation to danger-full-access
-        // routes the call through the unsandboxed backend.
+    async fn require_escalated_grants_full_access_for_one_call() {
+        // Standing sandbox; an approved escalation to full access routes the
+        // call through the unsandboxed backend.
         let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let approver = Arc::new(CannedApprover {
             outcome: crate::sandbox::EscalationOutcome::AllowedOnce,
             asked: Arc::clone(&asked),
         });
-        let (tool, _) = escalation_tool(PermissionMode::ReadOnly, Some(approver));
+        let (tool, _) = escalation_tool(AccessMode::Sandbox, Some(approver));
         let (ctx, _dir) = ctx();
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"command": "git push", "cwd": [""], "sandbox_permissions": "danger-full-access", "justification": "need to push"}),
+                serde_json::json!({"command": "git push", "cwd": [""], "require_escalated": true, "justification": "need to push"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1746,27 +1737,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_permissions_same_level_is_silent_no_op() {
-        // workspace-write -> workspace-write: an idempotent no-op grant. The
+    async fn require_escalated_same_level_is_silent_no_op() {
+        // full-access -> full-access: an idempotent no-op grant. The
         // approver is never asked, the call runs at the standing mode.
         let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let approver = Arc::new(CannedApprover {
             outcome: crate::sandbox::EscalationOutcome::AllowedOnce,
             asked: Arc::clone(&asked),
         });
-        let (tool, _) = escalation_tool(PermissionMode::WorkspaceWrite, Some(approver));
+        let (tool, _) = escalation_tool(AccessMode::FullAccess, Some(approver));
         let (ctx, _dir) = ctx();
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"command": "ls", "cwd": [""], "sandbox_permissions": "workspace-write", "justification": "x"}),
+                serde_json::json!({"command": "ls", "cwd": [""], "require_escalated": true, "justification": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
             .await
             .unwrap();
         assert!(
-            output_text(&result).contains("ran=sandboxed"),
+            output_text(&result).contains("ran=unsandboxed"),
             "the no-op grant stays at the standing mode"
         );
         assert_eq!(
@@ -1777,13 +1768,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_permissions_without_approver_fails_closed() {
-        let (tool, _) = escalation_tool(PermissionMode::ReadOnly, None);
+    async fn require_escalated_without_approver_fails_closed() {
+        let (tool, _) = escalation_tool(AccessMode::Sandbox, None);
         let (ctx, _dir) = ctx();
         let err = tool
             .execute(
                 "c1",
-                serde_json::json!({"command": "ls", "cwd": [""], "sandbox_permissions": "workspace-write", "justification": "x"}),
+                serde_json::json!({"command": "ls", "cwd": [""], "require_escalated": true, "justification": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1797,13 +1788,13 @@ mod tests {
     }
 
     #[test]
-    fn sandboxed_bash_needs_no_approval_unless_sandbox_permissions() {
-        let (tool, _) = escalation_tool(PermissionMode::WorkspaceWrite, None);
+    fn sandboxed_bash_needs_no_approval_unless_require_escalated() {
+        let (tool, _) = escalation_tool(AccessMode::Sandbox, None);
         // A plain sandboxed call rides the OS confinement: no gate.
         assert!(!tool.requires_approval(&serde_json::json!({"command": "ls"})));
-        // A sandbox_permissions escalation needs the approval round-trip.
+        // A require_escalated escalation needs the approval round-trip.
         assert!(tool.requires_approval(
-            &serde_json::json!({"command": "ls", "sandbox_permissions": "danger-full-access", "justification": "x"})
+            &serde_json::json!({"command": "ls", "require_escalated": true, "justification": "x"})
         ));
     }
 

@@ -210,7 +210,7 @@ pub struct JsConversation {
     pub project_id: Option<String>,
     pub model_provider: Option<String>,
     pub model_id: Option<String>,
-    pub permission_mode: Option<String>,
+    pub access_mode: Option<String>,
     pub reasoning_effort: Option<String>,
     pub draft: Option<String>,
     pub title: Option<String>,
@@ -245,7 +245,7 @@ fn js_conversation(row: manox_agent::object_store::ConversationRow) -> JsConvers
         project_id: row.project_id,
         model_provider: row.model_provider,
         model_id: row.model_id,
-        permission_mode: row.permission_mode,
+        access_mode: row.access_mode,
         reasoning_effort: row.reasoning_effort,
         draft: row.draft,
         title: row.title,
@@ -329,9 +329,9 @@ pub fn object_set_model(
 
 /// Set the permission mode pick (read before every tool execution).
 #[napi]
-pub fn object_set_permission_mode(id: String, mode: Option<String>) -> Result<()> {
+pub fn object_set_access_mode(id: String, mode: Option<String>) -> Result<()> {
     ensure_objects()?;
-    objects().set_permission_mode(&id, mode.as_deref());
+    objects().set_access_mode(&id, mode.as_deref());
     Ok(())
 }
 

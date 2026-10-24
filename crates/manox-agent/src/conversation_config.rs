@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use manox_harness::ConversationConfigSource;
-use manox_harness::sandbox::PermissionMode;
+use manox_harness::sandbox::AccessMode;
 
 use crate::object_store::ObjectStore;
 
@@ -49,11 +49,9 @@ impl ConversationConfigSource for ObjectConfigSource {
         })
     }
 
-    fn permission_mode(&self) -> Option<PermissionMode> {
+    fn access_mode(&self) -> Option<AccessMode> {
         let row = ObjectStore::try_global()?.conversation(&self.session_id)?;
-        row.permission_mode
-            .as_deref()
-            .and_then(PermissionMode::from_wire)
+        row.access_mode.as_deref().and_then(AccessMode::from_wire)
     }
 
     fn reasoning_effort(&self) -> Option<String> {
@@ -95,17 +93,17 @@ mod tests {
         let sid = "c-1";
         let source = ObjectConfigSource::for_session(sid);
 
-        assert_eq!(source.permission_mode(), None);
+        assert_eq!(source.access_mode(), None);
         assert_eq!(source.reasoning_effort(), None);
         assert_eq!(source.model_ref(), None);
         assert_eq!(source.config_version(), 0);
 
         store.create_conversation(sid, None);
-        store.set_permission_mode(sid, Some(PermissionMode::ReadOnly.wire()));
+        store.set_access_mode(sid, Some(AccessMode::FullAccess.wire()));
         store.set_reasoning_effort(sid, Some("max"));
         store.set_model(sid, Some("test-provider"), Some("test-model"));
 
-        assert_eq!(source.permission_mode(), Some(PermissionMode::ReadOnly));
+        assert_eq!(source.access_mode(), Some(AccessMode::FullAccess));
         assert_eq!(source.reasoning_effort().as_deref(), Some("max"));
         assert_eq!(
             source.model_ref().as_deref(),
@@ -124,9 +122,9 @@ mod tests {
         let (_dir, _lock) = scratch();
         let store = ObjectStore;
         store.create_conversation("c-1", None);
-        store.set_permission_mode("c-1", Some("not-a-mode"));
+        store.set_access_mode("c-1", Some("not-a-mode"));
         let source = ObjectConfigSource::for_session("c-1");
-        assert_eq!(source.permission_mode(), None);
+        assert_eq!(source.access_mode(), None);
     }
 
     /// The model reference keeps the provider when the row carries one, so a

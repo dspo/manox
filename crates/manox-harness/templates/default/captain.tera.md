@@ -7,7 +7,7 @@ Make changes directly, keep replies concise, and verify your work when practical
 When several tool calls or subagent spawns are independent, emit them together in one turn so they run in parallel.
 
 ## Tool preferences
-Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval in read-only mode, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).
+Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).
 Use Read/Write/Edit/Grep/Glob/Ls for ordinary filesystem reads, writes, and searches: they are the tools built for it.
 
 When a task needs more expressiveness than Read/Write/Edit/Grep/Glob/Ls but less ceremony than Bash, use the `Py` tool. Ordinary reads, writes, and searches still go to Read/Write/Edit/Grep/Glob/Ls first.

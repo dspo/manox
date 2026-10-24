@@ -62,7 +62,7 @@ use ahp_types::state::{
     SessionLifecycle, SessionState, SessionStatus,
 };
 use manox_ahp::channels::{chat, session};
-use manox_harness::sandbox::PermissionMode;
+use manox_harness::sandbox::AccessMode;
 use manox_harness::session::SessionTreeEntry;
 use serde_json::Value;
 
@@ -626,19 +626,15 @@ fn session_config_schema() -> SessionConfigSchema {
         ),
     );
     properties.insert(
-        config_keys::APPROVAL_MODE.to_string(),
-        // The wire vocabulary is `PermissionMode`'s kebab form; the default
-        // is the host's own (`PermissionMode::default()`). Parity is pinned
+        config_keys::ACCESS_MODE.to_string(),
+        // The wire vocabulary is `AccessMode`'s kebab form; the default
+        // is the host's own (`AccessMode::default()`). Parity is pinned
         // by test, not trusted.
         prop(
-            "Approval mode",
+            "Access mode",
             None,
-            Some(&[
-                PermissionMode::ReadOnly.wire(),
-                PermissionMode::WorkspaceWrite.wire(),
-                PermissionMode::DangerFullAccess.wire(),
-            ]),
-            Some(PermissionMode::default().wire()),
+            Some(&[AccessMode::Sandbox.wire(), AccessMode::FullAccess.wire()]),
+            Some(AccessMode::default().wire()),
         ),
     );
     properties.insert(
@@ -1346,33 +1342,29 @@ mod config_schema_tests {
         }
     }
 
-    /// The approval-mode vocabulary is `PermissionMode`'s own wire set with
+    /// The access-mode vocabulary is `AccessMode`'s own wire set with
     /// the host's default — the enum is not a hand-maintained look-alike.
     #[test]
-    fn the_approval_mode_enum_is_the_permission_mode_wire_vocabulary() {
+    fn the_access_mode_enum_is_the_access_mode_wire_vocabulary() {
         let schema = session_config_schema();
         let prop = schema
             .properties
-            .get(config_keys::APPROVAL_MODE)
-            .expect("approvalMode declared");
+            .get(config_keys::ACCESS_MODE)
+            .expect("accessMode declared");
         let values: Vec<&str> = prop
             .r#enum
             .as_ref()
-            .expect("approvalMode enumerates its values")
+            .expect("accessMode enumerates its values")
             .iter()
             .filter_map(Value::as_str)
             .collect();
         assert_eq!(
             values,
-            vec![
-                PermissionMode::ReadOnly.wire(),
-                PermissionMode::WorkspaceWrite.wire(),
-                PermissionMode::DangerFullAccess.wire(),
-            ]
+            vec![AccessMode::Sandbox.wire(), AccessMode::FullAccess.wire()]
         );
         assert_eq!(
             prop.default.as_ref().and_then(Value::as_str),
-            Some(PermissionMode::default().wire()),
+            Some(AccessMode::default().wire()),
             "the declared default is the host's own default mode"
         );
     }

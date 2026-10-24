@@ -65,13 +65,13 @@ impl manox_harness::tool::AgentTool for SubagentBashTool {
     }
     fn parameters_schema(&self) -> serde_json::Value {
         // Strip `run_in_background` (refused by this wrapper — N1) and the
-        // `sandbox_permissions`/`justification` escalation fields (no
+        // `require_escalated`/`justification` escalation fields (no
         // escalation path in the ungated subagent session) so the model
         // never proposes them.
         let mut schema = self.inner.parameters_schema();
         if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
             props.remove("run_in_background");
-            props.remove("sandbox_permissions");
+            props.remove("require_escalated");
             props.remove("justification");
         }
         schema
@@ -329,7 +329,7 @@ pub(super) fn build_tools(
 ) -> (Vec<Arc<dyn HarnessAgentTool>>, Arc<BackgroundManager>) {
     // Bash execution backend: seatbelt-wrapped one-shot commands when the
     // OS backend is available (the per-call file-effect profile is rendered
-    // from the effective `PermissionMode`; shell state does not persist —
+    // from the effective `AccessMode`; shell state does not persist —
     // the tool's `cwd` parameter pins each call), otherwise the unsandboxed
     // persistent brush shell (permission-gated as always). Background tasks
     // reuse this backend's `wrap_command`, so a non-escalated background
@@ -347,11 +347,11 @@ pub(super) fn build_tools(
     let bash_ops: Arc<dyn manox_harness::tools::bash::BashOperations> = if sandbox_available {
         let sandbox_mode_gate = Arc::clone(gate);
         let cell_for_resolver = Arc::clone(&grant_cell);
-        let sandbox_mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
+        let sandbox_mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync> =
             Arc::new(move || {
                 let g = cell_for_resolver.load(std::sync::atomic::Ordering::SeqCst);
                 if g != manox_harness::sandbox::NO_GRANT {
-                    PermissionMode::from_i64(g)
+                    AccessMode::from_i64(g)
                 } else {
                     sandbox_mode_gate.mode()
                 }
@@ -365,7 +365,7 @@ pub(super) fn build_tools(
         let wrap: manox_harness::bash::background::SandboxCommandBuilder =
             Arc::new(move |command, cwd| wrap_ops.wrap_background(command, cwd));
         // Escalated tasks run in the unsandboxed backend's own shell and
-        // env, so `danger-full-access` behaves the same whether the command
+        // env, so `full-access` behaves the same whether the command
         // runs in the foreground or the background.
         let unconfined: manox_harness::bash::background::SandboxCommandBuilder =
             Arc::new(crate::sandbox::UnsandboxedBashOperations::command);
@@ -385,8 +385,8 @@ pub(super) fn build_tools(
     let subagent_background = Arc::new(BackgroundRegistry::new());
     let manager = BackgroundManager::new(Arc::clone(&background));
     // Unsandboxed backend (no confinement): selected per call when the
-    // effective mode is `danger-full-access` (the standing session mode, or
-    // an approved `sandbox_permissions` grant). Installed only where a
+    // effective mode is `full-access` (the standing session mode, or
+    // an approved `require_escalated` grant). Installed only where a
     // seatbelt exists to escape from; on other platforms the default backend
     // is already unsandboxed.
     let unsandboxed_ops: Option<Arc<dyn manox_harness::tools::bash::BashOperations>> =
@@ -398,7 +398,7 @@ pub(super) fn build_tools(
     // Standing-mode resolver (the session mode, NOT the grant — the grant is
     // what an escalation requests, so it cannot be its own baseline).
     let standing_gate = Arc::clone(gate);
-    let standing_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
+    let standing_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync> =
         Arc::new(move || standing_gate.mode());
     let escalation_approver: Arc<dyn manox_harness::sandbox::EscalationApprover + Send + Sync> =
         Arc::new(crate::approval::GateEscalationApprover::new(Arc::clone(
@@ -439,7 +439,7 @@ pub(super) fn build_tools(
         // file tool — the prompt sends ordinary reads/writes/searches to
         // Read/Write/Edit/Grep/Glob/Ls — and it owns no sandbox: unlike
         // sandbox-confined Bash it has no OS fence to ride, so the gate
-        // fails it closed in workspace-write and an approved escalation is
+        // fails it closed under sandbox and an approved escalation is
         // its only wider road.
         Arc::new(manox_harness::tools::py::PyTool),
         Arc::new(bash),
@@ -452,7 +452,7 @@ pub(super) fn build_tools(
     ];
     // Bash rides the OS confinement (the per-call file-effect profile) instead
     // of the host gate whenever a seatbelt is mounted: the mode drives the
-    // seatbelt directly, and a `sandbox_permissions` escalation is resolved
+    // seatbelt directly, and a `require_escalated` escalation is resolved
     // inside the tool through the host-injected approver (never the gate).
     let confined_bash_auto_allow: Option<crate::approval::AutoAllowResolver> = sandbox_available
         .then(|| {

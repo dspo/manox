@@ -4,8 +4,8 @@
 // traversal (respects .gitignore). No shell execution — the LLM's input is
 // treated as data, not as a command string.
 //
-// Prefer this over `grep` in Bash for plain searches: no sandbox, no approval
-// in read-only mode, bounded structured output. Use Bash only for pipes
+// Prefer this over `grep` in Bash for plain searches: no sandbox, no
+// approval, bounded structured output. Use Bash only for pipes
 // (grep|awk, wc -l) or when the ripgrep engine's regex dialect is insufficient.
 // Supports count, files-with-matches, and per-file max-count modes.
 
@@ -42,7 +42,7 @@ impl AgentTool for GrepTool {
     fn description(&self) -> &str {
         "Search file contents with a regex (ripgrep engine). \
          Prefer this over `grep` in Bash for plain searches: no sandbox, no \
-         approval in read-only mode, bounded structured output. Use Bash only \
+         approval, bounded structured output. Use Bash only \
          for pipes (grep|awk, wc -l) or when the ripgrep engine's regex dialect \
          is insufficient. Supports count and files-with-matches modes."
     }

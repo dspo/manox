@@ -279,6 +279,9 @@ mod accept_without_a_reactor_tests {
         fn has_session(&self, _: &str) -> bool {
             false
         }
+        fn open_session(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+            unreachable!("unused")
+        }
         fn submit(
             &self,
             _: &str,
@@ -314,7 +317,7 @@ mod accept_without_a_reactor_tests {
         fn set_reasoning_effort(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
-        fn set_approval_mode(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+        fn set_access_mode(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
         fn set_cwd(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
