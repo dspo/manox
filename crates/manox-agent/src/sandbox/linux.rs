@@ -24,7 +24,6 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use super::NetworkRoute;
-use manox_harness::sandbox::NetworkAccess;
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
     SeccompRule, TargetArch, apply_filter,
@@ -323,19 +322,26 @@ fn deny_rules(route: NetworkRoute) -> BTreeMap<i64, Vec<SeccompRule>> {
         }
         // `socket`/`socketpair` with domain != AF_UNIX are denied; AF_UNIX
         // falls through to the default allow.
-        let unix_only = SeccompRule::new(vec![
-            SeccompCondition::new(
-                0, // first argument (domain)
-                SeccompCmpArgLen::Dword,
-                SeccompCmpOp::Ne,
-                libc::AF_UNIX as u64,
-            )
-            .expect("AF_UNIX comparison compiles"),
-        ]);
-        rules.insert(libc::SYS_socket, vec![unix_only.clone()]);
-        rules.insert(libc::SYS_socketpair, vec![unix_only]);
+        rules.insert(libc::SYS_socket, vec![unix_only_rule()]);
+        rules.insert(libc::SYS_socketpair, vec![unix_only_rule()]);
     }
     rules
+}
+
+/// The AF_UNIX-only rule shared by `socket` and `socketpair`: denied when the
+/// domain argument is anything else; the empty default action allows the
+/// unix case.
+fn unix_only_rule() -> SeccompRule {
+    SeccompRule::new(vec![
+        SeccompCondition::new(
+            0, // first argument (domain)
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            libc::AF_UNIX as u64,
+        )
+        .expect("AF_UNIX comparison compiles"),
+    ])
+    .expect("AF_UNIX-only rule compiles")
 }
 
 fn seccomp_target_arch() -> Option<TargetArch> {
