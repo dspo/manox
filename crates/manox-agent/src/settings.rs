@@ -790,7 +790,11 @@ allow = ["crates.io", "*.example.com"]
             .and_then(|t| t.get("allow"))
             .and_then(|v| v.as_array())
             .map(Vec::len);
-        assert_eq!(allow, Some(0), "clearing the allowlist did not reach disk:\n{out}");
+        assert_eq!(
+            allow,
+            Some(0),
+            "clearing the allowlist did not reach disk:\n{out}"
+        );
     }
 
     #[test]

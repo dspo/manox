@@ -1396,7 +1396,10 @@ mod config_schema_tests {
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert_eq!(values, vec![NetworkAccess::Off.wire(), NetworkAccess::On.wire()]);
+        assert_eq!(
+            values,
+            vec![NetworkAccess::Off.wire(), NetworkAccess::On.wire()]
+        );
         assert_eq!(
             prop.default.as_ref().and_then(Value::as_str),
             Some(NetworkAccess::default().wire()),

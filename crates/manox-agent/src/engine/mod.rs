@@ -499,9 +499,10 @@ pub fn spawn_engine(
     // The managed proxy's amendment ask parks through the same card
     // channel; the approver holds the gate WEAK (the gate owns the policy
     // that owns the approver — a strong back-reference would cycle).
-    gate.network_policy().set_approver(Arc::new(
-        crate::approval::GateNetworkApprover::new(Arc::downgrade(&gate)),
-    ));
+    gate.network_policy()
+        .set_approver(Arc::new(crate::approval::GateNetworkApprover::new(
+            Arc::downgrade(&gate),
+        )));
     // K3: the user's verdict on a parked card is an observable state
     // change — the gate journals it as an `approval` decision entry through
     // the actor queue (the request entry rides the notice tap).

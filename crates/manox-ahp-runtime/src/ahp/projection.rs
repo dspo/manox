@@ -2820,14 +2820,12 @@ fn no_user_row(entry: &Envelope) -> Message {
 /// verdict strings the gateway maps back, and clients render the set
 /// verbatim.
 fn approval_options(tool_name: Option<&str>) -> Vec<ConfirmationOption> {
-    let mut options = vec![
-        ConfirmationOption {
-            id: "allow_once".to_string(),
-            label: "Allow once".to_string(),
-            kind: ConfirmationOptionKind::Approve,
-            group: Some(0),
-        },
-    ];
+    let mut options = vec![ConfirmationOption {
+        id: "allow_once".to_string(),
+        label: "Allow once".to_string(),
+        kind: ConfirmationOptionKind::Approve,
+        group: Some(0),
+    }];
     if tool_name == Some(manox_harness::sandbox::NETWORK_APPROVAL_TOOL) {
         options.push(ConfirmationOption {
             id: "allow_host_session".to_string(),
@@ -3797,14 +3795,14 @@ mod fold_semantics_tests {
             let ids = out
                 .iter()
                 .find_map(|e| match &e.action {
-                    StateAction::ChatToolCallReady(ready) => ready.options.as_ref().map(
-                        |options| {
+                    StateAction::ChatToolCallReady(ready) => {
+                        ready.options.as_ref().map(|options| {
                             options
                                 .iter()
                                 .map(|option| option.id.as_str())
                                 .collect::<Vec<_>>()
-                        },
-                    ),
+                        })
+                    }
                     _ => None,
                 })
                 .unwrap_or_default();

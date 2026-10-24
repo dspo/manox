@@ -417,9 +417,7 @@ pub(super) fn build_tools(
         .with_manager(Arc::clone(&manager))
         .with_sandbox_available(sandbox_available)
         .with_mode_resolver(Arc::clone(&standing_resolver))
-        .with_network_resolver(Arc::new(
-            move || classifier_gate.network_route().access(),
-        ))
+        .with_network_resolver(Arc::new(move || classifier_gate.network_route().access()))
         .with_grant_cell(grant_cell)
         .with_escalation_approver(Arc::clone(&escalation_approver));
     if let Some(ops) = unsandboxed_ops {

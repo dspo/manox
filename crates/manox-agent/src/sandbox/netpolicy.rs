@@ -254,9 +254,7 @@ pub(crate) struct JudgeCtx {
 impl JudgeCtx {
     fn new(settings_allow: Vec<String>) -> Self {
         Self {
-            allowlist: std::sync::RwLock::new(Arc::new(DomainAllowlist::compile(
-                &settings_allow,
-            ))),
+            allowlist: std::sync::RwLock::new(Arc::new(DomainAllowlist::compile(&settings_allow))),
             approver: Mutex::new(None),
             ask_serial: tokio::sync::Mutex::new(()),
             session_allow: Mutex::new(Vec::new()),
@@ -390,8 +388,9 @@ async fn serve_connection(mut client: tokio::net::TcpStream, ctx: Arc<JudgeCtx>)
                 return;
             }
         };
-        let Some(upstream_addr) =
-            addrs.iter().find(|addr| !DomainAllowlist::is_private_ip(addr.ip()))
+        let Some(upstream_addr) = addrs
+            .iter()
+            .find(|addr| !DomainAllowlist::is_private_ip(addr.ip()))
         else {
             let _ = client
                 .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
@@ -478,15 +477,16 @@ impl NetworkPolicy {
     }
 
     /// A policy with an explicit allowlist (tests: the live smoke must not
-    /// read the developer's real settings.toml).
+    /// depend on the developer's real settings.toml). The hosts ride the
+    /// session-amendment set, so an enable's settings re-read cannot wipe
+    /// them — the same placement a user-approved host amendment gets.
     #[cfg(test)]
     pub fn for_allowlist(allow: Vec<String>) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                running: Mutex::new(None),
-                ctx: Arc::new(JudgeCtx::new(allow)),
-            }),
+        let policy = Self::new();
+        for host in allow {
+            policy.inner.ctx.admit(&host);
         }
+        policy
     }
 
     /// The face one confined call runs under, given the gate's access cell.
@@ -518,13 +518,8 @@ impl NetworkPolicy {
         }
     }
 
-    /// The live judge context (the proxy host ask path reads it to amend).
-    pub(crate) fn judge_ctx(&self) -> Arc<JudgeCtx> {
-        self.inner.ctx.clone()
-    }
-
     /// Install the amendment approver (once, at engine spawn).
-    pub fn set_approver(&self, approver: Arc<dyn HostApprover>) {
+    pub(crate) fn set_approver(&self, approver: Arc<dyn HostApprover>) {
         self.inner.ctx.install_approver(approver);
     }
 
@@ -543,6 +538,11 @@ impl NetworkPolicy {
         if self.inner.running.lock().unwrap().is_some() {
             return;
         }
+        // Every enable re-reads the configured set (plus the session's
+        // amendments), so a settings edit between switches applies.
+        self.inner
+            .ctx
+            .recompile(crate::settings::sandbox_network_allow());
         if self.inner.ctx.allowlist().is_empty() {
             return; // Direct route: no proxy.
         }
@@ -556,6 +556,12 @@ impl NetworkPolicy {
                 tracing::warn!(%error, "managed network proxy failed to bind; sandbox network stays closed");
             }
         }
+    }
+}
+
+impl Default for NetworkPolicy {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -598,12 +604,7 @@ mod tests {
     use super::*;
 
     fn allowlist(patterns: &[&str]) -> DomainAllowlist {
-        DomainAllowlist::compile(
-            &patterns
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>(),
-        )
+        DomainAllowlist::compile(&patterns.iter().map(|p| p.to_string()).collect::<Vec<_>>())
     }
 
     #[test]
@@ -630,7 +631,10 @@ mod tests {
         assert_eq!(list.judge("noexact.org"), HostVerdict::NotAllowlisted);
         // A sibling suffix never matches.
         assert_eq!(list.judge("evilexample.com"), HostVerdict::NotAllowlisted);
-        assert_eq!(list.judge("example.com.evil.io"), HostVerdict::NotAllowlisted);
+        assert_eq!(
+            list.judge("example.com.evil.io"),
+            HostVerdict::NotAllowlisted
+        );
         // A subdomain of an exact entry is not covered.
         assert_eq!(list.judge("a.exact.org"), HostVerdict::NotAllowlisted);
     }
@@ -654,7 +658,17 @@ mod tests {
 
     #[test]
     fn private_ranges_are_recognized() {
-        for ip in ["127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.9", "169.254.1.1", "0.0.0.0", "::1", "fe80::1", "fc00::1"] {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.0.9",
+            "169.254.1.1",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+        ] {
             assert!(
                 DomainAllowlist::is_private_ip(ip.parse().unwrap()),
                 "{ip} is private"
@@ -716,8 +730,7 @@ mod tests {
         let mut miss = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
-        miss
-            .write_all(b"CONNECT unknown.invalid:443 HTTP/1.1\r\n\r\n")
+        miss.write_all(b"CONNECT unknown.invalid:443 HTTP/1.1\r\n\r\n")
             .await
             .unwrap();
         let mut answer = String::new();
@@ -733,9 +746,7 @@ mod tests {
             .await
             .unwrap();
         tunneled
-            .write_all(
-                format!("CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\n\r\n").as_bytes(),
-            )
+            .write_all(format!("CONNECT 127.0.0.1:{upstream_port} HTTP/1.1\r\n\r\n").as_bytes())
             .await
             .unwrap();
         let mut head = Vec::new();
@@ -783,9 +794,11 @@ mod tests {
     impl HostApprover for CannedApprover {
         async fn request(&self, _host: &str, _port: u16) -> HostDecision {
             let mut verdicts = self.0.lock().unwrap();
-            (!verdicts.is_empty())
-                .then(|| verdicts.remove(0))
-                .unwrap_or(HostDecision::Deny)
+            if verdicts.is_empty() {
+                HostDecision::Deny
+            } else {
+                verdicts.remove(0)
+            }
         }
     }
 
@@ -855,7 +868,10 @@ mod tests {
         let mut answer = String::new();
         client.read_to_string(&mut answer).await.unwrap();
         assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
-        assert_eq!(ctx.allowlist().judge("127.0.0.1"), HostVerdict::NotAllowlisted);
+        assert_eq!(
+            ctx.allowlist().judge("127.0.0.1"),
+            HostVerdict::NotAllowlisted
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

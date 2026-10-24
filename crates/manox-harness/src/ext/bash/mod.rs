@@ -16,8 +16,8 @@ use std::time::Duration;
 use crate::core::BackgroundTaskRegistry;
 use crate::core::env::CommandResult;
 use crate::sandbox::{
-    AccessMode, EscalationApprover, EscalationRequest, NetworkAccess, NO_GRANT,
-    approve_escalation, validate_escalation_args,
+    AccessMode, EscalationApprover, EscalationRequest, NO_GRANT, NetworkAccess, approve_escalation,
+    validate_escalation_args,
 };
 
 use crate::core::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};

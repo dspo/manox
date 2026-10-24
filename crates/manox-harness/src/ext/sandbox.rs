@@ -594,7 +594,11 @@ mod tests {
         ];
         let stderrs: Vec<&str> = stderrs
             .iter()
-            .chain(cfg!(target_os = "linux").then(|| linux_only.iter()).unwrap_or_default())
+            .chain(
+                cfg!(target_os = "linux")
+                    .then(|| linux_only.iter())
+                    .unwrap_or_default(),
+            )
             .copied()
             .collect();
         for stderr in stderrs {

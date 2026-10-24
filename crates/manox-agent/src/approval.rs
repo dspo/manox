@@ -378,11 +378,7 @@ impl GateNetworkApprover {
 
 #[async_trait::async_trait]
 impl crate::sandbox::netpolicy::HostApprover for GateNetworkApprover {
-    async fn request(
-        &self,
-        host: &str,
-        port: u16,
-    ) -> crate::sandbox::netpolicy::HostDecision {
+    async fn request(&self, host: &str, port: u16) -> crate::sandbox::netpolicy::HostDecision {
         use crate::sandbox::netpolicy::HostDecision;
         let Some(gate) = self.gate.upgrade() else {
             return HostDecision::Deny; // Session gone: nothing to amend.

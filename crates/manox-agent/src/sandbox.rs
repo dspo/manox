@@ -394,7 +394,10 @@ impl SandboxPolicy {
     pub fn network_env(route: NetworkRoute) -> Vec<(&'static str, String)> {
         let mut env = Vec::new();
         if route == NetworkRoute::Disabled {
-            env.push((manox_harness::sandbox::NETWORK_DISABLED_ENV, "1".to_string()));
+            env.push((
+                manox_harness::sandbox::NETWORK_DISABLED_ENV,
+                "1".to_string(),
+            ));
         }
         if let NetworkRoute::Managed { proxy_port } = route {
             let url = format!("http://127.0.0.1:{proxy_port}");
@@ -469,7 +472,8 @@ fn render_network_section(route: NetworkRoute) -> String {
 /// Each root gets an anchor deny on the root directory itself: renaming (or
 /// otherwise unlinking) the boundary directory would move every protected
 /// path out from under the policy that names it.
-fn render_write_section(roots: &[PathBuf]) -> (String, Vec<(String, PathBuf)>) {    let mut profile = String::new();
+fn render_write_section(roots: &[PathBuf]) -> (String, Vec<(String, PathBuf)>) {
+    let mut profile = String::new();
     let mut params = Vec::new();
     profile.push_str("; Writes only under the curated roots; each root directory itself is\n; anchored so it cannot be renamed out of the boundary.\n");
     for (index, root) in roots.iter().enumerate() {
@@ -697,12 +701,7 @@ impl SandboxedBashOperations {
             let mode = (self.mode_resolver)();
             let route = (self.network_resolver)();
             match self.policy_for(cwd).and_then(|policy| {
-                linux::wrap_command(
-                    &policy.writable_root_set(mode),
-                    command,
-                    cwd,
-                    route,
-                )
+                linux::wrap_command(&policy.writable_root_set(mode), command, cwd, route)
             }) {
                 Ok(cmd) => cmd,
                 Err(_) => refused(cwd),
@@ -948,9 +947,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn route_resolver(
-        route: NetworkRoute,
-    ) -> Arc<dyn Fn() -> NetworkRoute + Send + Sync> {
+    fn route_resolver(route: NetworkRoute) -> Arc<dyn Fn() -> NetworkRoute + Send + Sync> {
         Arc::new(move || route)
     }
 
@@ -1017,7 +1014,8 @@ mod tests {
         // phase); `full-access` never reaches this renderer (backend
         // selection skips the seatbelt), but rendering it anyway shows the
         // profile alone cannot be trusted to unconfine.
-        let (sb, params) = policy().render_seatbelt_with_params(AccessMode::FullAccess, NetworkRoute::Direct);
+        let (sb, params) =
+            policy().render_seatbelt_with_params(AccessMode::FullAccess, NetworkRoute::Direct);
         assert!(sb.contains("(deny default)"));
         assert!(params.is_empty(), "full access admits no roots: {params:?}");
         assert!(!sb.contains("(allow file-write* (subpath"));
@@ -1032,7 +1030,8 @@ mod tests {
         // explicit under the deny-default base; the loopback-only closure is
         // phase 3 and shrinks this section. The platform minimums (DNS
         // configuration, TLS trust mach services) ride with it.
-        let (sb, _) = policy().render_seatbelt_with_params(AccessMode::Sandbox, NetworkRoute::Direct);
+        let (sb, _) =
+            policy().render_seatbelt_with_params(AccessMode::Sandbox, NetworkRoute::Direct);
         assert!(sb.contains("(allow network-outbound)"));
         assert!(sb.contains("(allow network-inbound)"));
         assert!(sb.contains("(socket-domain AF_SYSTEM)"));
@@ -1051,8 +1050,8 @@ mod tests {
         // deny-default base is the enforcement), no DNS/TLS mach minimums,
         // no AF_SYSTEM — but unix-socket IPC stays so build-tool subprocess
         // plumbing survives.
-        let (sb, _) = policy()
-            .render_seatbelt_with_params(AccessMode::Sandbox, NetworkRoute::Disabled);
+        let (sb, _) =
+            policy().render_seatbelt_with_params(AccessMode::Sandbox, NetworkRoute::Disabled);
         // The blanket allowance is gone (the unix-socket outbound line
         // carries a qualifier and stays).
         assert!(!sb.contains("(allow network-outbound)\n"), "{sb}");
@@ -1066,7 +1065,10 @@ mod tests {
         assert!(!sb.contains("net.routetable"), "{sb}");
         // The unix IPC minimum rides in every state.
         assert!(sb.contains("(socket-domain AF_UNIX)"), "{sb}");
-        assert!(sb.contains("(allow network-outbound (remote unix-socket))"), "{sb}");
+        assert!(
+            sb.contains("(allow network-outbound (remote unix-socket))"),
+            "{sb}"
+        );
         // The writes and hardening denies are untouched.
         assert!(sb.contains("(allow file-write* (subpath (param \"WRITABLE_ROOT_0\")))"));
         assert!(sb.contains("(deny system-fcntl (fcntl-command 80 110))"));
@@ -1086,7 +1088,10 @@ mod tests {
             sb.contains("(allow network-outbound (remote ip \"localhost:54321\"))"),
             "{sb}"
         );
-        assert!(sb.contains("(allow network-bind (local ip \"*:*\"))"), "{sb}");
+        assert!(
+            sb.contains("(allow network-bind (local ip \"*:*\"))"),
+            "{sb}"
+        );
         assert!(
             sb.contains("(allow network-inbound (local ip \"localhost:*\"))"),
             "{sb}"
@@ -1108,9 +1113,7 @@ mod tests {
             "{disabled:?}"
         );
         assert!(SandboxPolicy::network_env(NetworkRoute::Direct).is_empty());
-        let managed = SandboxPolicy::network_env(NetworkRoute::Managed {
-            proxy_port: 54321,
-        });
+        let managed = SandboxPolicy::network_env(NetworkRoute::Managed { proxy_port: 54321 });
         for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "https_proxy"] {
             assert!(
                 managed
@@ -1121,11 +1124,7 @@ mod tests {
         }
         // The disabled env never rides a proxy route, and the proxy env
         // never rides a closed one.
-        assert!(
-            !managed
-                .iter()
-                .any(|(k, _)| *k == NETWORK_DISABLED_ENV)
-        );
+        assert!(!managed.iter().any(|(k, _)| *k == NETWORK_DISABLED_ENV));
         assert!(!disabled.iter().any(|(k, _)| k.contains("PROXY")));
     }
 
@@ -1170,7 +1169,8 @@ mod tests {
             .unwrap()
             .with_extra_roots(vec![wt.clone(), git.clone(), wt.clone()])
             .unwrap();
-        let (_, params) = policy.render_seatbelt_with_params(AccessMode::Sandbox, NetworkRoute::Direct);
+        let (_, params) =
+            policy.render_seatbelt_with_params(AccessMode::Sandbox, NetworkRoute::Direct);
         let paths = param_paths(&params);
         for root in [&wt, &git] {
             assert!(
@@ -1188,7 +1188,8 @@ mod tests {
             "{params:?}"
         );
         // Full access never admits anything.
-        let (_, full) = policy.render_seatbelt_with_params(AccessMode::FullAccess, NetworkRoute::Direct);
+        let (_, full) =
+            policy.render_seatbelt_with_params(AccessMode::FullAccess, NetworkRoute::Direct);
         assert!(full.is_empty());
     }
 
@@ -1427,11 +1428,7 @@ mod tests {
     // (skip loudly when the parent process is itself sandboxed — the same
     // guard the confinement tests use.)
 
-    async fn live_exec(
-        root: &Path,
-        command: &str,
-        route: NetworkRoute,
-    ) -> CommandResult {
+    async fn live_exec(root: &Path, command: &str, route: NetworkRoute) -> CommandResult {
         let ops = SandboxedBashOperations::new(
             root,
             crate::granted_roots::GrantedRoots::new(root),
@@ -1462,7 +1459,12 @@ mod tests {
         // `-sS`: silence the progress meter but keep the error text — the
         // classifier reads stderr, and a bare `-s` would swallow the very
         // failure this test pins.
-        let res = live_exec(&root, "curl -sS -I https://crates.io", NetworkRoute::Disabled).await;
+        let res = live_exec(
+            &root,
+            "curl -sS -I https://crates.io",
+            NetworkRoute::Disabled,
+        )
+        .await;
         if nested_sandboxed(&res) {
             eprintln!("skipping live seatbelt test: parent process sandboxed");
             return;
@@ -1478,7 +1480,8 @@ mod tests {
             res.stderr
         );
         assert!(
-            res.stderr.contains("network access denied under sandbox mode"),
+            res.stderr
+                .contains("network access denied under sandbox mode"),
             "network marker in stderr: {}",
             res.stderr
         );

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use super::NetworkRoute;
 use manox_harness::sandbox::NetworkAccess;
 use seccompiler::{
-    BpfProgram, SeccompAction, SeccompFilter, SeccompCondition, SeccompCmpArgLen, SeccompCmpOp,
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
     SeccompRule, TargetArch, apply_filter,
 };
 
@@ -323,13 +323,15 @@ fn deny_rules(route: NetworkRoute) -> BTreeMap<i64, Vec<SeccompRule>> {
         }
         // `socket`/`socketpair` with domain != AF_UNIX are denied; AF_UNIX
         // falls through to the default allow.
-        let unix_only = SeccompRule::new(vec![SeccompCondition::new(
-            0, // first argument (domain)
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Ne,
-            libc::AF_UNIX as u64,
-        )
-        .expect("AF_UNIX comparison compiles")]);
+        let unix_only = SeccompRule::new(vec![
+            SeccompCondition::new(
+                0, // first argument (domain)
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Ne,
+                libc::AF_UNIX as u64,
+            )
+            .expect("AF_UNIX comparison compiles"),
+        ]);
         rules.insert(libc::SYS_socket, vec![unix_only.clone()]);
         rules.insert(libc::SYS_socketpair, vec![unix_only]);
     }
@@ -807,7 +809,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let ops = ops_for_route(root.path(), super::NetworkRoute::Disabled);
         let res = ops
-            .exec(request("test \"$MANOX_SANDBOX_NETWORK_DISABLED\" = 1", root.path()))
+            .exec(request(
+                "test \"$MANOX_SANDBOX_NETWORK_DISABLED\" = 1",
+                root.path(),
+            ))
             .await
             .expect("exec runs");
         assert_eq!(
