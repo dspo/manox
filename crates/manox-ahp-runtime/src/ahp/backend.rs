@@ -2110,8 +2110,10 @@ impl Backend for RuntimeBackend {
                 // skipped now has an engine to bridge, and the verdict's
                 // journal row above the seed's watermark is how every client
                 // fold learns the card retired.
-                if matches!(outcome, DispatchOutcome::Accepted)
-                    && let Some(session_id) = chat::id(channel)
+                if matches!(
+                    outcome,
+                    DispatchOutcome::Accepted | DispatchOutcome::AcceptedThen(_)
+                ) && let Some(session_id) = chat::id(channel)
                 {
                     self.ensure_bridge(session_id);
                 }
@@ -2134,8 +2136,10 @@ impl Backend for RuntimeBackend {
                         map_answers(&completed.answers),
                     )
                 };
-                if matches!(outcome, DispatchOutcome::Accepted)
-                    && let Some(session_id) = chat::id(channel)
+                if matches!(
+                    outcome,
+                    DispatchOutcome::Accepted | DispatchOutcome::AcceptedThen(_)
+                ) && let Some(session_id) = chat::id(channel)
                 {
                     self.ensure_bridge(session_id);
                 }
