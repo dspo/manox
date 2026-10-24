@@ -364,6 +364,7 @@ mod accept_without_a_reactor_tests {
             _: &str,
             _: &str,
             _: bool,
+            _: Option<String>,
         ) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }

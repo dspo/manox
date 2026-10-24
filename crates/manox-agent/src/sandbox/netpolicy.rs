@@ -764,6 +764,88 @@ mod tests {
         drop(proxy3);
     }
 
+    /// A canned approver for the ask-path tests.
+    struct CannedApprover(std::sync::Mutex<Vec<HostDecision>>);
+
+    #[async_trait::async_trait]
+    impl HostApprover for CannedApprover {
+        async fn request(&self, _host: &str, _port: u16) -> HostDecision {
+            let mut verdicts = self.0.lock().unwrap();
+            (!verdicts.is_empty())
+                .then(|| verdicts.remove(0))
+                .unwrap_or(HostDecision::Deny)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approved_miss_tunnels_and_amends_the_allowlist() {
+        let ctx = Arc::new(JudgeCtx::new(vec![]));
+        ctx.install_approver(Arc::new(CannedApprover(
+            vec![HostDecision::AllowSession].into(),
+        )));
+        // The upstream stub.
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        });
+        // The literal loopback target is NOT allowlisted: the ask fires,
+        // the canned Session verdict amends the set, and the tunnel then
+        // proceeds (the literal path skips the private guard — the user
+        // named the address).
+        let proxy = ProxyServer::bind(ctx.clone()).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+            .await
+            .unwrap();
+        client
+            .write_all(format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let n = client.read(&mut byte).await.unwrap();
+            assert!(n > 0, "proxy closed before answering");
+            head.push(byte[0]);
+        }
+        assert!(
+            head.starts_with(b"HTTP/1.1 200"),
+            "the approved miss tunnels: {}",
+            String::from_utf8_lossy(&head)
+        );
+        // The relay is live end to end: the request lands on the stub and
+        // its response comes back through the tunnel.
+        client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut body = String::new();
+        client.read_to_string(&mut body).await.unwrap();
+        assert!(body.contains("ok"), "{body}");
+        // The session set gained the host: a second tunnel skips the ask.
+        assert_eq!(ctx.allowlist().judge("127.0.0.1"), HostVerdict::Allow);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_denied_miss_refuses_without_amending() {
+        let ctx = Arc::new(JudgeCtx::new(vec![]));
+        ctx.install_approver(Arc::new(CannedApprover(vec![].into())));
+        let proxy = ProxyServer::bind(ctx.clone()).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"CONNECT 127.0.0.1:1 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        client.read_to_string(&mut answer).await.unwrap();
+        assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+        assert_eq!(ctx.allowlist().judge("127.0.0.1"), HostVerdict::NotAllowlisted);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn session_amendment_admits_the_host_for_the_next_tunnel() {
         let ctx = Arc::new(JudgeCtx::new(vec![]));

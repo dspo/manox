@@ -12,6 +12,15 @@ pub enum PermissionDecision {
     AllowOnce,
     /// Deny (an error is fed back to the model).
     Deny,
+    /// Network host amendment: allow this host for the rest of the session
+    /// (the in-memory allowlist gains it). Only a network approval card
+    /// offers it; any other consumer treats it as its nearest neighbor
+    /// (an approval that never widens to full access).
+    AllowHostSession,
+    /// Network host amendment: allow this host permanently (the settings
+    /// allowlist gains it). Same single-card provenance as
+    /// [`PermissionDecision::AllowHostSession`].
+    AllowHostPersistent,
 }
 
 /// One canonical answer to one `AskUserQuestion` question, routed by the

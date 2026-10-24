@@ -75,6 +75,13 @@ impl NetworkAccess {
     }
 }
 
+/// The synthetic tool name a network host approval parks under: the
+/// journal's approval row carries it as `toolName`, and the AHP projection
+/// mints the network option set (allow_once / deny / allow_host_session /
+/// allow_host_persistent) for that name — the one shared token between the
+/// host approver and the protocol translator.
+pub const NETWORK_APPROVAL_TOOL: &str = "Network";
+
 /// Trapped-env self-check signal: injected as `MANOX_SANDBOX_NETWORK_DISABLED=1`
 /// into every confined command that runs with [`NetworkAccess::Off`], so a
 /// script (or a build tool's feature probe) can see the closure instead of

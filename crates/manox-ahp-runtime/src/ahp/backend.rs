@@ -1221,6 +1221,7 @@ impl RuntimeBackend {
         tool_call_id: &str,
         meta: Option<&ahp_types::common::JsonObject>,
         approved: bool,
+        selected_option_id: Option<String>,
     ) -> DispatchOutcome {
         let Some(session_id) = chat::id(channel) else {
             return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
@@ -1236,7 +1237,10 @@ impl RuntimeBackend {
             tracing::debug!(tool_call_id, "tool call confirmation without an authId");
             return DispatchOutcome::Ignored;
         };
-        match self.server.confirm_tool_call(session_id, auth_id, approved) {
+        match self
+            .server
+            .confirm_tool_call(session_id, auth_id, approved, selected_option_id)
+        {
             Ok(()) => DispatchOutcome::Accepted,
             Err(error) => DispatchOutcome::Rejected(error.message),
         }
@@ -2094,6 +2098,7 @@ impl Backend for RuntimeBackend {
                     &confirmed.tool_call_id,
                     confirmed.meta.as_ref(),
                     confirmed.approved,
+                    confirmed.selected_option_id.clone(),
                 );
                 // A settle may have cold-opened the session (a verdict for a
                 // subscribed-but-never-submitted thread): the bridge the seed
@@ -3249,6 +3254,7 @@ mod mcp_dispatch_tests {
             _session_id: &str,
             _auth_id: &str,
             _approved: bool,
+            _selected_option_id: Option<String>,
         ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }

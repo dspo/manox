@@ -302,12 +302,17 @@ pub trait SessionRuntime: Send + Sync + 'static {
         max_rounds: Option<u64>,
     ) -> Result<(), RuntimeError>;
 
-    /// Settle a tool-call confirmation.
+    /// Settle a tool-call confirmation. `selected_option_id` is the option
+    /// the user clicked, exactly as the confirmation surfaced it — the
+    /// approve-kind options beyond the bare `allow_once` (the network host
+    /// amendments) are distinguishable only through it, so a client that
+    /// knows the vocabulary sends it and a legacy client may omit it.
     fn confirm_tool_call(
         &self,
         session_id: &str,
         auth_id: &str,
         approved: bool,
+        selected_option_id: Option<String>,
     ) -> Result<(), RuntimeError>;
 
     /// Settle a question card: the client's submitted answers, or a

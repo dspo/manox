@@ -243,6 +243,12 @@ impl ApprovalGate {
             let verdict = match &response {
                 ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => "allow_once",
                 ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => "deny",
+                ToolAuthorizationResponse::Decision(PermissionDecision::AllowHostSession) => {
+                    "allow_host_session"
+                }
+                ToolAuthorizationResponse::Decision(PermissionDecision::AllowHostPersistent) => {
+                    "allow_host_persistent"
+                }
                 ToolAuthorizationResponse::AskUserQuestion { .. } => "answered",
                 ToolAuthorizationResponse::AskUserQuestionExpired => "expired",
                 ToolAuthorizationResponse::AskUserQuestionDismissed => "dismissed",
@@ -340,6 +346,91 @@ impl manox_harness::sandbox::EscalationApprover for GateEscalationApprover {
                 manox_harness::sandbox::EscalationOutcome::AllowedOnce
             }
             _ => manox_harness::sandbox::EscalationOutcome::Rejected,
+        }
+    }
+}
+
+/// Host network-host approver over the `ApprovalGate`: parks a
+/// non-allowlisted CONNECT target on the user via the same
+/// `ToolCallAuthorization` round-trip the escalations use, mapping the
+/// verdict onto the amendment vocabulary. The proxy's ask serializer (one
+/// pending network card at a time) sits in front of this, so concurrent
+/// misses queue rather than racing for the single open card. An unanswered
+/// ask denies after a generous timeout — a stuck card must not pin the
+/// proxy's ask pipeline forever.
+pub(crate) struct GateNetworkApprover {
+    gate: std::sync::Weak<ApprovalGate>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+/// How long a parked network card may wait for its verdict before the
+/// CONNECT it serves is refused (and the pipeline unblocks).
+const NETWORK_ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+impl GateNetworkApprover {
+    pub(crate) fn new(gate: std::sync::Weak<ApprovalGate>) -> Self {
+        Self {
+            gate,
+            next_id: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::sandbox::netpolicy::HostApprover for GateNetworkApprover {
+    async fn request(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> crate::sandbox::netpolicy::HostDecision {
+        use crate::sandbox::netpolicy::HostDecision;
+        let Some(gate) = self.gate.upgrade() else {
+            return HostDecision::Deny; // Session gone: nothing to amend.
+        };
+        let id = format!(
+            "network-host-{}",
+            self.next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        );
+        let summary = format!(
+            "A sandboxed command wants to reach {host}:{port} - it is not on the              network allowlist."
+        );
+        let input = serde_json::json!({ "host": host, "port": port });
+        let rx = gate.register(
+            &id,
+            PendingAuthMeta {
+                tool_name: manox_harness::sandbox::NETWORK_APPROVAL_TOOL.to_string(),
+                summary: summary.clone(),
+                input: input.clone(),
+            },
+        );
+        gate.emit(ThreadEvent::ToolCallAuthorization {
+            id: id.clone(),
+            tool_name: manox_harness::sandbox::NETWORK_APPROVAL_TOOL.to_string(),
+            summary,
+            input,
+        });
+        let response = tokio::select! {
+            r = rx => r.unwrap_or(ToolAuthorizationResponse::Decision(
+                PermissionDecision::Deny,
+            )),
+            _ = tokio::time::sleep(NETWORK_ASK_TIMEOUT) => {
+                gate.discard(&id);
+                return HostDecision::Deny;
+            }
+        };
+        gate.discard(&id);
+        match response {
+            ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => {
+                HostDecision::AllowOnce
+            }
+            ToolAuthorizationResponse::Decision(PermissionDecision::AllowHostSession) => {
+                HostDecision::AllowSession
+            }
+            ToolAuthorizationResponse::Decision(PermissionDecision::AllowHostPersistent) => {
+                HostDecision::AllowPersistent
+            }
+            _ => HostDecision::Deny,
         }
     }
 }
