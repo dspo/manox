@@ -166,9 +166,8 @@ fn environ_holds_sentinel(env: *mut *mut libc::c_char) -> bool {
         let mut cursor = env;
         while !(*cursor).is_null() {
             let mut entry = *cursor;
-            let mut needle = NEEDLE.iter();
             let mut matched = true;
-            for &expected in needle {
+            for &expected in NEEDLE {
                 if *entry != expected as libc::c_char {
                     matched = false;
                     break;
