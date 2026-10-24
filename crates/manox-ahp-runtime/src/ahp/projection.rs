@@ -90,6 +90,8 @@ pub mod config_keys {
     pub const REASONING_EFFORT: &str = "reasoningEffort";
     /// Access-mode vocabulary string.
     pub const ACCESS_MODE: &str = "accessMode";
+    /// Network-access vocabulary string (`off`/`on`) for sandboxed bash.
+    pub const NETWORK_ACCESS: &str = "networkAccess";
     /// Server-owned project path (`null` clears).
     pub const PROJECT: &str = "project";
     /// Effective working directory of this journal.
@@ -101,7 +103,7 @@ pub mod config_keys {
     /// travel this seat host→client only: `workingDirectory` writes ride
     /// the dedicated `session/workingDirectorySet` action, so their arrival
     /// through a config dispatch is a client bug, not a fold.
-    pub const MUTABLE: &[&str] = &[MODEL, REASONING_EFFORT, ACCESS_MODE];
+    pub const MUTABLE: &[&str] = &[MODEL, REASONING_EFFORT, ACCESS_MODE, NETWORK_ACCESS];
 }
 
 /// The journal-row facts the projection mints identities from: one kernel
@@ -1914,7 +1916,10 @@ impl Translator {
         // manox's gate registers by tool-call id, so the authId *is* the handle
         // when the row does not name one separately.
         let call_id = tool_call_id.unwrap_or(auth_id);
-        let approved = matches!(verdict.unwrap_or_default(), "allow_once" | "answered");
+        let approved = matches!(
+            verdict.unwrap_or_default(),
+            "allow_once" | "allow_host_session" | "allow_host_persistent" | "answered"
+        );
         let turn_id = match kind {
             "request" => {
                 self.ensure_turn(entry, chat, out);
@@ -1941,7 +1946,7 @@ impl Translator {
                         edits: None,
                         editable: None,
                         confirmed: None,
-                        options: Some(approval_options()),
+                        options: Some(approval_options(tool_name)),
                     }),
                 ));
                 self.mark_awaiting(call_id, auth_id, &prompt);
@@ -2628,7 +2633,7 @@ impl Translator {
                 .call(call_id)
                 .and_then(|call| preview_edits(&call.tool_name, call.input.as_ref())),
             editable: None,
-            options: Some(approval_options()),
+            options: Some(approval_options(Some(name))),
         }
     }
 
@@ -2810,21 +2815,38 @@ fn no_user_row(entry: &Envelope) -> Message {
 ///
 /// manox's gate answers with a verdict string, and these ids *are* that
 /// vocabulary, so a client that renders them still round-trips honestly.
-fn approval_options() -> Vec<ConfirmationOption> {
-    vec![
-        ConfirmationOption {
-            id: "allow_once".to_string(),
-            label: "Allow once".to_string(),
+/// The network approval carries the two amendment shapes (session /
+/// persistent host grants) on top of the bare pair — the ids match the
+/// verdict strings the gateway maps back, and clients render the set
+/// verbatim.
+fn approval_options(tool_name: Option<&str>) -> Vec<ConfirmationOption> {
+    let mut options = vec![ConfirmationOption {
+        id: "allow_once".to_string(),
+        label: "Allow once".to_string(),
+        kind: ConfirmationOptionKind::Approve,
+        group: Some(0),
+    }];
+    if tool_name == Some(manox_harness::sandbox::NETWORK_APPROVAL_TOOL) {
+        options.push(ConfirmationOption {
+            id: "allow_host_session".to_string(),
+            label: "Allow this host for the session".to_string(),
             kind: ConfirmationOptionKind::Approve,
             group: Some(0),
-        },
-        ConfirmationOption {
-            id: "deny".to_string(),
-            label: "Deny".to_string(),
-            kind: ConfirmationOptionKind::Deny,
-            group: Some(1),
-        },
-    ]
+        });
+        options.push(ConfirmationOption {
+            id: "allow_host_persistent".to_string(),
+            label: "Always allow this host".to_string(),
+            kind: ConfirmationOptionKind::Approve,
+            group: Some(0),
+        });
+    }
+    options.push(ConfirmationOption {
+        id: "deny".to_string(),
+        label: "Deny".to_string(),
+        kind: ConfirmationOptionKind::Deny,
+        group: Some(1),
+    });
+    options
 }
 
 /// The `_meta["x-manox"]` payload of a confirmation.
@@ -3736,6 +3758,56 @@ mod fold_semantics_tests {
             "the header IS the question text"
         );
         assert_eq!(single.options.len(), 2, "both options survive");
+    }
+
+    /// The network approval card carries the two amendment options on top
+    /// of the bare pair; every other tool's card stays at exactly
+    /// allow-once/deny. The ids ARE the verdict vocabulary the gateway maps
+    /// back.
+    #[test]
+    fn the_network_approval_card_offers_the_host_amendments() {
+        for (tool_name, expected_ids) in [
+            (
+                manox_harness::sandbox::NETWORK_APPROVAL_TOOL,
+                vec![
+                    "allow_once",
+                    "allow_host_session",
+                    "allow_host_persistent",
+                    "deny",
+                ],
+            ),
+            ("Edit", vec!["allow_once", "deny"]),
+        ] {
+            let mut t = Translator::new();
+            let mut out = Vec::new();
+            for (seq, entry) in [
+                kernel(json!({"type": "turn_start"})),
+                kernel(json!({
+                    "type": "approval", "id": "e-3", "kind": "request", "authId": "a-net",
+                    "payload": {"toolName": tool_name},
+                })),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                out.extend(t.on_entry("c-1", "s-1", seq as u64, &entry));
+            }
+            let ids = out
+                .iter()
+                .find_map(|e| match &e.action {
+                    StateAction::ChatToolCallReady(ready) => {
+                        ready.options.as_ref().map(|options| {
+                            options
+                                .iter()
+                                .map(|option| option.id.as_str())
+                                .collect::<Vec<_>>()
+                        })
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            assert_eq!(ids, expected_ids, "options for {tool_name}");
+        }
     }
 
     /// A question row carrying neither `question` nor `header` has nothing

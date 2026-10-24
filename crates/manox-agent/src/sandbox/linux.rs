@@ -23,8 +23,10 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use super::NetworkRoute;
 use seccompiler::{
-    BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch, apply_filter,
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+    SeccompRule, TargetArch, apply_filter,
 };
 
 /// The confinement binary searched on PATH.
@@ -207,9 +209,16 @@ fn stderr_namespaces_are_denied(stderr: &str) -> bool {
 /// a-container needs no ambient capabilities to create the rest), the pid
 /// namespace with bwrap itself as its pid 1 when the build supports it
 /// (signals reach bash, and the namespace dies with the direct child the
-/// parent manages). The network namespace stays shared this phase — closing
-/// it is phase 3 — so there is deliberately no `--unshare-net`.
-pub(super) fn bwrap_argv(roots: &[PathBuf], command: &str, supports_as_pid_1: bool) -> Vec<String> {
+/// parent manages). The network namespace follows the route:
+/// `NetworkRoute::Disabled` unshares it (no interfaces but the downed
+/// loopback — deny-default by construction), the open routes share the
+/// host's.
+pub(super) fn bwrap_argv(
+    roots: &[PathBuf],
+    command: &str,
+    supports_as_pid_1: bool,
+    route: NetworkRoute,
+) -> Vec<String> {
     let mut argv: Vec<String> = [
         "--ro-bind",
         "/",
@@ -231,6 +240,9 @@ pub(super) fn bwrap_argv(roots: &[PathBuf], command: &str, supports_as_pid_1: bo
     .iter()
     .map(|s| s.to_string())
     .collect();
+    if route == NetworkRoute::Disabled {
+        argv.push("--unshare-net".into());
+    }
     for root in roots {
         if root.exists() {
             argv.push("--bind".into());
@@ -259,9 +271,8 @@ pub(super) fn bwrap_argv(roots: &[PathBuf], command: &str, supports_as_pid_1: bo
 /// the classic sandbox-escape primitives against the host process itself
 /// (the filter is inherited, so a sandboxed child could otherwise attach
 /// back to its unsandboxed ancestor); `io_uring` bypasses the standard
-/// syscall path for its submitted operations, which would let a future
-/// network closure (phase 3) be sidestepped — it stays unavailable from day
-/// one. Socket-family filtering is deliberately absent until phase 3.
+/// syscall path for its submitted operations, which would let the network
+/// closure be sidestepped — it stays unavailable in every network state.
 const DENIED_SYSCALLS: &[i64] = &[
     libc::SYS_ptrace,
     libc::SYS_process_vm_readv,
@@ -271,14 +282,75 @@ const DENIED_SYSCALLS: &[i64] = &[
     libc::SYS_io_uring_register,
 ];
 
+/// The syscalls the socket-restricted face additionally refuses when the
+/// route is closed: the data-plane verbs that survive the single-phase
+/// design. The socket-family gate on `socket`/`socketpair` already makes an
+/// inet socket uncreatable; these denials are the second layer against
+/// stray inherited fds (std spawn closes them anyway). `bind`/`sendto`/
+/// `sendmsg`/`recvmsg`/`getsockname` and the option calls stay ALLOWED
+/// because bwrap itself raises the netns loopback over a NETLINK_ROUTE
+/// socket (`socket`→`bind`→`sendto` of RTM_NEWADDR/RTM_NEWLINK) — our
+/// filter installs before bwrap execs (no inner helper), so bwrap's
+/// in-band setup must ride through, and netlink inside an unshared netns
+/// reaches no host state. A codex-shaped two-phase design could deny
+/// `sendto` outright because its filter lands after bwrap's setup; ours
+/// cannot express that split. `recvfrom` stays allowed for socketpair-based
+/// subprocess management (`cargo clippy` and friends).
+const NETWORK_DENIED_SYSCALLS: &[i64] = &[
+    libc::SYS_connect,
+    libc::SYS_accept,
+    libc::SYS_accept4,
+    libc::SYS_listen,
+    libc::SYS_sendmmsg,
+    libc::SYS_recvmmsg,
+];
+
 /// The unconditional deny rules: one entry per denied syscall, each with an
-/// empty rule chain (matches every invocation of that syscall).
-fn deny_rules() -> BTreeMap<i64, Vec<SeccompRule>> {
+/// empty rule chain (matches every invocation of that syscall). The closed
+/// route adds the network face: the socket lifecycle denials above plus
+/// AF_UNIX-only conditions on `socket`/`socketpair` (denied when the domain
+/// argument is anything else — `arg0 != AF_UNIX` matches, the empty default
+/// action allows the unix case).
+fn deny_rules(route: NetworkRoute) -> BTreeMap<i64, Vec<SeccompRule>> {
     let mut rules = BTreeMap::new();
     for &nr in DENIED_SYSCALLS {
         rules.insert(nr, Vec::new());
     }
+    if route == NetworkRoute::Disabled {
+        for &nr in NETWORK_DENIED_SYSCALLS {
+            rules.insert(nr, Vec::new());
+        }
+        // `socket`/`socketpair` are denied for every domain except the
+        // local-only pair: AF_UNIX (pipes-in-process tooling) and AF_NETLINK
+        // — bwrap itself raises the netns loopback over NETLINK_ROUTE, and
+        // netlink inside an unshared netns reaches no host state.
+        rules.insert(libc::SYS_socket, vec![local_domain_rule()]);
+        rules.insert(libc::SYS_socketpair, vec![local_domain_rule()]);
+    }
     rules
+}
+
+/// The local-domain rule shared by `socket` and `socketpair`: denied only
+/// when the domain argument is neither AF_UNIX nor AF_NETLINK; both local
+/// cases fall through to the default allow.
+fn local_domain_rule() -> SeccompRule {
+    SeccompRule::new(vec![
+        SeccompCondition::new(
+            0, // first argument (domain)
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            libc::AF_UNIX as u64,
+        )
+        .expect("AF_UNIX comparison compiles"),
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            libc::AF_NETLINK as u64,
+        )
+        .expect("AF_NETLINK comparison compiles"),
+    ])
+    .expect("local-domain rule compiles")
 }
 
 fn seccomp_target_arch() -> Option<TargetArch> {
@@ -291,10 +363,10 @@ fn seccomp_target_arch() -> Option<TargetArch> {
     }
 }
 
-/// Compile the BPF program in the parent (once per process): allow-by-
-/// default with EPERM on the deny face. `Err` only where the architecture
-/// is outside the supported set.
-fn compile_program() -> Result<BpfProgram, String> {
+/// Compile the BPF program in the parent (once per process and per network
+/// face): allow-by-default with EPERM on the deny face. `Err` only where the
+/// architecture is outside the supported set.
+fn compile_program(route: NetworkRoute) -> Result<BpfProgram, String> {
     let Some(arch) = seccomp_target_arch() else {
         return Err(
             "seccomp filter unsupported on this architecture - the Linux sandbox \
@@ -303,7 +375,7 @@ fn compile_program() -> Result<BpfProgram, String> {
         );
     };
     let filter = SeccompFilter::new(
-        deny_rules(),
+        deny_rules(route),
         SeccompAction::Allow,                     // default: allow
         SeccompAction::Errno(libc::EPERM as u32), // denied syscall: EPERM
         arch,
@@ -315,12 +387,19 @@ fn compile_program() -> Result<BpfProgram, String> {
     Ok(program)
 }
 
-/// The compiled deny-face program, cached. Compilation is infallible for
-/// the shipped targets; a failure fails the CALL closed (never the process).
-fn seccomp_program() -> Result<&'static BpfProgram, String> {
-    static PROGRAM: OnceLock<Result<BpfProgram, String>> = OnceLock::new();
-    PROGRAM
-        .get_or_init(compile_program)
+/// The compiled deny-face programs (one per network face), cached. There
+/// are exactly two faces: the open base and the socket-restricted closed
+/// one — a switch between them never recompiles mid-session. Compilation is
+/// infallible for the shipped targets; a failure fails the CALL closed
+/// (never the process).
+fn seccomp_program(route: NetworkRoute) -> Result<&'static BpfProgram, String> {
+    static OPEN: OnceLock<Result<BpfProgram, String>> = OnceLock::new();
+    static RESTRICTED: OnceLock<Result<BpfProgram, String>> = OnceLock::new();
+    let slot = match route {
+        NetworkRoute::Disabled => &RESTRICTED,
+        NetworkRoute::Direct | NetworkRoute::Managed { .. } => &OPEN,
+    };
+    slot.get_or_init(|| compile_program(route))
         .as_ref()
         .map_err(Clone::clone)
 }
@@ -335,17 +414,20 @@ pub(super) fn wrap_command(
     roots: &[PathBuf],
     command: &str,
     cwd: &Path,
+    route: NetworkRoute,
 ) -> Result<tokio::process::Command, String> {
     let probe = probe().as_ref().ok_or_else(|| {
         "bubblewrap is not available - sandboxed bash cannot run on this host".to_string()
     })?;
-    let program = seccomp_program()?;
+    let program = seccomp_program(route)?.clone();
     let mut cmd = tokio::process::Command::new(&probe.program);
-    cmd.args(bwrap_argv(roots, command, probe.supports_as_pid_1))
+    cmd.args(bwrap_argv(roots, command, probe.supports_as_pid_1, route))
         .current_dir(cwd)
         .env("PATH", super::login_shell_path());
+    for (key, value) in super::SandboxPolicy::network_env(route) {
+        cmd.env(key, value);
+    }
     super::inject_noninteractive_env(&mut cmd);
-    let program = program.clone();
     // SAFETY: the closure runs in the forked child immediately before exec;
     // `apply_filter` issues only prctl(PR_SET_NO_NEW_PRIVS) and seccomp(2)
     // against memory prepared here, with no allocation or locking.
@@ -370,7 +452,12 @@ mod tests {
         let extra = base.path().join("extra");
         std::fs::create_dir(&ws).unwrap();
         std::fs::create_dir(&extra).unwrap();
-        let argv = bwrap_argv(&[ws.clone(), extra.clone()], "echo hi", true);
+        let argv = bwrap_argv(
+            &[ws.clone(), extra.clone()],
+            "echo hi",
+            true,
+            NetworkRoute::Direct,
+        );
         // Base mounts first: read-only root, then the device tree with shm.
         assert_eq!(
             &argv[..8],
@@ -410,7 +497,7 @@ mod tests {
         assert_eq!(argv[pid_at + 1], "--as-pid-1");
         assert!(argv.contains(&"--proc".to_string()));
         assert!(argv.contains(&"/proc".to_string()));
-        // Network stays open this phase.
+        // The open route shares the host network namespace.
         assert!(!argv.contains(&"--unshare-net".to_string()));
         // The command rides after `--` as ONE argv element.
         let sep = argv.iter().position(|a| a == "--").unwrap();
@@ -419,7 +506,12 @@ mod tests {
 
     #[test]
     fn argv_without_as_pid_1_drops_the_pid_namespace_flags() {
-        let argv = bwrap_argv(&[PathBuf::from("/tmp/ws")], "echo hi", false);
+        let argv = bwrap_argv(
+            &[PathBuf::from("/tmp/ws")],
+            "echo hi",
+            false,
+            NetworkRoute::Direct,
+        );
         assert!(!argv.contains(&"--unshare-pid".to_string()));
         assert!(!argv.contains(&"--as-pid-1".to_string()));
         assert!(!argv.contains(&"--proc".to_string()));
@@ -430,7 +522,12 @@ mod tests {
     fn argv_skips_missing_writable_roots() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
-        let argv = bwrap_argv(&[dir.path().to_path_buf(), missing], "true", true);
+        let argv = bwrap_argv(
+            &[dir.path().to_path_buf(), missing],
+            "true",
+            true,
+            NetworkRoute::Direct,
+        );
         let binds: Vec<&[String]> = argv
             .split(|a| a == "--bind")
             .skip(1)
@@ -441,8 +538,17 @@ mod tests {
     }
 
     #[test]
+    fn closed_route_argv_unshares_the_network() {
+        let argv = bwrap_argv(&[], "true", true, NetworkRoute::Disabled);
+        assert!(argv.contains(&"--unshare-net".to_string()), "{argv:?}");
+        // The open faces share the host net.
+        let open = bwrap_argv(&[], "true", true, NetworkRoute::Managed { proxy_port: 1 });
+        assert!(!open.contains(&"--unshare-net".to_string()), "{open:?}");
+    }
+
+    #[test]
     fn deny_face_covers_exactly_the_escape_primitives() {
-        let rules = deny_rules();
+        let rules = deny_rules(NetworkRoute::Direct);
         let mut expected = DENIED_SYSCALLS.to_vec();
         expected.sort_unstable();
         let mut actual: Vec<i64> = rules.keys().copied().collect();
@@ -459,14 +565,45 @@ mod tests {
         assert!(rules.contains_key(&libc::SYS_io_uring_setup));
         assert!(rules.contains_key(&libc::SYS_io_uring_enter));
         assert!(rules.contains_key(&libc::SYS_io_uring_register));
+        // The open face leaves the socket families untouched.
+        assert!(!rules.contains_key(&libc::SYS_socket));
+        assert!(!rules.contains_key(&libc::SYS_connect));
     }
 
     #[test]
-    fn program_compiles_allow_default_with_eperm_face() {
-        let program = compile_program().expect("the shipped targets compile");
-        // The BPF program is nonempty and includes the arch-validation
-        // prologue, so a cross-arch program cannot be loaded by accident.
-        assert!(!program.is_empty());
+    fn closed_route_adds_the_socket_restricted_face() {
+        let rules = deny_rules(NetworkRoute::Disabled);
+        // Every network-lifecycle syscall denies unconditionally...
+        for &nr in NETWORK_DENIED_SYSCALLS {
+            assert!(
+                rules.get(&nr).is_some_and(|chain| chain.is_empty()),
+                "syscall {nr} must deny unconditionally"
+            );
+        }
+        // ...while socket/socketpair carry the AF_UNIX-only condition.
+        for nr in [libc::SYS_socket, libc::SYS_socketpair] {
+            let chain = rules.get(&nr).expect("socket family rule present");
+            assert_eq!(chain.len(), 1, "syscall {nr}: one conditional rule");
+        }
+        // The escape primitives ride in both faces.
+        assert!(rules.contains_key(&libc::SYS_ptrace));
+        assert!(rules.contains_key(&libc::SYS_io_uring_setup));
+    }
+
+    #[test]
+    fn both_faces_compile_for_the_shipped_targets() {
+        for route in [
+            NetworkRoute::Disabled,
+            NetworkRoute::Direct,
+            NetworkRoute::Managed { proxy_port: 1 },
+        ] {
+            let program = compile_program(route).expect("the shipped targets compile");
+            assert!(!program.is_empty(), "{route:?}");
+        }
+        // The two open faces share one compiled program (same cache slot).
+        assert!(seccomp_program(NetworkRoute::Direct).is_ok());
+        assert!(seccomp_program(NetworkRoute::Managed { proxy_port: 1 }).is_ok());
+        assert!(seccomp_program(NetworkRoute::Disabled).is_ok());
     }
 
     #[test]
@@ -518,6 +655,7 @@ mod tests {
             root,
             crate::granted_roots::GrantedRoots::new(root),
             resolver(mode),
+            std::sync::Arc::new(move || super::NetworkRoute::Direct),
         )
     }
 
@@ -635,5 +773,87 @@ mod tests {
             .await
             .expect("read runs");
         assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
+    }
+
+    fn ops_for_route(
+        root: &Path,
+        route: super::NetworkRoute,
+    ) -> crate::sandbox::SandboxedBashOperations {
+        crate::sandbox::SandboxedBashOperations::new(
+            root,
+            crate::granted_roots::GrantedRoots::new(root),
+            resolver(manox_harness::sandbox::AccessMode::Sandbox),
+            std::sync::Arc::new(move || route),
+        )
+    }
+
+    /// The closed route: no net namespace interface reaches the network, so
+    /// curl fails and the stderr carries a network-classified signature —
+    /// the marker + escalation hint ride the denial.
+    #[tokio::test]
+    async fn live_closed_network_denies_curl_and_classifies() {
+        if !live_ready() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let ops = ops_for_route(root.path(), super::NetworkRoute::Disabled);
+        let res = ops
+            .exec(request("curl -sS -I https://crates.io", root.path()))
+            .await
+            .expect("exec runs");
+        assert_ne!(res.exit_code, 0, "closed network denies curl");
+        assert!(
+            res.stderr
+                .contains("network access denied under sandbox mode"),
+            "network marker in stderr: {}",
+            res.stderr
+        );
+        assert!(
+            res.stderr.contains("require_escalated"),
+            "escalation hint rides the denial: {}",
+            res.stderr
+        );
+    }
+
+    /// The self-check signal reaches the trapped env.
+    #[tokio::test]
+    async fn live_closed_network_signals_the_self_check_env() {
+        if !live_ready() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let ops = ops_for_route(root.path(), super::NetworkRoute::Disabled);
+        let res = ops
+            .exec(request(
+                "test \"$MANOX_SANDBOX_NETWORK_DISABLED\" = 1",
+                root.path(),
+            ))
+            .await
+            .expect("exec runs");
+        assert_eq!(
+            res.exit_code, 0,
+            "self-check env set when closed: {}",
+            res.stderr
+        );
+    }
+
+    /// The open route on Linux is the historical direct net (no managed
+    /// path yet): curl reaches out with no proxy env in the way.
+    #[tokio::test]
+    async fn live_open_network_reaches_the_network_directly() {
+        if !live_ready() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let ops = ops_for_route(root.path(), super::NetworkRoute::Direct);
+        let res = ops
+            .exec(request("curl -sS -I https://crates.io", root.path()))
+            .await
+            .expect("exec runs");
+        assert_eq!(
+            res.exit_code, 0,
+            "the direct route reaches the network: {}",
+            res.stderr
+        );
     }
 }

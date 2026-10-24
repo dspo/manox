@@ -56,6 +56,14 @@ struct PendingAuth {
 /// respond path (gpui side) see one source of truth.
 pub struct ApprovalGate {
     mode: Mutex<AccessMode>,
+    /// The session's sandbox network switch (`networkAccess`). Memory-only
+    /// cell — no object row, no sidecar field — so a restored session
+    /// starts closed again; the AHP `session/configChanged` write is the
+    /// only thing that opens it. The per-call resolvers (the bash
+    /// seatbelt's route picker, the denial classifier) read this live; the
+    /// policy beside it owns the managed proxy the route may name.
+    network: Mutex<manox_harness::sandbox::NetworkAccess>,
+    network_policy: crate::sandbox::netpolicy::NetworkPolicy,
     /// The conversation's configuration authority. When installed it answers
     /// [`Self::mode`], so every per-call reader — this gate's own tool
     /// wrapper, the bash seatbelt's standing resolver, the Write/Edit
@@ -87,6 +95,8 @@ impl ApprovalGate {
     ) -> Self {
         Self {
             mode: Mutex::new(AccessMode::default()),
+            network: Mutex::new(manox_harness::sandbox::NetworkAccess::default()),
+            network_policy: crate::sandbox::netpolicy::NetworkPolicy::new(),
             config_source: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             notice_tx,
@@ -138,6 +148,29 @@ impl ApprovalGate {
 
     pub fn set_mode(&self, mode: AccessMode) {
         *self.mode.lock().unwrap() = mode;
+    }
+
+    /// The session's sandbox network state, read per call.
+    pub fn network_access(&self) -> manox_harness::sandbox::NetworkAccess {
+        *self.network.lock().unwrap()
+    }
+
+    pub fn set_network_access(&self, access: manox_harness::sandbox::NetworkAccess) {
+        *self.network.lock().unwrap() = access;
+    }
+
+    /// The network face one confined call runs under: the switch (read
+    /// synchronously — a route answer never lags the switch) mapped through
+    /// the policy's proxy state.
+    pub fn network_route(&self) -> crate::sandbox::NetworkRoute {
+        self.network_policy.route_for(self.network_access())
+    }
+
+    /// The network policy — the switch's proxy half is applied here (the
+    /// engine spawns the lifecycle call), and the amendment approver
+    /// installs on it.
+    pub fn network_policy(&self) -> &crate::sandbox::netpolicy::NetworkPolicy {
+        &self.network_policy
     }
 
     pub fn model(&self) -> Option<HarnessModel> {
@@ -210,6 +243,12 @@ impl ApprovalGate {
             let verdict = match &response {
                 ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => "allow_once",
                 ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => "deny",
+                ToolAuthorizationResponse::Decision(PermissionDecision::AllowHostSession) => {
+                    "allow_host_session"
+                }
+                ToolAuthorizationResponse::Decision(PermissionDecision::AllowHostPersistent) => {
+                    "allow_host_persistent"
+                }
                 ToolAuthorizationResponse::AskUserQuestion { .. } => "answered",
                 ToolAuthorizationResponse::AskUserQuestionExpired => "expired",
                 ToolAuthorizationResponse::AskUserQuestionDismissed => "dismissed",
@@ -307,6 +346,87 @@ impl manox_harness::sandbox::EscalationApprover for GateEscalationApprover {
                 manox_harness::sandbox::EscalationOutcome::AllowedOnce
             }
             _ => manox_harness::sandbox::EscalationOutcome::Rejected,
+        }
+    }
+}
+
+/// Host network-host approver over the `ApprovalGate`: parks a
+/// non-allowlisted CONNECT target on the user via the same
+/// `ToolCallAuthorization` round-trip the escalations use, mapping the
+/// verdict onto the amendment vocabulary. The proxy's ask serializer (one
+/// pending network card at a time) sits in front of this, so concurrent
+/// misses queue rather than racing for the single open card. An unanswered
+/// ask denies after a generous timeout — a stuck card must not pin the
+/// proxy's ask pipeline forever.
+pub(crate) struct GateNetworkApprover {
+    gate: std::sync::Weak<ApprovalGate>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+/// How long a parked network card may wait for its verdict before the
+/// CONNECT it serves is refused (and the pipeline unblocks).
+const NETWORK_ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+impl GateNetworkApprover {
+    pub(crate) fn new(gate: std::sync::Weak<ApprovalGate>) -> Self {
+        Self {
+            gate,
+            next_id: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::sandbox::netpolicy::HostApprover for GateNetworkApprover {
+    async fn request(&self, host: &str, port: u16) -> crate::sandbox::netpolicy::HostDecision {
+        use crate::sandbox::netpolicy::HostDecision;
+        let Some(gate) = self.gate.upgrade() else {
+            return HostDecision::Deny; // Session gone: nothing to amend.
+        };
+        let id = format!(
+            "network-host-{}",
+            self.next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        );
+        let summary = format!(
+            "A sandboxed command wants to reach {host}:{port} - it is not on the              network allowlist."
+        );
+        let input = serde_json::json!({ "host": host, "port": port });
+        let rx = gate.register(
+            &id,
+            PendingAuthMeta {
+                tool_name: manox_harness::sandbox::NETWORK_APPROVAL_TOOL.to_string(),
+                summary: summary.clone(),
+                input: input.clone(),
+            },
+        );
+        gate.emit(ThreadEvent::ToolCallAuthorization {
+            id: id.clone(),
+            tool_name: manox_harness::sandbox::NETWORK_APPROVAL_TOOL.to_string(),
+            summary,
+            input,
+        });
+        let response = tokio::select! {
+            r = rx => r.unwrap_or(ToolAuthorizationResponse::Decision(
+                PermissionDecision::Deny,
+            )),
+            _ = tokio::time::sleep(NETWORK_ASK_TIMEOUT) => {
+                gate.discard(&id);
+                return HostDecision::Deny;
+            }
+        };
+        gate.discard(&id);
+        match response {
+            ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => {
+                HostDecision::AllowOnce
+            }
+            ToolAuthorizationResponse::Decision(PermissionDecision::AllowHostSession) => {
+                HostDecision::AllowSession
+            }
+            ToolAuthorizationResponse::Decision(PermissionDecision::AllowHostPersistent) => {
+                HostDecision::AllowPersistent
+            }
+            _ => HostDecision::Deny,
         }
     }
 }

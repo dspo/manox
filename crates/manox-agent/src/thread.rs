@@ -162,6 +162,10 @@ pub enum ThreadEvent {
     AccessModeChanged {
         mode: AccessMode,
     },
+    /// The sandbox network switch changed (`networkAccess`).
+    NetworkAccessChanged {
+        access: manox_harness::sandbox::NetworkAccess,
+    },
     /// A completion turn started.
     TurnStarted,
     /// A completion turn ended.
@@ -287,6 +291,10 @@ pub struct Thread {
     project: Option<PathBuf>,
     model: Option<HarnessModel>,
     access_mode: AccessMode,
+    /// The session's sandbox network switch. Memory-only by design (no
+    /// object row, no sidecar field): a restored session starts closed
+    /// again, and the AHP config write is the only thing that opens it.
+    network_access: manox_harness::sandbox::NetworkAccess,
     messages: Vec<Message>,
     reasoning_effort: ReasoningEffort,
     pinned: bool,
@@ -783,6 +791,7 @@ impl Thread {
             project: None,
             model: crate::provider_glue::default_model(),
             access_mode: AccessMode::default(),
+            network_access: manox_harness::sandbox::NetworkAccess::default(),
             messages: Vec::new(),
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
@@ -920,6 +929,7 @@ impl Thread {
             project,
             model,
             access_mode: AccessMode::default(),
+            network_access: manox_harness::sandbox::NetworkAccess::default(),
             messages: Vec::new(),
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
@@ -1015,6 +1025,9 @@ impl Thread {
         if self.access_mode != AccessMode::default() {
             engine.set_access_mode(self.access_mode);
         }
+        if self.network_access != manox_harness::sandbox::NetworkAccess::default() {
+            engine.set_network_access(self.network_access);
+        }
         if self.reasoning_effort != ReasoningEffort::default() {
             engine.set_thinking_level(Some(self.reasoning_effort.wire_value().to_string()));
         }
@@ -1039,6 +1052,9 @@ impl Thread {
                 // change.
                 if let ThreadEvent::AccessModeChanged { mode } = *event {
                     self.access_mode = mode;
+                }
+                if let ThreadEvent::NetworkAccessChanged { access } = *event {
+                    self.network_access = access;
                 }
                 if let ThreadEvent::TitleChanged { title } = &*event {
                     self.title = Some(title.clone());
@@ -1545,6 +1561,11 @@ impl Thread {
         self.access_mode
     }
 
+    /// The session's sandbox network switch (memory-only; see the field).
+    pub fn network_access(&self) -> manox_harness::sandbox::NetworkAccess {
+        self.network_access
+    }
+
     pub fn reasoning_effort(&self) -> ReasoningEffort {
         self.reasoning_effort
     }
@@ -1886,6 +1907,7 @@ impl Thread {
             project: None,
             model,
             access_mode,
+            network_access: manox_harness::sandbox::NetworkAccess::default(),
             messages: Vec::new(),
             reasoning_effort,
             pinned: false,
@@ -2064,6 +2086,21 @@ impl Thread {
         }
         self.pending_events
             .push(ThreadEvent::AccessModeChanged { mode });
+    }
+    /// Switch the sandbox network state (`networkAccess`). Lands on the
+    /// live engine's gate immediately (a mid-turn switch governs the very
+    /// next confined call) and mirrors on the facade. Nothing durable is
+    /// written: the switch is session memory by design.
+    pub fn set_network_access(&mut self, access: manox_harness::sandbox::NetworkAccess) {
+        if self.network_access == access {
+            return;
+        }
+        self.network_access = access;
+        if let Some(engine) = &self.engine {
+            engine.set_network_access(access);
+        }
+        self.pending_events
+            .push(ThreadEvent::NetworkAccessChanged { access });
     }
 
     /// Deliver the user's answer for a pending interaction card
@@ -2903,6 +2940,7 @@ pub(crate) mod tests {
             project: None,
             model: None,
             access_mode: AccessMode::default(),
+            network_access: manox_harness::sandbox::NetworkAccess::default(),
             messages: Vec::new(),
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,

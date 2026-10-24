@@ -16,7 +16,7 @@ use std::time::Duration;
 use crate::core::BackgroundTaskRegistry;
 use crate::core::env::CommandResult;
 use crate::sandbox::{
-    AccessMode, EscalationApprover, EscalationRequest, NO_GRANT, approve_escalation,
+    AccessMode, EscalationApprover, EscalationRequest, NO_GRANT, NetworkAccess, approve_escalation,
     validate_escalation_args,
 };
 
@@ -175,6 +175,10 @@ pub struct BashTool {
     /// Host-injected session-mode resolver. Returns the standing mode the
     /// call runs under absent an escalation grant.
     mode_resolver: Option<Arc<dyn Fn() -> AccessMode + Send + Sync>>,
+    /// Host-injected network-state resolver, read per call for the denial
+    /// classification (a closed network re-words the marker) and mirrored to
+    /// the sandboxed backend through its own resolver. Defaults to closed.
+    network_resolver: Option<Arc<dyn Fn() -> NetworkAccess + Send + Sync>>,
     /// Host-injected approval channel for a `require_escalated` escalation.
     /// Absent, escalation fails closed ("no approval service composed").
     escalation_approver: Option<Arc<dyn EscalationApprover + Send + Sync>>,
@@ -200,6 +204,7 @@ impl BashTool {
             manager: None,
             unsandboxed_operations: None,
             mode_resolver: None,
+            network_resolver: None,
             escalation_approver: None,
             grant_cell: None,
             sandbox_available: false,
@@ -228,6 +233,17 @@ impl BashTool {
         resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
     ) -> Self {
         self.mode_resolver = Some(resolver);
+        self
+    }
+
+    /// Bind the network-state resolver (the session's `networkAccess`, read
+    /// per call). Hosts wire this to their gate's network cell alongside the
+    /// sandboxed backend's own resolver.
+    pub fn with_network_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> NetworkAccess + Send + Sync>,
+    ) -> Self {
+        self.network_resolver = Some(resolver);
         self
     }
 
@@ -611,8 +627,12 @@ impl BashTool {
         let code = exit.flatten().unwrap_or(0);
         let mut result = output.into_result(code);
         if sandboxed
-            && let Some(note) =
-                crate::sandbox::seatbelt_denial_note(&result.stderr, code, effective)
+            && let Some(note) = crate::sandbox::seatbelt_denial_note(
+                &result.stderr,
+                code,
+                effective,
+                self.network_access(),
+            )
         {
             result.stderr.push_str(&note);
         }
@@ -636,6 +656,16 @@ impl BashTool {
     /// The standing session mode (absent any per-call grant).
     fn standing_mode(&self) -> AccessMode {
         self.mode_resolver.as_ref().map(|r| r()).unwrap_or_default()
+    }
+
+    /// The session's network state, read per call. Defaults to closed — the
+    /// sandbox vocabulary's own default — so a host that never wired the
+    /// resolver classifies under the stricter face.
+    fn network_access(&self) -> NetworkAccess {
+        self.network_resolver
+            .as_ref()
+            .map(|r| r())
+            .unwrap_or_default()
     }
 
     /// The per-call effective mode: an approved escalation grant stamped on

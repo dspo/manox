@@ -290,11 +290,12 @@ impl SessionRuntime for GatewayRuntime {
         model: Option<&str>,
         effort: Option<&str>,
         mode: Option<&str>,
+        network: Option<&str>,
     ) -> Result<(), RuntimeError> {
         self.ensure_live("ahp", session_id)?;
         self.server
             .ahp_inner()
-            .preflight_config(session_id, model, effort, mode)
+            .preflight_config(session_id, model, effort, mode, network)
     }
 
     fn set_reasoning_effort(&self, session_id: &str, effort: &str) -> Result<(), RuntimeError> {
@@ -307,6 +308,13 @@ impl SessionRuntime for GatewayRuntime {
     fn set_access_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError> {
         self.ensure_live("ahp", session_id)?;
         self.server.ahp_inner().set_access_mode(session_id, mode)
+    }
+
+    fn set_network_access(&self, session_id: &str, access: &str) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id)?;
+        self.server
+            .ahp_inner()
+            .set_network_access(session_id, access)
     }
 
     fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError> {
@@ -415,16 +423,22 @@ impl SessionRuntime for GatewayRuntime {
         session_id: &str,
         auth_id: &str,
         approved: bool,
+        selected_option_id: Option<String>,
     ) -> Result<(), RuntimeError> {
-        let response = if approved {
-            manox_agent::permission::ToolAuthorizationResponse::Decision(
-                manox_agent::permission::PermissionDecision::AllowOnce,
-            )
-        } else {
-            manox_agent::permission::ToolAuthorizationResponse::Decision(
-                manox_agent::permission::PermissionDecision::Deny,
-            )
+        // The clicked option refines an approve verdict into its amendment
+        // shapes (the network host cards); an absent id (a legacy client,
+        // or the bare allow/deny pair) keeps the historical verdict.
+        let decision = match (approved, selected_option_id.as_deref()) {
+            (true, Some("allow_host_session")) => {
+                manox_agent::permission::PermissionDecision::AllowHostSession
+            }
+            (true, Some("allow_host_persistent")) => {
+                manox_agent::permission::PermissionDecision::AllowHostPersistent
+            }
+            (true, _) => manox_agent::permission::PermissionDecision::AllowOnce,
+            (false, _) => manox_agent::permission::PermissionDecision::Deny,
         };
+        let response = manox_agent::permission::ToolAuthorizationResponse::Decision(decision);
         // §D.6 settle path: a subscribed-but-never-submitted session has
         // served state without a live engine in the sessions table, so the
         // bare lookup would refuse a verdict as `unknown session` — the

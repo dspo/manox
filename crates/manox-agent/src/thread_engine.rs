@@ -167,6 +167,10 @@ pub trait ThreadEngine: Send + Sync {
     /// Backends without an access gate ignore this.
     fn set_access_mode(&self, _mode: AccessMode) {}
 
+    /// Switch the sandbox network state (`networkAccess`). Backends without
+    /// a network policy ignore this.
+    fn set_network_access(&self, _access: manox_harness::sandbox::NetworkAccess) {}
+
     /// Toggle an opt-in browser tool suite (WebExplore) on or off.
     fn set_browser_suite(&self, _suite: crate::engine::BrowserSuite, _enable: bool) {}
 

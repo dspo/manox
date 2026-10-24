@@ -311,6 +311,7 @@ mod accept_without_a_reactor_tests {
             _: Option<&str>,
             _: Option<&str>,
             _: Option<&str>,
+            _: Option<&str>,
         ) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
@@ -318,6 +319,9 @@ mod accept_without_a_reactor_tests {
             Ok(())
         }
         fn set_access_mode(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+        fn set_network_access(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
         fn set_cwd(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
@@ -360,6 +364,7 @@ mod accept_without_a_reactor_tests {
             _: &str,
             _: &str,
             _: bool,
+            _: Option<String>,
         ) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
