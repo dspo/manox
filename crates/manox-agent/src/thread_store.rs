@@ -70,11 +70,6 @@ pub struct ThreadStore {
     /// only signal until the user switches back). In-memory only: cleared on
     /// attach, on terminal events, and when the run resumes past the call.
     pending_auth: HashSet<String>,
-    /// Threads whose last turn parked on a plan-review verdict awaiting the
-    /// user's choice. Mirrors `pending_auth` (the sidebar shows a static
-    /// icon, not a spinner, while a verdict is due); cleared on verdict,
-    /// terminal events, and error.
-    pending_plan: HashSet<String>,
     /// Canonical entity lookup without retaining idle threads indefinitely.
     live_threads: HashMap<String, std::sync::Weak<ThreadCore>>,
     sessions_dir: PathBuf,
@@ -432,7 +427,6 @@ pub fn init() {
         order_dirty: false,
         running: HashSet::new(),
         pending_auth: HashSet::new(),
-        pending_plan: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
         projects_path,
@@ -1039,25 +1033,6 @@ impl ThreadStore {
             self.pending_auth.insert(id.to_string())
         } else {
             self.pending_auth.remove(id)
-        };
-        if changed {
-            self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
-        }
-    }
-
-    /// Whether a thread's turn is parked on a plan-review verdict.
-    pub fn pending_plan_contains(&self, id: &str) -> bool {
-        self.pending_plan.contains(id)
-    }
-
-    /// Mark/unmark a thread as awaiting a plan-review verdict. Same lifecycle
-    /// and event as `mark_pending_auth`: the sidebar's blue static icon (not
-    /// the spinner) signals the wait until the user decides.
-    pub fn mark_pending_plan(&mut self, id: &str, pending: bool) {
-        let changed = if pending {
-            self.pending_plan.insert(id.to_string())
-        } else {
-            self.pending_plan.remove(id)
         };
         if changed {
             self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
@@ -2005,7 +1980,6 @@ pub fn standalone_for_test() -> StoreHandle {
         order_dirty: false,
         running: HashSet::new(),
         pending_auth: HashSet::new(),
-        pending_plan: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
         projects_path,
@@ -2240,7 +2214,6 @@ mod tests {
             order_dirty: false,
             running: HashSet::new(),
             pending_auth: HashSet::new(),
-            pending_plan: HashSet::new(),
             live_threads: HashMap::new(),
             sessions_dir: dir,
             projects_path,
@@ -2451,7 +2424,6 @@ mod tests {
             order_dirty: false,
             running: HashSet::new(),
             pending_auth: HashSet::new(),
-            pending_plan: HashSet::new(),
             live_threads: HashMap::new(),
             sessions_dir,
             projects_path,
@@ -2489,7 +2461,6 @@ mod tests {
             order_dirty: false,
             running: HashSet::new(),
             pending_auth: HashSet::new(),
-            pending_plan: HashSet::new(),
             live_threads: HashMap::new(),
             sessions_dir: store.read(|s| s.sessions_dir.clone()),
             projects_path: path,
@@ -2589,28 +2560,6 @@ mod tests {
         store.with_mut(|s| s.mark_idle("t1"));
         assert!(!store.read(|s| s.is_running("t1")));
         assert!(store.read(|s| s.is_running("t2")));
-        assert_eq!(events.len(), 3);
-    }
-
-    /// The plan-review marker (the blue-static vs spinner distinction)
-    /// toggles per thread id and is idempotent under repeated marks.
-    #[test]
-    fn plan_marker_toggles() {
-        let _path = temp_db();
-        let store = store_handle();
-        let events = store.subscribe();
-        store.with_mut(|s| s.mark_pending_plan("t1", true));
-        assert!(store.read(|s| s.pending_plan_contains("t1")));
-        assert_eq!(events.len(), 1);
-        // Idempotent marks: no duplicate events.
-        store.with_mut(|s| s.mark_pending_plan("t1", true));
-        assert_eq!(events.len(), 1);
-        // A second thread marks independently; clearing only removes its own.
-        store.with_mut(|s| s.mark_pending_plan("t2", true));
-        assert_eq!(events.len(), 2);
-        store.with_mut(|s| s.mark_pending_plan("t1", false));
-        assert!(!store.read(|s| s.pending_plan_contains("t1")));
-        assert!(store.read(|s| s.pending_plan_contains("t2")));
         assert_eq!(events.len(), 3);
     }
 

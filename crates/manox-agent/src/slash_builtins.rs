@@ -2,14 +2,17 @@
 //!
 //! The gpui host (agent-ui's `⁄` popover / registry) and the headless actor
 //! behind the VS Code webview (`list_commands`, submit routing) each
-//! implement the six built-in commands' execution semantics in their own
+//! implement the built-in commands' execution semantics in their own
 //! layer, but both enumerate the command set from this table — names,
 //! aliases, and description keys — so the two surfaces can never drift
 //! apart on which `/name` invocations exist.
 //!
 //! Execution semantics intentionally stay host-side: the gpui host toggles
 //! workspace notices and popovers, the actor drives `display_text` and
-//! session lifecycle. Only the *set* is shared here.
+//! session lifecycle. Only the *set* is shared here. `/plan` is not in
+//! this table: it is a built-in *skill* (`skill::builtin_skills`), so its
+//! slash dispatch rides the generic skill path and a disk skill of the
+//! same name shadows it.
 
 /// Metadata for one built-in slash command.
 pub struct BuiltinSlashMeta {
@@ -28,11 +31,6 @@ pub const BUILTIN_SLASH_COMMANDS: &[BuiltinSlashMeta] = &[
         name: "mode",
         aliases: &[],
         description: "Cycle the permission mode (Read Only → Workspace Access → Full Access); `/mode <name>` sets a mode, and with a prompt switches and starts working immediately",
-    },
-    BuiltinSlashMeta {
-        name: "plan",
-        aliases: &[],
-        description: "Toggle plan mode (read-only research, plan file, structured approval); `/plan <prompt>` enters plan mode and starts planning the prompt",
     },
     BuiltinSlashMeta {
         name: "compact",

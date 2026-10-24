@@ -40,13 +40,9 @@ pub struct SessionMeta {
     /// chosen in the model dropdown. Absent = the harness default (High).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
-    /// Note: pre-W4 sidecars may still carry a `plan_mode` key. The field is
-    /// gone and `SessionMeta` ignores unknown keys, so the stale value is
-    /// inert — plan mode is journal-only now; never read it as state.
-    /// Last plan file this session proposed (`<slug>-plan.md` under the
-    /// global plans dir), kept for restore + execution handoff.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_file: Option<String>,
+    /// Note: pre-W4 sidecars may still carry `plan_mode` / `plan_file` keys.
+    /// Both fields are gone and `SessionMeta` ignores unknown keys, so the
+    /// stale values are inert — never read them as state.
     /// Last execution plan the model published via `UpdatePlan`, persisted so
     /// it survives compaction (the transcript's tool calls are summarized
     /// away) and restarts. Serialized `manox_agent::plan::PlanSnapshot`; `None`

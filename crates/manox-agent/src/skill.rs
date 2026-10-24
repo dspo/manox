@@ -84,9 +84,39 @@ pub struct SkillRegistry {
     skills: BTreeMap<String, Arc<SkillDefinition>>,
 }
 
+/// Built-in skills embedded in the binary — the retired plan mode's ritual
+/// as a one-shot contract (`plan`). Parsed from the same frontmatter format
+/// as disk skills, except a malformed embedded file panics at startup: it
+/// ships in the binary, not on a user's disk, so there is nothing to be
+/// lenient about. An empty `source` is the embedded sentinel: the
+/// management views filter on it (a built-in is not user-manageable), while
+/// the registry, catalogue, and slash mirror treat it like any skill.
+fn builtin_skills() -> Vec<SkillDefinition> {
+    let embedded = [include_str!("skills/plan/SKILL.md")];
+    embedded
+        .iter()
+        .map(|raw| {
+            let parsed = crate::frontmatter::parse::<SkillMeta>(raw)
+                .expect("embedded SKILL.md fails frontmatter parse");
+            SkillDefinition {
+                name: parsed.front.name,
+                description: parsed.front.description,
+                body: parsed.body,
+                disable_model_invocation: parsed.front.disable_model_invocation,
+                source: PathBuf::new(),
+            }
+        })
+        .collect()
+}
+
 impl SkillRegistry {
     pub fn load() -> Self {
         let mut skills = BTreeMap::new();
+        // Built-ins first so a disk skill of the same name shadows them —
+        // the precedence `builtin_commands` gives markdown commands.
+        for skill in builtin_skills() {
+            skills.insert(skill.name.clone(), Arc::new(skill));
+        }
         // User-authored skills: bare name.
         if let Ok(dir) = paths::skills_dir() {
             scan_skills_root(&dir, None, &mut skills);
@@ -292,13 +322,15 @@ pub fn try_global() -> Option<&'static SkillRegistry> {
 /// Freshly scan the filesystem and return a UI-friendly list of skills,
 /// including user-authored and plugin-provided entries. This bypasses the
 /// process-global registry so management views can reflect changes made during
-/// the current app session.
+/// the current app session. Built-ins (empty source) are excluded — they are
+/// not user-manageable; writing a disk skill of the same name shadows one.
 pub fn list_skill_records() -> Vec<SkillRecord> {
     let registry = SkillRegistry::load();
     let user_root = paths::skills_dir().ok();
     registry
         .skills
         .iter()
+        .filter(|(_, skill)| !skill.source.as_os_str().is_empty())
         .map(|(key, skill)| SkillRecord {
             key: key.clone(),
             name: skill.name.clone(),
@@ -574,6 +606,27 @@ mod tests {
         assert!(
             !merged.iter().any(|s| s.name == "secret"),
             "disable-model-invocation project skills must not be advertised"
+        );
+    }
+
+    #[test]
+    fn builtin_plan_skill_parses_and_stays_user_only() {
+        let builtins = builtin_skills();
+        let plan = builtins
+            .iter()
+            .find(|s| s.name == "plan")
+            .expect("embedded plan skill");
+        assert!(
+            plan.disable_model_invocation,
+            "the planning ritual is slash-only; the model must not self-invoke it"
+        );
+        assert!(!plan.description.is_empty());
+        assert!(plan.body.contains("Planning contract"));
+        assert!(plan.body.contains("AskUserQuestion"));
+        assert!(plan.body.contains("Plan review"));
+        assert!(
+            plan.source.as_os_str().is_empty(),
+            "embedded skills carry the empty-source sentinel"
         );
     }
 }

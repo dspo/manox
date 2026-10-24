@@ -322,7 +322,6 @@ pub(super) fn build_tools(
     session_id: &str,
     gate: &Arc<ApprovalGate>,
     question_gate: &Arc<crate::questions::UserQuestionGate>,
-    plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     granted_roots: &crate::granted_roots::GrantedRoots,
@@ -451,13 +450,6 @@ pub(super) fn build_tools(
         Arc::new(HostTaskStop),
         Arc::new(crate::web_fetch::WebFetchTool::new()),
     ];
-    // Plan-mode gate exemption: plan-file writes stay ungated while
-    // plan mode is active (the `ToolCall` hook blocks everything else).
-    let plan_policy = Arc::new(crate::plan_mode::PlanGatePolicy {
-        state: Arc::clone(plan),
-        plans_dir: crate::paths::plans_dir().unwrap_or_else(|_| PathBuf::from(".manox/plans")),
-        cwd: cwd.to_path_buf(),
-    });
     // Bash rides the OS confinement (the per-call file-effect profile) instead
     // of the host gate whenever a seatbelt is mounted: the mode drives the
     // seatbelt directly, and a `sandbox_permissions` escalation is resolved
@@ -479,7 +471,6 @@ pub(super) fn build_tools(
         .map(|tool| {
             let name = tool.name().to_string();
             let mut wrapper = ApprovalGatedTool::new(tool, Arc::clone(gate))
-                .with_plan_policy(Arc::clone(&plan_policy))
                 .with_granted_roots(granted_roots.clone());
             if let Some(allow) = &confined_bash_auto_allow
                 && name == "Bash"
@@ -504,24 +495,18 @@ pub(super) fn build_tools(
     tools.push(Arc::new(AskUserQuestionTool::new(Arc::clone(
         question_gate,
     ))));
-    // Plan proposal rides ungated like AskUserQuestion: submitting a plan is
-    // the verdict request itself, not a side effect.
-    tools.push(Arc::new(crate::plan_mode::ProposePlanTool::new(
-        notice_tx.clone(),
-        Arc::clone(plan),
-        plan_policy.plans_dir.clone(),
-    )));
     // Execution progress: the model publishes its task list; the snapshot
     // rides PlanUpdated to the context rail. Ungated (mutates nothing on
-    // disk); plan mode's ToolCall hook blocks it while planning.
+    // disk).
     tools.push(Arc::new(crate::plan::UpdatePlanTool::new(
         notice_tx.clone(),
     )));
     // Task tools (TaskCreate/TaskList/TaskUpdate/TaskGet) were removed in
     // the tools-optimization cycle — they were retired with the Steer-based
     // team architecture and UpdatePlan provides a strictly better alternative.
-    // AskUserQuestion/ProposePlan — they persist the durable goal contract,
-    // not filesystem side effects. Absent when the db is unavailable.
+    // Goal tools ride ungated like AskUserQuestion — they persist the durable
+    // goal contract, not filesystem side effects. Absent when the db is
+    // unavailable.
     if let Some(bridge) = goal_bridge {
         tools.push(Arc::new(crate::goal_tools::GetGoalTool::new(Arc::clone(
             bridge,
@@ -535,7 +520,7 @@ pub(super) fn build_tools(
     }
     // Browser tools (main-thread host round trips via the facade): the read
     // axis stays ungated; the write axis rides the same permission gate as
-    // built-ins. Plan mode's ToolCall hook blocks both (fixed allowlist).
+    // built-ins.
     tools.push(Arc::new(crate::web_tools::WebExploreReadTextTool::new(
         notice_tx.clone(),
     )));
@@ -550,10 +535,7 @@ pub(super) fn build_tools(
     // no host surface exposes neither tool. The clipboard read is a read;
     // the opener rides the same approval gate as the browser write axis.
     if let Some(opener) = crate::host_tools::append(&mut tools, notice_tx.clone()) {
-        tools.push(Arc::new(
-            ApprovalGatedTool::new(opener, Arc::clone(gate))
-                .with_plan_policy(Arc::clone(&plan_policy)),
-        ));
+        tools.push(Arc::new(ApprovalGatedTool::new(opener, Arc::clone(gate))));
     }
     for tool in [
         Arc::new(crate::web_tools::WebExploreOpenTool::new(notice_tx.clone()))
@@ -576,12 +558,10 @@ pub(super) fn build_tools(
         )),
     ] {
         tools.push(Arc::new(
-            ApprovalGatedTool::new(tool, Arc::clone(gate))
-                .with_plan_policy(Arc::clone(&plan_policy))
-                .with_escalation(
-                    Arc::clone(&escalation_approver),
-                    Arc::clone(&standing_resolver),
-                ),
+            ApprovalGatedTool::new(tool, Arc::clone(gate)).with_escalation(
+                Arc::clone(&escalation_approver),
+                Arc::clone(&standing_resolver),
+            ),
         ));
     }
     // MCP servers (mcp.json + project/plugin .mcp.json): each advertised tool rides

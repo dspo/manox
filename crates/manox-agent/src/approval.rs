@@ -324,9 +324,6 @@ impl manox_harness::sandbox::EscalationApprover for GateEscalationApprover {
 pub struct ApprovalGatedTool {
     inner: Arc<dyn HarnessAgentTool>,
     gate: Arc<ApprovalGate>,
-    /// Plan-mode exemption: plan-file writes bypass the gate while plan
-    /// mode is active (the model drafts the plan incrementally).
-    plan_policy: Option<Arc<crate::plan_mode::PlanGatePolicy>>,
     auto_allow: Option<AutoAllowResolver>,
     /// Optional sandbox-escalation config (Write/Edit): resolves a
     /// `sandbox_permissions` grant through the host approver before the
@@ -352,19 +349,11 @@ impl ApprovalGatedTool {
         Self {
             inner,
             gate,
-            plan_policy: None,
             auto_allow: None,
             escalation_approver: None,
             mode_resolver: None,
             granted_roots: None,
         }
-    }
-
-    /// Attach the plan-mode gate exemption (plan-file writes stay
-    /// approval-free while plan mode is active).
-    pub fn with_plan_policy(mut self, policy: Arc<crate::plan_mode::PlanGatePolicy>) -> Self {
-        self.plan_policy = Some(policy);
-        self
     }
 
     pub fn with_auto_allow(mut self, resolver: AutoAllowResolver) -> Self {
@@ -398,15 +387,8 @@ impl ApprovalGatedTool {
 
     /// Host gate set: the kernel's declarative hint OR any mutating tool
     /// (write/edit/bash gated, reads free). Read-only tools and tools the
-    /// kernel marks approval-free run ungated. Plan-file writes during plan
-    /// mode are exempt so the model can draft the plan without a denial per
-    /// edit.
+    /// kernel marks approval-free run ungated.
     fn needs_gate(&self, params: &serde_json::Value) -> bool {
-        if let Some(policy) = &self.plan_policy
-            && policy.is_exempt(self.inner.name(), params)
-        {
-            return false;
-        }
         if self
             .auto_allow
             .as_ref()

@@ -370,7 +370,7 @@ async fn run_loop_inner(
                 };
 
                 // Any finalized call asking to terminate ends the run: the
-                // interaction devices (AskUserQuestion, ProposePlan) may land
+                // interaction devices (AskUserQuestion) may land
                 // in a parallel batch beside research tools, and their stop
                 // must not depend on the siblings.
                 let any_terminate = executed.iter().any(|ec| ec.result.terminate);
@@ -2858,7 +2858,7 @@ mod tests {
     // ── turn-final devices: any-terminate batches and the turn-end gate ──────
 
     /// A tool whose result terminates the run (the interaction-device shape:
-    /// `AskUserQuestion`, `ProposePlan`).
+    /// `AskUserQuestion`).
     struct TerminatingTool;
 
     #[async_trait::async_trait]

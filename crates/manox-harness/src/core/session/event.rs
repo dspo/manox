@@ -214,32 +214,6 @@ pub enum Event {
     // keys (`seq`/`id`/`parentId`/`timestamp`/`type`) are exclusive: payload
     // fields never reuse them, so tool handles are `callId` and subagent
     // handles `agentId` (§C.1 exclusivity rule).
-    /// A plan-review lifecycle edge (the C4 vocabulary augmentation):
-    /// `state` is `"proposed"` (a review card is due — the pending
-    /// projection raises) or `"resolved"` (a verdict landed — it clears;
-    /// the verdict discriminant rides the notice plane). The fold source
-    /// for the pending projection; the sidecar `plan_review_pending` flag
-    /// demotes to the pre-vocabulary hole-fill.
-    #[serde(rename = "plan_review", rename_all = "camelCase")]
-    PlanReview {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        state: String,
-        plan_file: Option<String>,
-        #[serde(default)]
-        title: Option<String>,
-        #[serde(default)]
-        content: Option<String>,
-        /// The settled edge's back-reference to its proposal — the request id
-        /// (`plan-review:<proposal entry id>`) the proposal edge minted. A
-        /// review outlives its turn and routinely spans a host restart, so
-        /// the resolution must be self-describing: a fold that never saw the
-        /// proposal (a bridge resuming above it) can still emit the verdict.
-        /// Absent on rows written before the field existed.
-        #[serde(default)]
-        request_id: Option<String>,
-    },
     /// A persisted UI note card (was the fire-and-forget AppendUiNote).
     #[serde(rename = "ui_note", rename_all = "camelCase")]
     UiNote {
@@ -383,23 +357,6 @@ pub enum Event {
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
         mode: String,
-    },
-    /// Plan mode toggled.
-    #[serde(rename = "plan_mode_change", rename_all = "camelCase")]
-    PlanModeChange {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        enabled: bool,
-    },
-    /// A plan-mode selection the user made, awaiting the next turn
-    /// boundary to commit as `plan_mode_change`. Log-only whole value.
-    #[serde(rename = "plan_mode_request", rename_all = "camelCase")]
-    PlanModeRequest {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        enabled: bool,
     },
     /// The persisted plan snapshot changed.
     #[serde(rename = "plan_update", rename_all = "camelCase")]

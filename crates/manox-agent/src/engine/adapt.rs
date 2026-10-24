@@ -141,14 +141,6 @@ pub fn harness_messages_to_messages(input: &[AgentMessage]) -> Vec<Message> {
                     .iter()
                     .map(content_block_to_message_content)
                     .collect();
-                // Plan blocks surface through the PlanReady review flow;
-                // strip them from the displayed transcript (the session
-                // jsonl keeps the raw text, manox parity).
-                for block in blocks.iter_mut() {
-                    if let MessageContent::Text(text) = block {
-                        *text = crate::proposed_plan::strip_proposed_plan_blocks(text);
-                    }
-                }
                 if matches!(stop_reason, Some(StopReason::Error)) {
                     blocks.push(MessageContent::Text(format!(
                         "[turn failed: {}]",
@@ -310,7 +302,6 @@ fn annotation_ui_note(annotation: &serde_json::Value) -> Option<(String, UiNoteR
     let xmanox = annotation.get("_meta")?.get("x-manox")?;
     let kind = match xmanox.get("uiNoteKind")?.as_str()? {
         "error" => crate::db::UiNoteKind::Error,
-        "plan_review" => crate::db::UiNoteKind::PlanReview,
         _ => crate::db::UiNoteKind::Notice,
     };
     let text = annotation
@@ -522,10 +513,6 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
                 None => "Py".to_string(),
             }
         }
-        "ProposePlan" => match arg("title").or_else(|| arg("slug")) {
-            Some(label) => format!("ProposePlan {label}"),
-            None => "ProposePlan".to_string(),
-        },
         "UpdatePlan" => match args.get("plan").and_then(|v| v.as_array()) {
             Some(steps) => format!("UpdatePlan ({} steps)", steps.len()),
             None => "UpdatePlan".to_string(),
@@ -943,14 +930,6 @@ mod tests {
         assert_eq!(tool_title("Py", &json!({"script": "\n  "})), "Py");
         assert_eq!(tool_title("Py", &json!({})), "Py");
 
-        assert_eq!(
-            tool_title("ProposePlan", &json!({"slug": "s", "title": "My Plan"})),
-            "ProposePlan My Plan"
-        );
-        assert_eq!(
-            tool_title("ProposePlan", &json!({"slug": "my-slug"})),
-            "ProposePlan my-slug"
-        );
         assert_eq!(
             tool_title(
                 "UpdatePlan",

@@ -940,3 +940,42 @@ VS Code 拿到的是一个普通单选问题，不是它的原生 plan-review �
 问题到达订阅者、计划块进了宿主扩展状态、问题折进了 open turn。
 
 **合并状态**：CI lint 已修（`d81e2e0`），plan-review 已修（见上），故本项不再是阻断项。
+
+### H.7 Plan mode 整体退役：`/plan` 退化为内置 skill，裁决走通用 ask（2026-10-23）
+
+上文 §B.4/§D 冻结文本里 plan 模式相关的落点（`SetPlanMode`→`planModeChanged`、
+`PlanSeedExecution`→`x-manox/planExecute`、`PlanVerdict`→`verdictRequested|reviewSettled`、
+通道表 `x-manox-plan` 的「plan 模式开关 / 评审请求与裁决」描述）自本节起**全部失效**，
+不回改冻结文本。as-built：
+
+- **plan mode 不再是 harness 概念**：`manox-agent` 的 `plan_mode`/`collaboration_mode` 模块、
+  `ProposePlan` 工具、`BeforeAgentStart` 逐回合注入、`BeforeTurnEnd` 的 plan 退出门
+  handler、审批门的 plan 文件豁免、`~/.manox/plans` 目录约定、`ModePlanActive`/
+  `ModePlanApproved` 模板、engine 的 `RequestPlanMode`/`SetPlanReviewPending`/
+  `StartPlanExecution`/`ApprovePlan` 命令、`ThreadEvent::{PlanReady, PlanModeChanged}`
+  一律删除。`HookPoint::BeforeTurnEnd` 与 loop 的弹回预算作为泛型钩子点保留。
+- **journal 词汇**：`plan_mode_change` / `plan_mode_request` / `plan_review` 三个条目类型
+  删除（无兼容读，与 `a_retired_row_name_is_refused_like_an_unknown_one` 的既有裁决一致：
+  用过 plan mode 的旧会话 restore 会整文件拒载）。`plan_update`（`UpdatePlan` 执行计划快照）
+  存续。sidecar 的 `plan_file` 键停写；旧 sidecar 的未知键照旧惰性忽略。
+- **x-manox 声明面**：动作 `x-manox-plan/planModeChanged`、`/verdictRequested`、
+  `/reviewSettled` 与命令 `x-manox/planExecute` 删除；通道 `x-manox-plan:/<chat-id>` 存续，
+  **只**承载执行计划文档（`planChanged` ← `plan_update`）。`XManoxState` 失去
+  `plan_mode`/`plan_review` 字段。runtime 侧 `plan_reviews` ledger、`resolve_plan_review`、
+  `ChatInputCompleted` 的 `plan-review:` 前缀特判、`plan_seed` 一并删除。
+- **`/plan` 的新家**：`manox-agent::skill::builtin_skills()` 内嵌 `skills/plan/SKILL.md`
+  （`disable-model-invocation: true`，仅用户斜杠入口；磁盘同名 skill 遮蔽内置）。
+  `BUILTIN_SLASH_COMMANDS` 删去 `plan` 行，`x-manox-commands://` 目录自动改列
+  kind=`skill`。`/plan <task>` 走既有 `submit_skill` 分发：渲染契约正文 + 追加 task，
+  display 文本保留 `/plan <task>`。契约要求以 `AskUserQuestion` 单问题卡提案
+  （header `Plan review`，`detail` = 完整计划 markdown，`intent.kind` = `plan-review`，
+  选项 Approve / Approve with changes / Revise），答案经既有 turn-final 播种进入下一回合。
+- **通用载体（替代 H.6 的 plan 专项通道）**：`on_question` 投影把问题级 `detail`
+  markdown 写进 SDK 原生的 `ChatInputRequest.message`（单问题原样；多问题按 `header`
+  分节拼接；全无 detail → `None`，不再填工具名占位）。ahp-types 是
+  microsoft/agent-host-protocol 的 crate，无 per-question detail 槽，故不改 SDK。任何 AHP
+  客户端（含 VS Code 扩展）自此从 `message` 读 ask 的支撑文本——H.6 里「plan 块只能走
+  x-manox-plan」的前提随 plan review 的消失而解除。
+- **伴随义务**：dspo/manox-app 删 chip / `/plan` 本地命令 / plan 通道读面 / `plan-review:`
+  特判，`pending_ask_from_ahp` 改读 `req.message`；dspo/manox-vscode-extension 的
+  `plan-review-card.tsx`/`chatFold.ts` 等读 plan 通道的代码改读 `ChatInputRequest.message`。

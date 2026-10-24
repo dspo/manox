@@ -315,7 +315,7 @@ pub struct DelegationToolConfig {
     /// Tool name — the definition's registry name.
     pub name: String,
     /// Capability tag (`read-only` / `write+bash` / …) surfaced in the
-    /// description and consumed by the plan-mode read-only gate.
+    /// description.
     pub capability: String,
     /// The full rendered tool description (host-assembled from the fields
     /// above plus the dispatch contract).

@@ -71,7 +71,7 @@ use ahp_types::state::{
     ToolCallConfirmationReason, ToolCallConfirmationState, ToolCallPendingConfirmationState,
     ToolCallResult, ToolCallState, ToolInput, ToolResultContent, ToolResultTextContent, UsageInfo,
 };
-use manox_harness::session::{SessionTreeEntry, plan_review_request_id};
+use manox_harness::session::SessionTreeEntry;
 use manox_harness::types::{AgentMessage, ContentBlock};
 use serde_json::{Value, json};
 
@@ -159,7 +159,7 @@ pub(crate) enum Target {
     Chat,
     /// `ahp-session:/<id>` — title, working directories, config, catalog.
     Session,
-    /// `x-manox-plan:/<chat-id>` — plan mode, plan document.
+    /// `x-manox-plan:/<chat-id>` — the execution-plan document.
     Plan,
     /// `x-manox-work:/<session-id>` — goal, background work, sub-agents, suites.
     Work,
@@ -235,14 +235,13 @@ pub(crate) fn target_of(entry: &SessionTreeEntry) -> Target {
         // Annotation rows land here for the durable face; a UI note card's
         // transcript half re-targets the chat channel at its emit site.
         E::AnnotationSet { .. } | E::AnnotationRemoved { .. } => Target::Annotations,
-        // ── plan ─────────────────────────────────────────────────────
-        E::PlanModeChange { .. } | E::PlanModeRequest { .. } | E::PlanUpdate { .. } => Target::Plan,
+        // ── plan (the execution-plan snapshot channel) ────────────────
+        E::PlanUpdate { .. } => Target::Plan,
         // ── extension work surface ───────────────────────────────────
         E::Goal { .. } | E::BrowserSuites { .. } | E::BackgroundTask { .. } => Target::Work,
         E::ActiveToolsChange { .. } => Target::Work,
-        // ── approvals / questions / plan review ride the chat's tool-call +
-        //    input state (the plan-review card is a `chat/inputRequested`) ──
-        E::Approval { .. } | E::Question { .. } | E::PlanReview { .. } => Target::Chat,
+        // ── approvals / questions ride the chat's tool-call + input state ──
+        E::Approval { .. } | E::Question { .. } => Target::Chat,
         // ── compaction and branch summaries surface in the transcript ──
         E::Compaction { .. } | E::CompactionStarted { .. } | E::BranchSummary { .. } => {
             Target::Chat
@@ -538,9 +537,6 @@ pub struct Translator {
     /// Directories already granted, so repeated `cwdChange` rows for the same path
     /// do not re-publish membership.
     granted: Vec<Uri>,
-    /// The open plan-review card's request id, so the `resolved` edge (which
-    /// carries no proposal id) can close the very part the proposal opened.
-    plan_review: Option<String>,
     /// Subagent run ids currently listed in the parent chat's background
     /// work, so a progress tick settles to exactly one Set edge per run and
     /// exactly one Removed edge at its terminal status.
@@ -618,10 +614,44 @@ fn decode_message(message: &AgentMessage, origin_rpc: Option<&str>) -> DecodedMe
 struct AskRow<'a> {
     kind: &'a str,
     auth_id: &'a str,
-    tool_name: Option<&'a str>,
     verdict: Option<&'a str>,
     reason: Option<&'a str>,
     input: Option<&'a serde_json::Value>,
+}
+
+/// The ask's support markdown for the request-level `message` field: the
+/// question-level `detail` payloads, joined under their headers when more
+/// than one carries content. The AHP wire has no per-question detail slot,
+/// so this is the only route support text reaches a client.
+fn ask_details_markdown(input: &serde_json::Value) -> Option<String> {
+    let questions = input.get("questions")?.as_array()?;
+    let details: Vec<(&str, &str)> = questions
+        .iter()
+        .filter_map(|q| {
+            let detail = q.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+            (!detail.trim().is_empty()).then(|| {
+                let header = q.get("header").and_then(|v| v.as_str()).unwrap_or("");
+                (header, detail)
+            })
+        })
+        .collect();
+    match details.len() {
+        0 => None,
+        1 => Some(details[0].1.to_string()),
+        _ => Some(
+            details
+                .iter()
+                .map(|(header, detail)| {
+                    if header.is_empty() {
+                        (*detail).to_string()
+                    } else {
+                        format!("## {header}\n\n{detail}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n"),
+        ),
+    }
 }
 
 /// Map one AskUserQuestion's durable `{questions: [...]}` input onto AHP's
@@ -728,7 +758,6 @@ impl Translator {
         self.open = None;
         self.pending_user.clear();
         self.granted.clear();
-        self.plan_review = None;
         let Some(active) = &chat.active_turn else {
             return;
         };
@@ -776,7 +805,6 @@ impl Translator {
         let chat = Target::Chat.uri(chat_id, session_id);
         let session = Target::Session.uri(chat_id, session_id);
         let thread = Target::Thread.uri(chat_id, session_id);
-        let plan = Target::Plan.uri(chat_id, session_id);
         let mut out = Vec::new();
         match entry {
             // ── transcript ───────────────────────────────────────────────
@@ -1005,7 +1033,6 @@ impl Translator {
                     AskRow {
                         kind,
                         auth_id,
-                        tool_name: field("toolName"),
                         verdict: field("verdict"),
                         reason: field("reason"),
                         input: payload.get("input"),
@@ -1316,118 +1343,11 @@ impl Translator {
                     annotation_id: annotation_id.clone(),
                 }),
             )),
-            // ── plan ─────────────────────────────────────────────────────
-            SessionTreeEntry::PlanModeChange { enabled, .. } => out.push(Emitted::new(
-                &at,
-                extension_action(
-                    ext::actions::PLAN_MODE_CHANGED,
-                    json!({"enabled": enabled, "pending": false}),
-                ),
-            )),
-            SessionTreeEntry::PlanModeRequest { enabled, .. } => out.push(Emitted::new(
-                &at,
-                extension_action(
-                    ext::actions::PLAN_MODE_CHANGED,
-                    json!({"enabled": enabled, "pending": true}),
-                ),
-            )),
+            // ── plan (execution snapshot) ──────────────────────────────
             SessionTreeEntry::PlanUpdate { snapshot, .. } => out.push(Emitted::new(
                 &at,
                 extension_action(ext::actions::PLAN_CHANGED, json!({"snapshot": snapshot})),
             )),
-            SessionTreeEntry::PlanReview {
-                state,
-                plan_file,
-                title,
-                content,
-                request_id: row_request_id,
-                ..
-            } => {
-                // The review's two edges: a verdict is owed, or one landed.
-                // The proposal opens VS Code's native plan-review card (a
-                // `chat/inputRequested` whose request carries the `planReview`
-                // block); the resolution closes that same part by its request
-                // id on the chat face, and the plan-channel settle below is
-                // the fold-visible half for clients whose turn lifecycle
-                // already archived the request.
-                if state == "resolved" {
-                    // The settled edge is self-describing on rows the engine
-                    // wrote after the field existed; projector memory covers
-                    // rows written before it (the proposal replayed in this
-                    // projector's own lifetime). A resolution neither names
-                    // nor is remembered for cannot name its request — skip
-                    // rather than emit a verdict no client can correlate.
-                    let request_id = row_request_id.clone().or_else(|| self.plan_review.take());
-                    // A resolution settles the remembered review too, named
-                    // or not — leaving the memory standing re-emits it on any
-                    // later id-less resolved row.
-                    self.plan_review = None;
-                    if let Some(request_id) = request_id {
-                        // The settlement rides the plan channel in its own
-                        // right: the chat-level `ChatInputCompleted` below only
-                        // folds when the request's turn is still ACTIVE, and a
-                        // plan review legitimately outlives its turn (the turn
-                        // finishes the moment the plan is proposed) — the
-                        // reducer then no-ops on both sides and the client's
-                        // card can never retire (#88's composer lock). The
-                        // plan-channel state is where the settlement is
-                        // fold-visible regardless of turn lifecycle. It names
-                        // no outcome — the journal edge does not carry one
-                        // (approve / refine / implicit dismissal all land
-                        // here) — hence "settled", not "verdict".
-                        out.push(Emitted::new(
-                            &plan,
-                            extension_action(
-                                ext::actions::PLAN_REVIEW_SETTLED,
-                                plan_review_settled_payload(&request_id, plan_file.as_deref()),
-                            ),
-                        ));
-                        out.push(Emitted::new(
-                            &chat,
-                            StateAction::ChatInputCompleted(ChatInputCompletedAction {
-                                request_id,
-                                response: ChatInputResponseKind::Accept,
-                                answers: None,
-                            }),
-                        ));
-                    } else {
-                        tracing::debug!(
-                            seq = row.seq,
-                            "plan review resolved with no correlatable request id; no settlement emitted"
-                        );
-                    }
-                } else {
-                    let request_id = plan_review_request_id(&row.id);
-                    self.plan_review = Some(request_id.clone());
-                    // The plan block rides the `x-manox-plan` channel, which is
-                    // the one place it can survive: AHP's `ChatInputRequest` has
-                    // no `planReview` field, and a raw-JSON action cannot carry
-                    // one either — `StateAction::Unknown` loses to the typed
-                    // variant on any parse, and the SDK client parses every
-                    // inbound action. That channel folds the payload into its
-                    // own state (durable, and backfillable to a client that
-                    // reconnects), which the one-shot broadcast was not.
-                    out.push(Emitted::new(
-                        &plan,
-                        extension_action(
-                            ext::actions::PLAN_VERDICT_REQUESTED,
-                            plan_review_payload(
-                                &request_id,
-                                plan_file.as_deref(),
-                                title.as_deref(),
-                                content.as_deref(),
-                            ),
-                        ),
-                    ));
-                    // …and the interactive half is a real typed input request,
-                    // so the client can answer it through the protocol's own
-                    // `chat/inputCompleted` path.
-                    out.push(Emitted::new(
-                        &chat,
-                        plan_review_requested(&request_id, title.as_deref()),
-                    ));
-                }
-            }
             // ── work ─────────────────────────────────────────────────────
             SessionTreeEntry::Goal { goal, .. } => out.push(Emitted::new(
                 &at,
@@ -2114,7 +2034,6 @@ impl Translator {
         let AskRow {
             kind,
             auth_id,
-            tool_name,
             verdict,
             reason,
             input,
@@ -2122,9 +2041,6 @@ impl Translator {
         match kind {
             "request" => {
                 self.ensure_turn(entry, chat, out);
-                let message = tool_name
-                    .unwrap_or("the agent is asking a question")
-                    .to_string();
                 if let Some(open) = self.open.as_mut() {
                     open.open_asks.push(auth_id.to_string());
                 }
@@ -2133,7 +2049,13 @@ impl Translator {
                     StateAction::ChatInputRequested(ChatInputRequestedAction {
                         request: ChatInputRequest {
                             id: auth_id.to_string(),
-                            message: Some(message),
+                            // The request-level display message carries the
+                            // questions' `detail` support markdown — the wire
+                            // has no per-question detail slot, so this is the
+                            // only route support text reaches a client (a
+                            // plan review is just an ask whose detail is the
+                            // plan). No detail anywhere → no display message.
+                            message: input.and_then(ask_details_markdown),
                             url: None,
                             // The structured questions ride the durable row's
                             // `input` payload (`{questions: [...]}`) and are folded
@@ -2932,106 +2854,6 @@ fn confirmation_prompt(title: &str, tool_name: &str) -> String {
     format!("{subject} — awaiting confirmation")
 }
 
-/// The plan-review block, for the `x-manox-plan` channel.
-///
-/// This is where the plan's title, content and actions live. It cannot ride
-/// `chat/inputRequested`: AHP's `ChatInputRequest` has no `planReview` field,
-/// and a raw-JSON action cannot smuggle one in either — `StateAction::Unknown`
-/// is an untagged fallback, so any parse resolves the tag to the *typed*
-/// variant and drops the fields that variant does not declare. The SDK client
-/// parses every inbound action, so the block was being stripped on arrival.
-///
-/// The extension channel takes it instead: it folds the payload into its own
-/// state (so a client reads it back from the channel baseline, and a
-/// reconnecting client is backfilled), which a one-shot broadcast could not do.
-fn plan_review_payload(
-    request_id: &str,
-    plan_file: Option<&str>,
-    title: Option<&str>,
-    content: Option<&str>,
-) -> Value {
-    let title = title
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or("Review Plan");
-    let content = content
-        .filter(|c| !c.trim().is_empty())
-        .unwrap_or("A plan is ready for review.");
-    let mut payload = json!({
-        "requestId": request_id,
-        "title": title,
-        "content": content,
-        "actions": [
-            { "id": "approve", "label": "Approve", "default": true },
-            { "id": "refine", "label": "Refine" },
-        ],
-        "canProvideFeedback": true,
-    });
-    if let Some(plan_file) = plan_file {
-        payload["planUri"] = json!(file_uri(plan_file));
-    }
-    payload
-}
-
-/// The settled edge's payload: the same `planUri` spelling and encoding the
-/// proposal edge used (the fold replaces `plan_review` wholesale, so the pair
-/// must speak one shape or a late subscriber sees the plan reference mutate).
-/// The key is omitted — not null — when the journal row carried no file, as
-/// `plan_review_payload` does.
-fn plan_review_settled_payload(request_id: &str, plan_file: Option<&str>) -> Value {
-    let mut payload = json!({ "requestId": request_id });
-    if let Some(plan_file) = plan_file {
-        payload["planUri"] = json!(file_uri(plan_file));
-    }
-    payload
-}
-
-/// The interactive half: a typed `chat/inputRequested` asking the user to
-/// approve or refine.
-///
-/// Typed deliberately, and only the question rides it. AHP folds this into the
-/// turn as an `InputRequest` response part, so the client can answer through
-/// `chat/inputCompleted` and the request is durable and backfillable — none of
-/// which holds for a hand-rolled action. The plan's *content* is not here
-/// because the protocol has no field for it; it rides
-/// [`plan_review_payload`].
-fn plan_review_requested(request_id: &str, title: Option<&str>) -> StateAction {
-    let question_id = format!("{request_id}:q");
-    let title = title
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or("Review Plan");
-    StateAction::ChatInputRequested(ChatInputRequestedAction {
-        request: ChatInputRequest {
-            id: request_id.to_string(),
-            message: Some("A plan is ready for review.".to_string()),
-            url: None,
-            questions: Some(vec![ChatInputQuestion::SingleSelect(
-                ChatInputSingleSelectQuestion {
-                    id: question_id,
-                    title: Some(title.to_string()),
-                    message: "How would you like to proceed?".to_string(),
-                    required: Some(true),
-                    options: vec![
-                        ChatInputOption {
-                            id: "approve".to_string(),
-                            label: "Approve".to_string(),
-                            description: None,
-                            recommended: Some(true),
-                        },
-                        ChatInputOption {
-                            id: "refine".to_string(),
-                            label: "Refine".to_string(),
-                            description: None,
-                            recommended: None,
-                        },
-                    ],
-                    allow_freeform_input: Some(true),
-                },
-            )]),
-            answers: None,
-        },
-    })
-}
-
 /// `{"x-manox": value}` — the one private metadata seat this crate writes.
 fn manox_meta(value: Value) -> JsonObject {
     let mut meta = JsonObject::new();
@@ -3317,146 +3139,6 @@ mod tests {
             serde_json::Value::Null,
             "None serializes as an absent/null activity — the reducer's clear edge"
         );
-    }
-
-    #[test]
-    fn plan_review_proposal_splits_content_from_the_question() {
-        let mut translator = Translator::new();
-        let emitted = translator.on_entry(
-            "c-1",
-            "s-1",
-            0,
-            &kernel(json!({
-                "type": "plan_review",
-                "state": "proposed",
-                "planFile": "/plans/demo-plan.md",
-                "title": "Demo plan",
-                "content": "# Demo\n\n- step one",
-            })),
-        );
-        assert_eq!(
-            emitted.len(),
-            2,
-            "the proposal emits the plan block and the question: {emitted:?}"
-        );
-
-        // The plan's own content rides the extension channel — the only place
-        // it survives a parse, and the only place a reconnect is backfilled
-        // from.
-        let plan = emitted
-            .iter()
-            .find(|e| e.channel == "x-manox-plan:/c-1")
-            .expect("the plan block rides the plan channel");
-        let value = serde_json::to_value(&plan.action).expect("action serializes");
-        assert_eq!(value["type"], "x-manox-plan/verdictRequested");
-        assert_eq!(value["requestId"], "plan-review:e-1");
-        assert_eq!(value["title"], "Demo plan");
-        assert_eq!(value["content"], "# Demo\n\n- step one");
-        assert_eq!(value["actions"][0]["id"], "approve");
-        assert_eq!(value["actions"][1]["id"], "refine");
-        assert_eq!(value["canProvideFeedback"], true);
-        assert!(
-            value["planUri"]
-                .as_str()
-                .is_some_and(|u| u.contains("demo-plan")),
-            "the block names the reviewed plan: {value}"
-        );
-
-        // The question is a real typed `chat/inputRequested`, so the client
-        // answers it through the protocol's own completion path and the host
-        // folds it into the turn.
-        let card = emitted
-            .iter()
-            .find(|e| e.channel == "ahp-chat:/c-1")
-            .expect("the question rides the chat channel");
-        let card = serde_json::to_value(&card.action).expect("action serializes");
-        assert_eq!(card["type"], "chat/inputRequested");
-        assert_eq!(card["request"]["id"], "plan-review:e-1");
-        assert_eq!(card["request"]["questions"][0]["kind"], "single-select");
-        assert_eq!(card["request"]["questions"][0]["id"], "plan-review:e-1:q");
-        assert_eq!(
-            card["request"]["questions"][0]["options"][0]["id"],
-            "approve"
-        );
-    }
-
-    #[test]
-    fn plan_review_resolution_closes_the_card() {
-        let mut translator = Translator::new();
-        translator.on_entry(
-            "c-1",
-            "s-1",
-            0,
-            &kernel(json!({
-                "type": "plan_review",
-                "state": "proposed",
-                "planFile": "/p.md",
-                "title": "T",
-                "content": "# T",
-            })),
-        );
-        let emitted = translator.on_entry(
-            "c-1",
-            "s-1",
-            1,
-            &kernel(json!({"type": "plan_review", "id": "e-2", "state": "resolved"})),
-        );
-        assert_eq!(emitted.len(), 2);
-        let settled = serde_json::to_value(&emitted[0].action).expect("action serializes");
-        assert_eq!(settled["type"], ext::actions::PLAN_REVIEW_SETTLED);
-        assert_eq!(settled["requestId"], "plan-review:e-1");
-        // No file on the resolved edge: the key is OMITTED — the same
-        // `planUri` spelling and absence semantics the proposal edge uses
-        // (the fold replaces `plan_review` wholesale, so the pair must
-        // speak one shape).
-        assert!(emitted[0].channel.starts_with("x-manox-plan"));
-        assert!(settled.get("planUri").is_none());
-        let value = serde_json::to_value(&emitted[1].action).expect("action serializes");
-        assert_eq!(value["type"], "chat/inputCompleted");
-        assert_eq!(value["requestId"], "plan-review:e-1");
-    }
-
-    /// The resolution is self-describing: a resolved row carrying its
-    /// request id settles in a projector that never saw the proposal (a
-    /// bridge resuming above it, after a host restart). The payload names
-    /// the plan with the proposal edge's `planUri` encoding.
-    #[test]
-    fn plan_review_resolution_survives_a_projector_restart() {
-        let mut translator = Translator::new();
-        let emitted = translator.on_entry(
-            "c-1",
-            "s-1",
-            0,
-            &kernel(json!({
-                "type": "plan_review",
-                "id": "e-9",
-                "state": "resolved",
-                "planFile": "/p.md",
-                "requestId": "plan-review:e-1",
-            })),
-        );
-        assert_eq!(emitted.len(), 2);
-        let settled = serde_json::to_value(&emitted[0].action).expect("action serializes");
-        assert_eq!(settled["type"], ext::actions::PLAN_REVIEW_SETTLED);
-        assert_eq!(settled["requestId"], "plan-review:e-1");
-        assert_eq!(settled["planUri"], "file:///p.md");
-        let value = serde_json::to_value(&emitted[1].action).expect("action serializes");
-        assert_eq!(value["requestId"], "plan-review:e-1");
-    }
-
-    /// A resolution that neither names its request nor is remembered for
-    /// one cannot be correlated — nothing is emitted rather than a verdict
-    /// no client can route.
-    #[test]
-    fn plan_review_resolution_without_a_correlatable_id_emits_nothing() {
-        let mut translator = Translator::new();
-        let emitted = translator.on_entry(
-            "c-1",
-            "s-1",
-            0,
-            &kernel(json!({"type": "plan_review", "id": "e-9", "state": "resolved"})),
-        );
-        assert!(emitted.is_empty());
     }
 
     #[test]
@@ -4092,6 +3774,87 @@ mod fold_semantics_tests {
             None,
             "no text means no fabricated question card"
         );
+        assert_eq!(
+            request.message, None,
+            "no detail anywhere means no request-level display message"
+        );
+    }
+
+    /// The questions' `detail` markdown is the ask's support text — a plan
+    /// review is just an ask whose detail is the plan. The AHP wire has no
+    /// per-question detail slot, so it rides the request-level `message`:
+    /// verbatim for one question, joined under the question headers when
+    /// several carry content.
+    #[test]
+    fn ask_details_ride_the_request_level_message() {
+        let single = kernel(json!({
+            "type": "question",
+            "id": "e9",
+            "kind": "request",
+            "authId": "call_plan",
+            "payload": {
+                "toolName": "AskUserQuestion",
+                "input": {"questions": [{
+                    "header": "Plan review",
+                    "question": "Approve this plan?",
+                    "detail": "# Plan\n\n- step one\n- step two",
+                    "options": [{"label": "Approve"}, {"label": "Revise"}],
+                }]},
+            },
+        }));
+        let mut translator = Translator::new();
+        let actions: Vec<_> = translator
+            .on_entry("c-1", "s-1", 9, &single)
+            .into_iter()
+            .map(|e| e.action)
+            .collect();
+        let request = actions
+            .iter()
+            .find_map(|a| match a {
+                StateAction::ChatInputRequested(r) => Some(&r.request),
+                _ => None,
+            })
+            .expect("the ask reaches the client");
+        assert_eq!(
+            request.message.as_deref(),
+            Some("# Plan\n\n- step one\n- step two"),
+            "a single detail rides verbatim"
+        );
+
+        let several = kernel(json!({
+            "type": "question",
+            "id": "e10",
+            "kind": "request",
+            "authId": "call_two",
+            "payload": {
+                "toolName": "AskUserQuestion",
+                "input": {"questions": [
+                    {"header": "Scope", "question": "Which scope?", "detail": "scope notes",
+                     "options": [{"label": "A"}]},
+                    {"header": "Style", "question": "Which style?",
+                     "options": [{"label": "B"}]},
+                    {"question": "Anything else?", "detail": "trailing notes",
+                     "options": [{"label": "C"}]},
+                ]},
+            },
+        }));
+        let actions: Vec<_> = translator
+            .on_entry("c-1", "s-1", 10, &several)
+            .into_iter()
+            .map(|e| e.action)
+            .collect();
+        let request = actions
+            .iter()
+            .find_map(|a| match a {
+                StateAction::ChatInputRequested(r) => Some(&r.request),
+                _ => None,
+            })
+            .expect("the ask reaches the client");
+        assert_eq!(
+            request.message.as_deref(),
+            Some("## Scope\n\nscope notes\n\n---\n\ntrailing notes"),
+            "several details join under their headers; a detail-less question contributes nothing"
+        );
     }
 
     /// A turn that dies with a parked question and NO journalled decision —
@@ -4592,19 +4355,8 @@ mod extension_gate_tests {
         // cannot catch it).
         let host_cases: Vec<(SessionTreeEntry, &str, &str)> = vec![
             (
-                kernel(json!({"type": "plan_mode_change", "enabled": true})),
-                ext_actions::PLAN_MODE_CHANGED,
-                "x-manox-plan:/c-1",
-            ),
-            (
                 kernel(json!({"type": "plan_update", "snapshot": {}})),
                 ext_actions::PLAN_CHANGED,
-                "x-manox-plan:/c-1",
-            ),
-            (
-                kernel(json!({"type": "plan_review", "state": "proposed",
-                              "requestId": "plan-review:e-gate"})),
-                ext_actions::PLAN_VERDICT_REQUESTED,
                 "x-manox-plan:/c-1",
             ),
             (
@@ -4659,12 +4411,10 @@ mod extension_gate_tests {
             json!({"type": ext_actions::ORDER_CHANGED, "order": {"s-1": 1}}),
             ext_actions::ORDER_CHANGED,
         )];
-        // Excluded, no fold arm to feed: BASELINE (host envelope),
-        // PLAN_REVIEW_SETTLED (folds with the host-emitted verdict-requested edge),
-        // the workspaces rows (declared, fold lives outside this bag).
+        // Excluded, no fold arm to feed: BASELINE (host envelope), the
+        // workspaces rows (declared, fold lives outside this bag).
 
         let mut state = XManoxState::default();
-        let mut plan_review_action = None;
         let mut translator = Translator::new();
         for (entry, tag, expected_channel) in &host_cases {
             assert!(ext_actions::ALL.contains(tag), "{tag} must stay declared");
@@ -4689,9 +4439,6 @@ mod extension_gate_tests {
                 ExtOutcome::Applied,
                 "{tag} did not fold: {action}"
             );
-            if *tag == ext_actions::PLAN_VERDICT_REQUESTED {
-                plan_review_action = Some(action.clone());
-            }
         }
         for (action, tag) in &client_cases {
             assert_eq!(
@@ -4706,9 +4453,7 @@ mod extension_gate_tests {
         assert_eq!(
             state,
             XManoxState {
-                plan_mode: Some(true),
                 plan: Some(json!({})),
-                plan_review: plan_review_action,
                 goal: Some(json!({"text": "ship"})),
                 browser_suites: Some(vec!["webexplore".to_string()]),
                 background_tasks: Some(

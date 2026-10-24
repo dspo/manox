@@ -1,7 +1,7 @@
 //! The x-manox extension surface — AHP's `x-` namespace, used for the domain
 //! state the protocol does not model.
 //!
-//! AHP deliberately stays agent-agnostic: plan mode and plan artefacts, goal,
+//! AHP deliberately stays agent-agnostic: the execution-plan document, goal,
 //! background work, browser suites, the sub-agent tree, thread
 //! pinning/ordering/grouping, the workspace rows, the command catalogue, the
 //! aggregated conversation metrics and client-contributed tools have **no**
@@ -58,7 +58,7 @@ pub const VERSION: u32 = 6;
 
 /// State-bearing extension channel prefixes, in declaration order.
 pub mod channels {
-    /// Plan mode, plan document, plan review lifecycle (per chat).
+    /// The execution-plan document (per chat).
     pub const PLAN: &str = "x-manox-plan:/";
     /// Goal, background tasks, browser suites (per session). The sub-agent
     /// roster and the child transcripts are standard AHP state — the parent
@@ -94,16 +94,8 @@ pub mod actions {
     /// notification: the Rust SDK client drops unknown notification methods,
     /// so a notification-shaped baseline never reaches an SDK client.
     pub const BASELINE: &str = "x-manox/baseline";
-    /// Plan mode toggled (client-dispatchable).
-    pub const PLAN_MODE_CHANGED: &str = "x-manox-plan/planModeChanged";
     /// The plan document changed (host-emitted).
     pub const PLAN_CHANGED: &str = "x-manox-plan/planChanged";
-    /// A plan review is due, carrying the verdict request (host-emitted).
-    pub const PLAN_VERDICT_REQUESTED: &str = "x-manox-plan/verdictRequested";
-    /// A plan review settled — approve, refine, or implicit dismissal (the
-    /// journal edge carries no outcome discriminant, so the action names the
-    /// lifecycle fact, not a verdict; host-emitted).
-    pub const PLAN_REVIEW_SETTLED: &str = "x-manox-plan/reviewSettled";
     /// Goal set/cleared (host-emitted; clients set it through `x-manox/goal`).
     pub const WORK_GOAL_CHANGED: &str = "x-manox-work/goalChanged";
     /// Background-task registry snapshot (host-emitted).
@@ -146,10 +138,7 @@ pub mod actions {
     /// Every declared action.
     pub const ALL: &[&str] = &[
         BASELINE,
-        PLAN_MODE_CHANGED,
         PLAN_CHANGED,
-        PLAN_VERDICT_REQUESTED,
-        PLAN_REVIEW_SETTLED,
         WORK_GOAL_CHANGED,
         WORK_BACKGROUND_TASKS,
         WORK_BROWSER_SUITES,
@@ -173,8 +162,6 @@ pub mod actions {
 pub mod commands {
     /// Compact older history into a summary (journal rewrite).
     pub const COMPACT: &str = "x-manox/compact";
-    /// Seed plan execution after a verdict.
-    pub const PLAN_EXECUTE: &str = "x-manox/planExecute";
     /// Set or clear the session goal.
     pub const GOAL: &str = "x-manox/goal";
     /// Ask for the open turn's owning process (pid), or none: a client that
@@ -205,7 +192,7 @@ pub mod commands {
     /// - adjudication retraction (`cancelDelivery`) — deliveries are the deleted
     ///   v2 waterfall's concept; AHP settles through channel actions;
     /// - process shutdown — a host-lifecycle concern, not a session one.
-    pub const ALL: &[&str] = &[COMPACT, PLAN_EXECUTE, GOAL, OPEN_TURN];
+    pub const ALL: &[&str] = &[COMPACT, GOAL, OPEN_TURN];
 }
 
 /// Client-contributed session tools: an AHP-native action, not an extension
@@ -417,9 +404,9 @@ mod tests {
             "chat/pendingMessageRemoved"
         ));
         assert!(!accepts_action("ahp-chat:/c-1", "chat/unknownFutureAction"));
-        assert!(accepts_action(
+        assert!(!accepts_action(
             "x-manox-plan:/c-1",
-            actions::PLAN_MODE_CHANGED
+            "x-manox-plan/unknownFutureAction"
         ));
     }
 

@@ -229,23 +229,10 @@ pub enum ThreadEvent {
         tokens_before: u64,
         retained_tail: Vec<crate::message::Message>,
     },
-    /// The model submitted a plan file for the user's review verdict via
-    /// the `ProposePlan` tool. `content` is the plan file's text so the
-    /// durable journal can serve the review card without a file read.
-    PlanReady {
-        plan_file: String,
-        title: String,
-        content: String,
-    },
     /// The model published/updated its execution task list via `UpdatePlan`;
     /// the context rail renders it as the plan overview.
     PlanUpdated {
         snapshot: crate::plan::PlanSnapshot,
-    },
-    /// Plan mode toggled (persisted in the session sidecar); the workspace
-    /// mirrors it for the plan chip.
-    PlanModeChanged {
-        enabled: bool,
     },
     /// The thread's active opt-in browser tool suites changed; the composer
     /// chips are derived state of this mirror.
@@ -366,10 +353,6 @@ pub struct Thread {
     /// `Ready` projection seeds the mirror (same pattern as
     /// `permission_mode_explicitly_set`).
     browser_suites_explicitly_set: bool,
-    /// Plan mode active: read-only research + plan-file writes, proposals
-    /// ride the `ProposePlan` tool. Mirrored from the engine on
-    /// `PlanModeChanged`/`Ready`.
-    plan_mode: bool,
     /// Last `UpdatePlan` snapshot mirrored from the engine: the rail's
     /// rebuild-after-compaction fallback (the transcript's plan tool calls
     /// are summarized away, but this survives via the session sidecar).
@@ -822,7 +805,6 @@ impl Thread {
             applied_config_version: 0,
             browser_suites: Vec::new(),
             browser_suites_explicitly_set: false,
-            plan_mode: false,
             persisted_plan: None,
             title: None,
             label: "lead".into(),
@@ -964,7 +946,6 @@ impl Thread {
             applied_config_version: 0,
             browser_suites: Vec::new(),
             browser_suites_explicitly_set: false,
-            plan_mode: false,
             persisted_plan: None,
             title: None,
             label: "lead".into(),
@@ -1059,9 +1040,6 @@ impl Thread {
                 if let ThreadEvent::PermissionModeChanged { mode } = *event {
                     self.permission_mode = mode;
                 }
-                if let ThreadEvent::PlanModeChanged { enabled } = *event {
-                    self.plan_mode = enabled;
-                }
                 if let ThreadEvent::TitleChanged { title } = &*event {
                     self.title = Some(title.clone());
                 }
@@ -1081,7 +1059,7 @@ impl Thread {
                     }
                 }
                 // Runs the actor starts on its own (idle-wakeups,
-                // plan-approval seeds) announce themselves with `TurnStarted`;
+                // answer-seeded turns) announce themselves with `TurnStarted`;
                 // mirror them onto the running flag so a switch-away parks the
                 // thread instead of dropping it mid-run. Idempotent with the
                 // facade's own `run_turn` (which emits `TurnStarted`
@@ -1109,9 +1087,6 @@ impl Thread {
                     permission_mode,
                     reasoning_effort,
                     browser_suites,
-                    plan_mode,
-                    plan_file,
-                    plan_review_pending,
                     plan_snapshot,
                     title,
                     pinned,
@@ -1166,27 +1141,6 @@ impl Thread {
                         suites: browser_suites,
                     });
                 }
-                if plan_mode {
-                    self.plan_mode = true;
-                }
-                if plan_review_pending && let Some(plan_file) = plan_file {
-                    // Re-surface the pending review card after a restart:
-                    // re-read the plan file and resolve the title the same
-                    // way the live propose did.
-                    let content = std::fs::read_to_string(&plan_file).unwrap_or_default();
-                    let slug = std::path::Path::new(&plan_file)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or_default()
-                        .trim_end_matches("-plan")
-                        .to_string();
-                    let title = crate::plan_mode::resolve_plan_title(None, &content, &slug);
-                    self.pending_events.push(ThreadEvent::PlanReady {
-                        plan_file,
-                        title,
-                        content,
-                    });
-                }
                 let was_loading = self.history_phase.is_loading();
                 self.history_phase = HistoryPhase::Ready;
                 self.refresh_history();
@@ -1232,9 +1186,8 @@ impl Thread {
             }
             BackendNotice::QuestionAnswered { seed } => {
                 // An answered ask closed the held turn; the answer seeds the
-                // next turn exactly like an approved plan does
-                // (`plan_seed`): a harness-authored user message, then the
-                // turn fires.
+                // next turn: a harness-authored user message, then the turn
+                // fires.
                 let ui = MessageUiMetadata {
                     model_id: self.model.as_ref().map(|m| m.id.clone()),
                     approval_mode: Some(self.permission_mode.as_i64()),
@@ -1957,7 +1910,6 @@ impl Thread {
             // Members never mount browser suites; the explicit flag keeps
             // even an empty-mirror seed from the Ready projection out.
             browser_suites_explicitly_set: true,
-            plan_mode: false,
             persisted_plan: None,
             title: None,
             goal_bridge: None,
@@ -2008,32 +1960,6 @@ impl Thread {
 
     // ── Thread duck-type: setters ──────────────────────────────────────────
 
-    /// Seed the approved plan as the next user message without running it
-    /// (the clear-context verdict inserts on a fresh thread, then the
-    /// workspace launches the turn).
-    /// Seed an approved plan's execution on this thread and run it: the
-    /// rendered execution directive (referencing the plan file) becomes the
-    /// first user message. Used by the fresh-context verdict on the spawned
-    /// thread.
-    pub fn seed_plan_execution(
-        &mut self,
-        plan_file: String,
-        seed_text: String,
-        ui: Option<MessageUiMetadata>,
-    ) {
-        self.ensure_engine(self.project.clone());
-        if let Some(engine) = &self.engine {
-            engine.start_plan_execution(plan_file);
-        }
-        self.insert_user_message_with_ui_metadata(seed_text, ui);
-        self.run_turn();
-    }
-
-    /// Plan mode active for this thread (mirrored from the engine).
-    pub fn plan_mode(&self) -> bool {
-        self.plan_mode
-    }
-
     /// Last `UpdatePlan` snapshot mirrored from the engine (sidecar-backed):
     /// the rail's rebuild fallback once compaction has summarized the
     /// transcript's plan tool calls away.
@@ -2045,24 +1971,6 @@ impl Thread {
     /// engine's `CwdChanged` events); `None` until the engine reports one.
     pub fn cwd_path(&self) -> Option<&str> {
         self.cwd_path.as_deref()
-    }
-
-    /// Persist whether a plan review card is pending, so a restarted
-    /// session re-surfaces the card (the card itself is UI-only state).
-    pub fn set_plan_review_pending(&mut self, pending: bool) {
-        if let Some(engine) = &self.engine {
-            engine.set_plan_review_pending(pending);
-        }
-    }
-
-    /// Toggle plan mode: the engine persists the flag in the session
-    /// sidecar, wires the turn-end exit gate, and injects the plan-mode
-    /// instructions (rendered for the configured agent language) every turn.
-    pub fn set_plan_mode(&mut self, enabled: bool) {
-        self.plan_mode = enabled;
-        if let Some(engine) = &self.engine {
-            engine.set_plan_mode(enabled);
-        }
     }
 
     /// Toggle an opt-in browser tool suite (WebExplore) on or off.
@@ -2096,26 +2004,6 @@ impl Thread {
     /// derives the composer chips from this mirror.
     pub fn browser_suites(&self) -> &[crate::engine::BrowserSuite] {
         &self.browser_suites
-    }
-
-    /// Execute an approved plan on this thread: optionally compact the
-    /// planning context first (distilled toward the plan file), then run
-    /// the execution seed turn.
-    pub fn approve_plan(
-        &mut self,
-        compact: bool,
-        compact_instructions: Option<String>,
-        seed_text: String,
-        ui: Option<MessageUiMetadata>,
-    ) {
-        self.plan_mode = false;
-        // The engine injects the seed into its own transcript; record the
-        // attribution now so the mirrored history keeps it after refresh.
-        self.persist_user_attribution(self.user_prompt_ordinal(), &ui);
-        self.last_user_ui = ui;
-        if let Some(engine) = &self.engine {
-            engine.approve_plan(compact, compact_instructions, seed_text);
-        }
     }
 
     /// Move the session's working directory at any interaction state —
@@ -2488,13 +2376,14 @@ impl Thread {
         true
     }
 
-    /// Run a built-in slash command (`/mode`, `/plan`, `/compact`,
-    /// `/goal`) at the thread level — the headless twin of the gpui host's
-    /// built-in command impls, sharing the name/alias set via
-    /// [`crate::slash_builtins`]. Returns `false` for names this layer does
-    /// not own (`exit`/`new` are session-level and handled by the host).
-    /// Prompt forms insert `args` as a user turn carrying the raw
-    /// `/name args` display form, mirroring [`Self::submit_command`].
+    /// Run a built-in slash command (`/mode`, `/compact`, `/goal`) at the
+    /// thread level — the headless twin of the gpui host's built-in command
+    /// impls, sharing the name/alias set via [`crate::slash_builtins`].
+    /// Returns `false` for names this layer does not own (`exit`/`new` are
+    /// session-level and handled by the host; `/plan` is a built-in skill
+    /// and rides [`Self::submit_skill`]). Prompt forms insert `args` as a
+    /// user turn carrying the raw `/name args` display form, mirroring
+    /// [`Self::submit_command`].
     pub fn run_slash_builtin(
         &mut self,
         name: &str,
@@ -2531,17 +2420,6 @@ impl Thread {
                                  workspace-write, or danger-full-access)"
                             )));
                         }
-                    }
-                }
-                true
-            }
-            Some("plan") => {
-                if self.plan_mode() {
-                    self.set_plan_mode(false);
-                } else {
-                    self.set_plan_mode(true);
-                    if !args.trim().is_empty() {
-                        self.insert_slash_turn(args.to_string(), ui);
                     }
                 }
                 true
@@ -3048,7 +2926,6 @@ pub(crate) mod tests {
             applied_config_version: 0,
             browser_suites: Vec::new(),
             browser_suites_explicitly_set: false,
-            plan_mode: false,
             persisted_plan: None,
             title: None,
             label: "lead".into(),
@@ -3164,9 +3041,10 @@ pub(crate) mod tests {
     }
 
     /// The headless slash router drives the same thread state the gpui host
-    /// toggles: plan mode, permission mode, compact, and goal lifecycle.
+    /// toggles: permission mode, compact, and goal lifecycle. `/plan` is not
+    /// owned here — it is a built-in skill (`plan_slash_rides_the_builtin_skill`).
     #[tokio::test]
-    async fn run_slash_builtin_plan_mode_compact_and_unowned() {
+    async fn run_slash_builtin_mode_compact_and_unowned() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -3179,30 +3057,6 @@ pub(crate) mod tests {
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
-        // The prompt form enters plan mode and runs the turn with the
-        // compact display form.
-        let ui = MessageUiMetadata {
-            display_text: Some("/plan fix it".into()),
-            ..Default::default()
-        };
-        assert!(thread.with_mut(|t| t.run_slash_builtin("plan", "fix it", Some(ui.clone()))));
-        thread.read(|t| assert!(t.plan_mode(), "/plan <prompt> enters plan mode"));
-        let runs = engine.runs.lock().unwrap();
-        assert_eq!(runs.len(), 1, "prompt form runs a turn");
-        assert_eq!(runs[0].0, "fix it");
-        drop(runs);
-        thread.read(|t| {
-            let last = t.messages().last().expect("turn message inserted");
-            assert_eq!(
-                last.ui.as_ref().and_then(|ui| ui.display_text.as_deref()),
-                Some("/plan fix it")
-            );
-        });
-
-        // A second invocation toggles plan mode back off, no new turn.
-        assert!(thread.with_mut(|t| t.run_slash_builtin("plan", "", None)));
-        thread.read(|t| assert!(!t.plan_mode(), "/plan bare exits plan mode"));
-        assert_eq!(engine.runs.lock().unwrap().len(), 1);
 
         assert!(thread.with_mut(|t| t.run_slash_builtin("mode", "", None)));
         thread.read(|t| assert_eq!(t.permission_mode(), PermissionMode::DangerFullAccess));
@@ -3212,11 +3066,52 @@ pub(crate) mod tests {
         assert!(thread.with_mut(|t| t.run_slash_builtin("compact", "focus", None)));
         assert!(thread.with_mut(|t| t.run_slash_builtin("goal", "clear", None)));
 
-        // Session-level commands and unknowns are not owned here.
+        // Session-level commands, the retired plan builtin, and unknowns are
+        // not owned here.
         assert!(!thread.with_mut(|t| t.run_slash_builtin("exit", "", None)));
         assert!(!thread.with_mut(|t| t.run_slash_builtin("quit", "", None)));
         assert!(!thread.with_mut(|t| t.run_slash_builtin("new", "", None)));
+        assert!(!thread.with_mut(|t| t.run_slash_builtin("plan", "", None)));
         assert!(!thread.with_mut(|t| t.run_slash_builtin("nope", "", None)));
+    }
+
+    /// `/plan` rides the generic skill path: the builtin `plan` skill renders
+    /// its contract, appends the user's arguments, and runs one turn under
+    /// the raw `/plan args` display form.
+    #[tokio::test]
+    async fn plan_slash_rides_the_builtin_skill() {
+        crate::skill::init();
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+            permission_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
+        let ui = MessageUiMetadata {
+            display_text: Some("/plan fix it".into()),
+            ..Default::default()
+        };
+        assert!(thread.with_mut(|t| t.submit_skill("plan", "fix it", Some(ui))));
+        let runs = engine.runs.lock().unwrap();
+        assert_eq!(runs.len(), 1, "the skill body runs as one turn");
+        assert!(
+            runs[0].0.contains("fix it"),
+            "the user's arguments ride the rendered skill body"
+        );
+        drop(runs);
+        thread.read(|t| {
+            let last = t.messages().last().expect("turn message inserted");
+            assert_eq!(
+                last.ui.as_ref().and_then(|ui| ui.display_text.as_deref()),
+                Some("/plan fix it")
+            );
+        });
     }
 
     #[tokio::test]
@@ -3683,9 +3578,6 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
-            plan_mode: false,
-            plan_file: None,
-            plan_review_pending: false,
             plan_snapshot: None,
             title: None,
             pinned: false,
@@ -3765,9 +3657,6 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
-            plan_mode: false,
-            plan_file: None,
-            plan_review_pending: false,
             plan_snapshot: None,
             title: None,
             pinned: false,
@@ -3868,9 +3757,6 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
-            plan_mode: false,
-            plan_file: None,
-            plan_review_pending: false,
             plan_snapshot: Some(value),
             title: None,
             pinned: false,
@@ -3908,9 +3794,6 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
-            plan_mode: false,
-            plan_file: None,
-            plan_review_pending: false,
             plan_snapshot: None,
             title: None,
             pinned: false,
@@ -3943,9 +3826,6 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::Max,
             browser_suites: Vec::new(),
-            plan_mode: false,
-            plan_file: None,
-            plan_review_pending: false,
             plan_snapshot: None,
             title: None,
             pinned: false,
@@ -3985,9 +3865,6 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: vec![crate::engine::BrowserSuite::WebExplore],
-            plan_mode: false,
-            plan_file: None,
-            plan_review_pending: false,
             plan_snapshot: None,
             title: None,
             pinned: false,
@@ -4020,9 +3897,6 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: vec![],
-            plan_mode: false,
-            plan_file: None,
-            plan_review_pending: false,
             plan_snapshot: None,
             title: None,
             pinned: false,
@@ -4074,9 +3948,6 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
-            plan_mode: false,
-            plan_file: None,
-            plan_review_pending: false,
             plan_snapshot: None,
             title: Some("终端标题修复".into()),
             pinned: false,
@@ -4111,9 +3982,6 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
-            plan_mode: false,
-            plan_file: None,
-            plan_review_pending: false,
             plan_snapshot: None,
             title: None,
             pinned: false,
@@ -4169,9 +4037,6 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
-            plan_mode: false,
-            plan_file: None,
-            plan_review_pending: false,
             plan_snapshot: None,
             title: Some("journal title".into()),
             pinned: true,
@@ -4198,9 +4063,6 @@ pub(crate) mod tests {
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
-            plan_mode: false,
-            plan_file: None,
-            plan_review_pending: false,
             plan_snapshot: None,
             title: None,
             pinned: false,

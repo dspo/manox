@@ -868,45 +868,6 @@ fn bash_output_update_still_maps_to_tool_output() {
         crate::thread::ThreadEvent::ToolOutput { chunk, .. } if chunk == "line one"
     ));
 }
-#[test]
-fn adapt_strips_proposed_plan_blocks_from_assistant_text() {
-    let plan = "## Steps\n- do the thing";
-    let messages = vec![manox_harness::types::AgentMessage::Assistant {
-        content: vec![manox_harness::types::ContentBlock::Text {
-            text: format!(
-                "Here is my plan.\n\n<proposed_plan>\n{plan}\n</proposed_plan>\n\nShall we?"
-            ),
-            signature: None,
-        }],
-        model: "test".into(),
-        provider: "test".into(),
-        api: "test".into(),
-        response_model: None,
-        response_id: None,
-        diagnostics: None,
-        stop_reason: Some(manox_harness::types::StopReason::Stop),
-        raw_stop_reason: None,
-        usage: Box::new(manox_harness::types::Usage::default()),
-        error_message: None,
-        timestamp: chrono::Utc::now(),
-    }];
-    let mapped = adapt::harness_messages_to_messages(&messages);
-    assert_eq!(mapped.len(), 1);
-    let text = mapped[0]
-        .content
-        .iter()
-        .find_map(|c| match c {
-            crate::language_model::MessageContent::Text(t) => Some(t.as_str()),
-            _ => None,
-        })
-        .unwrap();
-    assert!(
-        !text.contains("<proposed_plan>"),
-        "plan block must not render"
-    );
-    assert!(text.contains("Here is my plan."));
-    assert!(text.contains("Shall we?"));
-}
 
 /// L3 mechanical verification: every ThreadEvent the tap maps must
 /// have its (kind, payload) construct a typed journal entry — the
@@ -948,17 +909,11 @@ fn durable_journal_mapping_round_trips_every_journaled_event() {
             id: "tc-1".into(),
             chunk: "a".into(),
         },
-        ThreadEvent::PlanModeChanged { enabled: true },
         ThreadEvent::PlanUpdated {
             snapshot: crate::plan::PlanSnapshot {
                 explanation: None,
                 steps: vec![],
             },
-        },
-        ThreadEvent::PlanReady {
-            plan_file: "/plans/demo-plan.md".into(),
-            title: "Demo plan".into(),
-            content: "# Demo\n\n- step".into(),
         },
         ThreadEvent::GoalChanged { goal: None },
         ThreadEvent::TitleChanged { title: "t".into() },
@@ -1102,44 +1057,6 @@ fn ask_authorizations_journal_as_questions_not_approvals() {
     assert_eq!(kind_of("Bash"), "approval");
 }
 
-/// F6 guard: the turn-boundary commit applies a pending selection, consumes
-/// it, announces the switch, and stays silent for a converged selection.
-#[tokio::test]
-async fn boundary_commit_applies_pending_plan_mode_and_converges_silently() {
-    crate::runtime::init_hermetic_for_test();
-    let dir = tempfile::tempdir().unwrap();
-    let session = steer_test_session(&dir).await;
-    let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
-    let state = test_engine_state();
-
-    state.plan.set_requested(Some(true));
-    assert!(
-        !state.plan.enabled(),
-        "the selection waits for the boundary"
-    );
-    commit_requested_plan_mode(session.path(), dir.path(), &state, &notice_tx).await;
-    assert!(state.plan.enabled(), "the boundary applies the selection");
-    assert_eq!(state.plan.requested(), None, "and consumes it");
-    let mut announced = false;
-    while let Ok(notice) = notice_rx.try_recv() {
-        if let BackendNotice::Event(event) = notice
-            && matches!(*event, ThreadEvent::PlanModeChanged { enabled: true })
-        {
-            announced = true;
-        }
-    }
-    assert!(announced, "the commit announces the mode change");
-
-    // A selection equal to the committed state is a no-op intent.
-    state.plan.set_requested(Some(true));
-    commit_requested_plan_mode(session.path(), dir.path(), &state, &notice_tx).await;
-    assert_eq!(state.plan.requested(), None);
-    assert!(
-        notice_rx.try_recv().is_err(),
-        "a converged selection must not announce anything"
-    );
-}
-
 fn test_engine_state() -> Arc<EngineState> {
     let cwd = std::env::temp_dir();
     let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
@@ -1178,8 +1095,6 @@ fn test_engine_state() -> Arc<EngineState> {
         stale_questions: std::sync::Mutex::new(std::collections::HashSet::new()),
         awaiting_answers: std::sync::atomic::AtomicBool::new(false),
         awaiting_abort: std::sync::atomic::AtomicBool::new(false),
-        plan: crate::plan_mode::PlanSessionState::new(),
-        plan_review_request_id: Mutex::new(None),
         goal_bridge: None,
         goal_continuation_reserved: AtomicBool::new(false),
         goal_continuation_round: Mutex::new(None),
@@ -1364,78 +1279,6 @@ fn test_model_switched() -> HarnessModel {
         thinking: manox_harness::types::ThinkingKind::None,
         metadata: Default::default(),
     }
-}
-
-/// H3 guard: the plan-mode boundary commit sits at the shared run start,
-/// so a run that does not come through the actor's Prompt arm (a goal
-/// round, a drained steer, an idle wake-up — modelled here by calling
-/// `drive_run` directly) still commits a pending selection before the run
-/// future is polled. Reverting the commit to the Prompt arm alone makes
-/// this test fail with `enabled() == false`.
-#[tokio::test]
-async fn drive_run_commits_a_pending_plan_mode_selection_before_the_run() {
-    crate::runtime::init_hermetic_for_test();
-    let dir = tempfile::tempdir().unwrap();
-    let cwd = dir.path().join("proj");
-    std::fs::create_dir_all(&cwd).unwrap();
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &HarnessModel| {
-        Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
-    });
-    let mut session = create_agent_session()
-        .with_cwd(&cwd)
-        .with_session_dir(dir.path().join("sessions"))
-        .with_model_runtime(ModelRuntime::new(resolver))
-        .with_model(test_model())
-        .with_system_prompt("You are a test assistant.")
-        .build()
-        .await
-        .unwrap();
-
-    let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
-    let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
-    let state = test_engine_state();
-    let live = Arc::new(Mutex::new(LiveTranscript::default()));
-    let mut run_steers = Vec::new();
-    let mut shutdown_after_run = false;
-    let mut harness_model = test_model();
-    let handle = session.handle();
-    let sessions_path = dir.path().join("sessions");
-    let active_session_path = session.path().clone();
-    let journal_appender = session.journal_appender();
-
-    // A selection is outstanding when the run starts.
-    state.plan.set_requested(Some(true));
-    assert!(!state.plan.enabled());
-
-    let run = drive_run(
-        session.prompt("first turn"),
-        &handle,
-        &mut cmd_rx,
-        &mut run_steers,
-        &mut shutdown_after_run,
-        live,
-        &state,
-        &notice_tx,
-        &mut harness_model,
-        &sessions_path,
-        &active_session_path,
-        &journal_appender,
-    );
-    let (_result, _aborted) = run.await;
-    assert!(
-        state.plan.enabled(),
-        "the run start must commit the pending selection"
-    );
-    assert_eq!(state.plan.requested(), None, "and consume it");
-    let mut announced = false;
-    while let Ok(notice) = notice_rx.try_recv() {
-        if let BackendNotice::Event(event) = notice
-            && matches!(*event, ThreadEvent::PlanModeChanged { enabled: true })
-        {
-            announced = true;
-        }
-    }
-    assert!(announced, "the commit announces the switch");
 }
 
 fn test_model() -> HarnessModel {
@@ -3338,9 +3181,7 @@ fn delegation_tool_description_carries_definition_and_contract() {
 }
 
 /// The capability tag distinguishes write+bash defs (Sailor) from
-/// read-only defs (Explore). It is the routing key for the plan-mode
-/// read-only resolver, which blocks write/bash subagents from being
-/// dispatched while plan mode is active.
+/// read-only defs (Explore), surfaced in each definition's description.
 #[test]
 fn subagent_capability_tags_write_bash_vs_read_only() {
     let mut registry = manox_harness::ext_point_agent::AgentRegistry::new();
@@ -3616,14 +3457,9 @@ fn scripted_state_rows() -> Vec<(&'static str, serde_json::Value)> {
             "permission_mode_change",
             json!({ "mode": "danger-full-access" }),
         ),
-        ("plan_mode_change", json!({ "enabled": true })),
         (
             "plan_update",
             json!({ "snapshot": [{ "content": "step one", "status": "pending", "activeForm": "stepping" }] }),
-        ),
-        (
-            "plan_review",
-            json!({ "state": "proposed", "planFile": "/replay/plan.md" }),
         ),
         ("goal", json!({ "goal": { "objective": "replay" } })),
         ("title", json!({ "title": "replayed title" })),
@@ -3753,9 +3589,7 @@ const REPLAY_COVERAGE_KINDS: &[&str] = &[
     "project_change",
     "permission_mode_change",
     "thinking_level_change",
-    "plan_mode_change",
     "plan_update",
-    "plan_review",
     "goal",
     "title",
     "browser_suites",
@@ -3887,7 +3721,6 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     assert_eq!(live_replay.pinned, Some(false));
     assert_eq!(live_replay.archived, Some(true));
     assert_eq!(live_replay.project, Some(Some("/replay/proj".into())));
-    assert_eq!(live_replay.plan_mode, Some(true));
     assert_eq!(live_replay.cwd.as_deref(), Some("/replay/work"));
     assert_eq!(
         live_replay.goal,
@@ -3907,7 +3740,6 @@ async fn journal_replay_is_consistent_across_disk_reload() {
          default stands"
     );
     assert_eq!(live_rebuilt.reasoning_effort, ReasoningEffort::High);
-    assert!(live_rebuilt.plan_mode);
 
     // K2 cache repair: the diverging (here: empty) sidecar converges
     // toward the journal authority — INCLUDING the title (the repair
@@ -4121,13 +3953,6 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
         )
         .await
         .unwrap();
-    appender
-        .append_typed(
-            "plan_review",
-            serde_json::json!({ "state": "proposed", "planFile": null }),
-        )
-        .await
-        .unwrap();
 
     let rebuilt = rebuild_restored_state(&session, &sessions, "t-1").await;
     assert_eq!(rebuilt.title.as_deref(), Some("journal title"));
@@ -4148,13 +3973,6 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
             .and_then(|g| g.get("objective"))
             .and_then(|o| o.as_str()),
         Some("restored goal")
-    );
-    // Plan-review C4 vocabulary: the chain's proposed edge is the fold
-    // source — the sidecar carries no flag, so a sidecar-only merge
-    // would answer false.
-    assert!(
-        rebuilt.plan_review_pending,
-        "the journal plan_review edge must fold the pending flag"
     );
 
     // The cache converged toward the authority in the same pass —
@@ -4177,11 +3995,7 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
 }
 
 /// K2 migration window: a legacy chain without decision-point entries
-/// resolves from the sidecar for the fields that still cache there — and
-/// plan state no longer does: with the `plan_mode_change` /
-/// `plan_mode_request` / `plan_review` entries as the single source, a
-/// chain that never saw them restores plan mode OFF (the radical
-/// no-compat-read stance; W4 sidecar retirement).
+/// resolves from the sidecar for the fields that still cache there.
 #[tokio::test]
 async fn restored_state_falls_back_to_the_sidecar_for_a_conversation_without_a_row() {
     let replayed = crate::replay::ReplayedThreadState::default();
@@ -4190,7 +4004,6 @@ async fn restored_state_falls_back_to_the_sidecar_for_a_conversation_without_a_r
         project: Some("/sidecar/project".into()),
         approval_mode: Some("read-only".into()),
         reasoning_effort: Some("max".into()),
-        plan_file: Some("/plans/x-plan.md".into()),
         plan_snapshot: Some(serde_json::json!([{ "content": "step" }])),
         pinned: true,
         archived: true,
@@ -4200,10 +4013,7 @@ async fn restored_state_falls_back_to_the_sidecar_for_a_conversation_without_a_r
     assert_eq!(merged.title.as_deref(), Some("sidecar title"));
     assert_eq!(merged.project, Some(PathBuf::from("/sidecar/project")));
     assert_eq!(merged.permission_mode, PermissionMode::ReadOnly);
-    assert!(!merged.plan_mode, "plan state is journal-only now");
     assert_eq!(merged.reasoning_effort, ReasoningEffort::Max);
-    assert_eq!(merged.plan_file.as_deref(), Some("/plans/x-plan.md"));
-    assert!(!merged.plan_review_pending);
     assert_eq!(
         merged.plan_snapshot,
         Some(serde_json::json!([{ "content": "step" }]))

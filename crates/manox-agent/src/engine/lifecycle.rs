@@ -317,7 +317,6 @@ pub(super) fn session_builder(
     model: Option<&HarnessModel>,
     gate: &Arc<ApprovalGate>,
     question_gate: &Arc<crate::questions::UserQuestionGate>,
-    plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     granted_roots: &crate::granted_roots::GrantedRoots,
@@ -335,7 +334,6 @@ pub(super) fn session_builder(
         thread_id,
         gate,
         question_gate,
-        plan,
         notice_tx,
         goal_bridge,
         granted_roots,
@@ -438,26 +436,6 @@ pub(super) async fn adopt_session_model(
     *state.model.lock().unwrap() = Some(picked);
 }
 
-/// Register plan-mode extension hooks on a freshly built/restored session:
-/// `BeforeAgentStart` injects the rendered plan-mode instructions every turn
-/// while active; `BeforeTurnEnd` enforces the exit gate — a plan-mode run
-/// must end by calling one of the exit tools, and the harness bounces a
-/// bare stop with a continuation message. Both read through the shared
-/// [`PlanSessionState`].
-pub(super) fn attach_plan_hooks(
-    session: &mut AgentSession,
-    plan: &Arc<crate::plan_mode::PlanSessionState>,
-) {
-    session.on(
-        manox_harness::harness::HookPoint::BeforeAgentStart,
-        crate::plan_mode::injection_handler(Arc::clone(plan)),
-    );
-    session.on(
-        manox_harness::harness::HookPoint::BeforeTurnEnd,
-        crate::plan_mode::turn_end_gate_handler(Arc::clone(plan)),
-    );
-}
-
 /// Instruction-file resources for the session: the Claude Code-compatible
 /// memory hierarchy (managed policy, `~/.claude/CLAUDE.md` + rules, the
 /// per-directory chain down to the session cwd) loaded through
@@ -527,7 +505,6 @@ pub(super) async fn rebuild_session(
     fallback_cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     gate: &Arc<ApprovalGate>,
-    plan: &Arc<crate::plan_mode::PlanSessionState>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     granted_roots: &crate::granted_roots::GrantedRoots,
     thread_id: &str,
@@ -562,7 +539,6 @@ pub(super) async fn rebuild_session(
         None,
         gate,
         &state.question_gate,
-        plan,
         notice_tx,
         goal_bridge,
         granted_roots,
@@ -573,7 +549,6 @@ pub(super) async fn rebuild_session(
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
             attach_orchestrators(&mut s, &background);
-            attach_plan_hooks(&mut s, plan);
             // Session swaps (Open) must carry the
             // same plugin lifecycle hooks as fresh builds, or the swapped
             // session's PreToolUse/PostToolUse fire-and-forget shell-outs

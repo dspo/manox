@@ -64,16 +64,6 @@ impl TurnOwner {
     }
 }
 
-/// The request id a plan-review proposal mints from its own entry id — the
-/// single key the client's card, the resolved row's `requestId`
-/// back-reference, and the settle action all correlate by. Every mint site
-/// (engine journal write, restore replay, the AHP projection) goes through
-/// this one definition; a drifting copy strands the card with no error
-/// anywhere.
-pub fn plan_review_request_id(entry_id: &str) -> String {
-    format!("plan-review:{entry_id}")
-}
-
 /// The durable event vocabulary lives in [`event`]: one serde enum is the
 /// whole schema, absorbed from the former `SessionTreeEntry`. The tree
 /// name stays as an alias while call sites migrate.
@@ -137,10 +127,7 @@ impl SessionTreeEntry {
             SubagentProgress,
             ProjectChange,
             PermissionModeChange,
-            PlanModeRequest,
-            PlanModeChange,
             PlanUpdate,
-            PlanReview,
             Goal,
             Title,
             BrowserSuites,
@@ -1531,10 +1518,7 @@ pub enum EntryType {
     SubagentProgress,
     ProjectChange,
     PermissionModeChange,
-    PlanModeRequest,
-    PlanModeChange,
     PlanUpdate,
-    PlanReview,
     Goal,
     Title,
     BrowserSuites,
@@ -1583,10 +1567,7 @@ impl EntryType {
             EntryType::SubagentProgress => "subagent_progress",
             EntryType::ProjectChange => "project_change",
             EntryType::PermissionModeChange => "permission_mode_change",
-            EntryType::PlanModeRequest => "plan_mode_request",
-            EntryType::PlanModeChange => "plan_mode_change",
             EntryType::PlanUpdate => "plan_update",
-            EntryType::PlanReview => "plan_review",
             EntryType::Goal => "goal",
             EntryType::Title => "title",
             EntryType::BrowserSuites => "browser_suites",
@@ -1792,10 +1773,7 @@ pub fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
         SessionTreeEntry::SubagentProgress { .. } => EntryType::SubagentProgress,
         SessionTreeEntry::ProjectChange { .. } => EntryType::ProjectChange,
         SessionTreeEntry::PermissionModeChange { .. } => EntryType::PermissionModeChange,
-        SessionTreeEntry::PlanModeRequest { .. } => EntryType::PlanModeRequest,
-        SessionTreeEntry::PlanModeChange { .. } => EntryType::PlanModeChange,
         SessionTreeEntry::PlanUpdate { .. } => EntryType::PlanUpdate,
-        SessionTreeEntry::PlanReview { .. } => EntryType::PlanReview,
         SessionTreeEntry::Goal { .. } => EntryType::Goal,
         SessionTreeEntry::Title { .. } => EntryType::Title,
         SessionTreeEntry::BrowserSuites { .. } => EntryType::BrowserSuites,
