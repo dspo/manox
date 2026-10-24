@@ -757,4 +757,83 @@ mod tests {
             .expect("read runs");
         assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
     }
+
+    fn ops_for_route(
+        root: &Path,
+        route: super::NetworkRoute,
+    ) -> crate::sandbox::SandboxedBashOperations {
+        crate::sandbox::SandboxedBashOperations::new(
+            root,
+            crate::granted_roots::GrantedRoots::new(root),
+            resolver(manox_harness::sandbox::AccessMode::Sandbox),
+            std::sync::Arc::new(move || route),
+        )
+    }
+
+    /// The closed route: no net namespace interface reaches the network, so
+    /// curl fails and the stderr carries a network-classified signature —
+    /// the marker + escalation hint ride the denial.
+    #[tokio::test]
+    async fn live_closed_network_denies_curl_and_classifies() {
+        if !live_ready() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let ops = ops_for_route(root.path(), super::NetworkRoute::Disabled);
+        let res = ops
+            .exec(request("curl -sS -I https://crates.io", root.path()))
+            .await
+            .expect("exec runs");
+        assert_ne!(res.exit_code, 0, "closed network denies curl");
+        assert!(
+            res.stderr
+                .contains("network access denied under sandbox mode"),
+            "network marker in stderr: {}",
+            res.stderr
+        );
+        assert!(
+            res.stderr.contains("require_escalated"),
+            "escalation hint rides the denial: {}",
+            res.stderr
+        );
+    }
+
+    /// The self-check signal reaches the trapped env.
+    #[tokio::test]
+    async fn live_closed_network_signals_the_self_check_env() {
+        if !live_ready() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let ops = ops_for_route(root.path(), super::NetworkRoute::Disabled);
+        let res = ops
+            .exec(request("test \"$MANOX_SANDBOX_NETWORK_DISABLED\" = 1", root.path()))
+            .await
+            .expect("exec runs");
+        assert_eq!(
+            res.exit_code, 0,
+            "self-check env set when closed: {}",
+            res.stderr
+        );
+    }
+
+    /// The open route on Linux is the historical direct net (no managed
+    /// path yet): curl reaches out with no proxy env in the way.
+    #[tokio::test]
+    async fn live_open_network_reaches_the_network_directly() {
+        if !live_ready() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let ops = ops_for_route(root.path(), super::NetworkRoute::Direct);
+        let res = ops
+            .exec(request("curl -sS -I https://crates.io", root.path()))
+            .await
+            .expect("exec runs");
+        assert_eq!(
+            res.exit_code, 0,
+            "the direct route reaches the network: {}",
+            res.stderr
+        );
+    }
 }

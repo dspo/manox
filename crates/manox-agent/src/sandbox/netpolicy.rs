@@ -477,6 +477,18 @@ impl NetworkPolicy {
         }
     }
 
+    /// A policy with an explicit allowlist (tests: the live smoke must not
+    /// read the developer's real settings.toml).
+    #[cfg(test)]
+    pub fn for_allowlist(allow: Vec<String>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                running: Mutex::new(None),
+                ctx: Arc::new(JudgeCtx::new(allow)),
+            }),
+        }
+    }
+
     /// The face one confined call runs under, given the gate's access cell.
     /// A missing proxy where the managed shape requires one answers
     /// `Disabled` — fail-closed, never open (the transient bind window

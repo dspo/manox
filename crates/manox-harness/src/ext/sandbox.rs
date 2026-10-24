@@ -180,6 +180,9 @@ pub fn network_denial_marker(mode: AccessMode) -> String {
 pub const NETWORK_DENIAL_SIGNATURES: &[&str] = &[
     "could not create socket",
     "could not resolve host",
+    "could not connect to server",
+    "couldn't connect to server",
+    "failed to connect",
     "temporary failure in name resolution",
     "network is unreachable",
     "network is down",

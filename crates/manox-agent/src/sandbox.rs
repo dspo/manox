@@ -1423,6 +1423,173 @@ mod tests {
         );
     }
 
+    // ---- live: real seatbelt runs against the real network ----
+    // (skip loudly when the parent process is itself sandboxed — the same
+    // guard the confinement tests use.)
+
+    async fn live_exec(
+        root: &Path,
+        command: &str,
+        route: NetworkRoute,
+    ) -> CommandResult {
+        let ops = SandboxedBashOperations::new(
+            root,
+            crate::granted_roots::GrantedRoots::new(root),
+            resolver(AccessMode::Sandbox),
+            route_resolver(route),
+        );
+        use manox_harness::tools::bash::BashOperations as _;
+        ops.exec(BashExecRequest {
+            command,
+            cwd: Some(root),
+            timeout: Some(Duration::from_secs(60)),
+            signal: tokio_util::sync::CancellationToken::new(),
+            on_data: None,
+        })
+        .await
+        .expect("exec runs")
+    }
+
+    fn nested_sandboxed(result: &CommandResult) -> bool {
+        result.exit_code == 71 && result.stderr.contains("Operation not permitted")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn live_network_off_denies_curl_with_the_network_marker() {
+        let root = project_root();
+        std::fs::create_dir_all(&root).ok();
+        // `-sS`: silence the progress meter but keep the error text — the
+        // classifier reads stderr, and a bare `-s` would swallow the very
+        // failure this test pins.
+        let res = live_exec(&root, "curl -sS -I https://crates.io", NetworkRoute::Disabled).await;
+        if nested_sandboxed(&res) {
+            eprintln!("skipping live seatbelt test: parent process sandboxed");
+            return;
+        }
+        assert_ne!(res.exit_code, 0, "closed network denies curl");
+        // macOS curl has two phrasings for the refused connect ("Could not
+        // connect to server" / "Couldn't connect to server") — either keeps
+        // the failure classifiable.
+        let lower = res.stderr.to_ascii_lowercase();
+        assert!(
+            lower.contains("could not connect") || lower.contains("couldn't connect"),
+            "the connect failure is visible in stderr: {}",
+            res.stderr
+        );
+        assert!(
+            res.stderr.contains("network access denied under sandbox mode"),
+            "network marker in stderr: {}",
+            res.stderr
+        );
+        assert!(
+            res.stderr.contains("require_escalated"),
+            "escalation hint rides the denial: {}",
+            res.stderr
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn live_network_off_signals_the_self_check_env() {
+        let root = project_root();
+        std::fs::create_dir_all(&root).ok();
+        let res = live_exec(
+            &root,
+            &format!(
+                "test \"${}\" = 1",
+                manox_harness::sandbox::NETWORK_DISABLED_ENV
+            ),
+            NetworkRoute::Disabled,
+        )
+        .await;
+        if nested_sandboxed(&res) {
+            eprintln!("skipping live seatbelt test: parent process sandboxed");
+            return;
+        }
+        assert_eq!(
+            res.exit_code, 0,
+            "the self-check env is set when closed: {}",
+            res.stderr
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn live_network_on_reaches_the_network_directly() {
+        let root = project_root();
+        std::fs::create_dir_all(&root).ok();
+        let res = live_exec(&root, "curl -sI https://crates.io", NetworkRoute::Direct).await;
+        if nested_sandboxed(&res) {
+            eprintln!("skipping live seatbelt test: parent process sandboxed");
+            return;
+        }
+        assert_eq!(
+            res.exit_code, 0,
+            "the direct route reaches the network: {}",
+            res.stderr
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn live_managed_route_tunnels_the_allowlisted_host_and_refuses_misses() {
+        use crate::sandbox::netpolicy::NetworkPolicy;
+        use manox_harness::sandbox::NetworkAccess;
+
+        let root = project_root();
+        std::fs::create_dir_all(&root).ok();
+        let policy = NetworkPolicy::for_allowlist(vec!["crates.io".to_string()]);
+        policy.set_enabled(NetworkAccess::On).await;
+        let route = policy.route_for(NetworkAccess::On);
+        let NetworkRoute::Managed { proxy_port: _ } = route else {
+            panic!("an allowlisted policy binds the managed route, got {route:?}");
+        };
+        let policy_for_resolver = policy.clone();
+        let ops = SandboxedBashOperations::new(
+            &root,
+            crate::granted_roots::GrantedRoots::new(&root),
+            resolver(AccessMode::Sandbox),
+            Arc::new(move || policy_for_resolver.route_for(NetworkAccess::On)),
+        );
+        use manox_harness::tools::bash::BashOperations as _;
+
+        // Allowlisted: the tunnel carries it.
+        let res = ops
+            .exec(BashExecRequest {
+                command: "curl -sI https://crates.io",
+                cwd: Some(&root),
+                timeout: Some(Duration::from_secs(60)),
+                signal: tokio_util::sync::CancellationToken::new(),
+                on_data: None,
+            })
+            .await
+            .expect("exec runs");
+        if nested_sandboxed(&res) {
+            eprintln!("skipping live seatbelt test: parent process sandboxed");
+            return;
+        }
+        assert_eq!(
+            res.exit_code, 0,
+            "allowlisted host tunnels through the managed proxy: {} / {}",
+            res.stdout, res.stderr
+        );
+
+        // A miss: the proxy refuses (no approver installed) and curl sees
+        // the tunnel refusal.
+        let res = ops
+            .exec(BashExecRequest {
+                command: "curl -sI https://example.com",
+                cwd: Some(&root),
+                timeout: Some(Duration::from_secs(60)),
+                signal: tokio_util::sync::CancellationToken::new(),
+                on_data: None,
+            })
+            .await
+            .expect("exec runs");
+        assert_ne!(res.exit_code, 0, "a non-allowlisted host is refused");
+    }
+
     #[tokio::test]
     async fn unsandboxed_exec_runs_without_confinement() {
         let root = project_root();
