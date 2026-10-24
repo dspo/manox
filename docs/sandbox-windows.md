@@ -23,12 +23,13 @@ container image or a VM:**
    helper account, works from a plain user session.
 2. **Per-workspace capability SIDs over NTFS ACLs.** One persistent random
    `S-1-5-21-…` SID per workspace / writable root, stored next to the manox
-   state home and reused across runs. Setup appends deny ACEs for the
-   workspace's capability SID on everything outside that workspace's write
-   scope (and per-root deny carveouts), so the restricted token — which
-   carries the workspace's capability SID — can write the workspace and is
-   denied elsewhere. Persistent SIDs keep stale ACLs from expanding the write
-   scope of later, narrower policies.
+   state home and reused across runs. A `WRITE_RESTRICTED` token fails every
+   write that is not explicitly allowed for *all* of its restricting SIDs, so
+   setup only stamps **allow ACEs** on the writable roots themselves (write
+   mask, container/object-inherited, with a `FILE_DELETE_CHILD` carveout for
+   directory deletes) — denial everywhere else is the token's default, not an
+   ACL enumeration over the rest of the filesystem. Persistent SIDs keep
+   stale ACLs from expanding the write scope of later, narrower policies.
 3. **WFP firewall at the ALE layer.** Network confinement is Windows Filtering
    Platform, not in-process interception: persistent provider/sublayer/filters
    with `FWPM_CONDITION_ALE_USER_ID` conditions keyed on the sandbox
