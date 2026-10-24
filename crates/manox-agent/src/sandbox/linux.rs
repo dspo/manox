@@ -320,18 +320,20 @@ fn deny_rules(route: NetworkRoute) -> BTreeMap<i64, Vec<SeccompRule>> {
         for &nr in NETWORK_DENIED_SYSCALLS {
             rules.insert(nr, Vec::new());
         }
-        // `socket`/`socketpair` with domain != AF_UNIX are denied; AF_UNIX
-        // falls through to the default allow.
-        rules.insert(libc::SYS_socket, vec![unix_only_rule()]);
-        rules.insert(libc::SYS_socketpair, vec![unix_only_rule()]);
+        // `socket`/`socketpair` are denied for every domain except the
+        // local-only pair: AF_UNIX (pipes-in-process tooling) and AF_NETLINK
+        // — bwrap itself raises the netns loopback over NETLINK_ROUTE, and
+        // netlink inside an unshared netns reaches no host state.
+        rules.insert(libc::SYS_socket, vec![local_domain_rule()]);
+        rules.insert(libc::SYS_socketpair, vec![local_domain_rule()]);
     }
     rules
 }
 
-/// The AF_UNIX-only rule shared by `socket` and `socketpair`: denied when the
-/// domain argument is anything else; the empty default action allows the
-/// unix case.
-fn unix_only_rule() -> SeccompRule {
+/// The local-domain rule shared by `socket` and `socketpair`: denied only
+/// when the domain argument is neither AF_UNIX nor AF_NETLINK; both local
+/// cases fall through to the default allow.
+fn local_domain_rule() -> SeccompRule {
     SeccompRule::new(vec![
         SeccompCondition::new(
             0, // first argument (domain)
@@ -340,8 +342,15 @@ fn unix_only_rule() -> SeccompRule {
             libc::AF_UNIX as u64,
         )
         .expect("AF_UNIX comparison compiles"),
+        SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            libc::AF_NETLINK as u64,
+        )
+        .expect("AF_NETLINK comparison compiles"),
     ])
-    .expect("AF_UNIX-only rule compiles")
+    .expect("local-domain rule compiles")
 }
 
 fn seccomp_target_arch() -> Option<TargetArch> {

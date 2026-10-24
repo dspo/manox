@@ -497,11 +497,9 @@ impl NetworkPolicy {
         match access {
             NetworkAccess::Off => NetworkRoute::Disabled,
             NetworkAccess::On => {
-                // No managed path on Linux yet (netns loopback bridge is a
-                // later stage): on is fully direct there.
-                if !cfg!(target_os = "macos") {
-                    return NetworkRoute::Direct;
-                }
+                // No managed path binds on Linux yet (the netns loopback
+                // bridge is a later stage): an allowlist there fails closed
+                // rather than running direct against the configured intent.
                 match self.inner.running.lock().unwrap().as_ref() {
                     Some(proxy) => NetworkRoute::Managed {
                         proxy_port: proxy.port,
