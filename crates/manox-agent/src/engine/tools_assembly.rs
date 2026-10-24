@@ -357,10 +357,17 @@ pub(super) fn build_tools(
                     sandbox_mode_gate.mode()
                 }
             });
+        // The network route follows the session switch live (plus the
+        // managed proxy port when one is running) — same per-call read the
+        // mode resolver makes.
+        let network_gate = Arc::clone(gate);
+        let network_resolver: Arc<dyn Fn() -> crate::sandbox::NetworkRoute + Send + Sync> =
+            Arc::new(move || network_gate.network_route());
         let ops = Arc::new(crate::sandbox::SandboxedBashOperations::new(
             cwd,
             granted_roots.clone(),
             sandbox_mode_resolver,
+            network_resolver,
         ));
         let wrap_ops = Arc::clone(&ops);
         let wrap: manox_harness::bash::background::SandboxCommandBuilder =
@@ -405,10 +412,14 @@ pub(super) fn build_tools(
         Arc::new(crate::approval::GateEscalationApprover::new(Arc::clone(
             gate,
         )));
+    let classifier_gate = Arc::clone(gate);
     let mut bash = BashTool::new(bash_ops, background.clone())
         .with_manager(Arc::clone(&manager))
         .with_sandbox_available(sandbox_available)
         .with_mode_resolver(Arc::clone(&standing_resolver))
+        .with_network_resolver(Arc::new(
+            move || classifier_gate.network_route().access(),
+        ))
         .with_grant_cell(grant_cell)
         .with_escalation_approver(Arc::clone(&escalation_approver));
     if let Some(ops) = unsandboxed_ops {

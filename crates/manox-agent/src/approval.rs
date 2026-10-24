@@ -56,6 +56,12 @@ struct PendingAuth {
 /// respond path (gpui side) see one source of truth.
 pub struct ApprovalGate {
     mode: Mutex<AccessMode>,
+    /// The session's sandbox network switch (`networkAccess`). Memory-only
+    /// cell — no object row, no sidecar field — so a restored session
+    /// starts closed again; the AHP `session/configChanged` write is the
+    /// only thing that opens it. The per-call resolvers (the bash
+    /// seatbelt's route picker, the denial classifier) read this live.
+    network: Mutex<manox_harness::sandbox::NetworkAccess>,
     /// The conversation's configuration authority. When installed it answers
     /// [`Self::mode`], so every per-call reader — this gate's own tool
     /// wrapper, the bash seatbelt's standing resolver, the Write/Edit
@@ -87,6 +93,7 @@ impl ApprovalGate {
     ) -> Self {
         Self {
             mode: Mutex::new(AccessMode::default()),
+            network: Mutex::new(manox_harness::sandbox::NetworkAccess::default()),
             config_source: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             notice_tx,
@@ -138,6 +145,21 @@ impl ApprovalGate {
 
     pub fn set_mode(&self, mode: AccessMode) {
         *self.mode.lock().unwrap() = mode;
+    }
+
+    /// The session's sandbox network state, read per call.
+    pub fn network_access(&self) -> manox_harness::sandbox::NetworkAccess {
+        *self.network.lock().unwrap()
+    }
+
+    pub fn set_network_access(&self, access: manox_harness::sandbox::NetworkAccess) {
+        *self.network.lock().unwrap() = access;
+    }
+
+    /// The network face one confined call runs under: the switch mapped to
+    /// its route (the managed-proxy face joins when a proxy is running).
+    pub fn network_route(&self) -> crate::sandbox::NetworkRoute {
+        crate::sandbox::NetworkRoute::from_access(self.network_access())
     }
 
     pub fn model(&self) -> Option<HarnessModel> {

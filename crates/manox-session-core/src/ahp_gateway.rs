@@ -290,11 +290,12 @@ impl SessionRuntime for GatewayRuntime {
         model: Option<&str>,
         effort: Option<&str>,
         mode: Option<&str>,
+        network: Option<&str>,
     ) -> Result<(), RuntimeError> {
         self.ensure_live("ahp", session_id)?;
         self.server
             .ahp_inner()
-            .preflight_config(session_id, model, effort, mode)
+            .preflight_config(session_id, model, effort, mode, network)
     }
 
     fn set_reasoning_effort(&self, session_id: &str, effort: &str) -> Result<(), RuntimeError> {
@@ -307,6 +308,13 @@ impl SessionRuntime for GatewayRuntime {
     fn set_access_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError> {
         self.ensure_live("ahp", session_id)?;
         self.server.ahp_inner().set_access_mode(session_id, mode)
+    }
+
+    fn set_network_access(&self, session_id: &str, access: &str) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id)?;
+        self.server
+            .ahp_inner()
+            .set_network_access(session_id, access)
     }
 
     fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError> {

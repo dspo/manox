@@ -130,6 +130,8 @@ pub(crate) enum SessionCmd {
     SetThinkingLevel(Option<String>),
     /// Switch the access mode and persist it in the session sidecar.
     SetAccessMode(AccessMode),
+    /// Switch the sandbox network state (`networkAccess`; session memory).
+    SetNetworkAccess(manox_harness::sandbox::NetworkAccess),
     /// Toggle an opt-in browser tool suite (WebExplore) on or
     /// off; the engine merges/removes the suite names atomically.
     SetBrowserSuite { suite: BrowserSuite, enable: bool },
@@ -820,6 +822,15 @@ impl ThreadEngine for Engine {
         // re-stamps the same value idempotently.
         self.state.gate.set_mode(mode);
         let _ = self.cmd_tx.send(SessionCmd::SetAccessMode(mode));
+    }
+
+    fn set_network_access(&self, access: manox_harness::sandbox::NetworkAccess) {
+        // Same live-authority shape as `set_access_mode`: the gate's network
+        // cell answers the per-call resolvers, so the switch governs the
+        // very next confined call. The actor command re-stamps it
+        // idempotently (and, with the managed proxy, owns its start/stop).
+        self.state.gate.set_network_access(access);
+        let _ = self.cmd_tx.send(SessionCmd::SetNetworkAccess(access));
     }
 
     fn set_browser_suite(&self, suite: BrowserSuite, enable: bool) {
@@ -1661,6 +1672,9 @@ async fn run_actor(
             }
             SessionCmd::SetAccessMode(mode) => {
                 apply_access_mode(&state, &sessions_dir, session.path(), mode, &notice_tx).await;
+            }
+            SessionCmd::SetNetworkAccess(access) => {
+                apply_network_access(&state, access, &notice_tx).await;
             }
             SessionCmd::SetBrowserSuite { suite, enable } => {
                 apply_browser_suite(&mut session, suite, enable).await;
@@ -2791,6 +2805,23 @@ async fn handle_set_cwd(
         notice_tx,
         BackendNotice::Event(Box::new(ThreadEvent::CwdChanged { path: path_str })),
         "cwd changed notice",
+    );
+}
+
+/// Apply the sandbox network switch: the gate's network cell re-stamp (the
+/// actor's idempotent echo of what the facade already landed) plus the
+/// notice. Nothing durable is written — the switch is session memory by
+/// design, so a restored session starts closed again.
+async fn apply_network_access(
+    state: &Arc<EngineState>,
+    access: manox_harness::sandbox::NetworkAccess,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    state.gate.set_network_access(access);
+    send_notice(
+        notice_tx,
+        BackendNotice::Event(Box::new(ThreadEvent::NetworkAccessChanged { access })),
+        "network access changed notice",
     );
 }
 

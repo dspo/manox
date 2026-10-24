@@ -966,6 +966,19 @@ pub(crate) fn parse_access_mode(
     })
 }
 
+/// Parse the network-access switch strictly (same contract as
+/// [`parse_access_mode`]).
+pub(crate) fn parse_network_access(
+    access: &str,
+) -> Result<manox_harness::sandbox::NetworkAccess, manox_ahp_runtime::error::RuntimeError> {
+    manox_harness::sandbox::NetworkAccess::from_wire(access).ok_or_else(|| {
+        manox_ahp_runtime::error::RuntimeError::new(format!(
+            "unknown network access: {access} (expected off or on)"
+        ))
+        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
+    })
+}
+
 /// The writable effort vocabulary, shared by the dispatch gate's
 /// validate-first pass and the applying setter.
 pub(crate) fn parse_reasoning_effort(
@@ -1927,6 +1940,7 @@ impl AgentServerInner {
         model: Option<&str>,
         effort: Option<&str>,
         mode: Option<&str>,
+        network: Option<&str>,
     ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
         if let Some(model) = model {
             self.preflight_model(session_id, model)?;
@@ -1936,6 +1950,9 @@ impl AgentServerInner {
         }
         if let Some(mode) = mode {
             parse_access_mode(mode)?;
+        }
+        if let Some(network) = network {
+            parse_network_access(network)?;
         }
         Ok(())
     }
@@ -2020,6 +2037,22 @@ impl AgentServerInner {
         };
         let mode = parse_access_mode(mode)?;
         thread.with_mut(|t| t.set_access_mode(mode));
+        Ok(())
+    }
+
+    /// Switch the session's sandbox network access. The value lives in
+    /// session memory only (no durable row): a restored session starts
+    /// closed again.
+    pub(crate) fn set_network_access(
+        &self,
+        session_id: &str,
+        access: &str,
+    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
+        let Some(thread) = self.session_thread(session_id) else {
+            return Err(unknown_session(session_id));
+        };
+        let access = parse_network_access(access)?;
+        thread.with_mut(|t| t.set_network_access(access));
         Ok(())
     }
 

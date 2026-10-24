@@ -1340,6 +1340,9 @@ impl RuntimeBackend {
                 .get(config_keys::REASONING_EFFORT)
                 .and_then(Value::as_str),
             config.get(config_keys::ACCESS_MODE).and_then(Value::as_str),
+            config
+                .get(config_keys::NETWORK_ACCESS)
+                .and_then(Value::as_str),
         ) {
             return DispatchOutcome::Rejected(refusal(error));
         }
@@ -1356,6 +1359,10 @@ impl RuntimeBackend {
                 .get(config_keys::ACCESS_MODE)
                 .and_then(Value::as_str)
                 .map(|mode| self.server.set_access_mode(session_id, mode)),
+            config
+                .get(config_keys::NETWORK_ACCESS)
+                .and_then(Value::as_str)
+                .map(|access| self.server.set_network_access(session_id, access)),
         ];
         for outcome in applied.into_iter().flatten() {
             if let Err(error) = outcome {
@@ -3110,7 +3117,11 @@ mod mcp_dispatch_tests {
             _model: Option<&str>,
             _effort: Option<&str>,
             _mode: Option<&str>,
+            _network: Option<&str>,
         ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+        fn set_network_access(&self, _: &str, _: &str) -> Result<(), RuntimeError> {
             Ok(())
         }
         fn terminal_state(&self, _terminal_id: &str) -> Option<TerminalSnapshot> {

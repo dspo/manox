@@ -111,6 +111,11 @@ pub(super) fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde
         // reads it live before every tool call. Journaling a second copy is
         // what made "which one is in force" unanswerable.
         ThreadEvent::AccessModeChanged { .. } => return None,
+        // Same shape as the access mode, a fortiori: the network switch has
+        // NO durable home at all — session memory only, so a restored
+        // session starts closed again (documented trade-off, not an
+        // omission).
+        ThreadEvent::NetworkAccessChanged { .. } => return None,
         ThreadEvent::PlanUpdated { snapshot } => (
             "plan_update".into(),
             json!({ "snapshot": serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null) }),

@@ -252,6 +252,7 @@ pub trait SessionRuntime: Send + Sync + 'static {
         model: Option<&str>,
         effort: Option<&str>,
         mode: Option<&str>,
+        network: Option<&str>,
     ) -> Result<(), RuntimeError>;
 
     /// Select the session's reasoning effort.
@@ -259,6 +260,9 @@ pub trait SessionRuntime: Send + Sync + 'static {
 
     /// Select the session's access mode.
     fn set_access_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError>;
+
+    /// Switch the session's sandbox network access (`off`/`on`).
+    fn set_network_access(&self, session_id: &str, access: &str) -> Result<(), RuntimeError>;
 
     /// Move the session's effective working directory.
     fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError>;

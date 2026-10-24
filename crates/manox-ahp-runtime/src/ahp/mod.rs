@@ -62,7 +62,7 @@ use ahp_types::state::{
     SessionLifecycle, SessionState, SessionStatus,
 };
 use manox_ahp::channels::{chat, session};
-use manox_harness::sandbox::AccessMode;
+use manox_harness::sandbox::{AccessMode, NetworkAccess};
 use manox_harness::session::SessionTreeEntry;
 use serde_json::Value;
 
@@ -635,6 +635,17 @@ fn session_config_schema() -> SessionConfigSchema {
             None,
             Some(&[AccessMode::Sandbox.wire(), AccessMode::FullAccess.wire()]),
             Some(AccessMode::default().wire()),
+        ),
+    );
+    properties.insert(
+        config_keys::NETWORK_ACCESS.to_string(),
+        // The network switch for sandboxed bash; the default is the
+        // vocabulary's own closed default. Parity is pinned by test.
+        prop(
+            "Network access",
+            Some("Network reachability for sandboxed commands"),
+            Some(&[NetworkAccess::Off.wire(), NetworkAccess::On.wire()]),
+            Some(NetworkAccess::default().wire()),
         ),
     );
     properties.insert(
@@ -1366,6 +1377,30 @@ mod config_schema_tests {
             prop.default.as_ref().and_then(Value::as_str),
             Some(AccessMode::default().wire()),
             "the declared default is the host's own default mode"
+        );
+    }
+
+    /// The network-access vocabulary is `NetworkAccess`'s own wire set with
+    /// the closed default — same pin as the access-mode enum above.
+    #[test]
+    fn the_network_access_enum_is_the_network_wire_vocabulary() {
+        let schema = session_config_schema();
+        let prop = schema
+            .properties
+            .get(config_keys::NETWORK_ACCESS)
+            .expect("networkAccess declared");
+        let values: Vec<&str> = prop
+            .r#enum
+            .as_ref()
+            .expect("networkAccess enumerates its values")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(values, vec![NetworkAccess::Off.wire(), NetworkAccess::On.wire()]);
+        assert_eq!(
+            prop.default.as_ref().and_then(Value::as_str),
+            Some(NetworkAccess::default().wire()),
+            "the declared default is the closed default"
         );
     }
 }

@@ -90,6 +90,8 @@ pub mod config_keys {
     pub const REASONING_EFFORT: &str = "reasoningEffort";
     /// Access-mode vocabulary string.
     pub const ACCESS_MODE: &str = "accessMode";
+    /// Network-access vocabulary string (`off`/`on`) for sandboxed bash.
+    pub const NETWORK_ACCESS: &str = "networkAccess";
     /// Server-owned project path (`null` clears).
     pub const PROJECT: &str = "project";
     /// Effective working directory of this journal.
@@ -101,7 +103,7 @@ pub mod config_keys {
     /// travel this seat host→client only: `workingDirectory` writes ride
     /// the dedicated `session/workingDirectorySet` action, so their arrival
     /// through a config dispatch is a client bug, not a fold.
-    pub const MUTABLE: &[&str] = &[MODEL, REASONING_EFFORT, ACCESS_MODE];
+    pub const MUTABLE: &[&str] = &[MODEL, REASONING_EFFORT, ACCESS_MODE, NETWORK_ACCESS];
 }
 
 /// The journal-row facts the projection mints identities from: one kernel

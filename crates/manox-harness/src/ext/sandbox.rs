@@ -35,6 +35,52 @@ pub enum AccessMode {
 /// standing session mode applies.
 pub const NO_GRANT: i64 = i64::MIN;
 
+/// Session-mutable network switch for sandboxed bash (AHP config key
+/// `networkAccess`, values `off`/`on`). `off` (the default) closes the
+/// network for confined calls on both enforcing platforms; `on` opens it —
+/// directly when no allowlist is configured, through the host's managed
+/// loopback proxy otherwise (macOS). Full access never consults this: an
+/// unsandboxed call is outside every fence by definition. The value lives in
+/// session memory only (no durable row): a restored session starts closed
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkAccess {
+    /// Confined calls get no network: the seatbelt renders no outbound
+    /// allowance, Linux unshares the network namespace and installs the
+    /// socket-restricted seccomp face.
+    #[default]
+    Off,
+    /// Confined calls may reach the network (directly, or through the
+    /// managed proxy when a host allowlist is configured).
+    On,
+}
+
+impl NetworkAccess {
+    /// The kebab wire string (the schema enum value).
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    /// Parse a wire string; `None` for anything outside the closed vocabulary.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "on" => Some(Self::On),
+            _ => None,
+        }
+    }
+}
+
+/// Trapped-env self-check signal: injected as `MANOX_SANDBOX_NETWORK_DISABLED=1`
+/// into every confined command that runs with [`NetworkAccess::Off`], so a
+/// script (or a build tool's feature probe) can see the closure instead of
+/// guessing from a failed connection.
+pub const NETWORK_DISABLED_ENV: &str = "MANOX_SANDBOX_NETWORK_DISABLED";
+
 impl AccessMode {
     /// The kebab wire string (the schema enum value and the marker vocabulary).
     pub fn wire(self) -> &'static str {
@@ -107,15 +153,65 @@ pub fn sandbox_denial_marker(mode: AccessMode) -> String {
 pub const SANDBOX_DENIAL_SIGNATURES: &[&str] =
     &["operation not permitted", "read-only file system"];
 
+/// The model-facing denial marker for the network face — the wording a
+/// network-closed sandbox reports so the model distinguishes "the network is
+/// off" (fixable by flipping `networkAccess`, or by escalation) from a file
+/// denial. Only meaningful under the sandbox mode; full access never denies.
+pub fn network_denial_marker(mode: AccessMode) -> String {
+    format!(
+        "[sandbox: network access denied under {} mode — networkAccess is off]",
+        mode.wire()
+    )
+}
+
+/// Substrings a NETWORK-closed denial leaves in the process output stream:
+/// the specific connection failures curl and friends print (macOS closes at
+/// name resolution, Linux netns/seccomp at connect or socket creation), plus
+/// the generic EPERM text the socket-restricted seccomp face produces on
+/// Linux. Matched only while `networkAccess` is off — with the network on
+/// these are ordinary environment failures, not policy refusals.
+pub const NETWORK_DENIAL_SIGNATURES: &[&str] = &[
+    "could not create socket",
+    "could not resolve host",
+    "temporary failure in name resolution",
+    "network is unreachable",
+    "network is down",
+    "connection refused",
+];
+
 /// Post-exit denial classification: when a nonzero-exit command's output
 /// carries a sandbox denial signature, the marker + same-turn escalation
 /// hint is returned so the model recognizes a policy refusal (not a command
-/// bug) and can retry with `require_escalated`.
-pub fn seatbelt_denial_note(output: &str, exit_code: i32, mode: AccessMode) -> Option<String> {
+/// bug) and can retry with `require_escalated`. The network face is judged
+/// first while the network is closed — its signatures name connection
+/// failures the file faces never produce — so a closed-network run classifies
+/// a `curl` refusal as a network denial instead of a file denial. On Linux
+/// the two deny faces have distinct errnos (the read-only base surfaces
+/// EROFS, seccomp EPERM), so a bare "operation not permitted" under a closed
+/// network reads as the socket filter; on macOS the seatbelt's file denials
+/// are also EPERM, so there the generic signature keeps its file meaning.
+pub fn seatbelt_denial_note(
+    output: &str,
+    exit_code: i32,
+    mode: AccessMode,
+    network: NetworkAccess,
+) -> Option<String> {
     if exit_code == 0 {
         return None;
     }
     let lower = output.to_ascii_lowercase();
+    let network_denial = network == NetworkAccess::Off
+        && (NETWORK_DENIAL_SIGNATURES
+            .iter()
+            .any(|sig| lower.contains(sig))
+            || (cfg!(target_os = "linux") && lower.contains("operation not permitted")));
+    if network_denial {
+        return Some(format!(
+            "\n{}\n{}",
+            network_denial_marker(mode),
+            escalation_hint_marker("command")
+        ));
+    }
     if SANDBOX_DENIAL_SIGNATURES
         .iter()
         .any(|sig| lower.contains(sig))
@@ -440,8 +536,110 @@ mod tests {
             sandbox_denial_marker(AccessMode::Sandbox),
             "[sandbox: file access denied under sandbox mode]"
         );
+        assert_eq!(
+            network_denial_marker(AccessMode::Sandbox),
+            "[sandbox: network access denied under sandbox mode — networkAccess is off]"
+        );
         assert!(escalation_hint_marker("command").contains("retry this exact command once"));
         assert!(escalation_hint_marker("command").contains("`require_escalated: true`"));
+    }
+
+    #[test]
+    fn network_wire_vocabulary() {
+        assert_eq!(NetworkAccess::default(), NetworkAccess::Off);
+        assert_eq!(NetworkAccess::from_wire("off"), Some(NetworkAccess::Off));
+        assert_eq!(NetworkAccess::from_wire("on"), Some(NetworkAccess::On));
+        assert_eq!(NetworkAccess::from_wire("disabled"), None);
+        assert_eq!(NetworkAccess::from_wire(""), None);
+        assert_eq!(
+            serde_json::to_value(NetworkAccess::On).unwrap(),
+            serde_json::json!("on")
+        );
+        assert_eq!(
+            serde_json::from_value::<NetworkAccess>(serde_json::json!("off")).unwrap(),
+            NetworkAccess::Off
+        );
+    }
+
+    #[test]
+    fn closed_network_classifies_connection_failures_as_network_denials() {
+        let note = |out: &str, code: i32| {
+            seatbelt_denial_note(out, code, AccessMode::Sandbox, NetworkAccess::Off)
+        };
+        // The macOS shape: seatbelt denies the DNS mach lookups, curl reports
+        // name resolution.
+        let note = note("curl: (6) Could not resolve host: crates.io", 6).unwrap();
+        assert!(
+            note.contains("network access denied under sandbox mode"),
+            "{note}"
+        );
+        assert!(note.contains("require_escalated"), "{note}");
+        // The Linux shapes: netns (unreachable/refused) and the socket
+        // filter (EPERM — on Linux EPERM under a closed network reads as the
+        // socket face, its file face surfaces EROFS).
+        let linux_only = ["fatal: unable to access: Operation not permitted"];
+        let stderrs = [
+            "curl: (7) Failed to connect: Network is unreachable",
+            "curl: (7) Could not create socket: Operation not permitted",
+        ];
+        let stderrs: Vec<&str> = stderrs
+            .iter()
+            .chain(cfg!(target_os = "linux").then(|| linux_only.iter()).unwrap_or_default())
+            .copied()
+            .collect();
+        for stderr in stderrs {
+            let note = seatbelt_denial_note(stderr, 7, AccessMode::Sandbox, NetworkAccess::Off)
+                .unwrap_or_else(|| panic!("no classification for: {stderr}"));
+            assert!(note.contains("network access denied"), "{note}");
+        }
+    }
+
+    #[test]
+    fn open_network_never_classifies_connection_failures() {
+        // With the network on these are ordinary environment failures, not
+        // policy refusals — no marker may ride them.
+        for stderr in [
+            "curl: (7) Failed to connect: Network is unreachable",
+            "curl: (6) Could not resolve host: crates.io",
+            "curl: (7) Connection refused",
+        ] {
+            assert!(
+                seatbelt_denial_note(stderr, 7, AccessMode::Sandbox, NetworkAccess::On).is_none(),
+                "open network misclassified: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_denials_keep_the_file_marker_under_a_closed_network() {
+        // The seatbelt's out-of-root write is also EPERM: on macOS the
+        // generic signature keeps its file meaning even with the network
+        // closed (only Linux maps EPERM to the socket face — its file face
+        // surfaces EROFS).
+        let note = seatbelt_denial_note(
+            "touch: /usr/local/x: Operation not permitted",
+            1,
+            AccessMode::Sandbox,
+            NetworkAccess::Off,
+        );
+        if cfg!(target_os = "linux") {
+            assert!(note.unwrap().contains("network access denied"));
+        } else {
+            assert!(
+                note.unwrap()
+                    .contains("file access denied under sandbox mode")
+            );
+        }
+        // The EROFS file face classifies as a file denial under any network
+        // state.
+        let note = seatbelt_denial_note(
+            "touch: Read-only file system",
+            1,
+            AccessMode::Sandbox,
+            NetworkAccess::Off,
+        )
+        .unwrap();
+        assert!(note.contains("file access denied"), "{note}");
     }
 
     struct CannedApprover(EscalationOutcome);

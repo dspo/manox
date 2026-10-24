@@ -10,10 +10,12 @@
 //! The base is deny-default and the profile curates its allows: full-disk
 //! reads, per-root writes injected as `sandbox-exec -D` definitions (paths
 //! travel as argv and are referenced through `(param ...)`, never embedded in
-//! the profile text), process spawn, explicit network allowances with the
-//! platform's DNS/TLS minimums, and the sysctl/pty minimums toolchains probe
-//! for. Network stays open this phase — the allowance is already explicit, so
-//! the loopback-only closure (a later phase) shrinks one section. Writable
+//! the profile text), process spawn, and the sysctl/pty minimums toolchains
+//! probe for. The network sections follow the session's `networkAccess`
+//! switch (the [`NetworkRoute`]): off renders no network allowance at all
+//! (unix-socket IPC stays so subprocess plumbing survives), on-without-
+//! allowlist keeps the historical full open with the platform's DNS/TLS
+//! minimums, and the managed route admits only the loopback proxy. Writable
 //! roots are validated at construction: a symlink inside a root's component
 //! chain fails the build (fail-closed) while the platform's top-level aliases
 //! (`/tmp` → `/private/tmp`) are normalized instead.
@@ -28,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use manox_harness::env::{CommandResult, ExecutionError};
-use manox_harness::sandbox::{AccessMode, writable_roots};
+use manox_harness::sandbox::{AccessMode, NetworkAccess, writable_roots};
 use manox_harness::tools::bash::{BashExecRequest, BashOperations};
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +43,42 @@ pub use manox_harness::sandbox::canonicalize_best_effort;
 /// The Linux backend (bubblewrap + seccomp); compiled only on its target.
 #[cfg(target_os = "linux")]
 mod linux;
+
+/// The network face one confined call runs under: the session's
+/// `networkAccess` switch plus, when the managed proxy is running (macOS,
+/// allowlist configured), the loopback port it listens on. `full-access`
+/// calls never reach a renderer, so there is no "open" face here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkRoute {
+    /// `networkAccess=off`: no network allowance is rendered; Linux unshares
+    /// the network namespace and installs the socket-restricted seccomp face.
+    Disabled,
+    /// `networkAccess=on` with no allowlist: fully open, the pre-closure
+    /// behavior byte for byte.
+    Direct,
+    /// `networkAccess=on` with an allowlist (macOS): the profile admits only
+    /// the loopback proxy and loopback itself; non-proxied clients fail
+    /// closed at the OS layer.
+    Managed { proxy_port: u16 },
+}
+
+impl NetworkRoute {
+    /// The face a bare access switch produces (no managed proxy).
+    pub fn from_access(access: NetworkAccess) -> Self {
+        match access {
+            NetworkAccess::Off => Self::Disabled,
+            NetworkAccess::On => Self::Direct,
+        }
+    }
+
+    /// The access switch the route carries (the classifier reads this).
+    pub fn access(self) -> NetworkAccess {
+        match self {
+            Self::Disabled => NetworkAccess::Off,
+            Self::Direct | Self::Managed { .. } => NetworkAccess::On,
+        }
+    }
+}
 
 /// Default wall-clock limit for a one-shot command (mirrors the bash tool's
 /// own default).
@@ -160,16 +198,22 @@ const SEATBELT_BASE_POLICY: &str = r#"(version 1)
 (allow file-ioctl (regex #"^/dev/ttys[0-9]+"))
 "#;
 
-/// Network stays deliberately open this phase, but explicit — under a
-/// deny-default base the absence of an allowance IS a denial, so the
-/// loopback-only closure (phase 3) shrinks this section instead of touching
-/// the base. The platform minimums below are what DNS resolution and TLS
-/// trust consult on every connection; without them name resolution dies
-/// before any remote-host rule could matter.
-const SEATBELT_NETWORK_POLICY: &str = r#"(allow network-outbound)
+/// The full-network allowance: rendered only when the route is [`NetworkRoute::Direct`]
+/// (`networkAccess=on`, no allowlist). Under a deny-default base the absence
+/// of an allowance IS a denial, so the closure (network off) simply stops
+/// rendering this section instead of adding denies.
+const SEATBELT_NETWORK_OPEN_POLICY: &str = r#"(allow network-outbound)
 (allow network-inbound)
+"#;
 
-; Only the safe AF_SYSTEM sockets used by local platform services.
+/// The platform minimums every networked route consults: only the safe
+/// AF_SYSTEM sockets local platform services use, the DNS/TLS/user-directory
+/// mach services the network stack touches per connection, and the
+/// routing-table probes getaddrinfo sorts through. Rendered for
+/// [`NetworkRoute::Direct`] and [`NetworkRoute::Managed`] (the proxy path
+/// still resolves `localhost` and validates TLS to the proxy); omitted when
+/// the network is off — a DNS lookup has no meaning with no socket to use.
+const SEATBELT_NETWORK_PLATFORM_MINIMUMS: &str = r#"; Only the safe AF_SYSTEM sockets used by local platform services.
 (allow system-socket
   (require-all
     (socket-domain AF_SYSTEM)
@@ -191,6 +235,17 @@ const SEATBELT_NETWORK_POLICY: &str = r#"(allow network-outbound)
 ; Routing-table probes (getaddrinfo sorts results through these).
 (allow sysctl-read
   (sysctl-name-regex #"^net.routetable"))
+"#;
+
+/// Local unix-socket IPC, admitted in every network state: AF_UNIX
+/// socketpairs are how build tools (`cargo clippy` and friends) manage child
+/// processes, and a closed network must not take subprocess plumbing down
+/// with it. Under the open route the blanket outbound allowance already
+/// covers these; rendering them twice is harmless.
+const SEATBELT_UNIX_IPC_POLICY: &str = r#"; Unix domain sockets for local IPC (subprocess management, not network).
+(allow system-socket (socket-domain AF_UNIX))
+(allow network-bind (local unix-socket))
+(allow network-outbound (remote unix-socket))
 "#;
 
 /// Preference IPC: cfprefsd rides mach/shm outside the filesystem, and reads
@@ -254,14 +309,15 @@ impl SandboxPolicy {
         Ok(self)
     }
 
-    /// Render a seatbelt (`.sbpl`) policy string for the effective `mode`.
-    /// Deny-default base with the explicit allow set described in the module
-    /// docs; `sandbox` admits the shared `writable_roots()` plus the extra
-    /// granted roots. `full-access` is never rendered — backend selection
-    /// skips the seatbelt for it — and rendering it anyway shows the profile
-    /// alone cannot be trusted to unconfine.
-    pub fn render_seatbelt(&self, mode: AccessMode) -> String {
-        self.render_seatbelt_with_params(mode).0
+    /// Render a seatbelt (`.sbpl`) policy string for the effective `mode`
+    /// and network `route`. Deny-default base with the explicit allow set
+    /// described in the module docs; `sandbox` admits the shared
+    /// `writable_roots()` plus the extra granted roots. `full-access` is
+    /// never rendered — backend selection skips the seatbelt for it — and
+    /// rendering it anyway shows the profile alone cannot be trusted to
+    /// unconfine.
+    pub fn render_seatbelt(&self, mode: AccessMode, route: NetworkRoute) -> String {
+        self.render_seatbelt_with_params(mode, route).0
     }
 
     /// The writable roots one call admits under `mode`: the shared
@@ -286,14 +342,23 @@ impl SandboxPolicy {
     }
 
     /// The profile plus its `sandbox-exec -D` definitions, split so the argv
-    /// builder and the tests see the same root→param mapping.
-    fn render_seatbelt_with_params(&self, mode: AccessMode) -> (String, Vec<(String, PathBuf)>) {
+    /// builder and the tests see the same root→param mapping. The network
+    /// sections follow the route: `Disabled` renders the unix-IPC minimum
+    /// only (deny-default closes the rest), `Direct` renders the full open
+    /// network with the platform minimums, `Managed` renders the loopback
+    /// proxy shape.
+    fn render_seatbelt_with_params(
+        &self,
+        mode: AccessMode,
+        route: NetworkRoute,
+    ) -> (String, Vec<(String, PathBuf)>) {
         let roots = self.writable_root_set(mode);
         let (write_section, params) = render_write_section(&roots);
+        let network_section = render_network_section(route);
         let mut profile = String::new();
         profile.push_str(SEATBELT_BASE_POLICY);
         profile.push_str(&write_section);
-        profile.push_str(SEATBELT_NETWORK_POLICY);
+        profile.push_str(&network_section);
         profile.push_str(SEATBELT_PREFERENCES_POLICY);
         profile.push_str(SEATBELT_FINAL_DENIES);
         (profile, params)
@@ -305,8 +370,8 @@ impl SandboxPolicy {
     /// Cross-platform so the seatbelt renderer (and its tests) compile on
     /// every target even though only macOS actually runs `sandbox-exec`.
     #[cfg(target_os = "macos")]
-    pub fn wrap_argv(&self, command: &str, mode: AccessMode) -> Vec<String> {
-        let (profile, params) = self.render_seatbelt_with_params(mode);
+    pub fn wrap_argv(&self, command: &str, mode: AccessMode, route: NetworkRoute) -> Vec<String> {
+        let (profile, params) = self.render_seatbelt_with_params(mode, route);
         let mut argv = vec!["-p".to_string(), profile];
         for (key, value) in params {
             argv.push(format!("-D{key}={}", value.display()));
@@ -314,6 +379,32 @@ impl SandboxPolicy {
         argv.push("--".to_string());
         argv.extend(["bash".to_string(), "-c".to_string(), command.to_string()]);
         argv
+    }
+
+    /// The trapped-env signals the route injects on top of the confinement:
+    /// the network self-check flag when closed, and the proxy env when the
+    /// managed route is active (upper- and lowercase — clients differ in
+    /// which they honor; a client that honors none fails closed at the
+    /// profile).
+    pub fn network_env(route: NetworkRoute) -> Vec<(&'static str, String)> {
+        let mut env = Vec::new();
+        if route == NetworkRoute::Disabled {
+            env.push((manox_harness::sandbox::NETWORK_DISABLED_ENV, "1".to_string()));
+        }
+        if let NetworkRoute::Managed { proxy_port } = route {
+            let url = format!("http://127.0.0.1:{proxy_port}");
+            for key in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                env.push((key, url.clone()));
+            }
+        }
+        env
     }
 
     /// Build the `sandbox-exec` invocation for a command. The login shell's
@@ -328,22 +419,52 @@ impl SandboxPolicy {
         command: &str,
         cwd: &Path,
         mode: AccessMode,
+        route: NetworkRoute,
     ) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
-        cmd.args(self.wrap_argv(command, mode))
+        cmd.args(self.wrap_argv(command, mode, route))
             .env("PATH", login_shell_path())
             .current_dir(cwd);
+        for (key, value) in Self::network_env(route) {
+            cmd.env(key, value);
+        }
         inject_noninteractive_env(&mut cmd);
         cmd
     }
+}
+
+/// The network sections one route renders, in profile order. `Disabled`
+/// keeps only unix-socket IPC (subprocess plumbing survives; everything
+/// else deny-default closes). `Direct` is the pre-closure full open with
+/// the platform minimums. `Managed` admits loopback only — the proxy port
+/// for tunnelled egress, loopback bind/inbound for local servers — with the
+/// platform minimums and TLS trust kept (the client still resolves
+/// `localhost` and validates the proxy TLS hop); a client that ignores the
+/// proxy env finds no non-loopback allowance and fails closed at the OS.
+fn render_network_section(route: NetworkRoute) -> String {
+    let mut section = String::new();
+    section.push_str(SEATBELT_UNIX_IPC_POLICY);
+    match route {
+        NetworkRoute::Disabled => {}
+        NetworkRoute::Direct => {
+            section.push_str(SEATBELT_NETWORK_OPEN_POLICY);
+            section.push_str(SEATBELT_NETWORK_PLATFORM_MINIMUMS);
+        }
+        NetworkRoute::Managed { proxy_port } => {
+            section.push_str(&format!(
+                "; Managed egress: only the loopback proxy tunnel, plus loopback\n; bind/inbound for local servers.\n(allow network-bind (local ip \"*:*\"))\n(allow network-inbound (local ip \"localhost:*\"))\n(allow network-outbound (remote ip \"localhost:{proxy_port}\"))\n"
+            ));
+            section.push_str(SEATBELT_NETWORK_PLATFORM_MINIMUMS);
+        }
+    }
+    section
 }
 
 /// The per-root write allowances plus the `-D` definitions they reference.
 /// Each root gets an anchor deny on the root directory itself: renaming (or
 /// otherwise unlinking) the boundary directory would move every protected
 /// path out from under the policy that names it.
-fn render_write_section(roots: &[PathBuf]) -> (String, Vec<(String, PathBuf)>) {
-    let mut profile = String::new();
+fn render_write_section(roots: &[PathBuf]) -> (String, Vec<(String, PathBuf)>) {    let mut profile = String::new();
     let mut params = Vec::new();
     profile.push_str("; Writes only under the curated roots; each root directory itself is\n; anchored so it cannot be renamed out of the boundary.\n");
     for (index, root) in roots.iter().enumerate() {
@@ -501,6 +622,11 @@ pub struct SandboxedBashOperations {
     workspace: PathBuf,
     granted_roots: crate::granted_roots::GrantedRoots,
     mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
+    /// Host-injected network resolver: the session's `networkAccess` (plus
+    /// the managed proxy port when one is running), read per call. Mirrors
+    /// the `mode_resolver` injection pattern — the kernel trait stays
+    /// untouched.
+    network_resolver: Arc<dyn Fn() -> NetworkRoute + Send + Sync>,
 }
 
 impl SandboxedBashOperations {
@@ -508,11 +634,13 @@ impl SandboxedBashOperations {
         workspace: impl Into<PathBuf>,
         granted_roots: crate::granted_roots::GrantedRoots,
         mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
+        network_resolver: Arc<dyn Fn() -> NetworkRoute + Send + Sync>,
     ) -> Self {
         Self {
             workspace: workspace.into(),
             granted_roots,
             mode_resolver,
+            network_resolver,
         }
     }
 
@@ -553,16 +681,23 @@ impl SandboxedBashOperations {
         #[cfg(target_os = "macos")]
         {
             let mode = (self.mode_resolver)();
+            let route = (self.network_resolver)();
             match self.policy_for(cwd) {
-                Ok(policy) => policy.wrap_command(command, cwd, mode),
+                Ok(policy) => policy.wrap_command(command, cwd, mode, route),
                 Err(_) => refused(cwd),
             }
         }
         #[cfg(target_os = "linux")]
         {
             let mode = (self.mode_resolver)();
+            let route = (self.network_resolver)();
             match self.policy_for(cwd).and_then(|policy| {
-                linux::wrap_command(&policy.writable_root_set(mode), command, cwd)
+                linux::wrap_command(
+                    &policy.writable_root_set(mode),
+                    command,
+                    cwd,
+                    route,
+                )
             }) {
                 Ok(cmd) => cmd,
                 Err(_) => refused(cwd),
@@ -594,10 +729,11 @@ impl BashOperations for SandboxedBashOperations {
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| self.workspace.clone());
             let mode = (self.mode_resolver)();
+            let route = (self.network_resolver)();
             // A policy that cannot be built (a symlinked writable root)
             // fails the call closed — the command never runs unsandboxed.
             let policy = self.policy_for(&cwd).map_err(ExecutionError::Other)?;
-            let mut cmd = policy.wrap_command(request.command, &cwd, mode);
+            let mut cmd = policy.wrap_command(request.command, &cwd, mode, route);
             cmd.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true);
@@ -607,13 +743,17 @@ impl BashOperations for SandboxedBashOperations {
             let timeout = request.timeout.unwrap_or(DEFAULT_TIMEOUT);
             let mut result =
                 run_to_completion(child, request.on_data, timeout, &request.signal).await?;
-            // Classify a seatbelt file-write denial (EPERM) and surface the
-            // denial marker + escalation hint so the model recognizes a
-            // policy refusal (not a command bug) and can retry with
+            // Classify a seatbelt denial — file-write EPERM, or a network
+            // refusal when the route is closed — and surface the matching
+            // marker + escalation hint so the model recognizes a policy
+            // refusal (not a command bug) and can retry with
             // `require_escalated`.
-            if let Some(note) =
-                manox_harness::sandbox::seatbelt_denial_note(&result.stderr, result.exit_code, mode)
-            {
+            if let Some(note) = manox_harness::sandbox::seatbelt_denial_note(
+                &result.stderr,
+                result.exit_code,
+                mode,
+                route.access(),
+            ) {
                 result.stderr.push_str(&note);
             }
             Ok(result)
@@ -625,13 +765,14 @@ impl BashOperations for SandboxedBashOperations {
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| self.workspace.clone());
             let mode = (self.mode_resolver)();
+            let route = (self.network_resolver)();
             // Same fail-closed policy build as macOS (a symlinked writable
             // root never runs unsandboxed).
             let roots = self
                 .policy_for(&cwd)
                 .map_err(ExecutionError::Other)?
                 .writable_root_set(mode);
-            let mut cmd = linux::wrap_command(&roots, request.command, &cwd)
+            let mut cmd = linux::wrap_command(&roots, request.command, &cwd, route)
                 .map_err(ExecutionError::Other)?;
             cmd.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -642,12 +783,16 @@ impl BashOperations for SandboxedBashOperations {
             let timeout = request.timeout.unwrap_or(DEFAULT_TIMEOUT);
             let mut result =
                 run_to_completion(child, request.on_data, timeout, &request.signal).await?;
-            // Classify a bwrap file-write denial — the read-only base
-            // surfaces EROFS ("Read-only file system"), not the seatbelt's
-            // EPERM — onto the same marker + escalation hint vocabulary.
-            if let Some(note) =
-                manox_harness::sandbox::seatbelt_denial_note(&result.stderr, result.exit_code, mode)
-            {
+            // Classify a bwrap denial — the read-only base surfaces EROFS
+            // ("Read-only file system"), the socket-restricted seccomp face
+            // EPERM — onto the same marker + escalation hint vocabulary,
+            // re-worded for the network face when the route is closed.
+            if let Some(note) = manox_harness::sandbox::seatbelt_denial_note(
+                &result.stderr,
+                result.exit_code,
+                mode,
+                route.access(),
+            ) {
                 result.stderr.push_str(&note);
             }
             Ok(result)
@@ -797,13 +942,20 @@ mod tests {
         Arc::new(move || mode)
     }
 
+    #[cfg(target_os = "macos")]
+    fn route_resolver(
+        route: NetworkRoute,
+    ) -> Arc<dyn Fn() -> NetworkRoute + Send + Sync> {
+        Arc::new(move || route)
+    }
+
     #[test]
     fn sandbox_profile_is_deny_default_with_param_roots() {
         let root = project_root();
         std::fs::create_dir_all(&root).ok();
         let (sb, params) = SandboxPolicy::for_project(&root)
             .unwrap()
-            .render_seatbelt_with_params(AccessMode::Sandbox);
+            .render_seatbelt_with_params(AccessMode::Sandbox, NetworkRoute::Direct);
         // The base flips to deny-default; everything after it is curated
         // allowance.
         assert!(sb.starts_with("(version 1)\n(deny default)\n"));
@@ -860,7 +1012,7 @@ mod tests {
         // phase); `full-access` never reaches this renderer (backend
         // selection skips the seatbelt), but rendering it anyway shows the
         // profile alone cannot be trusted to unconfine.
-        let (sb, params) = policy().render_seatbelt_with_params(AccessMode::FullAccess);
+        let (sb, params) = policy().render_seatbelt_with_params(AccessMode::FullAccess, NetworkRoute::Direct);
         assert!(sb.contains("(deny default)"));
         assert!(params.is_empty(), "full access admits no roots: {params:?}");
         assert!(!sb.contains("(allow file-write* (subpath"));
@@ -875,7 +1027,7 @@ mod tests {
         // explicit under the deny-default base; the loopback-only closure is
         // phase 3 and shrinks this section. The platform minimums (DNS
         // configuration, TLS trust mach services) ride with it.
-        let (sb, _) = policy().render_seatbelt_with_params(AccessMode::Sandbox);
+        let (sb, _) = policy().render_seatbelt_with_params(AccessMode::Sandbox, NetworkRoute::Direct);
         assert!(sb.contains("(allow network-outbound)"));
         assert!(sb.contains("(allow network-inbound)"));
         assert!(sb.contains("(socket-domain AF_SYSTEM)"));
@@ -889,13 +1041,115 @@ mod tests {
     }
 
     #[test]
+    fn closed_network_renders_no_network_allowance() {
+        // networkAccess=off: no outbound/inbound allowance anywhere (the
+        // deny-default base is the enforcement), no DNS/TLS mach minimums,
+        // no AF_SYSTEM — but unix-socket IPC stays so build-tool subprocess
+        // plumbing survives.
+        let (sb, _) = policy()
+            .render_seatbelt_with_params(AccessMode::Sandbox, NetworkRoute::Disabled);
+        // The blanket allowance is gone (the unix-socket outbound line
+        // carries a qualifier and stays).
+        assert!(!sb.contains("(allow network-outbound)\n"), "{sb}");
+        assert!(!sb.contains("(allow network-inbound)"), "{sb}");
+        assert!(!sb.contains("socket-domain AF_SYSTEM"), "{sb}");
+        assert!(
+            !sb.contains("com.apple.SystemConfiguration.DNSConfiguration"),
+            "{sb}"
+        );
+        assert!(!sb.contains("com.apple.trustd.agent"), "{sb}");
+        assert!(!sb.contains("net.routetable"), "{sb}");
+        // The unix IPC minimum rides in every state.
+        assert!(sb.contains("(socket-domain AF_UNIX)"), "{sb}");
+        assert!(sb.contains("(allow network-outbound (remote unix-socket))"), "{sb}");
+        // The writes and hardening denies are untouched.
+        assert!(sb.contains("(allow file-write* (subpath (param \"WRITABLE_ROOT_0\")))"));
+        assert!(sb.contains("(deny system-fcntl (fcntl-command 80 110))"));
+    }
+
+    #[test]
+    fn managed_network_renders_the_loopback_proxy_shape() {
+        // The managed route: loopback only — the proxy port for tunnelled
+        // egress, loopback bind/inbound for local servers — with the
+        // platform minimums; no blanket outbound allowance survives.
+        let (sb, _) = policy().render_seatbelt_with_params(
+            AccessMode::Sandbox,
+            NetworkRoute::Managed { proxy_port: 54321 },
+        );
+        assert!(!sb.contains("(allow network-outbound)\n"), "{sb}");
+        assert!(
+            sb.contains("(allow network-outbound (remote ip \"localhost:54321\"))"),
+            "{sb}"
+        );
+        assert!(sb.contains("(allow network-bind (local ip \"*:*\"))"), "{sb}");
+        assert!(
+            sb.contains("(allow network-inbound (local ip \"localhost:*\"))"),
+            "{sb}"
+        );
+        // The platform minimums and TLS trust stay (the proxy hop itself
+        // resolves localhost and validates TLS).
+        assert!(sb.contains("com.apple.SystemConfiguration.DNSConfiguration"));
+        assert!(sb.contains("com.apple.TrustEvaluationAgent"));
+    }
+
+    #[test]
+    fn network_env_signals_the_route() {
+        use manox_harness::sandbox::NETWORK_DISABLED_ENV;
+        let disabled = SandboxPolicy::network_env(NetworkRoute::Disabled);
+        assert!(
+            disabled
+                .iter()
+                .any(|(k, v)| *k == NETWORK_DISABLED_ENV && v == "1"),
+            "{disabled:?}"
+        );
+        assert!(SandboxPolicy::network_env(NetworkRoute::Direct).is_empty());
+        let managed = SandboxPolicy::network_env(NetworkRoute::Managed {
+            proxy_port: 54321,
+        });
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "https_proxy"] {
+            assert!(
+                managed
+                    .iter()
+                    .any(|(k, v)| *k == key && v == "http://127.0.0.1:54321"),
+                "{managed:?}"
+            );
+        }
+        // The disabled env never rides a proxy route, and the proxy env
+        // never rides a closed one.
+        assert!(
+            !managed
+                .iter()
+                .any(|(k, _)| *k == NETWORK_DISABLED_ENV)
+        );
+        assert!(!disabled.iter().any(|(k, _)| k.contains("PROXY")));
+    }
+
+    #[test]
+    fn route_access_maps_the_classifier_vocabulary() {
+        assert_eq!(NetworkRoute::Disabled.access(), NetworkAccess::Off);
+        assert_eq!(NetworkRoute::Direct.access(), NetworkAccess::On);
+        assert_eq!(
+            NetworkRoute::Managed { proxy_port: 1 }.access(),
+            NetworkAccess::On
+        );
+        assert_eq!(
+            NetworkRoute::from_access(NetworkAccess::Off),
+            NetworkRoute::Disabled
+        );
+        assert_eq!(
+            NetworkRoute::from_access(NetworkAccess::On),
+            NetworkRoute::Direct
+        );
+    }
+
+    #[test]
     fn filesystem_root_is_filtered_out() {
         // Launching from `/` must not admit the entire disk: the fs root is
         // filtered from the writable allow-list (the temp areas and the
         // manox home still ride along).
         let (sb, params) = SandboxPolicy::for_project(Path::new("/"))
             .unwrap()
-            .render_seatbelt_with_params(AccessMode::Sandbox);
+            .render_seatbelt_with_params(AccessMode::Sandbox, NetworkRoute::Direct);
         assert!(
             !param_paths(&params).contains(&PathBuf::from("/")),
             "fs root not admitted: {params:?}"
@@ -911,7 +1165,7 @@ mod tests {
             .unwrap()
             .with_extra_roots(vec![wt.clone(), git.clone(), wt.clone()])
             .unwrap();
-        let (_, params) = policy.render_seatbelt_with_params(AccessMode::Sandbox);
+        let (_, params) = policy.render_seatbelt_with_params(AccessMode::Sandbox, NetworkRoute::Direct);
         let paths = param_paths(&params);
         for root in [&wt, &git] {
             assert!(
@@ -929,7 +1183,7 @@ mod tests {
             "{params:?}"
         );
         // Full access never admits anything.
-        let (_, full) = policy.render_seatbelt_with_params(AccessMode::FullAccess);
+        let (_, full) = policy.render_seatbelt_with_params(AccessMode::FullAccess, NetworkRoute::Direct);
         assert!(full.is_empty());
     }
 
@@ -976,6 +1230,7 @@ mod tests {
             &link,
             crate::granted_roots::GrantedRoots::new(&target),
             resolver(AccessMode::Sandbox),
+            route_resolver(NetworkRoute::Direct),
         );
         let cmd = ops.wrap_background("echo hi", &target);
         let std_cmd = cmd.as_std();
@@ -993,7 +1248,7 @@ mod tests {
         let root = project_root();
         std::fs::create_dir_all(&root).ok();
         let policy = SandboxPolicy::for_project(&root).unwrap();
-        let args = policy.wrap_argv("echo hi", AccessMode::Sandbox);
+        let args = policy.wrap_argv("echo hi", AccessMode::Sandbox, NetworkRoute::Direct);
         assert_eq!(args[0], "-p");
         assert!(args[1].contains("(deny default)"));
         // One `-D` definition per writable root, workspace root first, all
@@ -1027,6 +1282,7 @@ mod tests {
             &root,
             crate::granted_roots::GrantedRoots::new(&root),
             resolver(AccessMode::Sandbox),
+            route_resolver(NetworkRoute::Direct),
         );
 
         // A confined write inside the project succeeds.
@@ -1078,6 +1334,7 @@ mod tests {
             &root,
             crate::granted_roots::GrantedRoots::new(&root),
             resolver(AccessMode::Sandbox),
+            route_resolver(NetworkRoute::Direct),
         );
 
         // The manox state home is writable under sandbox (plan files
@@ -1117,6 +1374,7 @@ mod tests {
             &root,
             crate::granted_roots::GrantedRoots::new(&root),
             resolver(AccessMode::Sandbox),
+            route_resolver(NetworkRoute::Direct),
         );
 
         // A write outside the workspace + temp areas is denied under sandbox.
