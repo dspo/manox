@@ -29,13 +29,14 @@ pub struct SessionMeta {
     /// fence keeps admitting them. Empty (the default) = single-cwd.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub working_directories: Vec<String>,
-    /// The permission gate policy the session runs under (`"read-only"`,
-    /// `"workspace-write"`, or `"danger-full-access"`), as chosen in the access
-    /// chip. Absent = the harness default. Stored as the mode's wire string
-    /// (field name kept as `approval_mode`); the harness parses it leniently
-    /// and falls back to its bounded default on unknown values.
+    /// The access mode the session runs under (`"sandbox"` or
+    /// `"full-access"`), as chosen in the access chip. Absent = the harness
+    /// default. Stored as the mode's wire string; the harness parses it
+    /// leniently and falls back to its bounded default on unknown values
+    /// (sidecars carrying a retired three-tier wire string restore at the
+    /// default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_mode: Option<String>,
+    pub access_mode: Option<String>,
     /// The reasoning effort the session runs at (`"high"` or `"max"`), as
     /// chosen in the model dropdown. Absent = the harness default (High).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,7 +242,7 @@ async fn mtime_of(path: &Path) -> i64 {
 
 /// Per-sidecar write lock keyed by sidecar path: every load→modify→save
 /// cycle takes it before touching the file, so concurrent writers (archive /
-/// pin / unread, engine title / approval-mode persists) can never interleave
+/// pin / unread, engine title / access-mode persists) can never interleave
 /// and clobber each other's fields. The map is unbounded by design — one
 /// entry per session ever written.
 static WRITE_LOCKS: OnceLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =

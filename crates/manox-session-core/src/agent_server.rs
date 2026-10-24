@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use manox_agent::language_model::{MessageContent, ReasoningEffort};
-use manox_agent::thread::{PermissionMode, ThreadHandle};
+use manox_agent::thread::{AccessMode, ThreadHandle};
 use manox_agent::thread_engine::BackendNotice;
 use manox_agent::{MessageUiMetadata, Thread, ThreadEvent, ThreadId};
 use manox_harness::session::claim::{self, ClaimOutcome, ClaimRequest, SessionFacts};
@@ -195,7 +195,7 @@ impl AgentServerInner {
     /// acquisitions, so a racing same-id create/open could pass both checks
     /// and build two entries. This recheck adopts the entry that won the race
     /// and hands the loser back to its caller, so the loser's intent seeds can
-    /// never overwrite the winner's model / approval / effort.
+    /// never overwrite the winner's model / access mode / effort.
     fn insert_session_if_absent(
         &self,
         session_id: String,
@@ -955,12 +955,14 @@ fn unservable_model(id: &str, reason: &str) -> manox_ahp_runtime::error::Runtime
 /// (a silent no-op beats a chip bounce-back on a projected mutation).
 /// Shared by the dispatch gate's validate-first pass and the applying
 /// setter so the two can never disagree.
-pub(crate) fn parse_approval_mode(
+pub(crate) fn parse_access_mode(
     mode: &str,
-) -> Result<PermissionMode, manox_ahp_runtime::error::RuntimeError> {
-    serde_json::from_value::<PermissionMode>(Value::String(mode.to_string())).map_err(|_| {
-        manox_ahp_runtime::error::RuntimeError::new(format!("unknown approval mode: {mode}"))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
+) -> Result<AccessMode, manox_ahp_runtime::error::RuntimeError> {
+    serde_json::from_value::<AccessMode>(Value::String(mode.to_string())).map_err(|_| {
+        manox_ahp_runtime::error::RuntimeError::new(format!(
+            "unknown access mode: {mode} (expected sandbox or full-access)"
+        ))
+        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
     })
 }
 
@@ -1031,7 +1033,7 @@ pub(crate) async fn fork_session(
         cwd,
         project,
         initial_model,
-        approval_mode,
+        access_mode,
         reasoning_effort,
     } = intent;
     // Resolve every intent field that can fail before touching the
@@ -1052,13 +1054,13 @@ pub(crate) async fn fork_session(
             }
         }
     };
-    let approval = match approval_mode.as_deref() {
+    let access = match access_mode.as_deref() {
         None => None,
-        Some(s) => match serde_json::from_value::<PermissionMode>(Value::String(s.to_string())) {
+        Some(s) => match serde_json::from_value::<AccessMode>(Value::String(s.to_string())) {
             Ok(mode) => Some(mode),
             Err(_) => {
                 return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
-                    "unknown approval mode: {s}"
+                    "unknown access mode: {s} (expected sandbox or full-access)"
                 ))
                 .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
             }
@@ -1186,8 +1188,8 @@ pub(crate) async fn fork_session(
             if let Some(model) = model {
                 t.set_model(model);
             }
-            if let Some(mode) = approval {
-                t.set_permission_mode(mode);
+            if let Some(mode) = access {
+                t.set_access_mode(mode);
             }
             if let Some(effort) = effort {
                 t.set_reasoning_effort(effort);
@@ -1203,7 +1205,7 @@ pub(crate) async fn fork_session(
 // ── Per-command handlers (&self methods, no spawning). ────────────────────────
 
 /// The `createSession` intent: optional explicit id, working directory,
-/// project binding, and the initial model / approval mode / reasoning effort
+/// project binding, and the initial model / access mode / reasoning effort
 /// the session opens with.
 pub(crate) use manox_ahp_runtime::runtime_trait::SessionIntent;
 
@@ -1332,14 +1334,13 @@ impl AgentServerInner {
                 }
             }
         };
-        let approval = match intent.approval_mode.as_deref() {
+        let access = match intent.access_mode.as_deref() {
             None => None,
-            Some(s) => match serde_json::from_value::<PermissionMode>(Value::String(s.to_string()))
-            {
+            Some(s) => match serde_json::from_value::<AccessMode>(Value::String(s.to_string())) {
                 Ok(mode) => Some(mode),
                 Err(_) => {
                     return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
-                        "unknown approval mode: {s}"
+                        "unknown access mode: {s} (expected sandbox or full-access)"
                     ))
                     .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
                 }
@@ -1522,8 +1523,8 @@ impl AgentServerInner {
                     if let Some(model) = model {
                         t.set_model(model);
                     }
-                    if let Some(mode) = approval {
-                        t.set_permission_mode(mode);
+                    if let Some(mode) = access {
+                        t.set_access_mode(mode);
                     }
                     if let Some(effort) = effort {
                         t.set_reasoning_effort(effort);
@@ -1575,14 +1576,14 @@ impl AgentServerInner {
             });
         }
         // Intent application: model (explicit canonical or the global
-        // default), approval mode, reasoning effort.
+        // default), access mode, reasoning effort.
         let initial = model.or_else(manox_agent::provider_glue::default_model);
         thread.with_mut(|t| {
             if let Some(model) = initial {
                 t.set_model(model);
             }
-            if let Some(mode) = approval {
-                t.set_permission_mode(mode);
+            if let Some(mode) = access {
+                t.set_access_mode(mode);
             }
             if let Some(effort) = effort {
                 t.set_reasoning_effort(effort);
@@ -1593,7 +1594,7 @@ impl AgentServerInner {
         // The insert is a single-lock recheck: a racing same-id create/open
         // that won the race since the live check above has its entry adopted
         // and ours dropped — never clobbered, so the loser's intent seeds
-        // cannot overwrite the winner's model / approval / effort.
+        // cannot overwrite the winner's model / access mode / effort.
         let settle_cancel = tokio_util::sync::CancellationToken::new();
         let _watcher = spawn_settle_watcher(
             session_id.clone(),
@@ -1705,7 +1706,7 @@ impl AgentServerInner {
         if turn_active.load(Ordering::SeqCst) && slash.is_none() {
             let ui = thread.read(|t| MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
-                approval_mode: Some(t.permission_mode().as_i64()),
+                access_mode: Some(t.access_mode().as_i64()),
                 ..Default::default()
             });
             pending_submits.lock().push(QueuedSubmit {
@@ -1726,7 +1727,7 @@ impl AgentServerInner {
             if let Some((name, args)) = slash {
                 let ui = MessageUiMetadata {
                     model_id: t.model().map(|m| m.id.clone()),
-                    approval_mode: Some(t.permission_mode().as_i64()),
+                    access_mode: Some(t.access_mode().as_i64()),
                     ..Default::default()
                 };
                 let slash_ui = MessageUiMetadata {
@@ -1821,7 +1822,7 @@ impl AgentServerInner {
             t.set_pending_turn_accepted_entry(accepted_entry);
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
-                approval_mode: Some(t.permission_mode().as_i64()),
+                access_mode: Some(t.access_mode().as_i64()),
                 ..Default::default()
             };
             let content = to_message_content(text, images);
@@ -1863,7 +1864,7 @@ impl AgentServerInner {
         let injected = thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
-                approval_mode: Some(t.permission_mode().as_i64()),
+                access_mode: Some(t.access_mode().as_i64()),
                 ..Default::default()
             };
             let content = to_message_content(text, images);
@@ -1939,7 +1940,7 @@ impl AgentServerInner {
             parse_reasoning_effort(effort)?;
         }
         if let Some(mode) = mode {
-            parse_approval_mode(mode)?;
+            parse_access_mode(mode)?;
         }
         Ok(())
     }
@@ -2014,7 +2015,7 @@ impl AgentServerInner {
         Ok(())
     }
 
-    pub(crate) fn set_approval_mode(
+    pub(crate) fn set_access_mode(
         &self,
         session_id: &str,
         mode: &str,
@@ -2022,8 +2023,8 @@ impl AgentServerInner {
         let Some(thread) = self.session_thread(session_id) else {
             return Err(unknown_session(session_id));
         };
-        let mode = parse_approval_mode(mode)?;
-        thread.with_mut(|t| t.set_permission_mode(mode));
+        let mode = parse_access_mode(mode)?;
+        thread.with_mut(|t| t.set_access_mode(mode));
         Ok(())
     }
 
@@ -2079,7 +2080,7 @@ impl AgentServerInner {
         thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
-                approval_mode: Some(t.permission_mode().as_i64()),
+                access_mode: Some(t.access_mode().as_i64()),
                 // The expanded plan directive is written by the harness on
                 // the user's behalf, so the bubble header names the harness
                 // (the desktop's local seed path always did; U6b③ aligns
@@ -2457,7 +2458,7 @@ impl manox_harness::tool::AgentTool for EmbedderToolAdapter {
     /// Mirror of the registrant's read_only hint: the approval gate's
     /// `needs_gate` is `requires_approval() || !is_read_only()`, so without
     /// this override a read_only registration still fell through the gate
-    /// and — outside danger-full-access — into its fail-closed deny arm.
+    /// and — outside full-access — into its fail-closed deny arm.
     fn is_read_only(&self) -> bool {
         self.spec.read_only
     }

@@ -79,10 +79,10 @@ pub const BUS_CAPTAIN_NAME: &str = "captain";
 pub struct MessageUiMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
-    /// `PermissionMode::as_i64`, stored as an integer to avoid coupling the
+    /// `AccessMode::as_i64`, stored as an integer to avoid coupling the
     /// message schema to enum names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_mode: Option<i64>,
+    pub access_mode: Option<i64>,
     /// Set when this user message was injected mid-turn via the steer queue
     /// (drained by the turn loop), rather than starting a fresh turn. The tag
     /// is applied at drain time so it marks messages the running turn actually

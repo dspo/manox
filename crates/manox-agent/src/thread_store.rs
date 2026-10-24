@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::db::ThreadSummary;
-use crate::thread::{PermissionMode, Thread, ThreadCore, ThreadHandle, ThreadId};
+use crate::thread::{AccessMode, Thread, ThreadCore, ThreadHandle, ThreadId};
 
 /// Events emitted by `ThreadStore` to the sidebar.
 #[derive(Debug, Clone)]
@@ -1166,7 +1166,7 @@ impl ThreadStore {
             title_override: None,
             model_id: String::new(),
             provider_id: None,
-            approval_mode: PermissionMode::default().as_i64(),
+            access_mode: AccessMode::default().as_i64(),
             project: String::new(),
             depth: parent.is_some() as i32,
             parent_id: parent.map(str::to_string),
@@ -1198,7 +1198,7 @@ impl ThreadStore {
         updated_at: i64,
         project: &str,
         tag: Option<&str>,
-        approval_mode: i64,
+        access_mode: i64,
     ) {
         self.insert_summary_for_test(id, parent);
         let summary = self.summaries.last_mut().expect("just inserted");
@@ -1206,7 +1206,7 @@ impl ThreadStore {
         summary.updated_at = updated_at;
         summary.project = project.to_string();
         summary.tag = tag.map(str::to_string);
-        summary.approval_mode = approval_mode;
+        summary.access_mode = access_mode;
     }
 
     /// Fold the decision overlay into the freshly scanned partitions: a
@@ -1723,7 +1723,7 @@ fn summary_from_cached(
         title_override: None,
         model_id: String::new(),
         provider_id: None,
-        approval_mode: PermissionMode::default().as_i64(),
+        access_mode: AccessMode::default().as_i64(),
         // The bound project (sidecar) wins over the header cwd.
         project: meta
             .project
@@ -2622,7 +2622,7 @@ mod tests {
             title_override: None,
             model_id: String::new(),
             provider_id: None,
-            approval_mode: PermissionMode::default().as_i64(),
+            access_mode: AccessMode::default().as_i64(),
             project: String::new(),
             depth: 0,
             parent_id: None,
@@ -3020,7 +3020,7 @@ mod tests {
             title_override: None,
             model_id: String::new(),
             provider_id: None,
-            approval_mode: PermissionMode::default().as_i64(),
+            access_mode: AccessMode::default().as_i64(),
             project: String::new(),
             depth: parent.is_some() as i32,
             parent_id: parent.map(str::to_string),
@@ -3301,7 +3301,7 @@ mod tests {
                     *at,
                     project,
                     None,
-                    PermissionMode::default().as_i64(),
+                    AccessMode::default().as_i64(),
                 );
                 if !project.is_empty() && !s.known_projects.iter().any(|p| p == project) {
                     s.known_projects.push(project.to_string());
@@ -3433,7 +3433,7 @@ mod tests {
                 900,
                 "/p/a",
                 None,
-                PermissionMode::default().as_i64(),
+                AccessMode::default().as_i64(),
             );
             s.rerank();
         });

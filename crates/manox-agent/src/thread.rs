@@ -51,11 +51,11 @@ pub struct SideCallMetric {
     pub latency_ms: u64,
 }
 
-/// File-effect policy for confined bash and the fs write fence (the per-call
+/// Access policy for confined bash and the fs write fence (the per-call
 /// sandbox mode). Defined in the extension layer (`manox_harness::sandbox`) so
 /// the bash tool and the host fence share one vocabulary; re-exported here for
-/// the host's session/persistence (wire field `approval_mode`, kebab values).
-pub use manox_harness::sandbox::PermissionMode;
+/// the host's session/persistence (wire field `access_mode`, kebab values).
+pub use manox_harness::sandbox::AccessMode;
 
 /// History-loading state of a thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -158,9 +158,9 @@ pub enum ThreadEvent {
         summary: String,
         input: serde_json::Value,
     },
-    /// Permission mode changed.
-    PermissionModeChanged {
-        mode: PermissionMode,
+    /// Access mode changed.
+    AccessModeChanged {
+        mode: AccessMode,
     },
     /// A completion turn started.
     TurnStarted,
@@ -299,7 +299,7 @@ pub struct Thread {
     extra_working_dirs: Vec<PathBuf>,
     project: Option<PathBuf>,
     model: Option<HarnessModel>,
-    permission_mode: PermissionMode,
+    access_mode: AccessMode,
     messages: Vec<Message>,
     reasoning_effort: ReasoningEffort,
     pinned: bool,
@@ -339,10 +339,10 @@ pub struct Thread {
     engine: Option<Arc<dyn ThreadEngine>>,
     /// History-loading state (see `HistoryPhase`).
     history_phase: HistoryPhase,
-    /// Whether the user explicitly set the permission mode on a landing
+    /// Whether the user explicitly set the access mode on a landing
     /// thread; the mode is then not overwritten by the session sidecar's
     /// default when the engine materializes.
-    permission_mode_explicitly_set: bool,
+    access_mode_explicitly_set: bool,
     /// Whether the user explicitly set the reasoning effort on a landing
     /// thread; the effort is then not overwritten by the session sidecar's
     /// default when the engine materializes.
@@ -364,7 +364,7 @@ pub struct Thread {
     browser_suites: Vec<crate::engine::BrowserSuite>,
     /// Whether a suite was toggled since construction; until then the
     /// `Ready` projection seeds the mirror (same pattern as
-    /// `permission_mode_explicitly_set`).
+    /// `access_mode_explicitly_set`).
     browser_suites_explicitly_set: bool,
     /// Plan mode active: read-only research + plan-file writes, proposals
     /// ride the `ProposePlan` tool. Mirrored from the engine on
@@ -758,7 +758,7 @@ impl Thread {
     /// Grant an additional working directory to the session (multi-root):
     /// queued for the engine's granted-root set at spawn and, when the
     /// engine already exists, approved into its shared set immediately —
-    /// `workspace-write` then admits writes under it exactly like the cwd.
+    /// `sandbox` then admits writes under it exactly like the cwd.
     pub fn grant_working_directory(&mut self, dir: PathBuf) {
         self.extra_working_dirs.push(dir.clone());
         if let Some(engine) = &self.engine {
@@ -799,7 +799,7 @@ impl Thread {
             cwd,
             project: None,
             model: crate::provider_glue::default_model(),
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             messages: Vec::new(),
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
@@ -816,7 +816,7 @@ impl Thread {
             last_user_ui: None,
             engine: None,
             history_phase: HistoryPhase::Ready,
-            permission_mode_explicitly_set: false,
+            access_mode_explicitly_set: false,
             reasoning_effort_explicitly_set: false,
             model_explicitly_set: false,
             applied_config_version: 0,
@@ -937,7 +937,7 @@ impl Thread {
             cwd,
             project,
             model,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             messages: Vec::new(),
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
@@ -958,7 +958,7 @@ impl Thread {
             } else {
                 HistoryPhase::Ready
             },
-            permission_mode_explicitly_set: false,
+            access_mode_explicitly_set: false,
             reasoning_effort_explicitly_set: false,
             model_explicitly_set: false,
             applied_config_version: 0,
@@ -1031,8 +1031,8 @@ impl Thread {
             &self.extra_working_dirs,
             None,
         );
-        if self.permission_mode != PermissionMode::default() {
-            engine.set_permission_mode(self.permission_mode);
+        if self.access_mode != AccessMode::default() {
+            engine.set_access_mode(self.access_mode);
         }
         if self.reasoning_effort != ReasoningEffort::default() {
             engine.set_thinking_level(Some(self.reasoning_effort.wire_value().to_string()));
@@ -1056,8 +1056,8 @@ impl Thread {
             BackendNotice::Event(event) => {
                 // Mirror the gate policy before the chip hears about the
                 // change.
-                if let ThreadEvent::PermissionModeChanged { mode } = *event {
-                    self.permission_mode = mode;
+                if let ThreadEvent::AccessModeChanged { mode } = *event {
+                    self.access_mode = mode;
                 }
                 if let ThreadEvent::PlanModeChanged { enabled } = *event {
                     self.plan_mode = enabled;
@@ -1106,7 +1106,7 @@ impl Thread {
                 let ReadyInfo {
                     restored,
                     model,
-                    permission_mode,
+                    access_mode,
                     reasoning_effort,
                     browser_suites,
                     plan_mode,
@@ -1151,8 +1151,8 @@ impl Thread {
                 {
                     self.model = Some(m);
                 }
-                if !self.permission_mode_explicitly_set {
-                    self.permission_mode = permission_mode;
+                if !self.access_mode_explicitly_set {
+                    self.access_mode = access_mode;
                 }
                 if !self.reasoning_effort_explicitly_set {
                     self.reasoning_effort = reasoning_effort;
@@ -1237,7 +1237,7 @@ impl Thread {
                 // turn fires.
                 let ui = MessageUiMetadata {
                     model_id: self.model.as_ref().map(|m| m.id.clone()),
-                    approval_mode: Some(self.permission_mode.as_i64()),
+                    access_mode: Some(self.access_mode.as_i64()),
                     author: Some(crate::MessageAuthor::Harness),
                     ..Default::default()
                 };
@@ -1588,8 +1588,8 @@ impl Thread {
             .unwrap_or_else(|| "manox".to_string())
     }
 
-    pub fn permission_mode(&self) -> PermissionMode {
-        self.permission_mode
+    pub fn access_mode(&self) -> AccessMode {
+        self.access_mode
     }
 
     pub fn reasoning_effort(&self) -> ReasoningEffort {
@@ -1891,7 +1891,7 @@ impl Thread {
         let id = ThreadId(uuid::Uuid::new_v4().to_string());
         let cwd = self.cwd.clone();
         let model = self.model.clone();
-        let permission_mode = self.permission_mode;
+        let access_mode = self.access_mode;
         let reasoning_effort = self.reasoning_effort;
         // A member works in its leader's project, so it shards there.
         let (sessions_dir, session_file) =
@@ -1921,8 +1921,8 @@ impl Thread {
             &[],
             None,
         );
-        if permission_mode != PermissionMode::default() {
-            engine.set_permission_mode(permission_mode);
+        if access_mode != AccessMode::default() {
+            engine.set_access_mode(access_mode);
         }
         if reasoning_effort != ReasoningEffort::default() {
             engine.set_thinking_level(Some(reasoning_effort.wire_value().to_string()));
@@ -1932,7 +1932,7 @@ impl Thread {
             cwd,
             project: None,
             model,
-            permission_mode,
+            access_mode,
             messages: Vec::new(),
             reasoning_effort,
             pinned: false,
@@ -1949,7 +1949,7 @@ impl Thread {
             last_user_ui: None,
             engine: Some(engine),
             history_phase: HistoryPhase::Ready,
-            permission_mode_explicitly_set: true,
+            access_mode_explicitly_set: true,
             reasoning_effort_explicitly_set: true,
             model_explicitly_set: true,
             applied_config_version: 0,
@@ -2161,21 +2161,21 @@ impl Thread {
         }
     }
 
-    pub fn set_permission_mode(&mut self, mode: PermissionMode) {
-        if self.permission_mode == mode {
+    pub fn set_access_mode(&mut self, mode: AccessMode) {
+        if self.access_mode == mode {
             return;
         }
-        self.permission_mode = mode;
+        self.access_mode = mode;
         // An explicit user choice must survive engine materialization: the
         // session sidecar's default would otherwise overwrite it at `Ready`.
-        self.permission_mode_explicitly_set = true;
+        self.access_mode_explicitly_set = true;
         if let Some(engine) = &self.engine {
             // The engine applies the mode to its gate and persists it in the
             // session sidecar; the chip reflects the change immediately.
-            engine.set_permission_mode(mode);
+            engine.set_access_mode(mode);
         }
         self.pending_events
-            .push(ThreadEvent::PermissionModeChanged { mode });
+            .push(ThreadEvent::AccessModeChanged { mode });
     }
 
     /// Deliver the user's answer for a pending interaction card
@@ -2279,12 +2279,12 @@ impl Thread {
             }
         }
 
-        if let Some(mode) = source.permission_mode()
-            && mode != self.permission_mode
+        if let Some(mode) = source.access_mode()
+            && mode != self.access_mode
         {
-            self.set_permission_mode(mode);
+            self.set_access_mode(mode);
             self.insert_config_notice(&format!(
-                "[harness] The permission mode is now {}. Adjust your approach accordingly.",
+                "[harness] The access mode is now {}. Adjust your approach accordingly.",
                 mode.wire()
             ));
         }
@@ -2505,30 +2505,29 @@ impl Thread {
             Some("mode") => {
                 let trimmed = args.trim();
                 if trimmed.is_empty() {
-                    let next = match self.permission_mode() {
-                        PermissionMode::ReadOnly => PermissionMode::WorkspaceWrite,
-                        PermissionMode::WorkspaceWrite => PermissionMode::DangerFullAccess,
-                        PermissionMode::DangerFullAccess => PermissionMode::ReadOnly,
+                    // No argument: toggle between the two tiers.
+                    let next = match self.access_mode() {
+                        AccessMode::Sandbox => AccessMode::FullAccess,
+                        AccessMode::FullAccess => AccessMode::Sandbox,
                     };
-                    self.set_permission_mode(next);
+                    self.set_access_mode(next);
                 } else {
                     let (name, rest) = match trimmed.split_once(char::is_whitespace) {
                         Some((head, tail)) => (head, tail.trim()),
                         None => (trimmed, ""),
                     };
-                    let parsed: Result<PermissionMode, _> =
+                    let parsed: Result<AccessMode, _> =
                         serde_json::from_value(serde_json::Value::String(name.to_string()));
                     match parsed {
                         Ok(mode) => {
-                            self.set_permission_mode(mode);
+                            self.set_access_mode(mode);
                             if !rest.is_empty() {
                                 self.insert_slash_turn(rest.to_string(), ui);
                             }
                         }
                         Err(_) => {
                             self.pending_events.push(ThreadEvent::Error(anyhow::anyhow!(
-                                "unknown permission mode `{name}` (expected read-only, \
-                                 workspace-write, or danger-full-access)"
+                                "unknown access mode `{name}` (expected sandbox or full-access)"
                             )));
                         }
                     }
@@ -2893,7 +2892,7 @@ pub(crate) mod tests {
         history: Vec<Message>,
         shutdown_calls: AtomicUsize,
         abort_calls: AtomicUsize,
-        permission_mode: Mutex<Option<PermissionMode>>,
+        access_mode: Mutex<Option<AccessMode>>,
         thinking_level: Mutex<Option<String>>,
         /// Recorded `run` calls: (prompt, images) pairs.
         runs: Mutex<Vec<(String, Vec<manox_harness::types::ContentBlock>)>>,
@@ -2913,7 +2912,7 @@ pub(crate) mod tests {
                 history: Vec::new(),
                 shutdown_calls: AtomicUsize::new(0),
                 abort_calls: AtomicUsize::new(0),
-                permission_mode: Mutex::new(None),
+                access_mode: Mutex::new(None),
                 thinking_level: Mutex::new(None),
                 runs: Mutex::new(Vec::new()),
                 plan_persists: Mutex::new(Vec::new()),
@@ -2995,8 +2994,8 @@ pub(crate) mod tests {
             self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
         }
 
-        fn set_permission_mode(&self, mode: PermissionMode) {
-            *self.permission_mode.lock().unwrap() = Some(mode);
+        fn set_access_mode(&self, mode: AccessMode) {
+            *self.access_mode.lock().unwrap() = Some(mode);
         }
     }
 
@@ -3025,7 +3024,7 @@ pub(crate) mod tests {
             cwd: PathBuf::from("/tmp"),
             project: None,
             model: None,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             messages: Vec::new(),
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
@@ -3042,7 +3041,7 @@ pub(crate) mod tests {
             last_user_ui: None,
             engine: Some(engine),
             history_phase: phase,
-            permission_mode_explicitly_set: false,
+            access_mode_explicitly_set: false,
             reasoning_effort_explicitly_set: false,
             model_explicitly_set: false,
             applied_config_version: 0,
@@ -3062,27 +3061,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn permission_mode_maps_i64_roundtrip() {
-        assert_eq!(PermissionMode::from_i64(0), PermissionMode::ReadOnly);
-        assert_eq!(PermissionMode::from_i64(1), PermissionMode::WorkspaceWrite);
-        assert_eq!(
-            PermissionMode::from_i64(2),
-            PermissionMode::DangerFullAccess
-        );
-        assert_eq!(PermissionMode::ReadOnly.as_i64(), 0);
-        assert_eq!(PermissionMode::WorkspaceWrite.as_i64(), 1);
-        assert_eq!(PermissionMode::DangerFullAccess.as_i64(), 2);
-        // Unknown persisted values land on the bounded default.
-        assert_eq!(PermissionMode::from_i64(-1), PermissionMode::default());
-        assert_eq!(PermissionMode::from_i64(3), PermissionMode::default());
+    fn access_mode_maps_i64_roundtrip() {
+        // 1 = sandbox, 2 = full access; every other value (including the
+        // retired read-only 0) lands on the bounded default.
+        assert_eq!(AccessMode::from_i64(1), AccessMode::Sandbox);
+        assert_eq!(AccessMode::from_i64(2), AccessMode::FullAccess);
+        assert_eq!(AccessMode::Sandbox.as_i64(), 1);
+        assert_eq!(AccessMode::FullAccess.as_i64(), 2);
+        assert_eq!(AccessMode::from_i64(-1), AccessMode::default());
+        assert_eq!(AccessMode::from_i64(0), AccessMode::default());
+        assert_eq!(AccessMode::from_i64(3), AccessMode::default());
         // Wire names are the kebab sidecar values.
         assert_eq!(
-            serde_json::to_value(PermissionMode::DangerFullAccess).unwrap(),
-            serde_json::json!("danger-full-access")
+            serde_json::to_value(AccessMode::FullAccess).unwrap(),
+            serde_json::json!("full-access")
         );
         assert_eq!(
-            serde_json::from_value::<PermissionMode>(serde_json::json!("read-only")).unwrap(),
-            PermissionMode::ReadOnly
+            serde_json::from_value::<AccessMode>(serde_json::json!("sandbox")).unwrap(),
+            AccessMode::Sandbox
         );
     }
 
@@ -3130,7 +3126,7 @@ pub(crate) mod tests {
             )])],
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3171,7 +3167,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3205,10 +3201,10 @@ pub(crate) mod tests {
         assert_eq!(engine.runs.lock().unwrap().len(), 1);
 
         assert!(thread.with_mut(|t| t.run_slash_builtin("mode", "", None)));
-        thread.read(|t| assert_eq!(t.permission_mode(), PermissionMode::DangerFullAccess));
-        // Named form sets the mode directly.
-        assert!(thread.with_mut(|t| t.run_slash_builtin("mode", "read-only", None)));
-        thread.read(|t| assert_eq!(t.permission_mode(), PermissionMode::ReadOnly));
+        thread.read(|t| assert_eq!(t.access_mode(), AccessMode::FullAccess));
+        // Named form sets the mode directly; the toggle flips back.
+        assert!(thread.with_mut(|t| t.run_slash_builtin("mode", "sandbox", None)));
+        thread.read(|t| assert_eq!(t.access_mode(), AccessMode::Sandbox));
         assert!(thread.with_mut(|t| t.run_slash_builtin("compact", "focus", None)));
         assert!(thread.with_mut(|t| t.run_slash_builtin("goal", "clear", None)));
 
@@ -3235,7 +3231,7 @@ pub(crate) mod tests {
             ],
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3385,7 +3381,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3401,14 +3397,14 @@ pub(crate) mod tests {
         });
         assert_eq!(thread.read(|t| t.messages.len()), 1);
 
-        // A row with a changed permission pick: applied + noticed, in order.
+        // A row with a changed access pick: applied + noticed, in order.
         store.create_conversation(&sid, None);
-        store.set_permission_mode(&sid, Some("read-only"));
+        store.set_access_mode(&sid, Some("full-access"));
         thread.with_mut(|t| {
             t.insert_user_message_with_ui_metadata("second".to_string(), None);
         });
-        let applied = *engine.permission_mode.lock().unwrap();
-        assert_eq!(applied, Some(PermissionMode::ReadOnly));
+        let applied = *engine.access_mode.lock().unwrap();
+        assert_eq!(applied, Some(AccessMode::FullAccess));
         let texts: Vec<String> = thread.read(|t| {
             t.messages
                 .iter()
@@ -3419,7 +3415,7 @@ pub(crate) mod tests {
                 .collect()
         });
         assert!(
-            texts[1].contains("[harness] The permission mode is now read-only"),
+            texts[1].contains("[harness] The access mode is now full-access"),
             "the notice lands ahead of the triggering message: {texts:?}"
         );
         assert_eq!(texts[2], "second");
@@ -3466,7 +3462,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3476,7 +3472,7 @@ pub(crate) mod tests {
         let thread = thread_with_engine_id(HistoryPhase::Ready, engine.clone(), "restated");
         let sid = "restated".to_string();
         store.create_conversation(&sid, None);
-        store.set_permission_mode(&sid, Some(PermissionMode::ReadOnly.wire()));
+        store.set_access_mode(&sid, Some(AccessMode::FullAccess.wire()));
         thread.with_mut(|t| {
             t.insert_user_message_with_ui_metadata("first".to_string(), None);
         });
@@ -3487,7 +3483,7 @@ pub(crate) mod tests {
         );
 
         // The same pick again: the version moves, the observable value does not.
-        store.set_permission_mode(&sid, Some(PermissionMode::ReadOnly.wire()));
+        store.set_access_mode(&sid, Some(AccessMode::FullAccess.wire()));
         thread.with_mut(|t| {
             t.insert_user_message_with_ui_metadata("second".to_string(), None);
         });
@@ -3506,7 +3502,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3616,7 +3612,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3642,7 +3638,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3664,7 +3660,7 @@ pub(crate) mod tests {
             history: vec![Message::user("authoritative".to_string())],
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3680,7 +3676,7 @@ pub(crate) mod tests {
             goal: None,
             restored: true,
             model: None,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
             plan_mode: false,
@@ -3721,7 +3717,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3738,16 +3734,16 @@ pub(crate) mod tests {
         assert_eq!(count, 0, "stale preview is dropped");
     }
 
-    /// I3: an explicit user permission-mode choice on a landing thread
+    /// I3: an explicit user access-mode choice on a landing thread
     /// survives the sidecar default arriving at `Ready`
-    /// (`permission_mode_explicitly_set`).
+    /// (`access_mode_explicitly_set`).
     #[tokio::test]
-    async fn explicit_permission_mode_survives_ready_sidecar_default() {
+    async fn explicit_access_mode_survives_ready_sidecar_default() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3755,14 +3751,14 @@ pub(crate) mod tests {
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
-        thread.with_mut(|t| t.set_permission_mode(PermissionMode::ReadOnly));
+        thread.with_mut(|t| t.set_access_mode(AccessMode::FullAccess));
         // The fresh session's sidecar reports the default at Ready; the
-        // user's ReadOnly choice must not be overwritten.
+        // user's full-access choice must not be overwritten.
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
             goal: None,
             restored: false,
             model: None,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
             plan_mode: false,
@@ -3774,10 +3770,7 @@ pub(crate) mod tests {
             archived: false,
             project: None,
         })));
-        assert_eq!(
-            thread.read(|t| t.permission_mode()),
-            PermissionMode::ReadOnly
-        );
+        assert_eq!(thread.read(|t| t.access_mode()), AccessMode::FullAccess);
     }
 
     /// P1: `PlanUpdated` mirrors onto the facade and persists through the
@@ -3788,7 +3781,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3845,7 +3838,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3865,7 +3858,7 @@ pub(crate) mod tests {
             goal: None,
             restored: true,
             model: None,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
             plan_mode: false,
@@ -3890,7 +3883,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3905,7 +3898,7 @@ pub(crate) mod tests {
             goal: None,
             restored: false,
             model: None,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
             plan_mode: false,
@@ -3928,7 +3921,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -3940,7 +3933,7 @@ pub(crate) mod tests {
             goal: None,
             restored: true,
             model: None,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             reasoning_effort: ReasoningEffort::Max,
             browser_suites: Vec::new(),
             plan_mode: false,
@@ -3982,7 +3975,7 @@ pub(crate) mod tests {
             goal: None,
             restored: true,
             model: None,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: vec![crate::engine::BrowserSuite::WebExplore],
             plan_mode: false,
@@ -4017,7 +4010,7 @@ pub(crate) mod tests {
             goal: None,
             restored: true,
             model: None,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: vec![],
             plan_mode: false,
@@ -4045,7 +4038,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
+            access_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -4071,7 +4064,7 @@ pub(crate) mod tests {
             goal: None,
             restored: true,
             model: None,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
             plan_mode: false,
@@ -4108,7 +4101,7 @@ pub(crate) mod tests {
             goal: None,
             restored: false,
             model,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
             plan_mode: false,
@@ -4166,7 +4159,7 @@ pub(crate) mod tests {
             goal: None,
             restored: true,
             model: None,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
             plan_mode: false,
@@ -4195,7 +4188,7 @@ pub(crate) mod tests {
             goal: None,
             restored: true,
             model: None,
-            permission_mode: PermissionMode::default(),
+            access_mode: AccessMode::default(),
             reasoning_effort: ReasoningEffort::default(),
             browser_suites: Vec::new(),
             plan_mode: false,

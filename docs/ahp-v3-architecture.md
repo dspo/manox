@@ -8,7 +8,7 @@
 
 - 两仓**已经是**「一进程内、typed 的状态同步协议」：`dspo/manox` 的 `manox-protocol` v2（`crates/manox-protocol`，约 4.4k LOC）+ `manox-session-core` 的 `AgentServer` 单例（`agent_server.rs` 5588 行）经 `transport::RpcConnection` 的 `in_process_pair`（async_channel，进程内对象）与 GPUI 前端通信；`cx web` 另起 loopback WS（`ws/{mod,listener,connection}.rs`，`/ws` 单路由、`?token=`、`~/.manox/gateway-ws.json`、`~/.manox/gateway.lock` 单例），**同一套帧直挂 socket 上**，无翻译层。
 - 协议 v2 已自带的协议级机制（与 AHP 高度重叠）：`Initialize{protocol_epoch}` 握手、`FollowSession` 流（`Snapshot`→`Entry`→`Projections`）、seq 单点盖章（L4）、投影 `key→{value,asOfSeq}` higher-seq-wins（L6）、溢出即 `StreamEnd{Resync}` 的重同步（L5）、客户端缺口修复引擎 `journal_stream.rs`（497 行）、六车道信封（`FromClient`/`FromServer`）、31 个 `ClientNote` + 18 个 `ClientCall` + 6 个 `ServerCall`（waterfall 审批/询问/计划评审）+ `HostEvent` 总线 + `wire_surface!` 声明面（`surface.rs` 1032 行）。
-- 客户端侧（`dspo/manox-app`）已自行实现 AHP 意义上的 state store：`client_store.rs`+`client_store_handle.rs`（1153+2143 行）持 journal 窗口 + 投影面 + echo 表 + 传输状态，`journal_fold.rs`/`journal_translate.rs`（437+888）折叠与翻译，`multiplexer.rs`（1970）做 MsgId/StreamId 路由；`source_gates.rs`（432）用 grep 计数冻结「绕过网关的直读」，`views/*` 仍 import runtime Rust 类型（`ThreadEvent`/`Message`/`HistoryEntry`/`PermissionMode`…）并持 `ThreadHandle`「渲染镜像」。
+- 客户端侧（`dspo/manox-app`）已自行实现 AHP 意义上的 state store：`client_store.rs`+`client_store_handle.rs`（1153+2143 行）持 journal 窗口 + 投影面 + echo 表 + 传输状态，`journal_fold.rs`/`journal_translate.rs`（437+888）折叠与翻译，`multiplexer.rs`（1970）做 MsgId/StreamId 路由；`source_gates.rs`（432）用 grep 计数冻结「绕过网关的直读」，`views/*` 仍 import runtime Rust 类型（`ThreadEvent`/`Message`/`HistoryEntry`/`AccessMode`…）并持 `ThreadHandle`「渲染镜像」。
 - AHP 侧（`~/projects/github/agent-host-protocol`，spec **1.0.0**）：JSON-RPC 2.0 + URI channel（`ahp-root://`、`ahp-session:/<uuid>`、`ahp-chat:/<cid>`、`ahp-terminal:/<id>`、`ahp-changeset:/<id>`、`ahp-automations://`、`ahp-session:/<uuid>/annotations`、`ahp-resource-watch:/<id>`、`ahp-otlp:`、`mcp://`）；"每帧 params 顶层带 `channel`" 使 `(method, params.channel)` 即可路由；宿主权威状态 + 客户端乐观写前（`dispatchAction{clientSeq}` → 宿主回 `action` 信封带 `origin{clientId,clientSeq}`/`rejectionReason`）；全局单调 `serverSeq` 与 `reconnect{lastSeenServerSeq}` 的「重放或快照」二选一；能力协商；`_meta` 与 **`x-` 前缀**为合法私有扩展位。
 - **必须自建（AHP 无宿主 SDK）**：`ahp`/`ahp-types`/`ahp-ws` 三个 crate 全是客户端（`ahp-ws` 只会 dial），没有任何 server/listener/session-manager/dispatcher/replay 设施。宿主半边——JSON-RPC 路由、全局 `serverSeq` 序号、快照与重连、动作校验/接受表、副作用派发（动作 → 真正跑 agent）、`resource*` 文件面——**是我们的新增维护面**。参考实现只有 VS Code（TS，`src/vs/platform/agentHost/node/`）与一个 157 行的 dotnet 一致性 fixture。
 
@@ -100,7 +100,7 @@ manox 内核 ThreadCore + Journal v4（磁盘 .jsonl，生态工具仍可直读�
 | `TerminalAttach` / `TerminalSnapshot` | `subscribe(ahp-terminal:/<id>)` + `terminal/claimed` |
 | `ModelChat` | `x-manox/modelChat` 命令 + 流式通知（stateless 通道） |
 | `RegisterSessionTools` | AHP 客户端工具腿（`activeClients`/`session.server_tools` + 归属客户端的 `chat/toolCallComplete`）；形状不足时兜底 `x-manox/invokeTool` |
-| `CreateSession{cwd,project,initial_model,approval_mode,reasoning_effort}` | `createSession{channel:ahp-session:/<客户端铸 uuid>,provider,workingDirectories,config}`；`lifecycle:'creating'`→`session/ready`；幂等键 = 客户端铸 URI |
+| `CreateSession{cwd,project,initial_model,access_mode,reasoning_effort}` | `createSession{channel:ahp-session:/<客户端铸 uuid>,provider,workingDirectories,config}`；`lifecycle:'creating'`→`session/ready`；幂等键 = 客户端铸 URI |
 | `Submit{session_id,text,images,origin_rpc}` | `dispatchAction{channel:ahp-chat:/<sid>,clientSeq,action:{type:'chat/turnStarted',turnId,message:{text,origin:{kind:'user'},attachments:[embeddedResource]}}}`（`origin_rpc` 角色由 `clientSeq` 取代） |
 | `Steer` | `chat/pendingMessageSet{kind:'steering'}` |
 | `PageHistory` | `fetchTurns{cursor}`（翻页语义）；journal 条目级翻页由 `x-manox/fetchEntries` 兜底 |
@@ -111,7 +111,7 @@ manox 内核 ThreadCore + Journal v4（磁盘 .jsonl，生态工具仍可直读�
 
 **`ClientNote`（27 + 3 compat）**
 
-`DetachSession`→`unsubscribe`；`DisposeSession`→`disposeChat`/`disposeSession`；`DropQueued`→`chat/pendingMessageRemoved{kind:'queued'}`；`CancelTurn`→`chat/turnCancelled`；`SetModel`→`session/configChanged`（canonical 串）；`SetReasoningEffort`/`SetApprovalMode`/`SetBrowserSuite`→`session/configChanged`（ConfigSchema 枚举；browser suite 仍由 `x-manox-work` 记状态）；`SetCwd`→`session/workingDirectorySet|Removed|Replaced`；`SetPlanMode`→`x-manox-plan/planModeChanged`；`PlanSeedExecution`→`x-manox/planExecute`（命令）；`Compact`→`x-manox/compact`（命令）；`Goal`→`x-manox/goal`（命令；状态落 `x-manox-work/goalChanged`）；`StopBackgroundTask`→无落点（`backgroundTaskStopped` 声明随声明面 v5 删除——它从未接派发臂，宿主也从不发）；`ArchiveThread`→`session/isArchivedChanged`；`PinThread`→`x-manox/pinnedChanged`（AHP 无 pin 位）；`InsertThreadBefore`/`InsertGroupBefore`→`x-manox/orderChanged`；`TerminalInput`/`TerminalResize`→`terminal/input`/`terminal/resized`；`CancelModelChat`→无落点（`x-manox/modelChatCancel` 随 v2 网关删除，`not-on-wire`）；`Shutdown`→无落点（连接关闭即断开，`not-on-wire`）；`AppendUserMessage`→`chat/pendingMessageSet{kind:'queued'}`；`AppendUiNote`→`chat/responsePart{kind:'systemNotification'}`；compat `CreateSession`/`Submit`/`Steer` 随 v2 一并删除（无兼容期）。
+`DetachSession`→`unsubscribe`；`DisposeSession`→`disposeChat`/`disposeSession`；`DropQueued`→`chat/pendingMessageRemoved{kind:'queued'}`；`CancelTurn`→`chat/turnCancelled`；`SetModel`→`session/configChanged`（canonical 串）；`SetReasoningEffort`/`SetAccessMode`/`SetBrowserSuite`→`session/configChanged`（ConfigSchema 枚举；browser suite 仍由 `x-manox-work` 记状态）；`SetCwd`→`session/workingDirectorySet|Removed|Replaced`；`SetPlanMode`→`x-manox-plan/planModeChanged`；`PlanSeedExecution`→`x-manox/planExecute`（命令）；`Compact`→`x-manox/compact`（命令）；`Goal`→`x-manox/goal`（命令；状态落 `x-manox-work/goalChanged`）；`StopBackgroundTask`→无落点（`backgroundTaskStopped` 声明随声明面 v5 删除——它从未接派发臂，宿主也从不发）；`ArchiveThread`→`session/isArchivedChanged`；`PinThread`→`x-manox/pinnedChanged`（AHP 无 pin 位）；`InsertThreadBefore`/`InsertGroupBefore`→`x-manox/orderChanged`；`TerminalInput`/`TerminalResize`→`terminal/input`/`terminal/resized`；`CancelModelChat`→无落点（`x-manox/modelChatCancel` 随 v2 网关删除，`not-on-wire`）；`Shutdown`→无落点（连接关闭即断开，`not-on-wire`）；`AppendUserMessage`→`chat/pendingMessageSet{kind:'queued'}`；`AppendUiNote`→`chat/responsePart{kind:'systemNotification'}`；compat `CreateSession`/`Submit`/`Steer` 随 v2 一并删除（无兼容期）。
 
 **`ServerCall`（6）**
 
@@ -232,7 +232,7 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 ### W2 域翻译与状态收敛（manox）
 
-- `projection.rs`（manox-ahp-runtime）：kernel 会话记录 **全射** → AHP 动作（消息、流式 delta 的 create-then-append、tool-call 生命周期、usage、lifecycle、title/activity、workingDirectories、config 承载 model/effort/approval/browserSuite、compaction、分支/摘要）；projection 值 → 通道状态字段。**2026-10-09 起无中间 wire 词汇**：`manox-journal`（§C.2 v2 遗产词汇 crate）已删除，投影输入即 kernel `SessionTreeEntry` 记录（#878）。
+- `projection.rs`（manox-ahp-runtime）：kernel 会话记录 **全射** → AHP 动作（消息、流式 delta 的 create-then-append、tool-call 生命周期、usage、lifecycle、title/activity、workingDirectories、config 承载 model/effort/accessMode/browserSuite、compaction、分支/摘要）；projection 值 → 通道状态字段。**2026-10-09 起无中间 wire 词汇**：`manox-journal`（§C.2 v2 遗产词汇 crate）已删除，投影输入即 kernel `SessionTreeEntry` 记录（#878）。
 - 审批面：`Approve` → `toolCallReady`(+`options[]`)/`toolCallConfirmed`（含 mid-execution 再确认、可编辑参数、result confirmation 三态的映射取舍）；`AskUserQuestion` → elicitation；`PlanVerdict` → x-manox-plan。
 - 副作用派发：`chat/turnStarted|pendingMessageSet|turnCancelled|toolCallConfirmed|inputCompleted|isArchivedChanged|workingDirectory*` 等 → 现有内核调用（原 27 个 note 的落点）。
 - x-manox 全线 + `resource*` 最小面（`resourceRead/Write/List/Delete` + ContentRef，落在会话工作目录围栏内，fail-closed）。
@@ -404,7 +404,7 @@ confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
 - **dispatch 映射**（`ahp/backend.rs`）：`chat/turnStarted`→`submit`；`chat/pendingMessageSet`→`steer`；
   `chat/pendingMessageRemoved`→`drop_queued`；`chat/turnCancelled`→线程 `cancel`；
   `chat/toolCallConfirmed`→`respond_authorization`；`chat/inputCompleted`→`respond_question`；
-  `session/configChanged`→`set_model`/`set_reasoning_effort`/`set_approval_mode` 扇出；
+  `session/configChanged`→`set_model`/`set_reasoning_effort`/`set_access_mode` 扇出；
   `session/workingDirectorySet`→`set_cwd`；`session/isArchivedChanged`→`archive_thread`。
   实施期修订：`SessionIsReadChanged`/`ChatDraftChanged`/`ChatTurnResume`/
   `ChatToolCallResultConfirmed`/`ChatInputAnswerChanged`/`ChatQueuedMessagesReordered`/
@@ -817,7 +817,7 @@ W4 开工前逐文件核实，发现**计划 §一「`manox-session-core` 整体
 
 **③ 拆除中暴露并修掉的 fail-closed 缺陷（都是真 bug，不是重构副作用）**：
 
-- `set_model`/`set_reasoning_effort`/`set_approval_mode` 返回 `()`，失败时只发 v2 note，而 AHP
+- `set_model`/`set_reasoning_effort`/`set_access_mode` 返回 `()`，失败时只发 v2 note，而 AHP
   派发无条件回 `Accepted`——**客户端被告知模型改动已生效，然后收敛到一个会话并未运行的模型**。
   三个 setter 及 `compact`/`plan_seed`/`set_cwd`/`goal` 改为返回 `Result`，派发据实拒绝。
 - `x-manox/goal` 与 `x-manox/invokeTool` 在声明面里**声明了却从未派发**，客户端拿到的是
