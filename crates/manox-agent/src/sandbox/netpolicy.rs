@@ -8,20 +8,24 @@
 //!   enforcing families close the network themselves).
 //! - **on, allowlist empty** — [`NetworkRoute::Direct`]: the historical full
 //!   open; no proxy runs.
-//! - **on, allowlist non-empty** (macOS) — [`NetworkRoute::Managed`]: a
-//!   loopback HTTP CONNECT proxy starts for the session, the profile admits
-//!   only that port plus loopback, and the trapped env carries the proxy
-//!   variables. A client that ignores the proxy env finds no non-loopback
-//!   allowance and fails closed at the OS layer.
+//! - **on, allowlist non-empty** — [`NetworkRoute::Managed`]: a loopback
+//!   HTTP CONNECT proxy starts for the session, and the trapped env carries
+//!   the proxy variables. macOS reaches it through the seatbelt profile
+//!   (only that port plus loopback allowed); Linux runs the sandbox in an
+//!   isolated network namespace whose only egress is the listener the inner
+//!   helper hands back and this module's proxy serves behind the host
+//!   bridge (`sandbox::bridge`). A client that ignores the proxy env finds
+//!   no non-loopback path either way and fails closed at the OS layer.
 //!
 //! The proxy judges each CONNECT target against the allowlist — exact
 //! hosts, `*.example.com` (any subdomain), `**.example.com` (apex plus
 //! subdomains), and IP literals. A hostname that resolves to a private,
 //! loopback, or link-local address is refused even when allowlisted (an
 //! allowlist entry is not an SSRF grant into the host's own services); an
-//! explicitly allowlisted IP literal is honored. Linux starts no proxy: its
-//! managed path needs a loopback bridge inside the network namespace (a
-//! later stage), so `on` stays fully direct there.
+//! explicitly allowlisted IP literal is honored. On a platform without a
+//! managed transport (`sandbox::managed_transport_ready`), an allowlist
+//! fails closed to `Disabled` — never an open route against the configured
+//! intent.
 //!
 //! The policy is per-session state hanging off the approval gate; dropping
 //! the gate aborts the proxy task and closes the listener.
@@ -496,23 +500,18 @@ impl NetworkPolicy {
     pub fn route_for(&self, access: NetworkAccess) -> NetworkRoute {
         match access {
             NetworkAccess::Off => NetworkRoute::Disabled,
-            NetworkAccess::On => {
-                // No managed path binds on Linux yet (the netns loopback
-                // bridge is a later stage): an allowlist there fails closed
-                // rather than running direct against the configured intent.
-                match self.inner.running.lock().unwrap().as_ref() {
-                    Some(proxy) => NetworkRoute::Managed {
-                        proxy_port: proxy.port,
-                    },
-                    None => {
-                        if self.inner.ctx.allowlist().is_empty() {
-                            NetworkRoute::Direct
-                        } else {
-                            NetworkRoute::Disabled
-                        }
+            NetworkAccess::On => match self.inner.running.lock().unwrap().as_ref() {
+                Some(proxy) => NetworkRoute::Managed {
+                    proxy_port: proxy.port,
+                },
+                None => {
+                    if self.inner.ctx.allowlist().is_empty() {
+                        NetworkRoute::Direct
+                    } else {
+                        NetworkRoute::Disabled
                     }
                 }
-            }
+            },
         }
     }
 
@@ -521,14 +520,12 @@ impl NetworkPolicy {
         self.inner.ctx.install_approver(approver);
     }
 
-    /// Apply the switch's proxy half: stop the proxy on off; on macOS with
-    /// an on-switch and a non-empty allowlist, ensure the proxy is running
-    /// (a running proxy keeps serving — the next enable re-reads the file).
-    /// Returns after the end-state is in place.
+    /// Apply the switch's proxy half: stop the proxy on off; with an
+    /// on-switch and a non-empty allowlist, ensure the proxy is running
+    /// where the platform can carry the managed route (a running proxy
+    /// keeps serving — the next enable re-reads the file). Returns after
+    /// the end-state is in place.
     pub async fn set_enabled(&self, access: NetworkAccess) {
-        if !cfg!(target_os = "macos") {
-            return;
-        }
         if access == NetworkAccess::Off {
             *self.inner.running.lock().unwrap() = None; // Drop aborts the loop.
             return;
@@ -543,6 +540,15 @@ impl NetworkPolicy {
             .recompile(crate::settings::sandbox_network_allow());
         if self.inner.ctx.allowlist().is_empty() {
             return; // Direct route: no proxy.
+        }
+        if !super::managed_transport_ready() {
+            // No managed transport where the policy wants one: no proxy
+            // binds, so `route_for` answers Disabled — fail-closed, never
+            // an open route against the configured intent.
+            tracing::warn!(
+                "managed network transport unavailable on this platform; sandbox network stays closed"
+            );
+            return;
         }
         match ProxyServer::bind(self.inner.ctx.clone()).await {
             Ok(server) => {

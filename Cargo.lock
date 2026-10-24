@@ -3088,6 +3088,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rmcp",
  "rusqlite",
+ "rustix 0.38.44",
  "schemars",
  "seccompiler",
  "serde",

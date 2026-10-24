@@ -1,6 +1,7 @@
 //! OS-level sandbox for the kernel-path `bash` tool: macOS seatbelt
-//! (`sandbox-exec`) wrapping one-shot commands, Linux bubblewrap + seccomp
-//! (`sandbox::linux`) under the same writable-root vocabulary.
+//! (`sandbox-exec`) wrapping one-shot commands, Linux bubblewrap + an inner
+//! seccomp helper (`sandbox::linux`, `sandbox::inner`) under the same
+//! writable-root vocabulary.
 //!
 //! The seatbelt renders a per-call profile from the effective `AccessMode`:
 //! `sandbox` confines writes to the shared `writable_roots`; `full-access`
@@ -15,10 +16,11 @@
 //! switch (the [`NetworkRoute`]): off renders no network allowance at all
 //! (unix-socket IPC stays so subprocess plumbing survives), on-without-
 //! allowlist keeps the historical full open with the platform's DNS/TLS
-//! minimums, and the managed route admits only the loopback proxy. Writable
-//! roots are validated at construction: a symlink inside a root's component
-//! chain fails the build (fail-closed) while the platform's top-level aliases
-//! (`/tmp` → `/private/tmp`) are normalized instead.
+//! minimums, and the managed route admits only the loopback proxy (macOS)
+//! or the netns bridge listener (Linux). Writable roots are validated at
+//! construction: a symlink inside a root's component chain fails the build
+//! (fail-closed) while the platform's top-level aliases (`/tmp` →
+//! `/private/tmp`) are normalized instead.
 //!
 //! The kernel `BashOperations` trait stays untouched (layering red line: no
 //! domain field in the kernel). The per-call effective mode reaches the
@@ -40,30 +42,46 @@ use tokio_util::sync::CancellationToken;
 // callers that still reach it as `crate::sandbox::canonicalize_best_effort`.
 pub use manox_harness::sandbox::canonicalize_best_effort;
 
-/// The Linux backend (bubblewrap + seccomp); compiled only on its target.
+/// The Linux backend (bubblewrap + the inner seccomp helper); compiled only
+/// on its target.
 #[cfg(target_os = "linux")]
 mod linux;
 
+/// The managed route's host-side transport on Linux: the control channel
+/// that receives the netns listener from the inner helper and the relay to
+/// the session proxy.
+#[cfg(target_os = "linux")]
+mod bridge;
+
+/// The inner sandbox helper: the host binary re-executing itself inside the
+/// sandbox; a `.init_array` constructor dispatches on the sentinel env.
+#[cfg(target_os = "linux")]
+mod inner;
+
 /// The managed-network half: the domain allowlist, the loopback CONNECT
-/// proxy, and the route the profile renders. macOS-only in effect — the
-/// Linux managed path needs a netns loopback bridge (a later stage).
+/// proxy, and the route the profile renders. The judge and proxy are
+/// platform-neutral; Linux reaches them through the netns bridge
+/// (`bridge`/`inner`).
 pub mod netpolicy;
 
 /// The network face one confined call runs under: the session's
-/// `networkAccess` switch plus, when the managed proxy is running (macOS,
+/// `networkAccess` switch plus, when the managed proxy is running (the
 /// allowlist configured), the loopback port it listens on. `full-access`
 /// calls never reach a renderer, so there is no "open" face here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkRoute {
     /// `networkAccess=off`: no network allowance is rendered; Linux unshares
-    /// the network namespace and installs the socket-restricted seccomp face.
+    /// the network namespace and the inner helper installs the
+    /// socket-restricted seccomp face.
     Disabled,
     /// `networkAccess=on` with no allowlist: fully open, the pre-closure
     /// behavior byte for byte.
     Direct,
-    /// `networkAccess=on` with an allowlist (macOS): the profile admits only
-    /// the loopback proxy and loopback itself; non-proxied clients fail
-    /// closed at the OS layer.
+    /// `networkAccess=on` with an allowlist: macOS admits only the loopback
+    /// proxy via the seatbelt; Linux runs in an isolated network namespace
+    /// whose only egress is the bridge listener the host relays to this
+    /// port. A client that ignores the proxy env fails closed at the OS
+    /// layer either way.
     Managed { proxy_port: u16 },
 }
 
@@ -568,6 +586,27 @@ pub fn is_available() -> bool {
     }
 }
 
+/// Whether this platform can carry the managed route's egress: macOS rides
+/// the seatbelt loopback allowance; Linux rides the netns bridge, which
+/// needs the host binary resolvable for the inner re-exec
+/// (`sandbox::linux::inner_ready`). The network policy consults this before
+/// binding its proxy, so an uncarryable managed shape fails closed
+/// (`Disabled`) instead of binding a proxy the trapped calls cannot reach.
+fn managed_transport_ready() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::inner_ready()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
 /// Non-interactive editor/pager defaults (see retired-harness rationale).
 pub const NONINTERACTIVE_ENV: &[(&str, &str)] = &[
     ("GIT_EDITOR", "true"),
@@ -703,7 +742,18 @@ impl SandboxedBashOperations {
             match self.policy_for(cwd).and_then(|policy| {
                 linux::wrap_command(&policy.writable_root_set(mode), command, cwd, route)
             }) {
-                Ok(cmd) => cmd,
+                // The bridge waiter detaches here: the registry spawns the
+                // command itself, so the handoff thread races it with the
+                // handoff deadline (a task that never spawns simply times
+                // the waiter out).
+                Ok(wrapped) => {
+                    if let Some(bridge) = wrapped.bridge
+                        && let NetworkRoute::Managed { proxy_port } = route
+                    {
+                        bridge.spawn_detached(proxy_port);
+                    }
+                    wrapped.command
+                }
                 Err(_) => refused(cwd),
             }
         }
@@ -776,14 +826,38 @@ impl BashOperations for SandboxedBashOperations {
                 .policy_for(&cwd)
                 .map_err(ExecutionError::Other)?
                 .writable_root_set(mode);
-            let mut cmd = linux::wrap_command(&roots, request.command, &cwd, route)
+            let wrapped = linux::wrap_command(&roots, request.command, &cwd, route)
                 .map_err(ExecutionError::Other)?;
+            let mut cmd = wrapped.command;
             cmd.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true);
-            let child = cmd
+            let mut child = cmd
                 .spawn()
                 .map_err(|e| ExecutionError::Spawn(e.to_string()))?;
+            // Managed: the inner hands its netns listener back after the
+            // spawn; a failed handoff kills the run and fails the call
+            // closed (never an open escape hatch).
+            if let Some(bridge) = wrapped.bridge {
+                let NetworkRoute::Managed { proxy_port } = route else {
+                    unreachable!("the bridge channel exists only under the managed route");
+                };
+                match tokio::task::spawn_blocking(move || bridge.handoff(proxy_port)).await {
+                    Ok(Ok(relay)) => relay.spawn_relay_thread(),
+                    Ok(Err(error)) => {
+                        let _ = child.kill().await;
+                        return Err(ExecutionError::Other(format!(
+                            "managed network handoff failed: {error}"
+                        )));
+                    }
+                    Err(error) => {
+                        let _ = child.kill().await;
+                        return Err(ExecutionError::Other(format!(
+                            "managed network handoff task failed: {error}"
+                        )));
+                    }
+                }
+            }
             let timeout = request.timeout.unwrap_or(DEFAULT_TIMEOUT);
             let mut result =
                 run_to_completion(child, request.on_data, timeout, &request.signal).await?;
