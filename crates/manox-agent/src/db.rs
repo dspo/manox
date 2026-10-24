@@ -20,8 +20,9 @@ pub struct ThreadSummary {
     pub title_override: Option<String>,
     pub model_id: String,
     pub provider_id: Option<String>,
-    /// Permission mode (`PermissionMode::as_i64` mapping); sidebar wash color.
-    pub approval_mode: i64,
+    /// Access mode (`AccessMode::as_i64` mapping: 1 = sandbox, 2 =
+    /// full access); sidebar wash color.
+    pub access_mode: i64,
     pub project: String,
     pub depth: i32,
     pub parent_id: Option<String>,

@@ -76,7 +76,7 @@ turn id 方案。结论如下，三条证据相互印证：
 | `ToolOutputChunk` | `chat/toolCallContentChanged` | A |
 | `Approval{kind:"request\|decision"}` | `chat/toolCallReady{status:pending-confirmation, options[]}` + 客户端 `chat/toolCallConfirmed` | A |
 | `Question{kind:"request\|decision"}` | `chat/inputRequested`·`chat/inputAnswerChanged`·`chat/inputCompleted`（`ChatInputRequest` 六种问法） | A |
-| `ModelChange` / `ReasoningEffortChange` / `PermissionModeChange` | `session/configChanged`（`SessionConfigState.values`；无审批策略时用 `ToolCallConfirmationReason::Setting` 语义进 running） | A |
+| `ModelChange` / `ReasoningEffortChange` | `session/configChanged`（`SessionConfigState.values`；无审批策略时用 `ToolCallConfirmationReason::Setting` 语义进 running）。`PermissionModeChange` 行已随 access-mode 收敛删除（模式不再进 journal，config 行由对象行承载） | A |
 | `CwdChange` | `session/workingDirectorySet` | A |
 | `ProjectChange` | `session/configChanged`（`project` 值）+ `SessionState.project` | A |
 | `Title` | `session/titleChanged` | A |
@@ -112,7 +112,7 @@ turn id 方案。结论如下，三条证据相互印证：
 ### §2.3 projection key（21）
 
 `title`→`session.titleChanged`；`cwd`→`SessionState.workingDirectories`；`project`→`SessionState.project`；
-`model`·`permission_mode`·`reasoning_effort`→`session/configChanged`；`plan_mode`·`plan`·`goal`·
+`model`·`access_mode`（accessMode 两档：`sandbox`/`full-access`）·`reasoning_effort`→`session/configChanged`；`plan_mode`·`plan`·`goal`·
 `browser_suites`·`background_tasks`·`pinned`→ `x-manox`（见 §2.1 同名行）；`running`→`SessionState.status`
 的 `InProgress` 位；`archived`→`IsArchived` 位；`pending_auth`→
 `session/inputNeededSet{request:ToolConfirmation}`（**原生**，且 AHP 要求由它派生
@@ -136,7 +136,7 @@ turn id 方案。结论如下，三条证据相互印证：
 
 `ClientNote`(27)：`DetachSession`→`unsubscribe`；`DisposeSession`→`disposeSession`；
 `DropQueued`→`chat/pendingMessageRemoved{kind:"queued"}`；`CancelTurn`→`chat/turnCancelled`；
-`SetModel`/`SetReasoningEffort`/`SetApprovalMode`→`session/configChanged`；`SetCwd`→`session/workingDirectory*`；
+`SetModel`/`SetReasoningEffort`/`SetAccessMode`→`session/configChanged`；`SetCwd`→`session/workingDirectory*`；
 `SetPlanMode`→`x-manox-plan/planModeChanged`（客户端可派发的 action）；`PlanSeedExecution`→`x-manox/planExecute`（命令）；
 `SetBrowserSuite`→无 `session/configChanged` 落点（宿主只认 schema 声明的 session-mutable 三键，浏览器套件不是其中之一；状态行由 `x-manox-work/browserSuitesChanged` 承载）；
 `Compact`→`x-manox/compact`（命令）；`Goal`→`x-manox/goal`（命令；状态落 `x-manox-work/goalChanged`）；
@@ -162,7 +162,7 @@ turn id 方案。结论如下，三条证据相互印证：
 
 | 落点 | 事件 |
 |---|---|
-| 已在 §2.1 有对应（经 `translate` 同一条路径） | `AgentText`·`AgentThinking`·`ToolCall`·`ToolResult`·`ToolOutput`·`SubagentStarted`·`SubagentProgress`·`SubagentChild`·`ToolCallAuthorization`·`TurnStarted`·`Stop`·`TurnFinished`·`Retry`·`Error`·`PermissionModeChanged`·`ModelChanged`·`ReasoningEffortChanged`·`GoalChanged`·`CwdChanged`·`CompactionStarted`·`Compaction`·`PlanReady`·`PlanUpdated`·`PlanModeChanged`·`BrowserSuitesChanged`·`BackgroundTaskUpdated`·`SteerInjected`（见 §1 的 turn 边界规则） |
+| 已在 §2.1 有对应（经 `translate` 同一条路径） | `AgentText`·`AgentThinking`·`ToolCall`·`ToolResult`·`ToolOutput`·`SubagentStarted`·`SubagentProgress`·`SubagentChild`·`ToolCallAuthorization`·`TurnStarted`·`Stop`·`TurnFinished`·`Retry`·`Error`·`AccessModeChanged`·`ModelChanged`·`ReasoningEffortChanged`·`GoalChanged`·`CwdChanged`·`CompactionStarted`·`Compaction`·`PlanReady`·`PlanUpdated`·`PlanModeChanged`·`BrowserSuitesChanged`·`BackgroundTaskUpdated`·`SteerInjected`（见 §1 的 turn 边界规则） |
 | `_meta` | `TitleChanged` |
 | 🔴 | `UserRowLanded`（client 从 journal fold，非 server 事件）·`PeerMessage`（多 agent 协作不在本期）·`HistoryProgress`·`HistoryRestored`（UI 瞬态）·`PrefixStability`·`CacheInvalidation`·`SideCallMetricsUpdated`·`MainCallMetricsUpdated`·`TokenUsageUpdated`（诊断指标，聚合进 `x-manox-metrics`） |
 

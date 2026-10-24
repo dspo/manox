@@ -2,7 +2,7 @@
 //
 // Supports long format (size/mtime columns), hidden files, and recursive depth.
 // Use this over `ls` in Bash for plain directory listings: no sandbox, no
-// approval in read-only mode. Use Bash `ls` only when format flags exceed
+// approval. Use Bash `ls` only when format flags exceed
 // what this tool offers (e.g. `-laR`, `-lhS`, `--sort=time`).
 
 use std::path::Path;
@@ -34,7 +34,7 @@ impl AgentTool for LsTool {
 
     fn description(&self) -> &str {
         "List directory contents. Use this over `ls` in Bash for plain \
-         directory listings: no sandbox, no approval in read-only mode. \
+         directory listings: no sandbox, no approval. \
          Supports long format (size/mtime), hidden files, and recursive depth. \
          Use Bash `ls` only when format flags exceed what this tool offers \
          (e.g. `-laR`, `-lhS`, `--sort=time`)."

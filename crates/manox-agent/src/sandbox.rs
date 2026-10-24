@@ -2,12 +2,12 @@
 //! (`sandbox-exec`) wrapping one-shot commands.
 //!
 //! The seatbelt renders a per-call file-effect profile from the effective
-//! `PermissionMode`: `read-only` denies all file writes (only required sinks
-//! like `/dev/null`); `workspace-write` allows the shared `writable_roots`;
-//! `danger-full-access` skips the seatbelt entirely (the unsandboxed backend).
+//! `AccessMode`: `sandbox` allows the shared `writable_roots`; `full-access`
+//! skips the seatbelt entirely (the unsandboxed backend, selected before any
+//! profile is rendered).
 //!
 //! Network and `.git` protection are outside the mode vocabulary: the
-//! `(allow default)` base admits all network, and `workspace-write` allows any
+//! `(allow default)` base admits all network, and `sandbox` allows any
 //! path under a writable root (including `.git`). Reads and process execution
 //! stay unrestricted in every mode.
 //!
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use manox_harness::env::{CommandResult, ExecutionError};
-use manox_harness::sandbox::{PermissionMode, writable_roots};
+use manox_harness::sandbox::{AccessMode, writable_roots};
 use manox_harness::tools::bash::{BashExecRequest, BashOperations};
 use tokio_util::sync::CancellationToken;
 
@@ -42,7 +42,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// windows-acl) adds its own list without touching the consumer.
 // The signatures are only classified in the macOS `exec` body; on other
 /// Confinement policy for one sandboxed invocation: the workspace root whose
-/// `writable_roots()` the `workspace-write` profile allows, plus extra
+/// `writable_roots()` the `sandbox` profile allows, plus extra
 /// granted roots (a same-repo worktree of the call's cwd admits itself;
 /// an escalation-approved root accumulates for the session — additive on
 /// top of the workspace, never a replacement). The effective mode is supplied per call
@@ -65,9 +65,9 @@ impl SandboxPolicy {
         }
     }
 
-    /// Add roots the `workspace-write` profile admits on top of the workspace
-    /// (canonicalized, deduplicated). Read-only rendering still admits
-    /// nothing; `danger-full-access` never renders.
+    /// Add roots the `sandbox` profile admits on top of the workspace
+    /// (canonicalized, deduplicated). Full access never renders a profile —
+    /// backend selection skips the seatbelt for it.
     pub fn with_extra_roots(mut self, roots: Vec<PathBuf>) -> Self {
         for root in roots {
             let canon = canonicalize_best_effort(&root);
@@ -81,16 +81,15 @@ impl SandboxPolicy {
     /// Render a seatbelt (`.sbpl`) policy string for the effective `mode`.
     /// Denylist base (`(allow default)`) with an allowlist over writes;
     /// network is unrestricted (the mode vocabulary governs file effects only,
-    /// not network or process visibility). `read-only` admits no writable
-    /// roots; `workspace-write` admits the shared `writable_roots()` plus the
-    /// extra granted roots. `danger-full-access` is never rendered — backend
-    /// selection skips the seatbelt for it.
-    pub fn render_seatbelt(&self, mode: PermissionMode) -> String {
+    /// not network or process visibility). `sandbox` admits the shared
+    /// `writable_roots()` plus the extra granted roots. `full-access` is
+    /// never rendered — backend selection skips the seatbelt for it.
+    pub fn render_seatbelt(&self, mode: AccessMode) -> String {
         let mut s = String::new();
         s.push_str("(version 1)\n");
         s.push_str("(allow default)\n");
         s.push_str("(deny file-write*)\n");
-        // The writable allow-list is empty unless the mode is `workspace-write`
+        // The writable allow-list is empty unless the mode is `sandbox`
         // (`writable_roots` checks the mode itself — no caller guard). Filter
         // out the filesystem root: admitting `/` would make the entire disk
         // writable, turning the sandbox into a no-op (a session launched from
@@ -105,7 +104,7 @@ impl SandboxPolicy {
             ));
         }
         // The extra granted roots ride the same mode gate as the workspace.
-        if mode == PermissionMode::WorkspaceWrite {
+        if mode == AccessMode::Sandbox {
             for root in self.extra_roots.iter().filter(|r| r.parent().is_some()) {
                 s.push_str(&format!(
                     "(allow file-write* (subpath \"{}\"))\n",
@@ -122,7 +121,7 @@ impl SandboxPolicy {
     /// seatbelt renderer (and its tests) compile on every target even though
     /// only macOS actually runs `sandbox-exec`.
     #[cfg(target_os = "macos")]
-    pub fn wrap_argv(&self, command: &str, mode: PermissionMode) -> Vec<String> {
+    pub fn wrap_argv(&self, command: &str, mode: AccessMode) -> Vec<String> {
         vec![
             "-p".to_string(),
             self.render_seatbelt(mode),
@@ -144,7 +143,7 @@ impl SandboxPolicy {
         &self,
         command: &str,
         cwd: &Path,
-        mode: PermissionMode,
+        mode: AccessMode,
     ) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
         cmd.args(self.wrap_argv(command, mode))
@@ -223,7 +222,7 @@ fn login_shell_path() -> String {
 
 /// One-shot seatbelt-wrapped bash backend for the bash tool. The effective
 /// mode is resolved per call by the host-injected `mode_resolver` (the
-/// session mode, or an approved `sandbox_permissions` grant for one call) —
+/// session mode, or an approved `require_escalated` grant for one call) —
 /// the kernel `BashOperations` trait stays untouched, so the mode travels
 /// through a closure, not a kernel field.
 // The seatbelt fields are macOS-only: on other platforms `is_available()`
@@ -233,14 +232,14 @@ fn login_shell_path() -> String {
 pub struct SandboxedBashOperations {
     workspace: PathBuf,
     granted_roots: crate::granted_roots::GrantedRoots,
-    mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync>,
+    mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
 }
 
 impl SandboxedBashOperations {
     pub fn new(
         workspace: impl Into<PathBuf>,
         granted_roots: crate::granted_roots::GrantedRoots,
-        mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync>,
+        mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
     ) -> Self {
         Self {
             workspace: workspace.into(),
@@ -315,7 +314,7 @@ impl BashOperations for SandboxedBashOperations {
             // Classify a seatbelt file-write denial (EPERM) and surface the
             // denial marker + escalation hint so the model recognizes a
             // policy refusal (not a command bug) and can retry with
-            // `sandbox_permissions`.
+            // `require_escalated`.
             if let Some(note) =
                 manox_harness::sandbox::seatbelt_denial_note(&result.stderr, result.exit_code, mode)
             {
@@ -400,7 +399,7 @@ async fn run_to_completion(
 
 /// One-shot unsandboxed bash backend: direct `bash -c` execution with no
 /// seatbelt confinement. Selected per call when the effective mode is
-/// `danger-full-access`; the same non-interactive git env and login PATH are
+/// `full-access`; the same non-interactive git env and login PATH are
 /// injected so escalated git/gh runs behave identically minus the
 /// confinement.
 pub struct UnsandboxedBashOperations {
@@ -457,7 +456,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn resolver(mode: PermissionMode) -> Arc<dyn Fn() -> PermissionMode + Send + Sync> {
+    fn resolver(mode: AccessMode) -> Arc<dyn Fn() -> AccessMode + Send + Sync> {
         Arc::new(move || mode)
     }
 
@@ -466,7 +465,7 @@ mod tests {
         let root = project_root();
         std::fs::create_dir_all(&root).ok();
         let policy = SandboxPolicy::for_project(&root);
-        let sb = policy.render_seatbelt(PermissionMode::WorkspaceWrite);
+        let sb = policy.render_seatbelt(AccessMode::Sandbox);
         assert!(sb.starts_with("(version 1)\n(allow default)\n(deny file-write*)\n"));
         // The workspace root is admitted.
         assert!(sb.contains(&format!(
@@ -489,12 +488,15 @@ mod tests {
     }
 
     #[test]
-    fn read_only_profile_admits_no_writable_roots() {
+    fn full_access_never_renders_a_profile_here_but_the_base_still_denies() {
+        // The deny-default base is mode-independent (hardening is a later
+        // phase); `full-access` never reaches this renderer (backend
+        // selection skips the seatbelt), but rendering it anyway shows the
+        // profile alone cannot be trusted to unconfine.
         let root = project_root();
         let policy = SandboxPolicy::for_project(&root);
-        let sb = policy.render_seatbelt(PermissionMode::ReadOnly);
+        let sb = policy.render_seatbelt(AccessMode::FullAccess);
         assert!(sb.contains("(deny file-write*)"));
-        // No writable-root allow rules under read-only — only the dev sinks.
         assert!(!sb.contains("(allow file-write* (subpath"));
         assert!(sb.contains("(allow file-write* (literal \"/dev/null\"))"));
     }
@@ -503,7 +505,7 @@ mod tests {
     fn seatbelt_has_no_network_deny_or_git_protection() {
         let root = project_root();
         let policy = SandboxPolicy::for_project(&root);
-        let sb = policy.render_seatbelt(PermissionMode::WorkspaceWrite);
+        let sb = policy.render_seatbelt(AccessMode::Sandbox);
         // Pure file-effect vocabulary: no network rule, no `.git` deny.
         assert!(!sb.contains("(deny network*)"));
         assert!(!sb.contains(".git"));
@@ -514,7 +516,7 @@ mod tests {
         // Launching from `/` must not admit the entire disk: the fs root is
         // filtered from the writable allow-list.
         let policy = SandboxPolicy::for_project(Path::new("/"));
-        let sb = policy.render_seatbelt(PermissionMode::WorkspaceWrite);
+        let sb = policy.render_seatbelt(AccessMode::Sandbox);
         assert!(
             !sb.contains("(allow file-write* (subpath \"/\"))"),
             "fs root not admitted: {sb}"
@@ -522,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn extra_roots_render_under_workspace_write_only() {
+    fn extra_roots_render_under_sandbox_only() {
         let wt = project_root().join("wt");
         let git = project_root().join(".git");
         let policy = SandboxPolicy::for_project(&project_root()).with_extra_roots(vec![
@@ -530,7 +532,7 @@ mod tests {
             git.clone(),
             wt.clone(),
         ]);
-        let sb = policy.render_seatbelt(PermissionMode::WorkspaceWrite);
+        let sb = policy.render_seatbelt(AccessMode::Sandbox);
         for root in [&wt, &git] {
             assert!(
                 sb.contains(&format!(
@@ -546,16 +548,13 @@ mod tests {
             canonicalize_best_effort(&wt).display()
         );
         assert_eq!(sb.matches(&pattern).count(), 1, "{sb}");
-        // Read-only admits none of the extra roots.
-        let sb_ro = policy.render_seatbelt(PermissionMode::ReadOnly);
-        assert!(!sb_ro.contains("(allow file-write* (subpath"));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn wrap_argv_shapes_the_invocation() {
         let policy = SandboxPolicy::for_project(&project_root());
-        let args = policy.wrap_argv("echo hi", PermissionMode::WorkspaceWrite);
+        let args = policy.wrap_argv("echo hi", AccessMode::Sandbox);
         assert_eq!(args[0], "-p");
         assert!(args[1].contains("(deny file-write*)"));
         assert_eq!(args[2], "--");
@@ -572,7 +571,7 @@ mod tests {
         let ops = SandboxedBashOperations::new(
             &root,
             crate::granted_roots::GrantedRoots::new(&root),
-            resolver(PermissionMode::WorkspaceWrite),
+            resolver(AccessMode::Sandbox),
         );
 
         // A confined write inside the project succeeds.
@@ -623,10 +622,10 @@ mod tests {
         let ops = SandboxedBashOperations::new(
             &root,
             crate::granted_roots::GrantedRoots::new(&root),
-            resolver(PermissionMode::WorkspaceWrite),
+            resolver(AccessMode::Sandbox),
         );
 
-        // The manox state home is writable under workspace-write (plan files
+        // The manox state home is writable under sandbox (plan files
         // and scratch state need no escalation).
         let probe = home.join("manox-sandbox-home-probe.txt");
         let _ = std::fs::remove_file(&probe);
@@ -656,20 +655,19 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn read_only_seatbelt_denies_writes_but_allows_reads() {
+    async fn sandbox_seatbelt_denies_out_of_root_writes_but_allows_reads() {
         let root = project_root();
         std::fs::create_dir_all(&root).ok();
-        let inside = root.join("ro-target.txt");
-        let _ = std::fs::remove_file(&inside);
         let ops = SandboxedBashOperations::new(
             &root,
             crate::granted_roots::GrantedRoots::new(&root),
-            resolver(PermissionMode::ReadOnly),
+            resolver(AccessMode::Sandbox),
         );
 
-        // A write inside the project is denied under read-only.
+        // A write outside the workspace + temp areas is denied under sandbox.
+        let denied = PathBuf::from("/usr/local/manox-sandbox-deny-target");
         let req = BashExecRequest {
-            command: &format!("echo hi > {}", inside.display()),
+            command: &format!("touch {}", denied.display()),
             cwd: Some(&root),
             timeout: Some(Duration::from_secs(30)),
             signal: tokio_util::sync::CancellationToken::new(),
@@ -680,16 +678,16 @@ mod tests {
             eprintln!("skipping seatbelt assertions: parent process sandboxed");
             return;
         }
-        assert_ne!(res.exit_code, 0, "read-only denies the write");
+        assert_ne!(res.exit_code, 0, "sandbox denies the write");
         // The seatbelt denial carries the denial marker + escalation hint
         // so the model recognizes a policy refusal (not a command bug).
         assert!(
             res.stderr
-                .contains("[sandbox: file access denied under read-only mode]"),
+                .contains("[sandbox: file access denied under sandbox mode]"),
             "denial marker in stderr: {}",
             res.stderr
         );
-        assert!(!inside.exists());
+        assert!(!denied.exists());
 
         // A read succeeds (reads are unrestricted in every mode).
         let req = BashExecRequest {
@@ -702,7 +700,7 @@ mod tests {
         let res = ops.exec(req).await.expect("read runs");
         assert_eq!(
             res.exit_code, 0,
-            "read succeeds under read-only: {}",
+            "read succeeds under sandbox: {}",
             res.stderr
         );
     }

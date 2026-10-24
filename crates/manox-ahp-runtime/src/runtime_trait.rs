@@ -80,8 +80,8 @@ pub struct SessionIntent {
     pub project: Option<String>,
     /// Initial model, as the canonical `provider/model` reference (L8).
     pub initial_model: Option<String>,
-    /// Approval mode for the new session.
-    pub approval_mode: Option<String>,
+    /// Access mode for the new session.
+    pub access_mode: Option<String>,
     /// Reasoning effort for the new session.
     pub reasoning_effort: Option<String>,
     /// Hidden context blocks written as non-displaying messages before the
@@ -109,8 +109,8 @@ pub struct ForkIntent {
     pub project: Option<String>,
     /// Initial model for the fork.
     pub initial_model: Option<String>,
-    /// Approval mode for the fork.
-    pub approval_mode: Option<String>,
+    /// Access mode for the fork.
+    pub access_mode: Option<String>,
     /// Reasoning effort for the fork.
     pub reasoning_effort: Option<String>,
 }
@@ -257,8 +257,8 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// Select the session's reasoning effort.
     fn set_reasoning_effort(&self, session_id: &str, effort: &str) -> Result<(), RuntimeError>;
 
-    /// Select the session's approval mode.
-    fn set_approval_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError>;
+    /// Select the session's access mode.
+    fn set_access_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError>;
 
     /// Move the session's effective working directory.
     fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError>;

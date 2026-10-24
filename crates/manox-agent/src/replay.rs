@@ -215,15 +215,13 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             //    lifecycle/delta/metrics rows carry no persistable thread
             //    state ────────────────────────────────────────────────────
             //
-            // The three configuration rows are here too, deliberately: the
-            // conversation's model, permission mode, and reasoning effort
-            // live in its object row (the engine reads them from there, the
-            // gate per tool call), and the journal carries no configuration
-            // of its own. Existing rows are left in place — this fold still
-            // parses them so a pre-store or hand-edited journal cannot break
-            // it — but nothing consumes them.
+            // The configuration rows are here too, deliberately: the
+            // conversation's model and reasoning effort live in its object
+            // row (the engine reads them from there) and the journal carries
+            // no configuration of its own. Existing rows are left in place —
+            // this fold still parses them so a pre-store or hand-edited
+            // journal cannot break it — but nothing consumes them.
             SessionTreeEntry::ModelChange { .. }
-            | SessionTreeEntry::PermissionModeChange { .. }
             | SessionTreeEntry::ThinkingLevelChange { .. }
             | SessionTreeEntry::ActiveToolsChange { .. }
             | SessionTreeEntry::TurnStart { .. }
@@ -395,12 +393,6 @@ mod tests {
                 timestamp: ts,
                 path: Some("/proj".into()),
             }),
-            record(E::PermissionModeChange {
-                id: id(),
-                parent_id: None,
-                timestamp: ts,
-                mode: "danger-full-access".into(),
-            }),
             record(E::ThinkingLevelChange {
                 id: id(),
                 parent_id: None,
@@ -438,48 +430,5 @@ mod tests {
         assert!(state.plan_snapshot.is_some());
         assert_eq!(state.goal, Some(serde_json::json!({"objective": "ship"})));
         assert_eq!(state.cwd.as_deref(), Some("/work"));
-    }
-
-    /// The configuration rows are tolerated, not consumed: a pre-store or
-    /// hand-edited journal that still carries them (including one carrying a
-    /// mode string from no vocabulary) folds without complaint, and the
-    /// state it produces is the same one an empty chain produces. The
-    /// conversation's row is where the engine reads these, so a value here
-    /// must not leak into a restore and re-open a second authority.
-    #[test]
-    fn configuration_rows_are_tolerated_but_not_consumed() {
-        let ts = Utc::now();
-        let id = || uuid::Uuid::new_v4().to_string();
-        let records = vec![
-            record(E::PermissionModeChange {
-                id: id(),
-                parent_id: None,
-                timestamp: ts,
-                mode: "workspace-write".into(),
-            }),
-            record(E::PermissionModeChange {
-                id: id(),
-                parent_id: None,
-                timestamp: ts,
-                mode: "not-a-mode".into(),
-            }),
-            record(E::ThinkingLevelChange {
-                id: id(),
-                parent_id: None,
-                timestamp: ts,
-                thinking_level: "max".into(),
-            }),
-            record(E::ModelChange {
-                id: id(),
-                parent_id: None,
-                timestamp: ts,
-                provider: "p".into(),
-                model_id: "m".into(),
-            }),
-        ];
-        assert_eq!(
-            replay_thread_state(&records),
-            ReplayedThreadState::default()
-        );
     }
 }

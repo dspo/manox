@@ -726,7 +726,7 @@ mod dispatch {
             cwd: None,
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
@@ -777,7 +777,7 @@ mod dispatch {
             cwd: None,
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
@@ -1178,7 +1178,7 @@ mod dispatch {
         let _guards = install();
         let (_server, backend) = fixture().await;
         let mut config = JsonObject::new();
-        config.insert("approvalMode".to_string(), json!("read-only"));
+        config.insert("accessMode".to_string(), json!("full-access"));
         config.insert("reasoningEffort".to_string(), json!("high"));
         let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
             config,
@@ -1304,7 +1304,7 @@ mod dispatch {
     }
 
     /// A multi-key write whose model key cannot be served is rejected
-    /// WHOLE: the approvalMode half must not land under the rejection —
+    /// WHOLE: the accessMode half must not land under the rejection —
     /// the write-ahead client rolls back every key of the action, so a
     /// half-applied write would strand the session on a mode its own chip
     /// no longer shows.
@@ -1319,14 +1319,14 @@ mod dispatch {
             .expect("live session");
         let before = (
             thread.read(|t| t.model().map(|m| m.id.clone())),
-            thread.read(|t| t.permission_mode()),
+            thread.read(|t| t.access_mode()),
         );
         let mut config = JsonObject::new();
         config.insert(
             "model".to_string(),
             json!("badkeyreg-anthropic/badkeyreg-anthropic-model"),
         );
-        config.insert("approvalMode".to_string(), json!("read-only"));
+        config.insert("accessMode".to_string(), json!("full-access"));
         let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
             config,
             replace: None,
@@ -1343,7 +1343,7 @@ mod dispatch {
         assert_eq!(
             (
                 thread.read(|t| t.model().map(|m| m.id.clone())),
-                thread.read(|t| t.permission_mode())
+                thread.read(|t| t.access_mode())
             ),
             before,
             "the rejected multi-key write landed nothing (neither half)"
@@ -1359,7 +1359,7 @@ mod dispatch {
         let _guards = install();
         let (_server, backend) = fixture().await;
         let mut config = JsonObject::new();
-        config.insert("approvalMode".to_string(), json!("read-only"));
+        config.insert("accessMode".to_string(), json!("full-access"));
         let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
             config,
             replace: Some(true),
@@ -2323,7 +2323,7 @@ mod dispatch {
             cwd: None,
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
@@ -2440,7 +2440,7 @@ mod dispatch {
             cwd: None,
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
@@ -2673,7 +2673,7 @@ mod dispatch {
             cwd: None,
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
@@ -2986,7 +2986,7 @@ mod dispatch {
             "model".to_string(),
             json!("okreg-anthropic/okreg-anthropic-model"),
         );
-        config.insert("approvalMode".to_string(), json!("read-only"));
+        config.insert("accessMode".to_string(), json!("full-access"));
         let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
             config,
             replace: None,
@@ -3001,7 +3001,7 @@ mod dispatch {
             .ahp_inner()
             .session_thread("s-coldconfig")
             .expect("the config write's cold open loaded the session");
-        let (model, mode) = thread.read(|t| (t.model().map(|m| m.id.clone()), t.permission_mode()));
+        let (model, mode) = thread.read(|t| (t.model().map(|m| m.id.clone()), t.access_mode()));
         assert_eq!(
             model.as_deref(),
             Some("okreg-anthropic-model"),
@@ -3009,8 +3009,8 @@ mod dispatch {
         );
         assert_eq!(
             mode,
-            manox_agent::thread::PermissionMode::ReadOnly,
-            "the approval-mode change landed on the restored thread"
+            manox_agent::thread::AccessMode::FullAccess,
+            "the access-mode change landed on the restored thread"
         );
         uninstall();
     }
@@ -3154,7 +3154,7 @@ mod dispatch {
         let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
         let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         let mut config = JsonObject::new();
-        config.insert("approvalMode".to_string(), json!("read-only"));
+        config.insert("accessMode".to_string(), json!("full-access"));
         let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
             config,
             replace: None,

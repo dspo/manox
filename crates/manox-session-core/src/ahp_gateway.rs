@@ -304,9 +304,9 @@ impl SessionRuntime for GatewayRuntime {
             .set_reasoning_effort(session_id, effort)
     }
 
-    fn set_approval_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError> {
+    fn set_access_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError> {
         self.ensure_live("ahp", session_id)?;
-        self.server.ahp_inner().set_approval_mode(session_id, mode)
+        self.server.ahp_inner().set_access_mode(session_id, mode)
     }
 
     fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError> {

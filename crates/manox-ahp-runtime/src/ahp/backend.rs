@@ -1412,9 +1412,7 @@ impl RuntimeBackend {
             config
                 .get(config_keys::REASONING_EFFORT)
                 .and_then(Value::as_str),
-            config
-                .get(config_keys::APPROVAL_MODE)
-                .and_then(Value::as_str),
+            config.get(config_keys::ACCESS_MODE).and_then(Value::as_str),
         ) {
             return DispatchOutcome::Rejected(refusal(error));
         }
@@ -1428,9 +1426,9 @@ impl RuntimeBackend {
                 .and_then(Value::as_str)
                 .map(|effort| self.server.set_reasoning_effort(session_id, effort)),
             config
-                .get(config_keys::APPROVAL_MODE)
+                .get(config_keys::ACCESS_MODE)
                 .and_then(Value::as_str)
-                .map(|mode| self.server.set_approval_mode(session_id, mode)),
+                .map(|mode| self.server.set_access_mode(session_id, mode)),
         ];
         for outcome in applied.into_iter().flatten() {
             if let Err(error) = outcome {
@@ -1831,7 +1829,7 @@ impl Backend for RuntimeBackend {
             cwd: working_directories.first().cloned(),
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
             seed: None,
             working_directories,
@@ -1917,7 +1915,7 @@ impl Backend for RuntimeBackend {
                     cwd: None,
                     project: None,
                     initial_model: None,
-                    approval_mode: None,
+                    access_mode: None,
                     reasoning_effort: None,
                 };
                 self.server
@@ -1991,7 +1989,7 @@ impl Backend for RuntimeBackend {
             cwd: None,
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
         };
         self.server
@@ -3307,7 +3305,7 @@ mod mcp_dispatch_tests {
         ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn set_approval_mode(&self, _session_id: &str, _mode: &str) -> Result<(), RuntimeError> {
+        fn set_access_mode(&self, _session_id: &str, _mode: &str) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
         fn set_cwd(&self, _session_id: &str, _cwd: &str) -> Result<(), RuntimeError> {

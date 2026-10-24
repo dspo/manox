@@ -27,7 +27,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[BuiltinSlashMeta] = &[
     BuiltinSlashMeta {
         name: "mode",
         aliases: &[],
-        description: "Cycle the permission mode (Read Only → Workspace Access → Full Access); `/mode <name>` sets a mode, and with a prompt switches and starts working immediately",
+        description: "Toggle the access mode (Sandbox ↔ Full Access); `/mode <name>` sets a mode (`sandbox` or `full-access`), and with a prompt switches and starts working immediately",
     },
     BuiltinSlashMeta {
         name: "plan",
@@ -47,7 +47,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[BuiltinSlashMeta] = &[
     BuiltinSlashMeta {
         name: "new",
         aliases: &["clear", "archive"],
-        description: "Archive the current thread and start a fresh one that keeps the project, permission mode, and model",
+        description: "Archive the current thread and start a fresh one that keeps the project, access mode, and model",
     },
     BuiltinSlashMeta {
         name: "goal",

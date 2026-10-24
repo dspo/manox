@@ -42,10 +42,10 @@ pub struct RuntimeIdentityPromptData {
     pub python3: String,
     pub node: String,
     pub today: String,
-    /// The active permission mode's wire label (`read-only` /
-    /// `workspace-write` / `danger-full-access`) — the template states the mode's
-    /// deny semantics so the model knows what will be refused.
-    pub permission_mode: &'static str,
+    /// The active access mode's wire label (`sandbox` / `full-access`) —
+    /// the template states the mode's deny semantics so the model knows
+    /// what will be refused.
+    pub access_mode: &'static str,
 }
 
 /// A git worktree row in the runtime identity block.

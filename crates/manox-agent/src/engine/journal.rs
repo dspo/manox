@@ -106,11 +106,11 @@ pub(super) fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde
             json!({ "callId": id, "chunk": chunk }),
         ),
         // ── state changes ────────────────────────────────────────────────
-        // The permission mode is NOT here: its durable home is the
+        // The access mode is NOT here: its durable home is the
         // conversation's object row, which the client writes, and the engine
         // reads it live before every tool call. Journaling a second copy is
         // what made "which one is in force" unanswerable.
-        ThreadEvent::PermissionModeChanged { .. } => return None,
+        ThreadEvent::AccessModeChanged { .. } => return None,
         ThreadEvent::PlanModeChanged { enabled } => {
             ("plan_mode_change".into(), json!({ "enabled": enabled }))
         }

@@ -1,7 +1,7 @@
 //! Session-scoped extra writable roots derived from the per-call cwd.
 //!
 //! Two families enforce file-write containment — the fs fence
-//! (`approval`'s workspace-write verdict) and the bash seatbelt
+//! (`approval`'s sandbox verdict) and the bash seatbelt
 //! (`sandbox::SandboxPolicy`) — and both must admit the same roots, or a
 //! call one family passed the other denies. One derivation, shared:
 //!
@@ -11,7 +11,7 @@
 //!   construction. The worktree itself and the common dir are roots (linked
 //!   worktree commits write into the shared git object store).
 //! - Any other directory is admitted once approved through a
-//!   `sandbox_permissions` escalation and stays for the session (approve
+//!   `require_escalated` escalation and stays for the session (approve
 //!   once, never re-ask for the same root).
 //!
 //! The same-repo derivation spawns `git rev-parse` once per distinct cwd and

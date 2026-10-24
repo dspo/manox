@@ -1,6 +1,6 @@
 //! The one read surface for a conversation's user-owned configuration.
 //!
-//! A conversation's picks — model, permission mode, reasoning effort — have
+//! A conversation's picks — model, access mode, reasoning effort — have
 //! exactly one durable home, and it is not the journal: for the desktop app
 //! it is the object store's `conversations` row. Every reader goes through
 //! this trait, so "the model is read here, the permission is read there"
@@ -12,16 +12,15 @@
 //!   `reasoning_effort`) and compares `config_version` against the version it
 //!   last applied, so a mid-conversation switch is applied once and
 //!   announced to the model ahead of the turn that triggered it;
-//! - the permission gate reads `permission_mode` again before **every tool
-//!   call**, so a switch governs the very next tool rather than the next
-//!   turn.
+//! - the access gate reads `access_mode` again before **every tool call**,
+//!   so a switch governs the very next tool rather than the next turn.
 //!
 //! The host installs one implementation per conversation. Implementations
-//! must be cheap and side-effect free: `permission_mode` is read per tool
-//! call, not once per turn.
+//! must be cheap and side-effect free: `access_mode` is read per tool call,
+//! not once per turn.
 
 use crate::core::types::Model;
-use crate::ext::sandbox::PermissionMode;
+use crate::ext::sandbox::AccessMode;
 
 /// A conversation's configuration picks, read from wherever they durably
 /// live. `None` from any getter means "this conversation has no pick", never
@@ -41,8 +40,8 @@ pub trait ConversationConfigSource: Send + Sync {
     /// resolves. `None` when the conversation has no model pick at all.
     fn model_ref(&self) -> Option<String>;
 
-    /// The picked permission mode.
-    fn permission_mode(&self) -> Option<PermissionMode>;
+    /// The picked access mode.
+    fn access_mode(&self) -> Option<AccessMode>;
 
     /// The picked reasoning effort, in the wire vocabulary the engine's
     /// thinking level uses (`"high"` / `"max"`).
