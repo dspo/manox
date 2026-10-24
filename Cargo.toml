@@ -82,6 +82,9 @@ ahp-ws = "=1.0.0"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util", "net"] }
 tokio-util = "0.7"
 libc = "0.2"
+# seccompiler — the seccomp filter compiler for the Linux sandbox backend
+# (deny-face filter compiled in-process, applied across a pre_exec boundary).
+seccompiler = "0.5"
 # brush: in-process bash-compatible shell used as the bash tool's execution engine.
 brush-core = "0.5.0"
 brush-builtins = "0.2.0"

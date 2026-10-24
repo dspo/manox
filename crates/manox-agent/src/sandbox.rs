@@ -1,5 +1,6 @@
 //! OS-level sandbox for the kernel-path `bash` tool: macOS seatbelt
-//! (`sandbox-exec`) wrapping one-shot commands.
+//! (`sandbox-exec`) wrapping one-shot commands, Linux bubblewrap + seccomp
+//! (`sandbox::linux`) under the same writable-root vocabulary.
 //!
 //! The seatbelt renders a per-call profile from the effective `AccessMode`:
 //! `sandbox` confines writes to the shared `writable_roots`; `full-access`
@@ -36,6 +37,10 @@ use tokio_util::sync::CancellationToken;
 // cannot survive into a classified path. Re-exported here for the host
 // callers that still reach it as `crate::sandbox::canonicalize_best_effort`.
 pub use manox_harness::sandbox::canonicalize_best_effort;
+
+/// The Linux backend (bubblewrap + seccomp); compiled only on its target.
+#[cfg(target_os = "linux")]
+mod linux;
 
 /// Default wall-clock limit for a one-shot command (mirrors the bash tool's
 /// own default).
@@ -259,9 +264,12 @@ impl SandboxPolicy {
         self.render_seatbelt_with_params(mode).0
     }
 
-    /// The profile plus its `sandbox-exec -D` definitions, split so the argv
-    /// builder and the tests see the same root→param mapping.
-    fn render_seatbelt_with_params(&self, mode: AccessMode) -> (String, Vec<(String, PathBuf)>) {
+    /// The writable roots one call admits under `mode`: the shared
+    /// `writable_roots()` plus the extra granted roots (both mode-gated,
+    /// the filesystem root filtered out). One derivation for both
+    /// enforcement faces — the seatbelt `-D` params and the Linux bwrap
+    /// `--bind` list — so the root sets cannot fork across platforms.
+    fn writable_root_set(&self, mode: AccessMode) -> Vec<PathBuf> {
         let mut roots = writable_roots(mode, &self.workspace_root)
             .into_iter()
             .filter(|r| r.parent().is_some())
@@ -274,6 +282,13 @@ impl SandboxPolicy {
                 }
             }
         }
+        roots
+    }
+
+    /// The profile plus its `sandbox-exec -D` definitions, split so the argv
+    /// builder and the tests see the same root→param mapping.
+    fn render_seatbelt_with_params(&self, mode: AccessMode) -> (String, Vec<(String, PathBuf)>) {
+        let roots = self.writable_root_set(mode);
         let (write_section, params) = render_write_section(&roots);
         let mut profile = String::new();
         profile.push_str(SEATBELT_BASE_POLICY);
@@ -404,9 +419,23 @@ fn nested_symlink_component(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Whether the OS sandbox backend is available on the current platform.
+/// Whether the OS sandbox backend is available on the current platform:
+/// macOS needs `sandbox-exec`; Linux needs a usable non-setuid bubblewrap
+/// with working unprivileged user namespaces (probed once per process).
+/// Where neither exists the bash tool degrades to per-call approval.
 pub fn is_available() -> bool {
-    cfg!(target_os = "macos") && std::path::Path::new("/usr/bin/sandbox-exec").exists()
+    #[cfg(target_os = "macos")]
+    {
+        std::path::Path::new("/usr/bin/sandbox-exec").exists()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::is_available()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
 }
 
 /// Non-interactive editor/pager defaults (see retired-harness rationale).
@@ -429,7 +458,7 @@ fn inject_noninteractive_env(cmd: &mut tokio::process::Command) {
 }
 
 /// The login shell's PATH (cached), with a conservative fallback.
-#[cfg(target_os = "macos")] // consumers: the seatbelt `wrap_command` + unsandboxed backend
+// Consumers: the seatbelt/bwrap wrap paths + the unsandboxed backend.
 fn login_shell_path() -> String {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
@@ -465,10 +494,9 @@ fn login_shell_path() -> String {
 /// session mode, or an approved `require_escalated` grant for one call) —
 /// the kernel `BashOperations` trait stays untouched, so the mode travels
 /// through a closure, not a kernel field.
-// The seatbelt fields are macOS-only: on other platforms `is_available()`
-// is false so the backend is never constructed at runtime, and the compiled
-// stub's fields stay unread.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// On platforms without a backend the compiled stub's fields stay unread
+// (`is_available()` is always false there, so the backend is never built).
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub struct SandboxedBashOperations {
     workspace: PathBuf,
     granted_roots: crate::granted_roots::GrantedRoots,
@@ -488,49 +516,59 @@ impl SandboxedBashOperations {
         }
     }
 
-    /// The seatbelt policy for a call running in `cwd`: the session
+    /// The confinement policy for a call running in `cwd`: the session
     /// workspace profile plus the granted roots derived from that exact
     /// directory — a linked worktree of the workspace admits itself, an
     /// escalation-approved root stays for the session. The same derivation
     /// the fs fence applies, so a call one surface passed the other never
     /// denies. `Err` when a root spelling fails validation (symlinked
     /// writable roots) — the caller must fail the call closed.
-    // Both call sites are macOS-only (seatbelt); gate the helper so it is not
-    // dead code on other platforms.
-    #[cfg(target_os = "macos")]
     fn policy_for(&self, cwd: &Path) -> Result<SandboxPolicy, String> {
         SandboxPolicy::for_project(&self.workspace)?
             .with_extra_roots(self.granted_roots.roots_for(cwd))
     }
 
-    /// Build the seatbelt-wrapped command for a background task — the same
-    /// per-call mode and env as a foreground call, so a non-escalated
-    /// background task is confined identically. The registry adds
-    /// process-group/pipes after this. Non-macOS stub is unreachable: the
-    /// wrap closure is only installed where `is_available()`.
+    /// Build the confined command for a background task — the same per-call
+    /// mode and env as a foreground call (seatbelt on macOS, bwrap + seccomp
+    /// on Linux), so a non-escalated background task is confined identically.
+    /// The registry adds process-group/pipes after this. Unreachable stub on
+    /// platforms without a backend: the wrap closure is only installed where
+    /// `is_available()`.
     pub fn wrap_background(&self, command: &str, cwd: &Path) -> tokio::process::Command {
+        /// Fail-closed refusal for an unbuildable confinement: the task
+        /// runs, prints a fixed refusal line, and exits nonzero — it never
+        /// falls back to an unsandboxed run. No escalation hint rides here
+        /// on purpose: a wider mode grants paths, it cannot fix a symlinked
+        /// root (nor a vanished bwrap).
+        fn refused(cwd: &Path) -> tokio::process::Command {
+            let mut cmd = tokio::process::Command::new("bash");
+            cmd.arg("-c")
+                .arg(
+                    "printf '%s\\n' 'sandbox: background task refused - a writable \
+                     root contains a symlink component' >&2; exit 126",
+                )
+                .current_dir(cwd);
+            cmd
+        }
         #[cfg(target_os = "macos")]
         {
             let mode = (self.mode_resolver)();
             match self.policy_for(cwd) {
                 Ok(policy) => policy.wrap_command(command, cwd, mode),
-                // Fail closed: the task runs, prints a fixed refusal line,
-                // and exits nonzero — it never falls back to an unsandboxed
-                // run. No escalation hint rides here on purpose: a wider
-                // mode grants paths, it cannot fix a symlinked root.
-                Err(_) => {
-                    let mut cmd = tokio::process::Command::new("bash");
-                    cmd.arg("-c")
-                        .arg(
-                            "printf '%s\\n' 'sandbox: background task refused - a writable \
-                             root contains a symlink component' >&2; exit 126",
-                        )
-                        .current_dir(cwd);
-                    cmd
-                }
+                Err(_) => refused(cwd),
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            let mode = (self.mode_resolver)();
+            match self.policy_for(cwd).and_then(|policy| {
+                linux::wrap_command(&policy.writable_root_set(mode), command, cwd)
+            }) {
+                Ok(cmd) => cmd,
+                Err(_) => refused(cwd),
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let mut c = tokio::process::Command::new("sh");
             c.arg("-c").arg(command).current_dir(cwd);
@@ -542,11 +580,11 @@ impl SandboxedBashOperations {
 #[async_trait::async_trait]
 impl BashOperations for SandboxedBashOperations {
     async fn exec(&self, request: BashExecRequest<'_>) -> Result<CommandResult, ExecutionError> {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = request;
             return Err(ExecutionError::Other(
-                "seatbelt sandbox is only available on macOS".into(),
+                "the OS sandbox backend is not available on this platform".into(),
             ));
         }
         #[cfg(target_os = "macos")]
@@ -573,6 +611,40 @@ impl BashOperations for SandboxedBashOperations {
             // denial marker + escalation hint so the model recognizes a
             // policy refusal (not a command bug) and can retry with
             // `require_escalated`.
+            if let Some(note) =
+                manox_harness::sandbox::seatbelt_denial_note(&result.stderr, result.exit_code, mode)
+            {
+                result.stderr.push_str(&note);
+            }
+            Ok(result)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let cwd = request
+                .cwd
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| self.workspace.clone());
+            let mode = (self.mode_resolver)();
+            // Same fail-closed policy build as macOS (a symlinked writable
+            // root never runs unsandboxed).
+            let roots = self
+                .policy_for(&cwd)
+                .map_err(ExecutionError::Other)?
+                .writable_root_set(mode);
+            let mut cmd = linux::wrap_command(&roots, request.command, &cwd)
+                .map_err(ExecutionError::Other)?;
+            cmd.stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            let child = cmd
+                .spawn()
+                .map_err(|e| ExecutionError::Spawn(e.to_string()))?;
+            let timeout = request.timeout.unwrap_or(DEFAULT_TIMEOUT);
+            let mut result =
+                run_to_completion(child, request.on_data, timeout, &request.signal).await?;
+            // Classify a bwrap file-write denial — the read-only base
+            // surfaces EROFS ("Read-only file system"), not the seatbelt's
+            // EPERM — onto the same marker + escalation hint vocabulary.
             if let Some(note) =
                 manox_harness::sandbox::seatbelt_denial_note(&result.stderr, result.exit_code, mode)
             {
@@ -679,7 +751,6 @@ impl UnsandboxedBashOperations {
     pub fn command(command: &str, cwd: &Path) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("bash");
         cmd.arg("-c").arg(command).current_dir(cwd);
-        #[cfg(target_os = "macos")]
         cmd.env("PATH", login_shell_path());
         inject_noninteractive_env(&mut cmd);
         cmd

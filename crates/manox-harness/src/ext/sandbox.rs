@@ -98,15 +98,17 @@ pub fn sandbox_denial_marker(mode: AccessMode) -> String {
     format!("[sandbox: file access denied under {} mode]", mode.wire())
 }
 
-/// Substrings a seatbelt file-write denial leaves in the process output
-/// stream (EPERM surfaces as "operation not permitted"). Shared by the
-/// sandboxed exec backend (stderr of a finished child) and the
-/// registry-executed foreground path (combined output after the exit is
-/// recorded).
-pub const SEATBELT_DENIAL_SIGNATURES: &[&str] = &["operation not permitted"];
+/// Substrings a sandboxed file-write denial leaves in the process output
+/// stream, per backend: the macOS seatbelt's EPERM surfaces as "operation
+/// not permitted", the Linux bwrap read-only base as EROFS ("read-only
+/// file system"). Shared by the sandboxed exec backends (stderr of a
+/// finished child) and the registry-executed foreground path (combined
+/// output after the exit is recorded).
+pub const SANDBOX_DENIAL_SIGNATURES: &[&str] =
+    &["operation not permitted", "read-only file system"];
 
 /// Post-exit denial classification: when a nonzero-exit command's output
-/// carries a seatbelt denial signature, the marker + same-turn escalation
+/// carries a sandbox denial signature, the marker + same-turn escalation
 /// hint is returned so the model recognizes a policy refusal (not a command
 /// bug) and can retry with `require_escalated`.
 pub fn seatbelt_denial_note(output: &str, exit_code: i32, mode: AccessMode) -> Option<String> {
@@ -114,7 +116,7 @@ pub fn seatbelt_denial_note(output: &str, exit_code: i32, mode: AccessMode) -> O
         return None;
     }
     let lower = output.to_ascii_lowercase();
-    if SEATBELT_DENIAL_SIGNATURES
+    if SANDBOX_DENIAL_SIGNATURES
         .iter()
         .any(|sig| lower.contains(sig))
     {

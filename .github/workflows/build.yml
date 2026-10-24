@@ -22,7 +22,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends pkg-config
+          # bubblewrap backs the Linux sandbox live tests (manox-agent
+          # sandbox::linux); 24.04's apparmor userns restriction would deny
+          # the probe, so lift it for this ephemeral runner.
+          sudo apt-get install -y --no-install-recommends pkg-config bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
