@@ -327,15 +327,16 @@ pub(super) fn build_tools(
     granted_roots: &crate::granted_roots::GrantedRoots,
     bus: &Arc<crate::steer_bus::AgentBus>,
 ) -> (Vec<Arc<dyn HarnessAgentTool>>, Arc<BackgroundManager>) {
-    // Bash execution backend: seatbelt-wrapped one-shot commands when the
-    // OS backend is available (the per-call file-effect profile is rendered
-    // from the effective `AccessMode`; shell state does not persist —
-    // the tool's `cwd` parameter pins each call), otherwise the unsandboxed
-    // persistent brush shell (permission-gated as always). Background tasks
-    // reuse this backend's `wrap_command`, so a non-escalated background
-    // task is confined exactly like a foreground call. The per-call effective
-    // mode reaches the seatbelt via the `mode_resolver`; the writable roots
-    // follow the call's cwd through the shared granted-roots store.
+    // Bash execution backend: OS-confined one-shot commands when the platform
+    // backend is available (seatbelt on macOS, bubblewrap + seccomp on Linux;
+    // the per-call file-effect profile follows the effective `AccessMode`;
+    // shell state does not persist — the tool's `cwd` parameter pins each
+    // call), otherwise the unsandboxed persistent brush shell
+    // (permission-gated as always). Background tasks reuse this backend's
+    // wrap path, so a non-escalated background task is confined exactly like
+    // a foreground call. The per-call effective mode reaches the backend via
+    // the `mode_resolver`; the writable roots follow the call's cwd through
+    // the shared granted-roots store.
     let sandbox_available = crate::sandbox::is_available();
     let mut background = Arc::new(BackgroundRegistry::new());
     // Shared per-call grant cell: an approved sandbox-escalation stamps the
