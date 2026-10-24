@@ -941,10 +941,12 @@ mod tests {
         params.iter().map(|(_, p)| p.clone()).collect()
     }
 
+    #[cfg(target_os = "macos")]
     fn resolver(mode: AccessMode) -> Arc<dyn Fn() -> AccessMode + Send + Sync> {
         Arc::new(move || mode)
     }
 
+    #[cfg(target_os = "macos")]
     fn route_resolver(route: NetworkRoute) -> Arc<dyn Fn() -> NetworkRoute + Send + Sync> {
         Arc::new(move || route)
     }
@@ -1426,6 +1428,7 @@ mod tests {
     // (skip loudly when the parent process is itself sandboxed — the same
     // guard the confinement tests use.)
 
+    #[cfg(target_os = "macos")]
     async fn live_exec(root: &Path, command: &str, route: NetworkRoute) -> CommandResult {
         let ops = SandboxedBashOperations::new(
             root,
@@ -1445,6 +1448,7 @@ mod tests {
         .expect("exec runs")
     }
 
+    #[cfg(target_os = "macos")]
     fn nested_sandboxed(result: &CommandResult) -> bool {
         result.exit_code == 71 && result.stderr.contains("Operation not permitted")
     }
