@@ -3004,7 +3004,7 @@ impl manox_harness::ConversationConfigSource for NoPicks {
         None
     }
 
-    fn permission_mode(&self) -> Option<PermissionMode> {
+    fn access_mode(&self) -> Option<AccessMode> {
         None
     }
 
@@ -3029,8 +3029,8 @@ impl manox_harness::ConversationConfigSource for Picks {
         None
     }
 
-    fn permission_mode(&self) -> Option<PermissionMode> {
-        Some(PermissionMode::ReadOnly)
+    fn access_mode(&self) -> Option<AccessMode> {
+        Some(AccessMode::Sandbox)
     }
 
     fn reasoning_effort(&self) -> Option<String> {
@@ -3327,8 +3327,8 @@ fn subagent_bash_schema_strips_background_and_escalation_fields() {
         "run_in_background stripped from the subagent schema"
     );
     assert!(
-        !props.contains_key("sandbox_permissions"),
-        "sandbox_permissions stripped from the subagent schema"
+        !props.contains_key("require_escalated"),
+        "require_escalated stripped from the subagent schema"
     );
     assert!(
         !props.contains_key("justification"),
@@ -3453,10 +3453,6 @@ fn scripted_state_rows() -> Vec<(&'static str, serde_json::Value)> {
         ),
         ("cwd_change", json!({ "cwd": "/replay/work" })),
         ("project_change", json!({ "path": "/replay/proj" })),
-        (
-            "permission_mode_change",
-            json!({ "mode": "danger-full-access" }),
-        ),
         (
             "plan_update",
             json!({ "snapshot": [{ "content": "step one", "status": "pending", "activeForm": "stepping" }] }),
@@ -3587,7 +3583,6 @@ const REPLAY_COVERAGE_KINDS: &[&str] = &[
     "model_change",
     "cwd_change",
     "project_change",
-    "permission_mode_change",
     "thinking_level_change",
     "plan_update",
     "goal",
@@ -3734,9 +3729,9 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     assert!(!live_rebuilt.pinned && live_rebuilt.archived);
     assert_eq!(live_rebuilt.project, Some(PathBuf::from("/replay/proj")));
     assert_eq!(
-        live_rebuilt.permission_mode,
-        PermissionMode::WorkspaceWrite,
-        "the chain's permission row is inert; with no object row the bounded \
+        live_rebuilt.access_mode,
+        AccessMode::Sandbox,
+        "the chain carries no mode row; with no object row the bounded \
          default stands"
     );
     assert_eq!(live_rebuilt.reasoning_effort, ReasoningEffort::High);
@@ -3756,7 +3751,7 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     // Neither the mode nor the effort is re-stamped: the conversation's row
     // owns them, and repairing the cache from the journal would put a second
     // copy back in play.
-    assert_eq!(repaired.approval_mode, None);
+    assert_eq!(repaired.access_mode, None);
     assert_eq!(repaired.reasoning_effort, None);
     // Plan state has no sidecar mirror anymore (W4): the journal is the
     // single source, so there is nothing to repair or assert here.
@@ -3883,9 +3878,9 @@ async fn journal_replay_is_consistent_across_disk_reload() {
 }
 
 /// K2 authority: the journal rebuild WINS over a diverging sidecar, and
-/// the sidecar cache is repaired toward the journal, while the permission
+/// the sidecar cache is repaired toward the journal, while the access
 /// mode is read from the conversation's row (absent here) with the sidecar as
-/// its fallback — never from the chain, whose own permission row is inert.
+/// its fallback — the chain carries no mode row at all.
 #[tokio::test]
 async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
     let dir = tempfile::tempdir().unwrap();
@@ -3914,7 +3909,7 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
         meta.title = Some("stale sidecar title".into());
         meta.pinned = true;
         meta.archived = false;
-        meta.approval_mode = Some("read-only".into());
+        meta.access_mode = Some("full-access".into());
         meta.project = Some("/stale/project".into());
     })
     .await
@@ -3929,13 +3924,6 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
         .append_typed(
             "pinned_archived",
             serde_json::json!({ "pinned": false, "archived": true }),
-        )
-        .await
-        .unwrap();
-    appender
-        .append_typed(
-            "permission_mode_change",
-            serde_json::json!({ "mode": "workspace-write" }),
         )
         .await
         .unwrap();
@@ -3959,9 +3947,10 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
     assert!(!rebuilt.pinned);
     assert!(rebuilt.archived);
     assert_eq!(
-        rebuilt.permission_mode,
-        PermissionMode::ReadOnly,
-        "no object row: the sidecar's value stands, not the chain's"
+        rebuilt.access_mode,
+        AccessMode::FullAccess,
+        "no object row: the sidecar's value stands, and the chain carries \
+         no mode row"
     );
     assert_eq!(rebuilt.project, Some(PathBuf::from("/journal/project")));
     // Goal stage ②: the rebuild passes the replayed journal snapshot
@@ -3986,9 +3975,9 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
     assert_eq!(repaired.title.as_deref(), Some("journal title"));
     assert!(!repaired.pinned && repaired.archived);
     assert_eq!(
-        repaired.approval_mode.as_deref(),
-        Some("read-only"),
-        "the stale cache is not re-stamped from an inert journal row"
+        repaired.access_mode.as_deref(),
+        Some("full-access"),
+        "the stale cache is not re-stamped from a chain that carries no mode"
     );
     assert_eq!(repaired.project.as_deref(), Some("/journal/project"));
     session.close().await.unwrap();
@@ -4002,7 +3991,7 @@ async fn restored_state_falls_back_to_the_sidecar_for_a_conversation_without_a_r
     let meta = manox_harness::session_meta::SessionMeta {
         title: Some("sidecar title".into()),
         project: Some("/sidecar/project".into()),
-        approval_mode: Some("read-only".into()),
+        access_mode: Some("full-access".into()),
         reasoning_effort: Some("max".into()),
         plan_snapshot: Some(serde_json::json!([{ "content": "step" }])),
         pinned: true,
@@ -4012,7 +4001,7 @@ async fn restored_state_falls_back_to_the_sidecar_for_a_conversation_without_a_r
     let merged = merge_restored_state(&replayed, &meta, &NoPicks);
     assert_eq!(merged.title.as_deref(), Some("sidecar title"));
     assert_eq!(merged.project, Some(PathBuf::from("/sidecar/project")));
-    assert_eq!(merged.permission_mode, PermissionMode::ReadOnly);
+    assert_eq!(merged.access_mode, AccessMode::FullAccess);
     assert_eq!(merged.reasoning_effort, ReasoningEffort::Max);
     assert_eq!(
         merged.plan_snapshot,
@@ -4028,12 +4017,12 @@ async fn restored_state_falls_back_to_the_sidecar_for_a_conversation_without_a_r
 fn the_conversations_row_beats_the_sidecar() {
     let replayed = crate::replay::ReplayedThreadState::default();
     let meta = manox_harness::session_meta::SessionMeta {
-        approval_mode: Some("danger-full-access".into()),
+        access_mode: Some("full-access".into()),
         reasoning_effort: Some("max".into()),
         ..Default::default()
     };
     let merged = merge_restored_state(&replayed, &meta, &Picks);
-    assert_eq!(merged.permission_mode, PermissionMode::ReadOnly);
+    assert_eq!(merged.access_mode, AccessMode::Sandbox);
     assert_eq!(merged.reasoning_effort, ReasoningEffort::High);
 }
 
@@ -4212,35 +4201,35 @@ async fn project_binding_journals_project_change_entry() {
     session.close().await.unwrap();
 }
 
-/// K3 (L3): the permission-mode decision settles the gate and notifies the
+/// K3 (L3): the access-mode decision settles the gate and notifies the
 /// UI, and writes nothing durable. The conversation's object row is the
 /// mode's home — written by whoever made the pick, read live by the gate per
 /// tool call — so a second copy in the chain or the sidecar would only give
 /// "which one is in force" a second answer.
 #[tokio::test]
-async fn permission_mode_decision_settles_the_gate_and_journals_nothing() {
+async fn access_mode_decision_settles_the_gate_and_journals_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("sessions");
     let session = decision_rig_session(&dir).await;
     let state = test_engine_state();
     let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
 
-    apply_permission_mode(
+    apply_access_mode(
         &state,
         &sessions,
         session.path(),
-        PermissionMode::ReadOnly,
+        AccessMode::FullAccess,
         &notice_tx,
     )
     .await;
 
-    assert_eq!(state.gate.mode(), PermissionMode::ReadOnly);
+    assert_eq!(state.gate.mode(), AccessMode::FullAccess);
     let meta = manox_harness::session_meta::load(&sessions, session.path())
         .await
         .unwrap();
     assert_eq!(
-        meta.approval_mode, None,
-        "the sidecar copy retired with the journal row"
+        meta.access_mode, None,
+        "the engine writes no sidecar copy: the conversation's row is the home"
     );
 
     // The decision still notifies — that is how the UI learns the switch.
@@ -4252,12 +4241,12 @@ async fn permission_mode_decision_settles_the_gate_and_journals_nothing() {
     let BackendNotice::Event(event) = notice else {
         panic!("the mode decision must ride a ThreadEvent notice");
     };
-    let ThreadEvent::PermissionModeChanged { mode } = *event else {
-        panic!("expected PermissionModeChanged");
+    let ThreadEvent::AccessModeChanged { mode } = *event else {
+        panic!("expected AccessModeChanged");
     };
-    assert_eq!(mode, PermissionMode::ReadOnly);
+    assert_eq!(mode, AccessMode::FullAccess);
     assert!(
-        durable_journal_payload(&ThreadEvent::PermissionModeChanged { mode }).is_none(),
+        durable_journal_payload(&ThreadEvent::AccessModeChanged { mode }).is_none(),
         "the mode decision must not map to a journal row"
     );
     session.close().await.unwrap();
@@ -4355,14 +4344,14 @@ async fn bind_order_leaves_exactly_one_cwd_witness_on_the_new_chain() {
     session.close().await.unwrap();
 }
 
-/// Hot-switch contract: `set_permission_mode` lands the mode on the live
+/// Hot-switch contract: `set_access_mode` lands the mode on the live
 /// gate before the actor ever drains its queue, so a mid-turn switch
 /// governs the very next tool call (every resolver reads the gate per
 /// call). The queued command below still carries the durable half.
 #[tokio::test]
-async fn set_permission_mode_writes_the_gate_before_the_actor_drains() {
+async fn set_access_mode_writes_the_gate_before_the_actor_drains() {
     let state = test_engine_state();
-    assert_eq!(state.gate.mode(), PermissionMode::default());
+    assert_eq!(state.gate.mode(), AccessMode::default());
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
     let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
     let bus = crate::steer_bus::AgentBus::new("test-thread".into(), notice_tx);
@@ -4372,14 +4361,14 @@ async fn set_permission_mode_writes_the_gate_before_the_actor_drains() {
         bus,
     };
 
-    ThreadEngine::set_permission_mode(&engine, PermissionMode::ReadOnly);
+    ThreadEngine::set_access_mode(&engine, AccessMode::FullAccess);
 
     // The gate flipped with no actor running at all.
-    assert_eq!(state.gate.mode(), PermissionMode::ReadOnly);
+    assert_eq!(state.gate.mode(), AccessMode::FullAccess);
     // The durable command is still queued, in order, with the same value.
     match cmd_rx.try_recv() {
-        Ok(SessionCmd::SetPermissionMode(mode)) => {
-            assert_eq!(mode, PermissionMode::ReadOnly)
+        Ok(SessionCmd::SetAccessMode(mode)) => {
+            assert_eq!(mode, AccessMode::FullAccess)
         }
         Ok(_) => panic!("a different command rode the queue for one switch"),
         Err(_) => panic!("the switch must still queue its durable command"),

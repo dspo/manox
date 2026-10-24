@@ -322,7 +322,7 @@ mod tests {
                     python3: "3.12".to_string(),
                     node: "20".to_string(),
                     today: "2026-07-14".to_string(),
-                    permission_mode: "danger-full-access",
+                    access_mode: "full-access",
                 },
             };
             assert_clean(
@@ -482,7 +482,7 @@ mod tests {
                 python3: "3.12".to_string(),
                 node: "20".to_string(),
                 today: "2026-07-14".to_string(),
-                permission_mode: "danger-full-access",
+                access_mode: "full-access",
             },
         };
         assert_eq!(
@@ -494,7 +494,7 @@ mod tests {
 
 
 ## Tool preferences
-Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval in read-only mode, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).
+Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).
 Every file-system and Bash call must carry `cwd` as an array `[anchor, ...route]`: the first element re-anchors the session's default directory (`""` keeps the current one — anchor it to the repo/worktree root once and leave it there), the remaining elements only locate this call. Express the target in `path` relative to the anchor rather than stacking route elements. Never `cd` inside a Bash command to reach a directory — `cd` does not move the session's working directory; pass `cwd`.
 
 ## Concurrency model
@@ -514,7 +514,7 @@ Unless the user specifies otherwise, write your user-facing responses in English
 - python3: 3.12
 - node: 20
 - Today: 2026-07-14
-- Permission mode: danger-full-access. Modes: read-only (bash runs but writes are denied by the seatbelt; fs mutations refused), workspace-write (writes under the workspace, the manox home (~/.manox), and temp areas; bash confined to the workspace-write profile), danger-full-access (no sandbox; bash unsandboxed, fs mutations unfenced). A denied bash or fs write is reported as `[sandbox: file access denied under <mode> mode]`; when a wider mode would let it succeed, retry the exact same call once with `sandbox_permissions` (the narrowest wider mode that suffices) + a one-sentence `justification` — the approval prompt asks the user. Never escalate speculatively.
+- Access mode: full-access. Modes: sandbox (writes under the workspace, the manox home (~/.manox), and temp areas; bash confined to the sandbox profile), full-access (no sandbox; bash unsandboxed, fs mutations unfenced). A denied bash or fs write is reported as `[sandbox: file access denied under <mode> mode]`; when full access would let a denied call succeed, retry the exact same call once with `require_escalated: true` + a one-sentence `justification` — the approval prompt asks the user. Never escalate speculatively.
 "##
         );
     }

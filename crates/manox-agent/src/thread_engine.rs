@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::db::ThreadSummary;
 use crate::language_model::TokenUsage;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
-use crate::thread::PermissionMode;
+use crate::thread::AccessMode;
 use manox_harness::types::Model as HarnessModel;
 
 /// Commands a facade can issue to its harness backend, plus the backend's
@@ -163,9 +163,9 @@ pub trait ThreadEngine: Send + Sync {
     /// Default is a no-op for backends that need no explicit shutdown.
     fn shutdown(&self) {}
 
-    /// Switch the permission mode gating the backend's tool executions.
-    /// Backends without a permission gate ignore this.
-    fn set_permission_mode(&self, _mode: PermissionMode) {}
+    /// Switch the access mode gating the backend's tool executions.
+    /// Backends without an access gate ignore this.
+    fn set_access_mode(&self, _mode: AccessMode) {}
 
     /// Toggle an opt-in browser tool suite (WebExplore) on or off.
     fn set_browser_suite(&self, _suite: crate::engine::BrowserSuite, _enable: bool) {}
@@ -258,7 +258,7 @@ pub struct ReadyInfo {
     /// The permission mode persisted in the session sidecar (fresh
     /// sessions take the bounded default); the facade mirrors it for the
     /// access chip.
-    pub permission_mode: crate::thread::PermissionMode,
+    pub access_mode: crate::thread::AccessMode,
     /// The reasoning effort restored from the session sidecar (fresh
     /// sessions default to High); the facade mirrors it so the model
     /// dropdown shows the restored selection.

@@ -80,8 +80,8 @@ pub struct SessionIntent {
     pub project: Option<String>,
     /// Initial model, as the canonical `provider/model` reference (L8).
     pub initial_model: Option<String>,
-    /// Approval mode for the new session.
-    pub approval_mode: Option<String>,
+    /// Access mode for the new session.
+    pub access_mode: Option<String>,
     /// Reasoning effort for the new session.
     pub reasoning_effort: Option<String>,
     /// Hidden context blocks written as non-displaying messages before the
@@ -109,8 +109,8 @@ pub struct ForkIntent {
     pub project: Option<String>,
     /// Initial model for the fork.
     pub initial_model: Option<String>,
-    /// Approval mode for the fork.
-    pub approval_mode: Option<String>,
+    /// Access mode for the fork.
+    pub access_mode: Option<String>,
     /// Reasoning effort for the fork.
     pub reasoning_effort: Option<String>,
 }
@@ -188,6 +188,27 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// Whether the runtime currently drives this session.
     fn has_session(&self, session_id: &str) -> bool;
 
+    /// Open a cold session (journal on disk, no live engine in this process)
+    /// so its runtime face is addressable — the same cold-open the
+    /// submit/cancel/settle paths take. A genuinely unknown id answers
+    /// not-found from the open itself.
+    fn open_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError>;
+
+    /// Ensure the runtime drives `session_id`, cold-opening it when the
+    /// journal proves it exists but this process has no live engine.
+    ///
+    /// A restored session serves folded state without an engine until
+    /// something needs one. Every client-initiated persistent write still
+    /// owes its client an answer, so writing paths call this first instead
+    /// of refusing a session the journal proves exists. A genuinely unknown
+    /// id keeps its not-found refusal, answered by the open itself.
+    fn ensure_live(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError> {
+        if self.has_session(session_id) {
+            return Ok(());
+        }
+        self.open_session(owner, session_id)
+    }
+
     /// The conversation-info Q face for a live session: per-model usage,
     /// cumulative totals and cost, folded from the journal (the retired v2
     /// `GetConversationInfo`). `None` for a cold session — a session without
@@ -236,8 +257,8 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// Select the session's reasoning effort.
     fn set_reasoning_effort(&self, session_id: &str, effort: &str) -> Result<(), RuntimeError>;
 
-    /// Select the session's approval mode.
-    fn set_approval_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError>;
+    /// Select the session's access mode.
+    fn set_access_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError>;
 
     /// Move the session's effective working directory.
     fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError>;

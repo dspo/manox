@@ -721,7 +721,7 @@ mod dispatch {
             cwd: None,
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
@@ -772,7 +772,7 @@ mod dispatch {
             cwd: None,
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
@@ -1173,7 +1173,7 @@ mod dispatch {
         let _guards = install();
         let (_server, backend) = fixture().await;
         let mut config = JsonObject::new();
-        config.insert("approvalMode".to_string(), json!("read-only"));
+        config.insert("accessMode".to_string(), json!("full-access"));
         config.insert("reasoningEffort".to_string(), json!("high"));
         let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
             config,
@@ -1299,7 +1299,7 @@ mod dispatch {
     }
 
     /// A multi-key write whose model key cannot be served is rejected
-    /// WHOLE: the approvalMode half must not land under the rejection —
+    /// WHOLE: the accessMode half must not land under the rejection —
     /// the write-ahead client rolls back every key of the action, so a
     /// half-applied write would strand the session on a mode its own chip
     /// no longer shows.
@@ -1314,14 +1314,14 @@ mod dispatch {
             .expect("live session");
         let before = (
             thread.read(|t| t.model().map(|m| m.id.clone())),
-            thread.read(|t| t.permission_mode()),
+            thread.read(|t| t.access_mode()),
         );
         let mut config = JsonObject::new();
         config.insert(
             "model".to_string(),
             json!("badkeyreg-anthropic/badkeyreg-anthropic-model"),
         );
-        config.insert("approvalMode".to_string(), json!("read-only"));
+        config.insert("accessMode".to_string(), json!("full-access"));
         let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
             config,
             replace: None,
@@ -1338,7 +1338,7 @@ mod dispatch {
         assert_eq!(
             (
                 thread.read(|t| t.model().map(|m| m.id.clone())),
-                thread.read(|t| t.permission_mode())
+                thread.read(|t| t.access_mode())
             ),
             before,
             "the rejected multi-key write landed nothing (neither half)"
@@ -1354,7 +1354,7 @@ mod dispatch {
         let _guards = install();
         let (_server, backend) = fixture().await;
         let mut config = JsonObject::new();
-        config.insert("approvalMode".to_string(), json!("read-only"));
+        config.insert("accessMode".to_string(), json!("full-access"));
         let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
             config,
             replace: Some(true),
@@ -2402,7 +2402,7 @@ mod dispatch {
             cwd: None,
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
@@ -2519,7 +2519,7 @@ mod dispatch {
             cwd: None,
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
@@ -2752,7 +2752,7 @@ mod dispatch {
             cwd: None,
             project: None,
             initial_model: None,
-            approval_mode: None,
+            access_mode: None,
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
@@ -3027,6 +3027,299 @@ mod dispatch {
         assert!(
             server.ahp_inner().session_thread("s-coldcancel").is_some(),
             "the cancel's cold open loaded the session"
+        );
+        uninstall();
+    }
+
+    /// A cold session's `session/configChanged` must open it instead of
+    /// refusing: the desktop's first model/approval change on a restored
+    /// session died as `unknown session [session/not-found]` while the client
+    /// had already folded the change into its chips (real-device round).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cold_restored_sessions_config_write_opens_it_instead_of_refusing() {
+        let _guards = install();
+        let _registry = install_two_provider_registry();
+        seed_session(
+            "s-coldconfig",
+            "thread-coldconfig",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", turn_start()),
+                ("e3", turn_finish()),
+            ],
+        )
+        .await;
+        // The scan is what teaches the store the id→path map on the real
+        // device; the test store's reconcile doesn't index direct file
+        // writes, so the note lands the same mapping the established idiom
+        // uses.
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.note_session_path("s-coldconfig", &core_journal("s-coldconfig")));
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let mut config = JsonObject::new();
+        config.insert(
+            "model".to_string(),
+            json!("okreg-anthropic/okreg-anthropic-model"),
+        );
+        config.insert("accessMode".to_string(), json!("full-access"));
+        let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
+            config,
+            replace: None,
+        });
+        match backend.dispatch(&session::uri("s-coldconfig"), &action, &origin()) {
+            DispatchOutcome::Accepted => {}
+            other => panic!("a cold session's config write must open and land, got {other:?}"),
+        }
+        // The open alone is not the fix: the write must land on the restored
+        // thread's own config — the value the client's chip already shows.
+        let thread = server
+            .ahp_inner()
+            .session_thread("s-coldconfig")
+            .expect("the config write's cold open loaded the session");
+        let (model, mode) = thread.read(|t| (t.model().map(|m| m.id.clone()), t.access_mode()));
+        assert_eq!(
+            model.as_deref(),
+            Some("okreg-anthropic-model"),
+            "the model change landed on the restored thread"
+        );
+        assert_eq!(
+            mode,
+            manox_agent::thread::AccessMode::FullAccess,
+            "the access-mode change landed on the restored thread"
+        );
+        uninstall();
+    }
+
+    /// A cold session's `session/activeClientSet` — the claim every client
+    /// dispatches on attach — must open it instead of refusing: the
+    /// registration answered "no live engine to register tools on" for a
+    /// session the journal proves exists, surfacing a bogus error
+    /// notification on every restore.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cold_restored_sessions_active_client_claim_opens_it_instead_of_refusing() {
+        let _guards = install();
+        seed_session(
+            "s-coldclaim",
+            "thread-coldclaim",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", turn_start()),
+                ("e3", turn_finish()),
+            ],
+        )
+        .await;
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.note_session_path("s-coldclaim", &core_journal("s-coldclaim")));
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let action =
+            StateAction::SessionActiveClientSet(ahp_types::actions::SessionActiveClientSetAction {
+                active_client: active_client("client-a", vec![tool_definition("cold_claim_tool")]),
+            });
+        match backend.dispatch(&session::uri("s-coldclaim"), &action, &origin()) {
+            DispatchOutcome::Accepted => {}
+            other => panic!("a cold session's claim must open and register, got {other:?}"),
+        }
+        assert!(
+            server.ahp_inner().session_thread("s-coldclaim").is_some(),
+            "the claim's cold open loaded the session"
+        );
+        // …and the registration the claim carries reached the runtime's tool
+        // store, which is the only reason the open was owed an answer.
+        let provider = crate::agent_server::AgentServerEmbedderTools::new(&server);
+        use manox_agent::embedder_tools::EmbedderToolProvider as _;
+        let mounted: Vec<String> = provider
+            .tools_for("s-coldclaim")
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert_eq!(
+            mounted,
+            vec!["cold_claim_tool"],
+            "the claim's tool landed on the just-opened thread"
+        );
+        uninstall();
+    }
+
+    /// A cold session's `session/workingDirectorySet` must open it too — the
+    /// same restored-journal shape, the same bare lookup downstream, the same
+    /// refusal the client already folded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cold_restored_sessions_cwd_write_opens_it_instead_of_refusing() {
+        let _guards = install();
+        // The engine only runs with a model configured: its actor retires at
+        // startup otherwise, and the queued `SetCwd` would never land. The
+        // registry's first visible model is the deliberately unservable one,
+        // so the settings pin the servable pick.
+        let _registry = install_two_provider_registry();
+        let settings = manox_agent::paths::settings_file().expect("the hermetic settings path");
+        std::fs::create_dir_all(settings.parent().expect("a parent")).expect("the home");
+        std::fs::write(
+            &settings,
+            "default_model = \"okreg-anthropic/okreg-anthropic-model\"\n",
+        )
+        .expect("the settings file");
+        seed_session(
+            "s-coldcwd",
+            "thread-coldcwd",
+            "/",
+            vec![
+                ("e1", user("hello")),
+                ("e2", turn_start()),
+                ("e3", turn_finish()),
+            ],
+        )
+        .await;
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.note_session_path("s-coldcwd", &core_journal("s-coldcwd")));
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd.clone());
+        // The engine refuses a directory that does not exist, so the write
+        // moves the session to a real one under the hermetic home.
+        let target = cwd.join("cold-cwd-target");
+        std::fs::create_dir_all(&target).expect("the target directory");
+        let target = target.to_string_lossy().into_owned();
+        let action = StateAction::SessionWorkingDirectorySet(
+            ahp_types::actions::SessionWorkingDirectorySetAction {
+                directory: format!("file://{target}"),
+            },
+        );
+        match backend.dispatch(&session::uri("s-coldcwd"), &action, &origin()) {
+            DispatchOutcome::Accepted => {}
+            other => panic!("a cold session's cwd write must open and land, got {other:?}"),
+        }
+        // The open alone is not the fix: the move must reach the engine, whose
+        // `CwdChanged` is what the client's directory chip mirrors.
+        let thread = server
+            .ahp_inner()
+            .session_thread("s-coldcwd")
+            .expect("the cwd write's cold open loaded the session");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let observed = thread.read(|t| t.cwd_path().map(str::to_string));
+            if observed.as_deref() == Some(target.as_str()) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the engine never applied the cwd write (saw {observed:?})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // The settings file is shared by every test in this process: leave the
+        // hermetic home as the next suite expects to find it.
+        let _ = std::fs::remove_file(&settings);
+        uninstall();
+    }
+
+    /// A genuinely unknown id keeps its not-found refusal: the cold-open
+    /// resurrects only sessions the journal proves exist; an id nothing on
+    /// disk answers is refused by name, with the stable code the client
+    /// branches on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_for_an_id_unknown_on_disk_stays_not_found() {
+        let _guards = install();
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        let mut config = JsonObject::new();
+        config.insert("accessMode".to_string(), json!("full-access"));
+        let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
+            config,
+            replace: None,
+        });
+        match backend.dispatch(&session::uri("s-nothing"), &action, &origin()) {
+            DispatchOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("session/not-found"),
+                    "the refusal carries the stable code: {reason}"
+                );
+            }
+            other => panic!("an id unknown on disk must stay not-found, got {other:?}"),
+        }
+        uninstall();
+    }
+
+    /// The `x-manox` command face must accept a cold session too: `compact`
+    /// and `goal` are the v2 height of `Compact` and `Goal`, and a restored
+    /// session is exactly where a user reaches for them. Each arm used to
+    /// bare-look the sessions table and refuse before the runtime's own
+    /// cold-open could run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cold_restored_sessions_commands_open_it_instead_of_refusing() {
+        let _guards = install();
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let ids = ["s-coldcompact", "s-coldgoal"];
+        for id in ids {
+            seed_session(
+                id,
+                id,
+                "/",
+                vec![
+                    ("e1", user("hello")),
+                    ("e2", turn_start()),
+                    ("e3", turn_finish()),
+                ],
+            )
+            .await;
+            manox_agent::thread_store::global()
+                .with_mut(|s| s.note_session_path(id, &core_journal(id)));
+        }
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+
+        let compact = backend.extension(
+            manox_ahp::ext::commands::COMPACT,
+            &json!({"channel": session::uri("s-coldcompact"), "instructions": "tighten"}),
+        );
+        assert_eq!(
+            compact.expect("a cold session compacts"),
+            serde_json::Value::Null
+        );
+        assert!(
+            server.ahp_inner().session_thread("s-coldcompact").is_some(),
+            "the compact command's cold open loaded the session"
+        );
+
+        let goal = backend.extension(
+            manox_ahp::ext::commands::GOAL,
+            &json!({"channel": session::uri("s-coldgoal"), "action": "clear"}),
+        );
+        assert_eq!(
+            goal.expect("a cold session clears its goal"),
+            serde_json::Value::Null
+        );
+        assert!(
+            server.ahp_inner().session_thread("s-coldgoal").is_some(),
+            "the goal command's cold open loaded the session"
+        );
+
+        // An id nothing on disk answers keeps the host-level not-found code:
+        // the cold-open widened the command face, not the unknown one.
+        let err = backend
+            .extension(
+                manox_ahp::ext::commands::COMPACT,
+                &json!({"channel": session::uri("s-nothing-cold")}),
+            )
+            .expect_err("an unknown id stays not-found");
+        assert_eq!(err.code(), manox_ahp::codes::ahp::SESSION_NOT_FOUND);
+        assert!(
+            server
+                .ahp_inner()
+                .session_thread("s-nothing-cold")
+                .is_none(),
+            "an unknown id is never opened"
         );
         uninstall();
     }

@@ -31,7 +31,7 @@ use crate::language_model::{MessageContent, ReasoningEffort, TokenUsage};
 use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
 use crate::questions::AskUserQuestionTool;
-use crate::thread::{PermissionMode, ThreadEvent};
+use crate::thread::{AccessMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine, send_notice};
 
 // The engine is split by concern: journal plumbing, tool assembly,
@@ -128,8 +128,8 @@ pub(crate) enum SessionCmd {
     SetModel(HarnessModel),
     /// Map the reasoning effort onto the harness's thinking level.
     SetThinkingLevel(Option<String>),
-    /// Switch the permission mode and persist it in the session sidecar.
-    SetPermissionMode(PermissionMode),
+    /// Switch the access mode and persist it in the session sidecar.
+    SetAccessMode(AccessMode),
     /// Toggle an opt-in browser tool suite (WebExplore) on or
     /// off; the engine merges/removes the suite names atomically.
     SetBrowserSuite { suite: BrowserSuite, enable: bool },
@@ -812,14 +812,14 @@ impl ThreadEngine for Engine {
         let _ = self.cmd_tx.send(SessionCmd::SetModel(model));
     }
 
-    fn set_permission_mode(&self, mode: PermissionMode) {
+    fn set_access_mode(&self, mode: AccessMode) {
         // The gate is the live authority every tool resolver reads per call,
         // so the mode lands on it directly — a mid-turn switch governs the
         // very next tool call. The queued command still serializes the
         // durable half (sidecar persist + journal echo) on the actor and
         // re-stamps the same value idempotently.
         self.state.gate.set_mode(mode);
-        let _ = self.cmd_tx.send(SessionCmd::SetPermissionMode(mode));
+        let _ = self.cmd_tx.send(SessionCmd::SetAccessMode(mode));
     }
 
     fn set_browser_suite(&self, suite: BrowserSuite, enable: bool) {
@@ -1215,10 +1215,11 @@ async fn run_actor(
         &wakeup_tx,
     );
 
-    // The permission mode rebuilds from the journal (the sidecar fills the
-    // legacy gap): restore it so a reopened session keeps its mode.
-    let permission_mode = restored_state.permission_mode;
-    state.gate.set_mode(permission_mode);
+    // The access mode rebuilds from the conversation's row (the sidecar
+    // fills the gap for a conversation the store has never seen): restore
+    // it so a reopened session keeps its mode.
+    let access_mode = restored_state.access_mode;
+    state.gate.set_mode(access_mode);
     repark_unsettled(&state, &restored_state);
     // The restore has landed — replayed parks are back on the gates. The
     // settle path awaits this watch, so a verdict issued during the
@@ -1262,7 +1263,7 @@ async fn run_actor(
         BackendNotice::Ready(Box::new(ReadyInfo {
             restored,
             model: Some(harness_model.clone()),
-            permission_mode,
+            access_mode,
             reasoning_effort,
             browser_suites,
             plan_snapshot,
@@ -1658,9 +1659,8 @@ async fn run_actor(
             SessionCmd::SetModel(new_model) => {
                 land_set_model(&mut session, &mut harness_model, &state, new_model).await;
             }
-            SessionCmd::SetPermissionMode(mode) => {
-                apply_permission_mode(&state, &sessions_dir, session.path(), mode, &notice_tx)
-                    .await;
+            SessionCmd::SetAccessMode(mode) => {
+                apply_access_mode(&state, &sessions_dir, session.path(), mode, &notice_tx).await;
             }
             SessionCmd::SetBrowserSuite { suite, enable } => {
                 apply_browser_suite(&mut session, suite, enable).await;
@@ -1838,7 +1838,7 @@ async fn run_actor(
                     .unwrap_or_default();
                 crate::thread_registry::set_active(&thread_id, opened_id).await;
                 *state.active_path.lock().unwrap() = Some(path);
-                resync_approval_mode(&restored_state, &state, &notice_tx);
+                resync_access_mode(&restored_state, &state, &notice_tx);
                 repark_unsettled(&state, &restored_state);
                 let _ = restore_ready.send(true);
                 // Opened sessions are resumed conversations: SessionStart
@@ -2320,21 +2320,21 @@ fn repark_unsettled(state: &Arc<EngineState>, restored: &RestoredThreadState) {
     }
 }
 
-/// Re-apply the persisted permission mode after a session switch (K2): the
+/// Re-apply the persisted access mode after a session switch (K2): the
 /// mode comes from the journal-first restore rebuild; align the gate and
 /// the facade's chip with it.
-fn resync_approval_mode(
+fn resync_access_mode(
     restored: &RestoredThreadState,
     state: &Arc<EngineState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) {
-    state.gate.set_mode(restored.permission_mode);
+    state.gate.set_mode(restored.access_mode);
     send_notice(
         notice_tx,
-        BackendNotice::Event(Box::new(ThreadEvent::PermissionModeChanged {
-            mode: restored.permission_mode,
+        BackendNotice::Event(Box::new(ThreadEvent::AccessModeChanged {
+            mode: restored.access_mode,
         })),
-        "permission mode changed notice",
+        "access mode changed notice",
     );
 }
 
@@ -2347,7 +2347,7 @@ fn resync_approval_mode(
 /// journal, never the reverse).
 #[derive(Debug, Clone, PartialEq)]
 struct RestoredThreadState {
-    permission_mode: PermissionMode,
+    access_mode: AccessMode,
     reasoning_effort: ReasoningEffort,
     /// Unsettled parks the restored chain still carries (a `request` with
     /// no `decision`): restore re-parks them so the verdict a park
@@ -2384,26 +2384,22 @@ fn journal_plan_snapshot(
 /// total — every restore face applies this resolution verbatim, and the
 /// replay-consistency regression asserts it across a disk round trip.
 ///
-/// The permission mode and the reasoning effort come from `config` — the
+/// The access mode and the reasoning effort come from `config` — the
 /// conversation's row — not from the chain and not from the sidecar. That is
-/// the same surface the request boundary reads and the permission gate reads
+/// the same surface the request boundary reads and the access gate reads
 /// per tool call, so a restore and a mid-run switch cannot disagree about
-/// what is in force. The journal's own rows for those two are legacy history:
-/// still parsed (a pre-store or hand-edited journal must not break the fold)
-/// and never consumed. The sidecar stays as the fallback for a conversation
-/// the store has never seen.
+/// what is in force. The journal carries no configuration of its own. The
+/// sidecar stays as the fallback for a conversation the store has never
+/// seen (a retired three-tier wire string there parses as unknown and
+/// lands on the bounded default).
 fn merge_restored_state(
     replayed: &crate::replay::ReplayedThreadState,
     meta: &manox_harness::session_meta::SessionMeta,
     config: &dyn manox_harness::ConversationConfigSource,
 ) -> RestoredThreadState {
-    let permission_mode = config
-        .permission_mode()
-        .or_else(|| {
-            meta.approval_mode
-                .as_deref()
-                .and_then(PermissionMode::from_wire)
-        })
+    let access_mode = config
+        .access_mode()
+        .or_else(|| meta.access_mode.as_deref().and_then(AccessMode::from_wire))
         .unwrap_or_default();
     let reasoning_effort = config
         .reasoning_effort()
@@ -2413,7 +2409,7 @@ fn merge_restored_state(
         })
         .unwrap_or_default();
     RestoredThreadState {
-        permission_mode,
+        access_mode,
         reasoning_effort,
         plan_snapshot: journal_plan_snapshot(replayed).or_else(|| meta.plan_snapshot.clone()),
         title: replayed
@@ -2798,23 +2794,23 @@ async fn handle_set_cwd(
     );
 }
 
-/// Apply the user's permission-mode decision (K3): the gate mirror plus the
+/// Apply the user's access-mode decision (K3): the gate mirror plus the
 /// notice the UI learns the switch from. Nothing durable is written here —
 /// the conversation's row is the mode's home, written by whoever made the
 /// pick, and the gate reads it live per tool call. The facade already
 /// broadcast its own synchronous copy of this event; the echo is idempotent.
-async fn apply_permission_mode(
+async fn apply_access_mode(
     state: &Arc<EngineState>,
     _sessions_dir: &Path,
     _session_path: &Path,
-    mode: PermissionMode,
+    mode: AccessMode,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) {
     state.gate.set_mode(mode);
     send_notice(
         notice_tx,
-        BackendNotice::Event(Box::new(ThreadEvent::PermissionModeChanged { mode })),
-        "permission mode changed notice",
+        BackendNotice::Event(Box::new(ThreadEvent::AccessModeChanged { mode })),
+        "access mode changed notice",
     );
 }
 
@@ -3078,7 +3074,7 @@ fn session_info_to_summary(
         title_override: None,
         model_id: String::new(),
         provider_id: None,
-        approval_mode: PermissionMode::default().as_i64(),
+        access_mode: AccessMode::default().as_i64(),
         project: if info.cwd == "/" {
             String::new()
         } else {

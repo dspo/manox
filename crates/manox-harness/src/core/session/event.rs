@@ -350,14 +350,6 @@ pub enum Event {
         timestamp: DateTime<Utc>,
         path: Option<String>,
     },
-    /// The approval mode changed.
-    #[serde(rename = "permission_mode_change", rename_all = "camelCase")]
-    PermissionModeChange {
-        id: String,
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        mode: String,
-    },
     /// The persisted plan snapshot changed.
     #[serde(rename = "plan_update", rename_all = "camelCase")]
     PlanUpdate {

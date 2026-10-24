@@ -37,7 +37,7 @@ impl AgentTool for GlobTool {
 
     fn description(&self) -> &str {
         "Find files matching a glob pattern. Use this over `find` in Bash for \
-         simple tree searches: no sandbox, no approval in read-only mode. \
+         simple tree searches: no sandbox, no approval. \
          Supports mtime filtering, kind (files/dirs), and mtime-sorted output. \
          Use Bash `find` only when the glob language is insufficient (complex \
          boolean predicates, custom sort, multi-pattern combinations)."

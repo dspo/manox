@@ -5,12 +5,11 @@
 //! module is the manox harness's gate: pure mode-based allow/deny, fully
 //! synchronous, no reviewer and no interactive approval round trip.
 //!
-//! - `DangerFullAccess` runs every gated call ungated (bash unsandboxed).
-//! - `WorkspaceWrite` runs a gated call when its target is provably inside
-//!   the workspace (`path_policy` for `Write`/`Edit`; sandbox-confined
+//! - `FullAccess` runs every gated call ungated (bash unsandboxed).
+//! - `Sandbox` runs a gated call when its target is provably inside the
+//!   writable roots (`sandbox_verdict` for `Write`/`Edit`; sandbox-confined
 //!   `Bash` bypass via the auto-allow resolver); anything the
 //!   policy cannot classify is denied (fail-closed).
-//! - `ReadOnly` denies every gated call; reads stay ungated.
 //!
 //! Denials return a `ToolError` to the model — the gate never parks a call
 //! on the user. The only round trip left on this channel is
@@ -30,24 +29,19 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::permission::{PendingAuthMeta, PermissionDecision, ToolAuthorizationResponse};
-use crate::thread::{PermissionMode, ThreadEvent};
+use crate::thread::{AccessMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, send_notice};
 
-/// Model-facing denial marker (always English, never localized): read-only mode
-/// refuses every fs mutation.
-const DENY_READ_ONLY: &str = "[sandbox: file access denied under read-only mode]";
-/// Model-facing denial marker: workspace-write refuses a mutation whose
-/// target the policy cannot prove inside the writable roots.
-const DENY_OUT_OF_WORKSPACE: &str = "[sandbox: file access denied under workspace-write mode]";
-
-/// The same-turn escalation hint appended to a fs-mutation refusal.
-fn fs_escalation_hint() -> String {
-    manox_harness::sandbox::escalation_hint_marker("operation")
-}
-
-/// A refused fs mutation: the marker for `mode` plus the escalation hint.
-fn fs_denial(marker: &str) -> ToolError {
-    ToolError::Other(format!("{marker}\n{}", fs_escalation_hint()))
+/// A refused fs mutation: the sandbox-mode marker (the one vocabulary both
+/// enforcing families teach) plus the same-turn escalation hint. Only the
+/// sandbox mode denies — full access runs unfenced, so there is exactly one
+/// denial word.
+fn fs_denial() -> ToolError {
+    ToolError::Other(format!(
+        "{}\n{}",
+        manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox),
+        manox_harness::sandbox::escalation_hint_marker("operation")
+    ))
 }
 
 /// A pending interaction parked on the user's answer (`AskUserQuestion`).
@@ -61,7 +55,7 @@ struct PendingAuth {
 /// the engine state so the tool wrappers (tokio side) and the facade's
 /// respond path (gpui side) see one source of truth.
 pub struct ApprovalGate {
-    mode: Mutex<PermissionMode>,
+    mode: Mutex<AccessMode>,
     /// The conversation's configuration authority. When installed it answers
     /// [`Self::mode`], so every per-call reader — this gate's own tool
     /// wrapper, the bash seatbelt's standing resolver, the Write/Edit
@@ -92,7 +86,7 @@ impl ApprovalGate {
         model_slot: Arc<Mutex<Option<HarnessModel>>>,
     ) -> Self {
         Self {
-            mode: Mutex::new(PermissionMode::default()),
+            mode: Mutex::new(AccessMode::default()),
             config_source: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             notice_tx,
@@ -134,15 +128,15 @@ impl ApprovalGate {
     /// installed this is a fresh read of the conversation's row, so a switch
     /// that lands mid-turn governs the very next call rather than the next
     /// turn.
-    pub fn mode(&self) -> PermissionMode {
+    pub fn mode(&self) -> AccessMode {
         let source = self.config_source.lock().unwrap().clone();
-        if let Some(mode) = source.as_ref().and_then(|source| source.permission_mode()) {
+        if let Some(mode) = source.as_ref().and_then(|source| source.access_mode()) {
             return mode;
         }
         *self.mode.lock().unwrap()
     }
 
-    pub fn set_mode(&self, mode: PermissionMode) {
+    pub fn set_mode(&self, mode: AccessMode) {
         *self.mode.lock().unwrap() = mode;
     }
 
@@ -255,7 +249,7 @@ impl ApprovalGate {
 }
 
 /// Host `EscalationApprover` over the `ApprovalGate`: parks a
-/// `sandbox_permissions` escalation on the user via the same
+/// `require_escalated` escalation on the user via the same
 /// `ToolCallAuthorization` round-trip `AskUserQuestion` uses, mapping the
 /// decision to the closed escalation outcome vocabulary.
 pub struct GateEscalationApprover {
@@ -278,7 +272,7 @@ impl manox_harness::sandbox::EscalationApprover for GateEscalationApprover {
         let tool_name = req.tool_name.clone();
         let reason = format!("escalate sandbox to {}: {}", mode.wire(), req.justification);
         let input = serde_json::json!({
-            "sandbox_permissions": mode.wire(),
+            "require_escalated": true,
             "justification": req.justification,
         });
         let rx = self.gate.register(
@@ -326,13 +320,13 @@ pub struct ApprovalGatedTool {
     gate: Arc<ApprovalGate>,
     auto_allow: Option<AutoAllowResolver>,
     /// Optional sandbox-escalation config (Write/Edit): resolves a
-    /// `sandbox_permissions` grant through the host approver before the
-    /// mode check, so an approved wider mode widens the verdict for one
-    /// call. The grant is a per-call local value (no shared cell —
+    /// `require_escalated` grant through the host approver before the
+    /// mode check, so an approved full-access grant widens the verdict for
+    /// one call. The grant is a per-call local value (no shared cell —
     /// Write/Edit run `Parallel`, a shared cell would race). Bash resolves
     /// its own escalation inside the tool.
     escalation_approver: Option<Arc<dyn manox_harness::sandbox::EscalationApprover + Send + Sync>>,
-    mode_resolver: Option<Arc<dyn Fn() -> PermissionMode + Send + Sync>>,
+    mode_resolver: Option<Arc<dyn Fn() -> AccessMode + Send + Sync>>,
     /// Session-shared extra writable roots, derived per call from the call's
     /// effective cwd: a linked worktree of the workspace admits itself
     /// automatically, any other directory is admitted by an approved
@@ -363,13 +357,13 @@ impl ApprovalGatedTool {
 
     /// Attach the sandbox-escalation config (Write/Edit): the host approver +
     /// the standing-mode resolver. When the model passes
-    /// `sandbox_permissions`+`justification`, the gate resolves the wider
-    /// mode through the approver and the returned per-call grant widens the
+    /// `require_escalated`+`justification`, the gate resolves full access
+    /// through the approver and the returned per-call grant widens the
     /// verdict for that one call (no shared cell — Write/Edit are parallel).
     pub fn with_escalation(
         mut self,
         approver: Arc<dyn manox_harness::sandbox::EscalationApprover + Send + Sync>,
-        mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync>,
+        mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
     ) -> Self {
         self.escalation_approver = Some(approver);
         self.mode_resolver = Some(mode_resolver);
@@ -431,77 +425,71 @@ impl ApprovalGatedTool {
                 .await;
         }
         // Resolve a one-shot sandbox-escalation grant (Write/Edit) before the
-        // mode check; an approved wider mode widens the verdict for this call
-        // only — a per-call local value, not a shared cell (Write/Edit run
-        // `Parallel`; a shared cell would race between concurrent calls).
-        // Bash resolves its own escalation inside the tool and never reaches
-        // here (auto-allowed).
+        // mode check; an approved full-access grant widens the verdict for
+        // this call only — a per-call local value, not a shared cell
+        // (Write/Edit run `Parallel`; a shared cell would race between
+        // concurrent calls). Bash resolves its own escalation inside the tool
+        // and never reaches here (auto-allowed).
         let standing = self.standing_mode();
         let grant = self
             .resolve_escalation(tool_call_id, &signal, &params, standing, ctx)
             .await?;
-        let mode = grant.unwrap_or(standing);
-        match mode {
-            PermissionMode::DangerFullAccess => {
+        match grant.unwrap_or(standing) {
+            // Full access runs every gated call ungated.
+            AccessMode::FullAccess => {
                 self.delegate(tool_call_id, params, signal, ctx, progress)
                     .await
             }
-            PermissionMode::WorkspaceWrite => {
-                self.workspace_write_verdict(&params, ctx)?;
+            // Sandbox enters the verdict: the call runs when its target is
+            // provably inside the writable roots, denied otherwise.
+            AccessMode::Sandbox => {
+                self.sandbox_verdict(&params, ctx)?;
                 self.delegate(tool_call_id, params, signal, ctx, progress)
                     .await
             }
-            PermissionMode::ReadOnly => Err(fs_denial(DENY_READ_ONLY)),
         }
     }
 
     /// The standing session mode (absent any per-call grant).
-    fn standing_mode(&self) -> PermissionMode {
+    fn standing_mode(&self) -> AccessMode {
         self.mode_resolver
             .as_ref()
             .map(|r| r())
             .unwrap_or_else(|| self.gate.mode())
     }
 
-    /// Validate the `sandbox_permissions`+`justification` pairing and, when
-    /// present, resolve the wider mode through the host approver, returning
-    /// it as a per-call grant (no shared state). `None`
-    /// means no escalation was requested. A non-widening or unapproved
-    /// request returns the verbatim error (fail-closed).
+    /// Validate the `require_escalated`+`justification` pairing and, when
+    /// set, resolve full access through the host approver, returning it as a
+    /// per-call grant (no shared state). `None` means no escalation was
+    /// requested. A non-widening or unapproved request returns the verbatim
+    /// error (fail-closed). The requested mode is always full access — with
+    /// two tiers it is the only widening edge.
     async fn resolve_escalation(
         &self,
         tool_call_id: &str,
         signal: &CancellationToken,
         params: &serde_json::Value,
-        standing: PermissionMode,
+        standing: AccessMode,
         ctx: &dyn ToolContext,
-    ) -> Result<Option<PermissionMode>, ToolError> {
-        let sp = params.get("sandbox_permissions").and_then(|v| v.as_str());
+    ) -> Result<Option<AccessMode>, ToolError> {
+        let escalate = params
+            .get("require_escalated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let just = params.get("justification").and_then(|v| v.as_str());
-        manox_harness::sandbox::validate_escalation_args(sp, just)
+        manox_harness::sandbox::validate_escalation_args(escalate, just)
             .map_err(ToolError::InvalidArguments)?;
-        let Some(requested) = sp else {
+        if !escalate {
             return Ok(None);
-        };
+        }
         let approver = self.escalation_approver.as_ref().ok_or_else(|| {
             ToolError::Other(
                 "sandbox escalation requires approval, but no approval service is composed".into(),
             )
         })?;
-        let requested =
-            manox_harness::sandbox::PermissionMode::from_wire(requested).ok_or_else(|| {
-                ToolError::InvalidArguments(format!(
-                    "sandbox_permissions must be one of: {}",
-                    manox_harness::sandbox::ESCALATION_TARGETS
-                        .iter()
-                        .map(|m| m.wire())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-            })?;
         let grant = manox_harness::sandbox::approve_escalation(
             manox_harness::sandbox::EscalationRequest {
-                requested_mode: requested,
+                requested_mode: AccessMode::FullAccess,
                 justification: just.unwrap().to_string(),
                 effective_mode: standing,
                 subject: "operation".into(),
@@ -564,17 +552,17 @@ impl ApprovalGatedTool {
         Some(nearest_existing_ancestor(&target))
     }
 
-    /// WorkspaceWrite verdict for one gated call: `Ok` when the operation
-    /// target is provably inside the workspace, `Err` (model-facing reason)
-    /// otherwise. Fail-closed: any gated call the policy cannot classify is
-    /// denied. Sandbox-confined bash never reaches this check (its
-    /// auto-allow resolver bypasses the gate entirely).
-    fn workspace_write_verdict(
+    /// Sandbox verdict for one gated call: `Ok` when the operation
+    /// target is provably inside the writable roots, `Err` (model-facing
+    /// reason) otherwise. Fail-closed: any gated call the policy cannot
+    /// classify is denied. Sandbox-confined bash never reaches this check
+    /// (its auto-allow resolver bypasses the gate entirely).
+    fn sandbox_verdict(
         &self,
         params: &serde_json::Value,
         ctx: &dyn ToolContext,
     ) -> Result<(), ToolError> {
-        let deny = || Err(fs_denial(DENY_OUT_OF_WORKSPACE));
+        let deny = || Err(fs_denial());
         // The call's effective cwd — the same `cwd` `[anchor, ...route]`
         // resolution the tool itself will perform, peeked read-only so the
         // fence does not advance the sticky cwd. A malformed or unresolvable
@@ -593,8 +581,7 @@ impl ApprovalGatedTool {
         // escalation-approved directory stays for the session — no `.git` or
         // plans-dir special-casing: the plans dir is admitted transitively
         // under the manox home.
-        let mut roots =
-            manox_harness::sandbox::writable_roots(PermissionMode::WorkspaceWrite, &cwd);
+        let mut roots = manox_harness::sandbox::writable_roots(AccessMode::Sandbox, &cwd);
         if let Some(granted) = &self.granted_roots {
             roots.extend(granted.roots_for(&cwd));
         }
@@ -645,10 +632,8 @@ impl ApprovalGatedTool {
             // in (the interpreter runs in-process, with the app's full user
             // privileges). The call fails closed with the escalation hint;
             // the assembly line arms this wrapper with the escalation
-            // config, so an approved `sandbox_permissions`+`justification`
-            // grant widens the mode for exactly that call. Read-only never
-            // reaches this arm: `run_gated` refuses the whole call before
-            // the verdict.
+            // config, so an approved `require_escalated`+`justification`
+            // grant widens the mode for exactly that call.
             crate::tools::PY => deny(),
             // Session/repo-scoped coordination (task tools) was removed in
             // the tools-optimization cycle — they were retired with the
@@ -688,26 +673,22 @@ impl HarnessAgentTool for ApprovalGatedTool {
         let mut schema = self.inner.parameters_schema();
         // Advertise the escalation fields on the wrapping tool (Write/Edit)
         // when a sandbox backend is mounted, so the model knows the denied
-        // call can be retried with `sandbox_permissions`+`justification`.
+        // call can be retried with `require_escalated`+`justification`.
         if self.escalation_approver.is_some()
             && let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut())
         {
             props.insert(
-                "sandbox_permissions".into(),
+                "require_escalated".into(),
                 serde_json::json!({
-                    "type": "string",
-                    "enum": manox_harness::sandbox::ESCALATION_TARGETS
-                        .iter()
-                        .map(|m| m.wire())
-                        .collect::<Vec<_>>(),
-                    "description": "The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval."
+                    "type": "boolean",
+                    "description": "Set true to retry this exact operation with full access (no sandbox). Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval."
                 }),
             );
             props.insert(
                 "justification".into(),
                 serde_json::json!({
                     "type": "string",
-                    "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."
+                    "description": "Required with require_escalated: one sentence for the user explaining why this exact file operation needs full access."
                 }),
             );
         }
@@ -757,6 +738,12 @@ mod tests {
     use manox_harness::env::TokioExecutionEnv;
     use manox_harness::tool::{LocalToolContext, ToolState};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The one denial word under two tiers: only sandbox mode denies, so the
+    /// model-facing marker is a constant fact.
+    fn sandbox_denial() -> String {
+        manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox)
+    }
 
     fn gate() -> Arc<ApprovalGate> {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -875,15 +862,15 @@ mod tests {
     #[test]
     fn gate_mode_switches() {
         let gate = gate();
-        assert_eq!(gate.mode(), PermissionMode::WorkspaceWrite);
-        gate.set_mode(PermissionMode::DangerFullAccess);
-        assert_eq!(gate.mode(), PermissionMode::DangerFullAccess);
+        assert_eq!(gate.mode(), AccessMode::Sandbox);
+        gate.set_mode(AccessMode::FullAccess);
+        assert_eq!(gate.mode(), AccessMode::FullAccess);
     }
 
     #[tokio::test]
     async fn read_only_tools_pass_through_ungated() {
         let (gate, mut rx) = gate_with_events();
-        gate.set_mode(PermissionMode::ReadOnly);
+        gate.set_mode(AccessMode::Sandbox);
         let (tool, ran) = gated(false, true, Arc::clone(&gate));
         let ctx = tool_ctx();
         let result = tool
@@ -898,7 +885,7 @@ mod tests {
     #[tokio::test]
     async fn full_access_delegates_gated_tools_without_prompting() {
         let (gate, mut rx) = gate_with_events();
-        gate.set_mode(PermissionMode::DangerFullAccess);
+        gate.set_mode(AccessMode::FullAccess);
         let (tool, ran) = gated(true, false, Arc::clone(&gate));
         let ctx = tool_ctx();
         let result = tool
@@ -911,24 +898,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_mode_denies_mutating_tools_with_tool_error() {
-        let (gate, mut rx) = gate_with_events();
-        gate.set_mode(PermissionMode::ReadOnly);
-        let (tool, ran) = gated(true, false, Arc::clone(&gate));
-        let ctx = tool_ctx();
-        let err = tool
-            .execute("c1", serde_json::json!({}), CancellationToken::new(), &ctx)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains(DENY_READ_ONLY));
-        assert_eq!(ran.load(Ordering::SeqCst), 0, "denied call must not run");
-        assert!(rx.try_recv().is_err(), "no authorization event on deny");
-    }
-
-    #[tokio::test]
-    async fn workspace_write_allows_in_workspace_write() {
+    async fn sandbox_allows_in_workspace() {
         let (gate, _rx) = gate_with_events();
-        gate.set_mode(PermissionMode::WorkspaceWrite);
+        gate.set_mode(AccessMode::Sandbox);
         let (tool, ran) = gated_named("Write", false, false, Arc::clone(&gate));
         let ctx = tool_ctx();
         // The tool ctx's cwd is the workspace root for the gate's policy.
@@ -948,15 +920,15 @@ mod tests {
 
     /// Py has no statically knowable target set — a script decides at
     /// runtime what it touches — and no OS sandbox stands in (the
-    /// interpreter runs in-process), so every fenced mode fails it closed:
-    /// workspace-write denies with the escalation hint (the assembly line
-    /// arms the wrapper with the escalation config, so an approved
-    /// `sandbox_permissions` grant is the one wider road), read-only denies
-    /// outright, and only full access runs the script.
+    /// interpreter runs in-process), so the sandbox mode fails it closed:
+    /// it denies with the escalation hint (the assembly line arms the
+    /// wrapper with the escalation config, so an approved
+    /// `require_escalated` grant is the one wider road), and only full
+    /// access runs the script.
     #[tokio::test]
-    async fn py_fails_closed_in_every_fenced_mode() {
+    async fn py_fails_closed_in_sandbox_runs_in_full_access() {
         let (gate, _rx) = gate_with_events();
-        gate.set_mode(PermissionMode::WorkspaceWrite);
+        gate.set_mode(AccessMode::Sandbox);
         let (tool, ran) = gated_named("Py", true, false, Arc::clone(&gate));
         let ctx = tool_ctx();
         let params = serde_json::json!({"script": "print(1)", "cwd": [""]});
@@ -966,25 +938,13 @@ mod tests {
             .unwrap_err();
         match err {
             ToolError::Other(message) => {
-                assert!(message.contains("workspace-write"), "{message}");
+                assert!(message.contains("sandbox mode"), "{message}");
             }
-            other => panic!("expected the workspace-write refusal, got {other:?}"),
-        }
-
-        gate.set_mode(PermissionMode::ReadOnly);
-        let err = tool
-            .execute("c2", params.clone(), CancellationToken::new(), &ctx)
-            .await
-            .unwrap_err();
-        match err {
-            ToolError::Other(message) => {
-                assert!(message.contains("read-only"), "{message}");
-            }
-            other => panic!("expected the read-only refusal, got {other:?}"),
+            other => panic!("expected the sandbox refusal, got {other:?}"),
         }
         assert_eq!(ran.load(Ordering::SeqCst), 0, "the script never ran");
 
-        gate.set_mode(PermissionMode::DangerFullAccess);
+        gate.set_mode(AccessMode::FullAccess);
         let result = tool
             .execute("c3", params, CancellationToken::new(), &ctx)
             .await
@@ -999,7 +959,7 @@ mod tests {
     /// every default writable root so only the accumulated root can admit
     /// it.
     #[tokio::test]
-    async fn workspace_write_allows_approved_granted_roots() {
+    async fn sandbox_allows_approved_granted_roots() {
         let dir = tempfile::tempdir().unwrap();
         // Outside every default writable root (temp areas and the manox home
         // would admit it regardless); the mock tool never writes, so the
@@ -1007,7 +967,7 @@ mod tests {
         let approved = PathBuf::from("/usr/local/manox-cwd-per-call-fence-probe");
         let target = approved.join("probe.txt");
         let (gate, _rx) = gate_with_events();
-        gate.set_mode(PermissionMode::WorkspaceWrite);
+        gate.set_mode(AccessMode::Sandbox);
 
         // With the granted-roots store holding the approved root: the write
         // passes.
@@ -1053,7 +1013,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains(DENY_OUT_OF_WORKSPACE));
+        assert!(err.to_string().contains(&sandbox_denial()));
         assert_eq!(ran2.load(Ordering::SeqCst), 0);
     }
 
@@ -1061,7 +1021,7 @@ mod tests {
     /// per-call cwd: an explicit `cwd` pointing into a same-repo worktree
     /// passes the verdict for targets inside it, with no approval anywhere.
     #[tokio::test]
-    async fn workspace_write_admits_a_same_repo_worktree_via_call_cwd() {
+    async fn sandbox_admits_a_same_repo_worktree_via_call_cwd() {
         let base = tempfile::tempdir().unwrap();
         let repo = base.path().join("repo");
         let wt = base.path().join("wt");
@@ -1088,7 +1048,7 @@ mod tests {
 
         let granted = crate::granted_roots::GrantedRoots::new(&repo);
         let (gate, _rx) = gate_with_events();
-        gate.set_mode(PermissionMode::WorkspaceWrite);
+        gate.set_mode(AccessMode::Sandbox);
         let ran = Arc::new(AtomicUsize::new(0));
         let tool = ApprovalGatedTool::new(
             Arc::new(MockTool {
@@ -1141,19 +1101,19 @@ mod tests {
         );
     }
 
-    /// The manox state home is part of the workspace-write writable scope:
+    /// The manox state home is part of the sandbox writable scope:
     /// plan files (and other session state) write without escalation. The
     /// target resolves through the HOST home resolver while the writable
     /// roots resolve through the extension layer's — this test pins that the
     /// two agree.
     #[tokio::test]
-    async fn workspace_write_allows_manox_home_write() {
+    async fn sandbox_allows_manox_home_write() {
         let Ok(home) = crate::paths::manox_home() else {
             return; // no home dir to admit
         };
         let target = home.join("plans/gate-probe-plan.md");
         let (gate, _rx) = gate_with_events();
-        gate.set_mode(PermissionMode::WorkspaceWrite);
+        gate.set_mode(AccessMode::Sandbox);
         let ctx = tool_ctx();
 
         let (tool, ran) = gated_named("Write", false, false, Arc::clone(&gate));
@@ -1188,9 +1148,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_write_denies_out_of_workspace_write() {
+    async fn sandbox_denies_out_of_roots_write() {
         let (gate, mut rx) = gate_with_events();
-        gate.set_mode(PermissionMode::WorkspaceWrite);
+        gate.set_mode(AccessMode::Sandbox);
         let (tool, ran) = gated_named("Write", false, false, Arc::clone(&gate));
         let ctx = tool_ctx();
         let err = tool
@@ -1202,15 +1162,15 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains(DENY_OUT_OF_WORKSPACE));
+        assert!(err.to_string().contains(&sandbox_denial()));
         assert_eq!(ran.load(Ordering::SeqCst), 0);
         assert!(rx.try_recv().is_err(), "no authorization event on deny");
     }
 
     #[tokio::test]
-    async fn workspace_write_edit_patch_confines_targets() {
+    async fn sandbox_edit_patch_confines_targets() {
         let (gate, _rx) = gate_with_events();
-        gate.set_mode(PermissionMode::WorkspaceWrite);
+        gate.set_mode(AccessMode::Sandbox);
         let (tool, ran) = gated_named("Edit", false, false, Arc::clone(&gate));
         let ctx = tool_ctx();
         let ok_patch = "*** Begin Patch\n[src/ok.rs#1A2B3C]\nDEL 1\n*** End Patch";
@@ -1237,18 +1197,18 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains(DENY_OUT_OF_WORKSPACE));
+        assert!(err.to_string().contains(&sandbox_denial()));
         assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     /// Fail-closed: a gated mutating tool the path policy cannot classify
-    /// (no path target) is denied under WorkspaceWrite. The `cwd` carries a
+    /// (no path target) is denied under Sandbox. The `cwd` carries a
     /// well-formed anchor so the case isolates target classification — a
     /// missing/malformed `cwd` is an argument error, not a denial.
     #[tokio::test]
-    async fn workspace_write_denies_unclassifiable_targets() {
+    async fn sandbox_denies_unclassifiable_targets() {
         let (gate, _rx) = gate_with_events();
-        gate.set_mode(PermissionMode::WorkspaceWrite);
+        gate.set_mode(AccessMode::Sandbox);
         let (tool, ran) = gated(true, false, Arc::clone(&gate));
         let ctx = tool_ctx();
         let err = tool
@@ -1260,7 +1220,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains(DENY_OUT_OF_WORKSPACE));
+        assert!(err.to_string().contains(&sandbox_denial()));
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
@@ -1269,9 +1229,9 @@ mod tests {
     /// instructional argument error — not a sandbox denial luring the model
     /// into an escalation — without running the tool.
     #[tokio::test]
-    async fn workspace_write_missing_cwd_surfaces_the_instructional_error() {
+    async fn sandbox_missing_cwd_surfaces_the_instructional_error() {
         let (gate, _rx) = gate_with_events();
-        gate.set_mode(PermissionMode::WorkspaceWrite);
+        gate.set_mode(AccessMode::Sandbox);
         let (tool, ran) = gated_named("Write", true, false, Arc::clone(&gate));
         let ctx = tool_ctx();
         let err = tool
@@ -1288,7 +1248,7 @@ mod tests {
                 .contains(manox_harness::tools::path_utils::CWD_REQUIRED_DOC),
             "{err}"
         );
-        assert!(!err.to_string().contains(DENY_OUT_OF_WORKSPACE));
+        assert!(!err.to_string().contains(&sandbox_denial()));
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
@@ -1330,17 +1290,17 @@ mod tests {
         }
     }
 
-    /// Regression: an approved escalation whose verdict then rejects (the
-    /// typical case — the model asked for an out-of-workspace target) must
-    /// clear the per-call grant so the NEXT call (no escalation) falls back
-    /// to the standing read-only mode, not the stale workspace-write grant.
+    /// Regression: the per-call grant dies with its call. Call 1 escalates
+    /// to full access and RUNS (full access is ungated); call 2 carries no
+    /// escalation and must fall back to the standing sandbox mode and be
+    /// DENIED — a leaked grant would have run it too.
     #[tokio::test]
-    async fn read_only_escalation_rejected_by_verdict_does_not_leak_grant() {
+    async fn escalation_grant_does_not_leak_to_the_next_call() {
         let (gate, _rx) = gate_with_events();
-        gate.set_mode(PermissionMode::ReadOnly);
-        let (tool, _ran) = gated_named("Write", false, false, Arc::clone(&gate));
+        gate.set_mode(AccessMode::Sandbox);
+        let (tool, ran) = gated_named("Write", false, false, Arc::clone(&gate));
         let standing = Arc::clone(&gate);
-        let mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
+        let mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync> =
             Arc::new(move || standing.mode());
         let tool = tool.with_escalation(
             Arc::new(CannedEscalationApprover(
@@ -1349,24 +1309,24 @@ mod tests {
             mode_resolver,
         );
         let ctx = tool_ctx();
-        // Call 1: escalate to workspace-write for an out-of-workspace target.
+        // Call 1: escalate to full access for an out-of-roots target — the
+        // approved grant runs the call.
         let args = serde_json::json!({
             "path": "/etc/manox-grant-leak-test/x.txt",
             "cwd": [""],
             "content": "x",
-            "sandbox_permissions": "workspace-write",
+            "require_escalated": true,
             "justification": "need it"
         });
-        let err = tool
+        let result = tool
             .execute("c1", args, CancellationToken::new(), &ctx)
             .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains(DENY_OUT_OF_WORKSPACE),
-            "call 1 rejected by the verdict: {err}"
-        );
-        // Call 2: no escalation, same out-of-workspace target — must fall
-        // back to read-only, NOT the stale workspace-write grant.
+            .unwrap();
+        assert!(!result.is_error, "the approved grant runs the call");
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        // Call 2: no escalation, same out-of-roots target — the standing
+        // sandbox verdict denies it; the stale full-access grant would have
+        // run it a second time.
         let args2 = serde_json::json!({
             "path": "/etc/manox-grant-leak-test/x.txt",
             "cwd": [""],
@@ -1377,26 +1337,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err2.to_string().contains(DENY_READ_ONLY),
-            "call 2 fell back to read-only: {err2}"
+            err2.to_string().contains(&sandbox_denial()),
+            "call 2 denied by the standing sandbox verdict: {err2}"
         );
-        assert!(
-            !err2.to_string().contains(DENY_OUT_OF_WORKSPACE),
-            "stale grant leaked to call 2: {err2}"
-        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the stale grant never ran");
     }
 
     /// Parallel regression: an escalated Write/Edit call must not leak its
     /// grant to a concurrent non-escalated call (Write/Edit run `Parallel`).
-    /// The grant is a per-call local value, so the concurrent plain call
-    /// stays read-only even while the escalated one is in flight.
+    /// The grant is a per-call local value, so the escalated call runs while
+    /// the plain call is denied by the standing sandbox verdict.
     #[tokio::test]
     async fn parallel_non_escalated_call_is_unaffected_by_in_flight_grant() {
         let (gate, _rx) = gate_with_events();
-        gate.set_mode(PermissionMode::ReadOnly);
-        let (tool, _ran) = gated_named("Write", false, false, Arc::clone(&gate));
+        gate.set_mode(AccessMode::Sandbox);
+        let (tool, ran) = gated_named("Write", false, false, Arc::clone(&gate));
         let standing = Arc::clone(&gate);
-        let mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
+        let mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync> =
             Arc::new(move || standing.mode());
         let tool = Arc::new(tool.with_escalation(
             Arc::new(CannedEscalationApprover(
@@ -1409,7 +1366,7 @@ mod tests {
             "path": "/etc/manox-parallel-race/x.txt",
             "cwd": [""],
             "content": "x",
-            "sandbox_permissions": "workspace-write",
+            "require_escalated": true,
             "justification": "need it"
         });
         let plain = serde_json::json!({
@@ -1421,22 +1378,16 @@ mod tests {
             tool.execute("c1", escalated, CancellationToken::new(), &ctx),
             tool.execute("c2", plain, CancellationToken::new(), &ctx),
         );
-        let a = a.unwrap_err();
+        let a = a.unwrap();
         let b = b.unwrap_err();
+        assert!(!a.is_error, "the escalated call runs at full access");
+        // The plain call must be denied by the standing sandbox verdict, NOT
+        // the in-flight full-access grant (no shared cell → no leak).
         assert!(
-            a.to_string().contains(DENY_OUT_OF_WORKSPACE),
-            "escalated: {a}"
+            b.to_string().contains(&sandbox_denial()),
+            "plain fell back to the sandbox verdict: {b}"
         );
-        // The plain call must be read-only, NOT the in-flight workspace-write
-        // grant (no shared cell → no leak).
-        assert!(
-            b.to_string().contains(DENY_READ_ONLY),
-            "plain fell back to read-only: {b}"
-        );
-        assert!(
-            !b.to_string().contains(DENY_OUT_OF_WORKSPACE),
-            "in-flight grant leaked to the parallel plain call: {b}"
-        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "only the escalated call ran");
     }
     /// A mock tool whose schema carries a `properties` object (so the gate's
     /// escalation-field merge has somewhere to land).
@@ -1474,7 +1425,7 @@ mod tests {
         let bare_gate = gate();
         let gate = gate();
         let standing = Arc::clone(&gate);
-        let mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
+        let mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync> =
             Arc::new(move || standing.mode());
         let tool = ApprovalGatedTool::new(Arc::new(PropMock), gate).with_escalation(
             Arc::new(CannedEscalationApprover(
@@ -1488,12 +1439,17 @@ mod tests {
             .expect("schema has properties");
         assert!(props.contains_key("path"), "inner field preserved");
         assert!(
-            props.contains_key("sandbox_permissions"),
+            props.contains_key("require_escalated"),
             "escalation field advertised"
         );
         assert!(
             props.contains_key("justification"),
             "escalation field advertised"
+        );
+        assert_eq!(
+            props["require_escalated"]["type"],
+            serde_json::json!("boolean"),
+            "the escalation slot is a boolean flag, not an enum"
         );
         // Without escalation configured, the inner schema passes through bare.
         let bare = ApprovalGatedTool::new(Arc::new(PropMock), bare_gate);
@@ -1501,7 +1457,7 @@ mod tests {
         let bare_props = bare_schema["properties"]
             .as_object()
             .expect("bare schema has properties");
-        assert!(!bare_props.contains_key("sandbox_permissions"));
+        assert!(!bare_props.contains_key("require_escalated"));
     }
 
     /// K3 (L3): the user's verdict on a parked card journals as an
@@ -1619,7 +1575,7 @@ mod tests {
     /// mid-run; the real object-store implementation is covered by
     /// `conversation_config`'s own tests.
     struct FakeConfigSource {
-        mode: Mutex<Option<PermissionMode>>,
+        mode: Mutex<Option<AccessMode>>,
     }
 
     impl manox_harness::ConversationConfigSource for FakeConfigSource {
@@ -1631,7 +1587,7 @@ mod tests {
             None
         }
 
-        fn permission_mode(&self) -> Option<PermissionMode> {
+        fn access_mode(&self) -> Option<AccessMode> {
             *self.mode.lock().unwrap()
         }
 
@@ -1666,31 +1622,38 @@ mod tests {
     #[tokio::test]
     async fn a_mode_flip_governs_the_very_next_tool_call() {
         let source = Arc::new(FakeConfigSource {
-            mode: Mutex::new(Some(PermissionMode::ReadOnly)),
+            mode: Mutex::new(Some(AccessMode::Sandbox)),
         });
         let gate = gate();
         gate.set_config_source(source.clone());
         // A stale mirror must not win over the source: this is the value the
         // gate was handed when the run began.
-        gate.set_mode(PermissionMode::DangerFullAccess);
+        gate.set_mode(AccessMode::FullAccess);
 
         let (tool, ran) = gated_mutating_tool(Arc::clone(&gate));
         let ctx = tool_ctx();
+        // An out-of-roots target: denied under sandbox, admitted at full
+        // access — the pair makes the governing mode observable.
+        let args = serde_json::json!({
+            "path": "/etc/manox-mode-flip-test/x.txt",
+            "cwd": [""],
+            "content": "x"
+        });
         let err = tool
-            .execute("c1", serde_json::json!({}), CancellationToken::new(), &ctx)
+            .execute("c1", args.clone(), CancellationToken::new(), &ctx)
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains(DENY_READ_ONLY),
-            "the source's read-only governs the first call: {err}"
+            err.to_string().contains(&sandbox_denial()),
+            "the source's sandbox governs the first call: {err}"
         );
         assert_eq!(ran.load(Ordering::SeqCst), 0);
 
         // The user's write lands while the run is in flight.
-        *source.mode.lock().unwrap() = Some(PermissionMode::DangerFullAccess);
+        *source.mode.lock().unwrap() = Some(AccessMode::FullAccess);
 
         let result = tool
-            .execute("c2", serde_json::json!({}), CancellationToken::new(), &ctx)
+            .execute("c2", args, CancellationToken::new(), &ctx)
             .await
             .expect("the next call must be admitted");
         assert!(!result.is_error);
@@ -1706,14 +1669,23 @@ mod tests {
     #[tokio::test]
     async fn a_gate_without_a_source_keeps_its_mirror() {
         let gate = gate();
-        gate.set_mode(PermissionMode::ReadOnly);
+        gate.set_mode(AccessMode::Sandbox);
         let (tool, ran) = gated_mutating_tool(Arc::clone(&gate));
         let ctx = tool_ctx();
         let err = tool
-            .execute("c1", serde_json::json!({}), CancellationToken::new(), &ctx)
+            .execute(
+                "c1",
+                serde_json::json!({
+                    "path": "/etc/manox-mirror-test/x.txt",
+                    "cwd": [""],
+                    "content": "x"
+                }),
+                CancellationToken::new(),
+                &ctx,
+            )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains(DENY_READ_ONLY));
+        assert!(err.to_string().contains(&sandbox_denial()));
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 }

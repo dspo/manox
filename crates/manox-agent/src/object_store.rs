@@ -8,7 +8,7 @@
 //!   its transcript from the journal.
 //! - The **object store** records user will and object metadata — the
 //!   project a conversation belongs to (never derived from any cwd), the
-//!   model and permission picks, drafts, pin/archive/title flags. Reopening
+//!   model and access-mode picks, drafts, pin/archive/title flags. Reopening
 //!   restores the conversation's configuration from its row.
 //!
 //! The two field sets are disjoint by construction: no value is mirrored
@@ -47,7 +47,11 @@ pub struct ConversationRow {
     pub project_id: Option<String>,
     pub model_provider: Option<String>,
     pub model_id: Option<String>,
-    pub permission_mode: Option<String>,
+    /// The access-mode wire string (`sandbox` / `full-access`). The SQL
+    /// column keeps its founding name `permission_mode` — `CREATE TABLE IF
+    /// NOT EXISTS` has no schema-version mechanism, so a column rename
+    /// would brick existing stores; only the Rust API carries the new name.
+    pub access_mode: Option<String>,
     pub reasoning_effort: Option<String>,
     pub draft: Option<String>,
     pub title: Option<String>,
@@ -425,8 +429,8 @@ impl ObjectStore {
         })
     }
 
-    /// Set the permission mode pick (read by the engine before every tool).
-    pub fn set_permission_mode(&self, id: &str, mode: Option<&str>) {
+    /// Set the access-mode pick (read by the engine before every tool).
+    pub fn set_access_mode(&self, id: &str, mode: Option<&str>) {
         with(|conn| {
             Self::bump(conn, id, "permission_mode = ?1", &[&mode]);
         })
@@ -584,7 +588,7 @@ fn conversation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversati
         project_id: row.get(1)?,
         model_provider: row.get(2)?,
         model_id: row.get(3)?,
-        permission_mode: row.get(4)?,
+        access_mode: row.get(4)?,
         reasoning_effort: row.get(5)?,
         draft: row.get(6)?,
         title: row.get(7)?,
@@ -790,11 +794,11 @@ mod tests {
         );
 
         store.set_model("c-1", Some("BigModel"), Some("glm-5.3"));
-        store.set_permission_mode("c-1", Some("workspace-write"));
+        store.set_access_mode("c-1", Some("sandbox"));
         let row = store.conversation("c-1").unwrap();
         assert_eq!(row.config_version, 2);
         assert_eq!(row.model_id.as_deref(), Some("glm-5.3"));
-        assert_eq!(row.permission_mode.as_deref(), Some("workspace-write"));
+        assert_eq!(row.access_mode.as_deref(), Some("sandbox"));
 
         // The human speaks: materialization clears the draft and orders it.
         store.mark_human_message("c-1", 1_700_000_500);
@@ -865,11 +869,11 @@ mod tests {
         let store = ObjectStore;
         assert!(store.conversation("fresh").is_none());
 
-        store.set_permission_mode("fresh", Some("read-only"));
+        store.set_access_mode("fresh", Some("full-access"));
         let row = store
             .conversation("fresh")
             .expect("the pick materialized the row");
-        assert_eq!(row.permission_mode.as_deref(), Some("read-only"));
+        assert_eq!(row.access_mode.as_deref(), Some("full-access"));
         assert_eq!(row.config_version, 1);
         assert!(row.project_id.is_none(), "materialized project-less");
         assert!(row.last_human_message_at.is_none(), "still a draft");
