@@ -160,6 +160,36 @@ fn is_state_bearing(event: &SessionTreeEntry) -> bool {
     )
 }
 
+/// Re-list the subagent runs a client's fold still holds into a freshly built
+/// translator. A bridge reset skips the `run/started` rows below its resume
+/// point, so the roster those rows opened is lost and the later `run/settled`
+/// would never remove the client's background-work entry. The source is the
+/// host's own fold — the same state the client converges to. A `replay_from`
+/// of zero means a full replay, which rebuilds the roster from the journal
+/// itself: pre-listed ids there would swallow their Set edges, so priming is
+/// a no-op by rule. Extra ids are harmless — a removal for an entry the
+/// client does not hold reduces to a no-op.
+fn prime_bridge_roster(
+    host: &manox_ahp::Host,
+    session_id: &str,
+    translator: &mut Translator,
+    replay_from: u64,
+) {
+    if replay_from == 0 {
+        return;
+    }
+    let Some(work) = host
+        .chat_state(session_id)
+        .and_then(|state| state.background_work)
+    else {
+        return;
+    };
+    translator.prime_subagent_roster(work.into_iter().filter_map(|entry| match entry {
+        ahp_types::state::BackgroundWork::Subagent(sub) => Some(sub.id),
+        _ => None,
+    }));
+}
+
 /// One session's folded state plus the journal tail it was taken at.
 struct Seeded {
     thread_id: String,
@@ -615,6 +645,7 @@ impl RuntimeBackend {
         watermark: Arc<AtomicU64>,
     ) {
         let mut translator = Translator::new();
+        prime_bridge_roster(&host, &session_id, &mut translator, resume_from);
         let mut cursor = Cursor {
             tail: resume_from.saturating_sub(1),
             watermark,
@@ -655,6 +686,7 @@ impl RuntimeBackend {
                     );
                     translator = Translator::new();
                     let replay_from = cursor.tail + 1;
+                    prime_bridge_roster(&host, &session_id, &mut translator, replay_from);
                     self.replay_journal(
                         &session_id,
                         &host,
@@ -732,6 +764,7 @@ impl RuntimeBackend {
         // filter drops the overlap.
         let mut feed = thread.subscribe_journal_feed();
         let mut translator = Translator::new();
+        prime_bridge_roster(&host, &session_id, &mut translator, resume_from);
         let mut cursor = Cursor {
             tail: resume_from.saturating_sub(1),
             watermark,
@@ -775,6 +808,7 @@ impl RuntimeBackend {
                     );
                     translator = Translator::new();
                     let replay_from = cursor.tail + 1;
+                    prime_bridge_roster(&host, &session_id, &mut translator, replay_from);
                     self.replay_journal(
                         &session_id,
                         &host,
