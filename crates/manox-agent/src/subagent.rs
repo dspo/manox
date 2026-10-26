@@ -272,6 +272,10 @@ impl AgentTool for DelegationTool {
                     "enum": ["off", "low", "medium", "high", "max"],
                     "description": "Optional reasoning effort for the child's model."
                 },
+                "replay_thinking": {
+                    "type": "boolean",
+                    "description": "Replay the child's thinking blocks from earlier turns on later requests. Off by default: historical reasoning is dropped to save tokens, while the current turn's thinking is always kept."
+                },
                 "run_in_background": {
                     "type": "boolean",
                     "description": "Run on a background card and deliver the report as a message on settlement instead of blocking this call until the final report."
@@ -360,10 +364,15 @@ impl AgentTool for DelegationTool {
             Some(requested) => Some(requested),
             None => declared_effort,
         };
-        let agent_options = if model.is_some() || effort.is_some() {
+        let replay_thinking = params
+            .get("replay_thinking")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let agent_options = if model.is_some() || effort.is_some() || replay_thinking {
             Some(manox_harness::subagent::AgentOptions {
                 model,
                 reasoning_effort: effort,
+                replay_thinking,
             })
         } else {
             None

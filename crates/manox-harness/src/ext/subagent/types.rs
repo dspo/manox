@@ -64,9 +64,10 @@ pub enum SubagentError {
     Provider(String, String),
 }
 
-/// Provider/model/reasoning-effort overrides for the child, resolved by the
-/// caller against its provider registry before the request is built (the
-/// seam carries detached data; resolution is the caller's job).
+/// Provider/model/reasoning-effort overrides and the thinking-replay policy
+/// for the child, resolved by the caller against its provider registry before
+/// the request is built (the seam carries detached data; resolution is the
+/// caller's job).
 #[derive(Debug, Clone, Default)]
 pub struct AgentOptions {
     /// Explicit model for the child. `None` lets the provider apply its own
@@ -74,6 +75,11 @@ pub struct AgentOptions {
     pub model: Option<Model>,
     /// Reasoning effort applied as the child's local thinking level.
     pub reasoning_effort: Option<String>,
+    /// Replay thinking blocks from turns before the current one on later
+    /// requests. Off by default: historical reasoning is dropped to save
+    /// tokens, while the current turn's thinking is always preserved for the
+    /// tool loop. Setting this restores verbatim replay.
+    pub replay_thinking: bool,
 }
 
 /// Child tool scoping over the parent's snapshot. An empty `allow` means the

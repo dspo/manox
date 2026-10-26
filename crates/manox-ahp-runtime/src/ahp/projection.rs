@@ -3346,6 +3346,136 @@ mod tests {
             "the stream reaches the chat channel: {first:?}"
         );
     }
+
+    /// The child-session rows the spawn writes must fold into reasoning and
+    /// tool cards, interleaved in emission order: a thinking delta before
+    /// its message row, and a tool call before its result.
+    #[test]
+    fn child_event_rows_fold_to_reasoning_and_settled_tool_cards() {
+        use manox_harness::ext::subagent::journal::child_journal_rows;
+        use manox_harness::tool::AgentToolResult;
+        use manox_harness::types::{AgentEvent, AgentMessage, AssistantMessageEvent, StopReason};
+
+        let assistant_message = AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: "reading it".into(),
+                signature: None,
+            }],
+            model: "test-model".into(),
+            provider: "test-provider".into(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::ToolUse),
+            raw_stop_reason: None,
+            usage: Box::default(),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let events = vec![
+            AgentEvent::AgentStart,
+            // The persistence middleware writes the user row; the event
+            // mapping does not.
+            AgentEvent::MessageEnd {
+                message: Box::new(AgentMessage::user("find the bug")),
+            },
+            AgentEvent::MessageUpdate {
+                message: Box::new(assistant_message.clone()),
+                assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                    content_index: 0,
+                    delta: "weighing options".into(),
+                },
+            },
+            AgentEvent::MessageUpdate {
+                message: Box::new(assistant_message.clone()),
+                assistant_message_event: AssistantMessageEvent::TextDelta {
+                    content_index: 1,
+                    delta: "reading the file".into(),
+                },
+            },
+            AgentEvent::MessageEnd {
+                message: Box::new(assistant_message),
+            },
+            AgentEvent::ToolExecutionStart {
+                tool_call_id: "call-1".into(),
+                tool_name: "Read".into(),
+                arguments: json!({"path": "src/lib.rs"}),
+            },
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id: "call-1".into(),
+                tool_name: "Read".into(),
+                result: AgentToolResult::text("contents"),
+                is_error: false,
+            },
+            AgentEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+        ];
+
+        let mut entries = Vec::new();
+        let mut seq = 0u64;
+        for event in &events {
+            if let AgentEvent::MessageEnd { message } = event {
+                entries.push(SessionTreeEntry::Message {
+                    id: format!("m-{seq}"),
+                    parent_id: None,
+                    timestamp: chrono::Utc::now(),
+                    message: (**message).clone(),
+                    origin: None,
+                });
+                seq += 1;
+                continue;
+            }
+            for (kind, payload) in child_journal_rows(event) {
+                entries.push(
+                    SessionTreeEntry::from_kind_payload(
+                        kind,
+                        format!("e-{seq}"),
+                        None,
+                        chrono::Utc::now(),
+                        payload,
+                    )
+                    .expect("the mapped row matches the typed vocabulary"),
+                );
+                seq += 1;
+            }
+        }
+
+        let mut translator = Translator::new();
+        let mut actions = Vec::new();
+        for (seq, entry) in entries.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if emitted.channel == "ahp-chat:/c-1" {
+                    actions.push(emitted.action);
+                }
+            }
+        }
+
+        let reasoning = actions
+            .iter()
+            .position(|action| {
+                matches!(action, StateAction::ChatReasoning(part) if part.content.contains("weighing options"))
+            })
+            .expect("the thinking delta folds to a reasoning part");
+        let call_start = actions
+            .iter()
+            .position(|action| {
+                matches!(action, StateAction::ChatToolCallStart(call) if call.tool_call_id == "call-1")
+            })
+            .expect("the tool call folds to a card");
+        let call_complete = actions
+            .iter()
+            .position(|action| {
+                matches!(action, StateAction::ChatToolCallComplete(call)
+                    if call.tool_call_id == "call-1" && call.result.success)
+            })
+            .expect("the tool result settles the card");
+        assert!(
+            reasoning < call_start && call_start < call_complete,
+            "rows interleave in emission order: {actions:?}"
+        );
+    }
 }
 
 #[cfg(test)]

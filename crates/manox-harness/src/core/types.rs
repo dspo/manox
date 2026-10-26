@@ -587,6 +587,12 @@ pub enum CacheRetention {
     Long,
 }
 
+/// [`AgentContext::metadata`] key: the request's historical thinking blocks
+/// were removed before the provider call. Providers that pair an assistant
+/// message's tool-call item id with its replayed reasoning item must drop the
+/// id for the stripped turns (no reasoning item survives to pair with it).
+pub const THINKING_STRIPPED_METADATA_KEY: &str = "x-manox.thinkingStripped";
+
 /// The context passed into the agent loop at the start of each turn.
 #[derive(Clone)]
 pub struct AgentContext {
