@@ -225,9 +225,10 @@ pub fn delegation_description(description: &str, capability: &str, name: &str) -
          only knows what you write). By default the call waits and returns the \
          child's final report; set `run_in_background: true` to run it on a \
          background card instead and receive the report as a message when it \
-         settles. `timeout_ms`/`idle_timeout_ms` (min {}) arm kill budgets that \
-         deliver a partial report on expiry. A child's approval-requiring \
-         operations are auto-rejected; it cannot delegate further.",
+         settles. `timeout_ms`/`idle_timeout_ms` (min {}ms, max 30 days) arm \
+         kill budgets that deliver a partial report on expiry. A child's \
+         approval-requiring operations are auto-rejected; it cannot delegate \
+         further.",
         manox_harness::subagent::MIN_BUDGET_MS
     )
 }
@@ -277,11 +278,11 @@ impl AgentTool for DelegationTool {
                 },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Optional wall-clock budget in milliseconds (min 1000). On expiry the child is terminated and a report with its partial output is delivered."
+                    "description": "Optional wall-clock budget in milliseconds (min 1000, max 30 days). On expiry the child is terminated and a report with its partial output is delivered."
                 },
                 "idle_timeout_ms": {
                     "type": "integer",
-                    "description": "Optional idle budget in milliseconds (min 1000): the longest stretch with no activity and no tool running before the child is terminated as stalled. Enforcement granularity is ~5s."
+                    "description": "Optional idle budget in milliseconds (min 1000, max 30 days): the longest stretch with no activity and no tool running before the child is terminated as stalled. Enforcement granularity is ~5s."
                 },
                 "isolation": {
                     "type": "string",
@@ -601,11 +602,15 @@ fn foreground_result(run_id: &str, result: RunResult) -> AgentToolResult {
 /// fixed 60s of additional silence means the settlement chain was lost.
 const SETTLEMENT_NET_GRACE: Duration = Duration::from_secs(60);
 
-/// Upper bound on the armed net. The wall-clock budget is caller-supplied
-/// milliseconds; without a cap an absurd budget would keep a lost run's
-/// capacity slot occupied for centuries and push `budget + grace` toward
-/// `Duration` overflow. Thirty days is far past any legitimate delegation.
-const SETTLEMENT_NET_MAX: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Upper bound on the armed net: the largest budget [`Budgets::validate`]
+/// admits plus the grace. Because the validator refuses anything past
+/// [`manox_harness::subagent::MAX_BUDGET_MS`], this cap can only shorten an
+/// invalid budget — it never fires before a run that could still reach its
+/// own deadline. The cap remains as defense: it keeps an absurd
+/// caller-supplied duration away from `Duration` overflow and a lost run's
+/// capacity slot from being held for years.
+const SETTLEMENT_NET_MAX: Duration = Duration::from_millis(manox_harness::subagent::MAX_BUDGET_MS)
+    .saturating_add(SETTLEMENT_NET_GRACE);
 
 /// The one sentence the net's settlement carries: the delivery footer's
 /// diagnostic, and the durable row's salvage (so the `stalled (no activity)`
@@ -974,7 +979,11 @@ pub struct SubagentRunObserver {
     /// `retire` cannot clear the marker — it runs immediately after the first
     /// settlement, while the recovered drive arrives later. `on_start` clears
     /// it for a new activation of the same id (a continuation reopens the
-    /// run). Entries are bounded by the run count of one assembly.
+    /// run). Entries are bounded by the run count of one assembly. Residual:
+    /// a stale settlement from the previous activation that recovers only
+    /// after the continuation started would land its row and consume the new
+    /// epoch's marker; closing that window needs an activation id carried on
+    /// every settlement, which the run id cannot express.
     settled_once: Mutex<HashSet<String>>,
 }
 

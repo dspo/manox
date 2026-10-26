@@ -351,7 +351,9 @@ impl SubagentRuntime {
     /// cap. The settle watcher wakes after the same result and removes a
     /// now-missing key (a no-op); if it also publishes a harness `Event::End`,
     /// that event is observation surface, not the durable contract, and may
-    /// duplicate the observer-side settlement.
+    /// duplicate the observer-side settlement. Capacity is reclaimed
+    /// optimistically, not refcounted: a forgotten run whose drive later
+    /// recovers continues alongside the run that took its slot.
     pub fn forget(&self, run_id: &str) -> bool {
         mutex(&self.runs).remove(run_id).is_some()
     }
