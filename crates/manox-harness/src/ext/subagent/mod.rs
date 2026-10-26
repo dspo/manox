@@ -18,11 +18,13 @@
 pub mod ask;
 pub mod descriptor;
 pub mod feeds;
+pub mod journal;
 pub mod provider;
 pub mod runtime;
 pub mod salvage;
 pub mod settlement;
 pub mod spawn;
+pub mod thinking;
 pub mod types;
 
 pub use descriptor::Descriptor;

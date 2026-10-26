@@ -329,6 +329,19 @@ impl SubagentProvider for SpawnProvider {
                         )
                     })?;
             }
+            // Historical thinking is request-only noise for a child: drop it
+            // from every request unless the caller asked for verbatim replay.
+            // The current turn's blocks stay either way.
+            let replay_thinking = req
+                .agent_options
+                .as_ref()
+                .is_some_and(|options| options.replay_thinking);
+            if !replay_thinking {
+                session.on(
+                    crate::harness::HookPoint::BeforeProviderRequest,
+                    super::thinking::strip_historical_thinking_hook(),
+                );
+            }
             Ok::<_, SubagentError>(session)
         })
         .await;
@@ -497,11 +510,33 @@ async fn drive_run(run: DrivenRun) -> RunResult {
         env,
     } = run;
     // Bridge the child session's streamed events to the observer so the
-    // transcript rail + health watchdog track live dynamics.
+    // transcript rail + health watchdog track live dynamics, and journal the
+    // same events as typed rows so the child's AHP transcript carries
+    // reasoning and tool activity. Appends run inline with each emission
+    // (listeners are awaited), which is what keeps a delta before the message
+    // row that closes its block and a tool call before its result.
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let journal_appender = session.journal_appender();
+    let listener_appender = Arc::clone(&journal_appender);
+    // A killed run never emits `AgentEnd`, so the journal's turn stays open
+    // unless the exit path closes it; the flag tells the two apart.
+    let saw_agent_end = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let listener_saw_agent_end = Arc::clone(&saw_agent_end);
     let _subscription = session.subscribe(Arc::new(move |event, _cancel| {
-        let _ = ev_tx.send(event);
-        Box::pin(async move {})
+        let ev_tx = ev_tx.clone();
+        let journal_appender = Arc::clone(&listener_appender);
+        let saw_agent_end = Arc::clone(&listener_saw_agent_end);
+        Box::pin(async move {
+            if matches!(event, AgentEvent::AgentEnd { .. }) {
+                saw_agent_end.store(true, Ordering::SeqCst);
+            }
+            let _ = ev_tx.send(event.clone());
+            for (kind, payload) in super::journal::child_journal_rows(&event) {
+                if let Err(err) = journal_appender.append_typed(kind, payload).await {
+                    tracing::warn!(%err, kind, "child journal row append failed");
+                }
+            }
+        })
     }));
     let full_prompt = format!(
         "{}\n\nWhen done, end your turn with a concise summary: what you \
@@ -564,6 +599,29 @@ async fn drive_run(run: DrivenRun) -> RunResult {
             }
         }
     };
+    // A run killed by dispose/budget/stall is dropped before the loop emits
+    // `AgentEnd`, so close the journal's turn here instead of leaving the
+    // child transcript with a permanently active turn.
+    if !saw_agent_end.load(Ordering::SeqCst) {
+        let (cancelled, failed) = match &ending {
+            Ending::Aborted => (true, false),
+            Ending::TimedOut | Ending::Stalled | Ending::Done(Err(_)) => (false, true),
+            Ending::Done(Ok(_)) => (false, false),
+        };
+        if let Err(err) = journal_appender
+            .append_typed(
+                "turn_finish",
+                serde_json::json!({
+                    "cancelled": cancelled,
+                    "failed": failed,
+                    "strandedSteerIds": [],
+                }),
+            )
+            .await
+        {
+            tracing::warn!(%err, "child journal turn_finish append failed");
+        }
+    }
     // Clean up the worktree; a kept (non-pristine) worktree's note must ride
     // the result so the caller can find the edits.
     let kept_note = match worktree.take() {

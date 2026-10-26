@@ -11,9 +11,9 @@
 //     message item keeps its server-side identity; positional `msg_pi_*`
 //     ids fill in when no signature exists;
 //   - tool call ids are `call_id|item_id` pairs; the item id survives
-//     replay only when it is a same-model `fc_` id, everything else is
-//     normalized away to satisfy the server's call/reasoning pairing
-//     validation;
+//     replay only when the same message also replays a reasoning item,
+//     everything else is normalized away to satisfy the server's
+//     call/reasoning pairing validation;
 //   - a tool result is output content only — the error bit has no wire
 //     representation and is NOT folded into the text on this shape;
 //   - tool calls left without a result (edited or truncated history) gain a
@@ -175,10 +175,13 @@ fn to_input(context: &AgentContext, messages: &[AgentMessage]) -> Vec<InputItem>
     items
 }
 
-/// Convert one assistant turn into its output items. `is_same_model`
+/// Convert one assistant turn into its output items. Same-model state
 /// decides what may be replayed verbatim: only the model that produced an
 /// item may see it again — reasoning items, text identities, and `fc_` call
-/// ids are all server-side state of a specific model's turn.
+/// ids are all server-side state of a specific model's turn. The `fc_` id
+/// additionally requires this message to actually replay its reasoning item;
+/// a stripped thinking block leaves the call id unpaired, which the server
+/// rejects.
 fn convert_assistant(
     items: &mut Vec<InputItem>,
     content: &[ContentBlock],
@@ -192,6 +195,24 @@ fn convert_assistant(
     // Same provider, different model: the message's items are
     // well-formed but belong to another model's turn.
     let is_different_model = !same_model && msg_provider == context.model.provider;
+    // The request-side thinking strip marks the context when it removed a
+    // block. Only then can an absent reasoning item mean "stripped" rather
+    // than "the model never reasoned".
+    let thinking_stripped = context
+        .metadata
+        .get(crate::types::THINKING_STRIPPED_METADATA_KEY)
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    // Whether this message actually replays a reasoning item. Only a
+    // same-model signature that parses contributes one.
+    let replays_reasoning = same_model
+        && content.iter().any(|block| match block {
+            ContentBlock::Thinking {
+                signature: Some(signature),
+                ..
+            } => serde_json::from_str::<JsonValue>(signature).is_ok(),
+            _ => false,
+        });
     let mut text_block_index = 0usize;
 
     for block in content {
@@ -242,12 +263,17 @@ fn convert_assistant(
                 let call_id = parts.next().unwrap_or("").to_string();
                 let item_id = parts.next();
                 // The item id pairs the call with the server's reasoning
-                // bookkeeping. A same-turn fc_ id keeps that pairing; a
-                // different model's fc_ id would fail validation against
-                // reasoning state that is not being replayed, and a
-                // non-fc_ id is malformed on this wire — both are omitted.
+                // bookkeeping. It must be omitted when no reasoning item from
+                // this response is replayed: another model's turn, another
+                // provider's turn, and a historical turn whose thinking the
+                // request-side strip removed all leave it unpaired. A non-fc_
+                // id is malformed on this wire and is omitted too.
                 let item_id = match item_id {
-                    Some(item) if item.starts_with("fc_") && !is_different_model => {
+                    Some(item)
+                        if item.starts_with("fc_")
+                            && !is_different_model
+                            && !(thinking_stripped && !replays_reasoning) =>
+                    {
                         Some(item.to_string())
                     }
                     _ => None,
@@ -855,6 +881,76 @@ mod tests {
         assert_eq!(item["id"], "fc_item1");
         assert_eq!(item["name"], "Read");
         assert_eq!(item["arguments"], "{\"path\":\"x\"}");
+    }
+
+    /// The request-side thinking strip leaves an assistant turn with its
+    /// tool call but no reasoning item. Replaying the call's `fc_` item id
+    /// then fails the server's pairing validation, so the id is omitted —
+    /// while a current-turn call that still carries its reasoning keeps it.
+    #[test]
+    fn stripped_history_drops_the_unpaired_fc_id() {
+        let reasoning = json!({"id": "rs_1", "type": "reasoning", "summary": []});
+        let historical = assistant(vec![ContentBlock::ToolUse {
+            id: "call_1|fc_item1".into(),
+            name: "Read".into(),
+            input: json!({}),
+            thought_signature: None,
+        }]);
+        let current = assistant(vec![
+            ContentBlock::Thinking {
+                thinking: "still here".into(),
+                signature: Some(reasoning.to_string()),
+                redacted: None,
+            },
+            ContentBlock::ToolUse {
+                id: "call_2|fc_item2".into(),
+                name: "Read".into(),
+                input: json!({}),
+                thought_signature: None,
+            },
+        ]);
+        let mut context = ctx(
+            vec![
+                historical,
+                tool_result("call_1|fc_item1", vec![text("ok")], false),
+                user("next"),
+                current,
+                tool_result("call_2|fc_item2", vec![text("ok")], false),
+            ],
+            ThinkingKind::Enabled,
+            Some("high"),
+        );
+        context.metadata.insert(
+            crate::types::THINKING_STRIPPED_METADATA_KEY.into(),
+            json!(true),
+        );
+        let v = request(&context);
+        let items = v["input"].as_array().unwrap();
+        let reasoning_items: Vec<&serde_json::Value> = items
+            .iter()
+            .filter(|item| item["type"] == "reasoning")
+            .collect();
+        assert_eq!(
+            reasoning_items.len(),
+            1,
+            "only the current turn's reasoning item is replayed"
+        );
+        assert_eq!(reasoning_items[0]["id"], "rs_1");
+        let calls: Vec<&serde_json::Value> = items
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["call_id"], "call_1");
+        assert!(
+            calls[0].get("id").is_none(),
+            "an unpaired historical fc_ id is omitted"
+        );
+        assert_eq!(calls[1]["call_id"], "call_2");
+        assert_eq!(
+            calls[1]["id"], "fc_item2",
+            "the current turn replays its reasoning item, so its id stays"
+        );
     }
 
     #[test]
