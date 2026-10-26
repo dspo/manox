@@ -528,12 +528,12 @@ impl AgentTool for DelegationTool {
             task,
             task_id,
             // Net past budget + grace: the drive loop's own deadline settles
-            // the run at the budget point, so a run still silent a grace
-            // period later has lost its settlement chain and the net lands
-            // the durable settlement unconditionally.
+            // the run at the budget point, so a run whose result is still
+            // absent a fixed grace period later has lost its settlement
+            // chain. `settle_with_net` caps the armed duration.
             budgets
                 .timeout_ms
-                .map(|ms| Duration::from_millis(ms) + SETTLEMENT_NET_GRACE),
+                .map(|ms| Duration::from_millis(ms).saturating_add(SETTLEMENT_NET_GRACE)),
         );
 
         Ok(AgentToolResult::text(
@@ -598,19 +598,34 @@ fn foreground_result(run_id: &str, result: RunResult) -> AgentToolResult {
 
 /// Grace past the run's wall-clock budget before the settlement net fires.
 /// The drive loop's own deadline settles the run at the budget point, so a
-/// whole budget period of silence past it means the settlement chain itself
-/// was lost (a wedged or dead drive task) — that, and only that, is what
-/// the net fires on.
+/// fixed 60s of additional silence means the settlement chain was lost.
 const SETTLEMENT_NET_GRACE: Duration = Duration::from_secs(60);
+
+/// Upper bound on the armed net. The wall-clock budget is caller-supplied
+/// milliseconds; without a cap an absurd budget would keep a lost run's
+/// capacity slot occupied for centuries and push `budget + grace` toward
+/// `Duration` overflow. Thirty days is far past any legitimate delegation.
+const SETTLEMENT_NET_MAX: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The one sentence the net's settlement carries: the delivery footer's
+/// diagnostic, and the durable row's salvage (so the `stalled (no activity)`
+/// verdict is not left claiming a silence that did not happen).
+const SETTLEMENT_NET_REASON: &str = "no terminal result within the run's wall-clock budget; \
+     settled by the supervisor's settlement net";
 
 /// Race the run's result against the settlement net. `net: None` = the run
 /// carries no wall-clock budget: with no bound there is no telling a lost
 /// settlement chain from a legitimate long run, so no net is armed and the
 /// result is awaited bare. When the net fires, `on_net` runs first (the
-/// caller cancels the run's residual child work) and the synthetic
-/// `Stalled` settlement — the same vocabulary as the watchdog's forced
-/// stall — stands in for the result that never came. Returns whether the
-/// net (not the result) produced the outcome.
+/// caller cancels the run's residual child work and releases its capacity
+/// slot) and the synthetic `Stalled` settlement — the same vocabulary as the
+/// watchdog's forced stall — stands in for the result that never came.
+/// Returns whether the net (not the result) produced the outcome.
+///
+/// The net covers exactly one failure mode: the delivery task and the drive
+/// task are both alive and the result is never produced. A dead or panicking
+/// drive synthesizes its own settlement at the source, and a wedge that
+/// holds the observer's own lock is unreachable from here by construction.
 async fn settle_with_net(
     result: impl std::future::Future<Output = RunResult>,
     net: Option<Duration>,
@@ -619,19 +634,24 @@ async fn settle_with_net(
     let Some(net) = net else {
         return (result.await, false);
     };
+    let net = net.min(SETTLEMENT_NET_MAX);
+    tokio::pin!(result);
     tokio::select! {
-        result = result => (result, false),
+        result = result.as_mut() => (result, false),
         () = tokio::time::sleep(net) => {
+            // A result that lands in the same instant the net expires is a
+            // real settlement, not a lost one — re-check before synthesizing
+            // (select! picks a ready branch at random, the same reason the
+            // drive loop re-polls its prompt at its own deadline).
+            if let std::task::Poll::Ready(result) = futures::poll!(result.as_mut()) {
+                return (result, false);
+            }
             on_net();
             (
                 RunResult {
                     output: String::new(),
                     structured: None,
-                    diagnostic: Some(
-                        "no terminal result within the run's wall-clock budget; settled by the \
-                         supervisor's settlement net"
-                            .to_string(),
-                    ),
+                    diagnostic: Some(SETTLEMENT_NET_REASON.to_string()),
                     stop_reason: StopReason::Stalled,
                 },
                 true,
@@ -647,9 +667,13 @@ async fn settle_with_net(
 /// diagnostic. Silence is never a delivery.
 ///
 /// `net` (the run's wall-clock budget plus [`SETTLEMENT_NET_GRACE`]) races
-/// the result: the drive loop settles at the budget point, so a run still
-/// silent past the grace window has lost its settlement chain and the net
-/// lands the durable settlement through this same funnel.
+/// the result. The drive loop settles at the budget point, so a run whose
+/// result is still absent past the grace window has lost its settlement
+/// chain: both tasks are alive, yet no terminal result will ever arrive (a
+/// dead or panicking drive already synthesizes its own result, and a wedge
+/// that holds the observer's own lock is not recoverable from inside this
+/// task either). The net lands the durable settlement through this same
+/// funnel.
 // The eight inputs are the settlement's own data set (runtime table, host
 // observer, run handle + id, label, card pair, net) — coherent as a unit,
 // same shape as `DelegationTool::new` above.
@@ -665,21 +689,33 @@ fn spawn_settlement_delivery(
     net: Option<Duration>,
 ) {
     tokio::spawn(async move {
-        let _keep_runtime = runtime; // the run table outlives the tool call
-        let (result, net_fired) = settle_with_net(run.result(), net, || run.dispose()).await;
+        let _keep_runtime = Arc::clone(&runtime); // the run table outlives the tool call
+        let (result, net_fired) = settle_with_net(run.result(), net, || {
+            // The net's own cancellation and capacity release. `forget` is
+            // the capacity gate's reclamation, not a second settlement: the
+            // durable row lands below through the observer. The runtime's
+            // settle watcher wakes after the same result and removes a
+            // now-missing key (a no-op); a duplicated harness `Event::End` is
+            // observation surface, not the durable contract.
+            run.dispose();
+            runtime.forget(&run_id);
+        })
+        .await;
         if net_fired {
             // The drive's own settlement — the normal `run/settled` writer —
             // never ran; that loss is why the net fired. Land the durable row
             // here through the same observer, so the two-rows-per-run
-            // invariant holds unconditionally. A wedged drive that later
-            // recovers appends its own (more detailed) row after this one.
+            // invariant holds unconditionally. The observer's exactly-once
+            // marker turns a recovered drive's later (richer) settlement into
+            // a no-op. The salvage carries the net's reason so the durable
+            // `stalled` verdict does not claim a silence that never happened.
             observer.on_settled(&RunEndInfo {
                 run_id: run_id.clone(),
                 provider: String::new(), // descriptive-only; the row never carries it
                 label: label.clone(),
                 local: true,
                 stop_reason: result.stop_reason.clone(),
-                output: result.output.clone(),
+                output: SETTLEMENT_NET_REASON.to_string(),
             });
         }
         let stats = observer.stats_of(&run_id);
@@ -932,6 +968,14 @@ pub struct SubagentRunObserver {
     pub(crate) notice_tx: mpsc::UnboundedSender<BackendNotice>,
     runs: Mutex<BTreeMap<String, RunWatch>>,
     settled: Mutex<BTreeMap<String, SettledStats>>,
+    /// Run ids whose settlement was already landed, exactly once per
+    /// activation: the net's synthetic settlement and a recovered drive's
+    /// later (richer) one must not both write a `run/settled` row, and
+    /// `retire` cannot clear the marker — it runs immediately after the first
+    /// settlement, while the recovered drive arrives later. `on_start` clears
+    /// it for a new activation of the same id (a continuation reopens the
+    /// run). Entries are bounded by the run count of one assembly.
+    settled_once: Mutex<HashSet<String>>,
 }
 
 impl SubagentRunObserver {
@@ -944,6 +988,7 @@ impl SubagentRunObserver {
             notice_tx,
             runs: Mutex::new(BTreeMap::new()),
             settled: Mutex::new(BTreeMap::new()),
+            settled_once: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1038,6 +1083,14 @@ impl RunObserver for SubagentRunObserver {
     }
 
     fn on_start(&self, info: &RunInfo) {
+        // A new activation of the run id (a fresh dispatch or a continuation
+        // that reopens the same id) starts a new settlement epoch: the
+        // previous activation's exactly-once marker must not swallow this
+        // one's `run/settled` row.
+        self.settled_once
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&info.run_id);
         let subagent_type = info.kind.clone();
         self.locked().insert(
             info.run_id.clone(),
@@ -1096,6 +1149,18 @@ impl RunObserver for SubagentRunObserver {
     }
 
     fn on_settled(&self, end: &RunEndInfo) {
+        // Exactly-once per activation: the first settlement lands the row;
+        // a recovered drive's later settlement is a whole no-op. The net's
+        // synthetic row is first by construction, and without this guard the
+        // recovered drive would append a second row with zero counters.
+        let first = self
+            .settled_once
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(end.run_id.clone());
+        if !first {
+            return;
+        }
         // The live row retires here; its delivery inputs move into the
         // settled table so the settling tool (or a delivery task whose
         // sibling tool future was dropped by turn teardown) can still read
@@ -1376,6 +1441,231 @@ mod tests {
         assert!(
             settled.is_err(),
             "a budgetless run must not settle through a net"
+        );
+    }
+
+    /// A result that is ready in the same instant the net expires wins: the
+    /// sleep arm re-checks the pinned result before synthesizing (select!
+    /// picks a ready branch at random, so the loop exercises both orders).
+    #[tokio::test]
+    async fn settlement_net_yields_to_a_result_ready_at_the_same_instant() {
+        for _ in 0..64 {
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&fired);
+            let (settled, net_fired) = settle_with_net(
+                std::future::ready(result(StopReason::Completed, "the report", None)),
+                Some(Duration::ZERO),
+                move || flag.store(true, std::sync::atomic::Ordering::SeqCst),
+            )
+            .await;
+            assert!(!net_fired, "a ready result wins the tie");
+            assert_eq!(settled.stop_reason, StopReason::Completed);
+            assert_eq!(settled.output, "the report");
+            assert!(
+                !fired.load(std::sync::atomic::Ordering::SeqCst),
+                "the net never fires when the result is already ready"
+            );
+        }
+    }
+
+    fn run_info(run_id: &str) -> RunInfo {
+        RunInfo {
+            run_id: run_id.to_string(),
+            provider: "spawn".to_string(),
+            label: "scout".to_string(),
+            kind: "Explore".to_string(),
+            model: None,
+            local: true,
+            budgets: Budgets::default(),
+            tool_call_id: None,
+        }
+    }
+
+    fn settled_info(run_id: &str, stop_reason: StopReason, output: &str) -> RunEndInfo {
+        RunEndInfo {
+            run_id: run_id.to_string(),
+            provider: "spawn".to_string(),
+            label: "scout".to_string(),
+            local: true,
+            stop_reason,
+            output: output.to_string(),
+        }
+    }
+
+    /// Feed tool-call events into a live row's watchdog (the run counters).
+    fn feed_tool_calls(observer: &SubagentRunObserver, run_id: &str, count: usize) {
+        let runs = observer.locked();
+        let watch = runs.get(run_id).expect("the run has a live row");
+        let mut wd = watch.watchdog.lock().unwrap_or_else(|e| e.into_inner());
+        for i in 0..count {
+            let _ = wd.observe(
+                &manox_harness::types::AgentEvent::ToolExecutionStart {
+                    tool_call_id: format!("call-{i}"),
+                    tool_name: "Read".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                std::time::Instant::now(),
+            );
+        }
+    }
+
+    /// Settlement is exactly-once per activation. The first `on_settled`
+    /// lands the row and moves the counters; a recovered drive's later (and
+    /// richer) settlement is a whole no-op, so the settled counters keep the
+    /// first settlement's values instead of being overwritten (and no second
+    /// zero-counter row is journaled). A continuation reopens the same run
+    /// id, and `on_start` opens a new epoch so its settlement lands again.
+    #[test]
+    fn settlement_is_exactly_once_per_activation() {
+        // The durable-row route needs the process-global runtime handle.
+        crate::runtime::init_hermetic_for_test();
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
+        let observer = SubagentRunObserver::new("thread-1".to_string(), notice_tx);
+
+        observer.on_start(&run_info("sub-1"));
+        feed_tool_calls(&observer, "sub-1", 2);
+        observer.on_settled(&settled_info(
+            "sub-1",
+            StopReason::Stalled,
+            SETTLEMENT_NET_REASON,
+        ));
+        assert_eq!(observer.stats_of("sub-1"), Some((0, 2)));
+        assert!(
+            observer
+                .settled_once
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains("sub-1"),
+            "the first settlement marks the run"
+        );
+
+        // A recovered drive re-publishes a live row and lands a richer late
+        // settlement. The marker makes the whole call a no-op.
+        observer.locked().insert(
+            "sub-1".to_string(),
+            RunWatch {
+                subagent_type: "Explore".to_string(),
+                watchdog: Arc::new(Mutex::new(SubagentWatchdog::new(
+                    std::time::Instant::now(),
+                    None,
+                ))),
+            },
+        );
+        feed_tool_calls(&observer, "sub-1", 5);
+        observer.on_settled(&settled_info("sub-1", StopReason::Completed, "late"));
+        assert_eq!(
+            observer
+                .settled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("sub-1")
+                .map(|s| (s.turns, s.tool_calls)),
+            Some((0, 2)),
+            "a late settlement never overwrites the first one"
+        );
+
+        // A continuation reopens the same run id: `on_start` clears the
+        // marker, so the continued activation settles with its own counters.
+        observer.on_start(&run_info("sub-1"));
+        feed_tool_calls(&observer, "sub-1", 1);
+        observer.on_settled(&settled_info("sub-1", StopReason::Completed, "continued"));
+        assert_eq!(
+            observer
+                .settled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("sub-1")
+                .map(|s| (s.turns, s.tool_calls)),
+            Some((0, 1)),
+            "a new activation settles again"
+        );
+    }
+
+    /// A provider whose run never produces a result: the drive task is alive
+    /// but the settlement never lands, the exact case the net covers.
+    struct PendingProvider;
+
+    #[async_trait::async_trait]
+    impl manox_harness::subagent::SubagentProvider for PendingProvider {
+        fn name(&self) -> &str {
+            "pending"
+        }
+
+        fn capabilities(&self) -> manox_harness::subagent::Capabilities {
+            manox_harness::subagent::Capabilities {
+                agent_options: false,
+                output_schema: false,
+                depth_limit: false,
+                tool_filter: false,
+                persona: false,
+            }
+        }
+
+        async fn start(
+            &self,
+            request: manox_harness::subagent::types::ResolvedStartRequest,
+        ) -> Result<manox_harness::subagent::SubagentRun, manox_harness::subagent::SubagentError>
+        {
+            let cancel = request.inner.cancel.clone();
+            Ok(manox_harness::subagent::SubagentRun::new(
+                request.run_id,
+                cancel,
+                Box::pin(std::future::pending()),
+            ))
+        }
+    }
+
+    /// When the net fires it releases the runtime's capacity slot: without
+    /// `forget` the wedged entry and its permit would survive forever, and
+    /// four such runs would reject every later delegation at the cap. The
+    /// delivery then retires the observer's own state.
+    #[tokio::test]
+    async fn settlement_net_releases_the_runtime_slot_it_settles() {
+        // The delivery journals its durable row through the global runtime.
+        crate::runtime::init_hermetic_for_test();
+        let runtime = manox_harness::subagent::SubagentRuntime::new();
+        runtime.register_provider_permanent(Arc::new(PendingProvider));
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
+        let observer = SubagentRunObserver::new("thread-1".to_string(), notice_tx);
+        let run = runtime
+            .start(
+                "pending",
+                manox_harness::subagent::test_request("scout", "do it"),
+            )
+            .await
+            .expect("start");
+        let run_id = run.id.clone();
+        observer.on_start(&run_info(&run_id));
+        assert!(runtime.is_live(&run_id));
+
+        let cancel = run.dispose_token().clone();
+        let (task_id, task) =
+            background_task::register("thread-1".to_string(), "scout".to_string(), cancel);
+        spawn_settlement_delivery(
+            Arc::clone(&runtime),
+            Arc::clone(&observer),
+            run,
+            run_id.clone(),
+            "scout".to_string(),
+            task,
+            task_id,
+            Some(Duration::from_millis(10)),
+        );
+
+        // The terminal notice is sent after the net settled, forgot the run,
+        // and retired the observer state, so receiving it proves the funnel.
+        let notice = tokio::time::timeout(Duration::from_secs(5), notice_rx.recv())
+            .await
+            .expect("the net settles the run");
+        assert!(notice.is_some(), "the settlement delivers a notice");
+        assert!(
+            !runtime.is_live(&run_id),
+            "the net releases the capacity slot"
+        );
+        assert!(runtime.list_runs().is_empty());
+        assert!(
+            observer.stats_of(&run_id).is_none(),
+            "the delivery retires the observer state"
         );
     }
 }

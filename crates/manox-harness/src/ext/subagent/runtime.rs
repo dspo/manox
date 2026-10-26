@@ -341,6 +341,21 @@ impl SubagentRuntime {
             .unwrap_or(false)
     }
 
+    /// Drop one run's live-table entry, releasing its capacity slot;
+    /// `false` when the id named no live child.
+    ///
+    /// This is the capacity gate's reclamation, not a second settlement: the
+    /// durable record is the observer's `run/settled` row. A run whose result
+    /// never resolves (the settlement net's case) would otherwise hold its
+    /// slot forever and eventually reject every dispatch at the active-child
+    /// cap. The settle watcher wakes after the same result and removes a
+    /// now-missing key (a no-op); if it also publishes a harness `Event::End`,
+    /// that event is observation surface, not the durable contract, and may
+    /// duplicate the observer-side settlement.
+    pub fn forget(&self, run_id: &str) -> bool {
+        mutex(&self.runs).remove(run_id).is_some()
+    }
+
     /// Whether `run_id` names a live child of this runtime.
     pub fn is_live(&self, run_id: &str) -> bool {
         mutex(&self.runs).contains_key(run_id)
@@ -567,6 +582,71 @@ mod tests {
         assert!(runtime.is_live(&run.id));
         assert!(runtime.interrupt(&run.id));
         assert!(!runtime.interrupt("sub-999"), "unknown id");
+    }
+
+    /// A provider whose run never produces a result: the settle watcher never
+    /// removes the entry, so only an explicit `forget` reclaims the slot.
+    struct PendingProvider;
+
+    #[async_trait::async_trait]
+    impl SubagentProvider for PendingProvider {
+        fn name(&self) -> &str {
+            "pending"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                agent_options: false,
+                output_schema: false,
+                depth_limit: false,
+                tool_filter: false,
+                persona: false,
+            }
+        }
+        async fn start(&self, request: ResolvedStartRequest) -> Result<SubagentRun, SubagentError> {
+            let cancel = request.inner.cancel.clone();
+            Ok(SubagentRun::new(
+                request.run_id,
+                cancel,
+                Box::pin(std::future::pending()),
+            ))
+        }
+    }
+
+    /// Capacity is reclaimed separately from settlement: a wedged run that
+    /// never produces a result holds its slot (and its semaphore permit)
+    /// forever, and at the cap every later dispatch is rejected. `forget`
+    /// drops the entry and admits the next run; a second forget is a no-op.
+    #[tokio::test]
+    async fn forget_releases_a_wedged_runs_capacity_slot() {
+        let runtime = SubagentRuntime::new();
+        runtime.register_provider_permanent(Arc::new(PendingProvider));
+        let mut runs = Vec::new();
+        for _ in 0..DEFAULT_ACTIVE_CAPACITY {
+            runs.push(
+                runtime
+                    .start("pending", test_request("l", "p"))
+                    .await
+                    .expect("start"),
+            );
+        }
+        let denied = runtime
+            .start("pending", test_request("l", "p"))
+            .await
+            .unwrap_err();
+        assert!(
+            denied.to_string().contains("subagent limit reached"),
+            "{denied}"
+        );
+
+        assert!(runtime.forget(&runs[0].id), "the live id is forgotten");
+        assert!(!runtime.is_live(&runs[0].id));
+        assert_eq!(runtime.list_runs().len(), DEFAULT_ACTIVE_CAPACITY - 1);
+        assert!(!runtime.forget(&runs[0].id), "a second forget is a no-op");
+
+        runtime
+            .start("pending", test_request("l", "p"))
+            .await
+            .expect("the freed slot admits another run");
     }
 
     #[tokio::test]
