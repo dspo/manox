@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use manox_harness::subagent::{
     Budgets, DelegationToolConfig, RunEndInfo, RunInfo, RunObserver, RunResult, StopReason,
@@ -478,6 +479,12 @@ impl AgentTool for DelegationTool {
                             card_title,
                             task,
                             task_id,
+                            // The promoted run was started WITHOUT a
+                            // wall-clock budget (the dispatch's `timeout_ms`
+                            // became this promotion timer). No budget, no
+                            // net: a budgetless run cannot be distinguished
+                            // from a legitimate long run.
+                            None,
                         );
                         return Ok(AgentToolResult::text(
                             serde_json::json!({
@@ -520,6 +527,13 @@ impl AgentTool for DelegationTool {
             card_title,
             task,
             task_id,
+            // Net past budget + grace: the drive loop's own deadline settles
+            // the run at the budget point, so a run still silent a grace
+            // period later has lost its settlement chain and the net lands
+            // the durable settlement unconditionally.
+            budgets
+                .timeout_ms
+                .map(|ms| Duration::from_millis(ms) + SETTLEMENT_NET_GRACE),
         );
 
         Ok(AgentToolResult::text(
@@ -582,11 +596,64 @@ fn foreground_result(run_id: &str, result: RunResult) -> AgentToolResult {
     tool_result
 }
 
+/// Grace past the run's wall-clock budget before the settlement net fires.
+/// The drive loop's own deadline settles the run at the budget point, so a
+/// whole budget period of silence past it means the settlement chain itself
+/// was lost (a wedged or dead drive task) — that, and only that, is what
+/// the net fires on.
+const SETTLEMENT_NET_GRACE: Duration = Duration::from_secs(60);
+
+/// Race the run's result against the settlement net. `net: None` = the run
+/// carries no wall-clock budget: with no bound there is no telling a lost
+/// settlement chain from a legitimate long run, so no net is armed and the
+/// result is awaited bare. When the net fires, `on_net` runs first (the
+/// caller cancels the run's residual child work) and the synthetic
+/// `Stalled` settlement — the same vocabulary as the watchdog's forced
+/// stall — stands in for the result that never came. Returns whether the
+/// net (not the result) produced the outcome.
+async fn settle_with_net(
+    result: impl std::future::Future<Output = RunResult>,
+    net: Option<Duration>,
+    on_net: impl FnOnce(),
+) -> (RunResult, bool) {
+    let Some(net) = net else {
+        return (result.await, false);
+    };
+    tokio::select! {
+        result = result => (result, false),
+        () = tokio::time::sleep(net) => {
+            on_net();
+            (
+                RunResult {
+                    output: String::new(),
+                    structured: None,
+                    diagnostic: Some(
+                        "no terminal result within the run's wall-clock budget; settled by the \
+                         supervisor's settlement net"
+                            .to_string(),
+                    ),
+                    stop_reason: StopReason::Stalled,
+                },
+                true,
+            )
+        }
+    }
+}
+
 /// The one settlement delivery. Every terminal — completion, error,
 /// timeout, stall, abort — lands the card settlement and delivers text
 /// composed the same way: the host's verdict line, the salvaged output (or
 /// the explicit no-closing-message line), the run counters, and any
 /// diagnostic. Silence is never a delivery.
+///
+/// `net` (the run's wall-clock budget plus [`SETTLEMENT_NET_GRACE`]) races
+/// the result: the drive loop settles at the budget point, so a run still
+/// silent past the grace window has lost its settlement chain and the net
+/// lands the durable settlement through this same funnel.
+// The eight inputs are the settlement's own data set (runtime table, host
+// observer, run handle + id, label, card pair, net) — coherent as a unit,
+// same shape as `DelegationTool::new` above.
+#[allow(clippy::too_many_arguments)]
 fn spawn_settlement_delivery(
     runtime: Arc<manox_harness::subagent::SubagentRuntime>,
     observer: Arc<SubagentRunObserver>,
@@ -595,10 +662,26 @@ fn spawn_settlement_delivery(
     label: String,
     task: Arc<background_task::BackgroundTask>,
     task_id: background_task::TaskId,
+    net: Option<Duration>,
 ) {
     tokio::spawn(async move {
         let _keep_runtime = runtime; // the run table outlives the tool call
-        let result = run.result().await;
+        let (result, net_fired) = settle_with_net(run.result(), net, || run.dispose()).await;
+        if net_fired {
+            // The drive's own settlement — the normal `run/settled` writer —
+            // never ran; that loss is why the net fired. Land the durable row
+            // here through the same observer, so the two-rows-per-run
+            // invariant holds unconditionally. A wedged drive that later
+            // recovers appends its own (more detailed) row after this one.
+            observer.on_settled(&RunEndInfo {
+                run_id: run_id.clone(),
+                provider: String::new(), // descriptive-only; the row never carries it
+                label: label.clone(),
+                local: true,
+                stop_reason: result.stop_reason.clone(),
+                output: result.output.clone(),
+            });
+        }
         let stats = observer.stats_of(&run_id);
         let delivery = background_delivery(&label, &result, stats);
         observer.retire(&run_id);
@@ -1227,6 +1310,72 @@ mod tests {
                 .chars()
                 .count(),
             64
+        );
+    }
+
+    /// The net lets a landing result through untouched: even a result that
+    /// takes a while returns verbatim (same stop reason, same output), and
+    /// neither the net nor the caller's dispose hook fires.
+    #[tokio::test]
+    async fn settlement_net_lets_a_landing_result_through_untouched() {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        let (settled, net_fired) = settle_with_net(
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                result(StopReason::Completed, "the report", None)
+            },
+            Some(Duration::from_secs(60)),
+            move || flag.store(true, std::sync::atomic::Ordering::SeqCst),
+        )
+        .await;
+        assert!(!net_fired);
+        assert_eq!(settled.stop_reason, StopReason::Completed);
+        assert_eq!(settled.output, "the report");
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::SeqCst),
+            "a result inside the window never fires the net"
+        );
+    }
+
+    /// A lost result settles synthetically once the net fires: the
+    /// watchdog-forced-stall vocabulary with an empty output and a
+    /// diagnostic naming the net, after the caller's dispose hook ran.
+    #[tokio::test]
+    async fn settlement_net_settles_synthetic_stalled_when_the_result_never_lands() {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        let (settled, net_fired) = settle_with_net(
+            std::future::pending(),
+            Some(Duration::from_millis(10)),
+            move || flag.store(true, std::sync::atomic::Ordering::SeqCst),
+        )
+        .await;
+        assert!(net_fired);
+        assert_eq!(settled.stop_reason, StopReason::Stalled);
+        assert!(settled.output.is_empty());
+        let diagnostic = settled.diagnostic.expect("the net names itself");
+        assert!(diagnostic.contains("settlement net"), "{diagnostic}");
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the net cancels the run's residual child work first"
+        );
+    }
+
+    /// A run with no wall-clock budget arms no net: the result is awaited
+    /// bare and never resolves, exactly as before the net existed.
+    #[tokio::test]
+    async fn settlement_net_is_disarmed_without_a_wall_clock_budget() {
+        let settled = tokio::time::timeout(
+            Duration::from_millis(50),
+            settle_with_net(std::future::pending(), None, || {
+                panic!("no budget, no net, no fire")
+            }),
+        )
+        .await;
+        assert!(
+            settled.is_err(),
+            "a budgetless run must not settle through a net"
         );
     }
 }
