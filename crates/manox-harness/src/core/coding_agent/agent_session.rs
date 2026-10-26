@@ -379,10 +379,26 @@ impl AgentSession {
             .filter(|l| l != "off");
         let wire = effective.clone().unwrap_or_else(|| "off".into());
 
-        // Update the agent (in-memory), then remember the preference. Neither
-        // half is persisted here: the conversation's configuration is the
-        // pick's durable home.
+        // Update the agent (in memory), then remember the preference. The
+        // durable model authority is the journal: a real switch lands its
+        // `model_change` row here (the change guard keeps re-adoptions of an
+        // already-restored model from appending a duplicate), so a reopen
+        // folds the pick back out instead of drifting to the registry
+        // default.
+        let previous = self.harness.model().clone();
         self.harness.set_model(model.clone()).await?;
+        if model != previous
+            && let Err(err) = self
+                .harness
+                .session()
+                .append_model_change(&model.provider, &model.id)
+                .await
+        {
+            tracing::warn!(
+                error = %err,
+                "model_change row append failed; the switch stays in memory only"
+            );
+        }
         if effective != current_level
             && (model.thinking != crate::types::ThinkingKind::None || wire != "off")
         {
@@ -399,10 +415,10 @@ impl AgentSession {
 
     /// Set the reasoning tier. `None` reads as `"off"` (the facade's
     /// contract, mirrored by the harness); the effective level is clamped
-    /// against the current model. The pick's durable home is the
-    /// conversation's configuration, so this touches the running session
-    /// only — subagent sessions apply their pinned effort through the same
-    /// path.
+    /// against the current model. This touches the running session only —
+    /// the durable `thinking_level_change` row is landed by the engine's
+    /// apply (both its idle and mid-run arms), and subagent sessions apply
+    /// their pinned effort through the same path.
     pub async fn set_thinking_level(&mut self, level: Option<String>) -> Result<(), anyhow::Error> {
         let model = self.harness.model().clone();
         let levels = self.runtime.thinking_levels(&model);
@@ -1102,11 +1118,11 @@ impl AgentSessionBuilder {
         let model_key = (model.provider.clone(), model.id.clone(), model.thinking);
 
         // A new session writes no configuration rows: the model and the
-        // thinking level are the caller's intent for this build, and their
-        // durable home is the conversation's configuration — read back by the
-        // host, never mirrored into the transcript. A reopened session still
-        // reads whatever entries its own transcript carries (a pre-store
-        // journal), which is the tolerated legacy read.
+        // thinking level are the caller's intent for this build — their
+        // durable rows land when a real switch happens
+        // ([`AgentSession::set_model`]). A reopened session still reads
+        // whatever entries its own transcript carries, which seeds the
+        // restore.
         let has_thinking_entry = if restore {
             session.build_session_context().await?.has_thinking_entry
         } else {
@@ -1300,7 +1316,7 @@ mod tests {
     impl StreamFn for Scripted {
         async fn stream(
             &self,
-            _context: &AgentContext,
+            context: &AgentContext,
             _signal: tokio_util::sync::CancellationToken,
             _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
         ) -> Result<AgentMessage, anyhow::Error> {
@@ -1310,9 +1326,12 @@ mod tests {
                     text: "answer".into(),
                     signature: None,
                 }],
-                model: "test".into(),
-                provider: "test".into(),
-                api: "test".into(),
+                // Echo the model actually in context: an assistant row is a
+                // model witness on restore, so a scripted answer naming a
+                // fixed id would overwrite the chain's model_change row.
+                model: context.model.id.clone(),
+                provider: context.model.provider.clone(),
+                api: context.model.api.clone(),
                 response_model: None,
                 response_id: None,
                 diagnostics: None,
@@ -1386,6 +1405,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resumed.harness_messages().len(), 4, "two turns restored");
+    }
+
+    /// The model pick's durable row, landed at the choke point: a real
+    /// switch appends exactly one `model_change`, a re-pick of the model
+    /// already in force appends none, and a reopen folds the pick back out
+    /// of the row (the journal is the authority — no reopen may drift the
+    /// model back to the registry default).
+    #[tokio::test]
+    async fn set_model_lands_one_row_and_a_repick_lands_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let model_a = test_model();
+        let model_b = Model {
+            id: "test-2".into(),
+            ..test_model()
+        };
+        // A catalog that restores BOTH models by id, so the reopen's row
+        // fold resolves the switched pick exactly.
+        let runtime = {
+            use crate::coding_agent::model_runtime::ModelCatalog;
+            let stream: Arc<dyn StreamFn> =
+                Arc::new(Scripted(Arc::new(std::sync::Mutex::new(Vec::new()))));
+            let resolver: crate::agent_loop::StreamResolver =
+                Arc::new(move |_model: &Model| Ok(Arc::clone(&stream)));
+            struct TwoModels(Model);
+            impl ModelCatalog for TwoModels {
+                fn resolve(&self, provider: &str, model_id: &str) -> Option<Model> {
+                    (provider == "test").then(|| {
+                        if model_id == self.0.id {
+                            self.0.clone()
+                        } else {
+                            test_model()
+                        }
+                    })
+                }
+            }
+            ModelRuntime::new(resolver).with_catalog(Arc::new(TwoModels(model_b.clone())))
+        };
+
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(runtime.clone())
+            .with_model(model_a.clone())
+            .build()
+            .await
+            .unwrap();
+
+        // The `model_change` rows the chain carries, in wire order.
+        async fn model_change_rows(session: &AgentSession) -> Vec<String> {
+            session
+                .harness
+                .session()
+                .storage()
+                .get_entries(Default::default())
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    SessionTreeEntry::ModelChange { model_id, .. } => Some(model_id),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // A real switch lands exactly one row naming the new model.
+        session.set_model(model_b.clone()).await.unwrap();
+        let rows = model_change_rows(&session).await;
+        assert_eq!(rows, vec!["test-2".to_string()], "the switch lands one row");
+
+        // A re-pick of the model already in force lands no second row.
+        session.set_model(model_b.clone()).await.unwrap();
+        assert_eq!(
+            model_change_rows(&session).await.len(),
+            1,
+            "a restate lands no duplicate"
+        );
+
+        // The reopen folds the pick back out of the row. A real turn first:
+        // the deferred session materializes its file on the prompt path, and
+        // the rows ride the materialization.
+        session.prompt("materialize").await.unwrap();
+        let path = session.close().await.unwrap();
+        let resumed = create_agent_session()
+            .with_cwd(&cwd)
+            .with_model_runtime(runtime)
+            .open(path)
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.model().id,
+            "test-2",
+            "the reopened session runs the picked model, not the default"
+        );
     }
 
     /// Tools execute against the session cwd, not the process cwd: a file

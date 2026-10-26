@@ -2077,11 +2077,12 @@ impl Thread {
         }
         self.access_mode = mode;
         // An explicit user choice must survive engine materialization: the
-        // session sidecar's default would otherwise overwrite it at `Ready`.
+        // restore projection would otherwise overwrite it at `Ready`.
         self.access_mode_explicitly_set = true;
         if let Some(engine) = &self.engine {
-            // The engine applies the mode to its gate and persists it in the
-            // session sidecar; the chip reflects the change immediately.
+            // The engine applies the mode to its gate and lands the durable
+            // `access_mode_change` row; the chip reflects the change
+            // immediately.
             engine.set_access_mode(mode);
         }
         self.pending_events
@@ -2159,15 +2160,17 @@ impl Thread {
         }
     }
 
-    /// The configuration handshake at the request boundary. The
-    /// conversation's [`ConversationConfigSource`] is the authority for the
-    /// user's picks — the same surface the permission gate reads before
-    /// every tool call. Any diff against what this thread last applied
-    /// (model, reasoning effort) is applied through the normal setters and
-    /// announced to the model as a harness-authored notice, inserted ahead
-    /// of the message that triggered this request.
+    /// The draft-intent handshake at the request boundary. A NEW thread's
+    /// picks live in the conversation's [`ConversationConfigSource`] row
+    /// until something lands them; this diff applies them through the
+    /// normal setters (model, reasoning effort, access mode) — the setters
+    /// that land the durable journal rows — and announces each applied pick
+    /// to the model as a harness-authored notice, inserted ahead of the
+    /// message that triggered this request. Once a pick has landed its
+    /// journal row, the journal is the authority this handshake no longer
+    /// needs to answer for.
     ///
-    /// The version watermark is what keeps a reopened conversation silent.
+    /// The version watermark is what keeps an applied conversation silent.
     /// A thread is built with the picks its row already carries, so the
     /// first boundary's diff is empty and emits nothing; the watermark then
     /// records that the build's values are current, and a write that
@@ -2290,7 +2293,7 @@ impl Thread {
         }
         self.reasoning_effort = effort;
         // An explicit user choice must survive engine materialization: the
-        // session sidecar's default would otherwise overwrite it at `Ready`.
+        // restore projection would otherwise overwrite it at `Ready`.
         self.reasoning_effort_explicitly_set = true;
         if let Some(engine) = &self.engine {
             engine.set_thinking_level(Some(effort.wire_value().to_string()));

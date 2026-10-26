@@ -45,6 +45,12 @@ pub struct ReplayedThreadState {
     pub goal: Option<serde_json::Value>,
     /// Effective working directory from the last `cwd_change` entry.
     pub cwd: Option<String>,
+    /// Access mode from the last `access_mode_change` entry (the raw wire
+    /// string; the merge parses it against the closed vocabulary).
+    pub access_mode: Option<String>,
+    /// Reasoning effort from the last `thinking_level_change` entry (the
+    /// raw wire string, `"off"` included; the merge parses it).
+    pub reasoning_effort: Option<String>,
 }
 
 /// An approval or question request the chain never answered.
@@ -169,6 +175,14 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             SessionTreeEntry::CwdChange { cwd, .. } => {
                 state.cwd = Some(cwd.clone());
             }
+            // ── session config (the journal rows are the durable authority):
+            // last row wins, exactly the fold the AHP projection runs.
+            SessionTreeEntry::AccessModeChange { mode, .. } => {
+                state.access_mode = Some(mode.clone());
+            }
+            SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => {
+                state.reasoning_effort = Some(thinking_level.clone());
+            }
             // ── transcript + display domain (rebuilt by the kernel's own
             //    transcript projection, not by this fold) ────────────────
             SessionTreeEntry::Message { .. }
@@ -183,14 +197,10 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             //    lifecycle/delta/metrics rows carry no persistable thread
             //    state ────────────────────────────────────────────────────
             //
-            // The configuration rows are here too, deliberately: the
-            // conversation's model and reasoning effort live in its object
-            // row (the engine reads them from there) and the journal carries
-            // no configuration of its own. Existing rows are left in place —
-            // this fold still parses them so a pre-store or hand-edited
-            // journal cannot break it — but nothing consumes them.
+            // The model row is here too, deliberately: the harness's own
+            // restore projection reads it onto the agent, so this fold has
+            // no second model answer to carry.
             SessionTreeEntry::ModelChange { .. }
-            | SessionTreeEntry::ThinkingLevelChange { .. }
             | SessionTreeEntry::ActiveToolsChange { .. }
             | SessionTreeEntry::TurnStart { .. }
             | SessionTreeEntry::TurnFinish { .. }

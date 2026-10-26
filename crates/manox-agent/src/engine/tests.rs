@@ -1100,6 +1100,8 @@ fn test_engine_state() -> Arc<EngineState> {
         goal_continuation_round: Mutex::new(None),
         granted_roots: crate::granted_roots::GrantedRoots::new(cwd.clone()),
         last_cwd_note: Mutex::new(None),
+        journaled_access_mode: Mutex::new(AccessMode::default()),
+        journaled_thinking_level: Mutex::new(None),
     })
 }
 
@@ -1408,8 +1410,9 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
         "switched-turn usage must enter the per-model stats: {:?}",
         stats.per_model
     );
-    // The switch wrote no transcript rows: the conversation's configuration
-    // owns the pick, and a reopen reads it there.
+    // The mid-run switch writes no transcript rows: the kernel boundary
+    // applies the queued pick to the agent only (the boundary's row write
+    // is a known kernel-side gap — the idle choke point owns journaling).
     let jsonl = tokio::fs::read_to_string(session.path()).await.unwrap();
     assert_eq!(
         jsonl.matches("\"type\":\"model_change\"").count(),
@@ -2933,10 +2936,10 @@ impl manox_harness::coding_agent::model_runtime::ModelCatalog for TestModelCatal
     }
 }
 
-/// With no row to read, the restore keeps what the reopened session carries
-/// — the tolerated legacy read. A conversation the store has never seen (a
-/// subagent seat, a session created outside the app) must not be reset to the
-/// default just because it has no object.
+/// The adopt after a restore mirrors what the reopened session's own
+/// projection carries: the actor's working model and the shared slot follow
+/// the harness (the journal rows the kernel restore folded), no re-apply,
+/// and a chain with no `model_change` row restores the build default.
 #[tokio::test]
 async fn adopt_session_model_keeps_the_sessions_model_without_a_row() {
     let dir = tempfile::tempdir().unwrap();
@@ -2978,68 +2981,16 @@ async fn adopt_session_model_keeps_the_sessions_model_without_a_row() {
 
     let state = test_engine_state();
     let mut harness_model = test_model();
-    adopt_session_model(&mut reopened, &mut harness_model, &state, "no-such-row").await;
+    adopt_session_model(&mut reopened, &mut harness_model, &state).await;
     assert_eq!(
         harness_model.id, "new",
-        "the reopened session's own model stands when the store has no row"
+        "the reopened session's own model stands when the chain has no row"
     );
     assert_eq!(
         state.model.lock().unwrap().as_ref().map(|m| m.id.as_str()),
         Some("new"),
         "the shared model slot follows it"
     );
-}
-
-/// A configuration source that carries no picks — the shape a conversation
-/// the store has never seen produces, which leaves the sidecar as the
-/// fallback.
-struct NoPicks;
-
-impl manox_harness::ConversationConfigSource for NoPicks {
-    fn model(&self) -> Option<manox_harness::types::Model> {
-        None
-    }
-
-    fn model_ref(&self) -> Option<String> {
-        None
-    }
-
-    fn access_mode(&self) -> Option<AccessMode> {
-        None
-    }
-
-    fn reasoning_effort(&self) -> Option<String> {
-        None
-    }
-
-    fn config_version(&self) -> i64 {
-        0
-    }
-}
-
-/// A configuration source carrying the picks a conversation's row holds.
-struct Picks;
-
-impl manox_harness::ConversationConfigSource for Picks {
-    fn model(&self) -> Option<manox_harness::types::Model> {
-        None
-    }
-
-    fn model_ref(&self) -> Option<String> {
-        None
-    }
-
-    fn access_mode(&self) -> Option<AccessMode> {
-        Some(AccessMode::Sandbox)
-    }
-
-    fn reasoning_effort(&self) -> Option<String> {
-        Some("high".to_string())
-    }
-
-    fn config_version(&self) -> i64 {
-        1
-    }
 }
 
 fn assistant_usage(cache_read: u64) -> manox_harness::types::Usage {
@@ -3451,6 +3402,7 @@ fn scripted_state_rows() -> Vec<(&'static str, serde_json::Value)> {
             "model_change",
             json!({ "provider": "test", "modelId": "replay-model" }),
         ),
+        ("access_mode_change", json!({ "mode": "full-access" })),
         ("cwd_change", json!({ "cwd": "/replay/work" })),
         ("project_change", json!({ "path": "/replay/proj" })),
         (
@@ -3584,6 +3536,7 @@ const REPLAY_COVERAGE_KINDS: &[&str] = &[
     "cwd_change",
     "project_change",
     "thinking_level_change",
+    "access_mode_change",
     "plan_update",
     "goal",
     "title",
@@ -3691,7 +3644,7 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     // ── Live-state capture. ──────────────────────────────────────────
     let live_records = appender.storage().journal_range(0, u64::MAX).await.unwrap();
     let live_replay = crate::replay::replay_thread_state(&live_records);
-    let live_rebuilt = rebuild_restored_state(&session, &sessions, "t-1").await;
+    let live_rebuilt = rebuild_restored_state(&session, &sessions).await;
     let live_entries = session.context_entries().await.unwrap();
     let (live_display, live_notes) = adapt::entries_to_display(&live_entries);
     let live_cursor = appender.storage().journal_cursor().await;
@@ -3730,11 +3683,14 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     assert_eq!(live_rebuilt.project, Some(PathBuf::from("/replay/proj")));
     assert_eq!(
         live_rebuilt.access_mode,
-        AccessMode::Sandbox,
-        "the chain carries no mode row; with no object row the bounded \
-         default stands"
+        AccessMode::FullAccess,
+        "the chain's own access_mode_change row is the mode's authority"
     );
-    assert_eq!(live_rebuilt.reasoning_effort, ReasoningEffort::High);
+    assert_eq!(
+        live_rebuilt.reasoning_effort,
+        ReasoningEffort::Max,
+        "the chain's own thinking_level_change row is the effort's authority"
+    );
 
     // K2 cache repair: the diverging (here: empty) sidecar converges
     // toward the journal authority — INCLUDING the title (the repair
@@ -3748,11 +3704,6 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     assert_eq!(repaired.title.as_deref(), Some("replayed title"));
     assert!(!repaired.pinned && repaired.archived);
     assert_eq!(repaired.project.as_deref(), Some("/replay/proj"));
-    // Neither the mode nor the effort is re-stamped: the conversation's row
-    // owns them, and repairing the cache from the journal would put a second
-    // copy back in play.
-    assert_eq!(repaired.access_mode, None);
-    assert_eq!(repaired.reasoning_effort, None);
     // Plan state has no sidecar mirror anymore (W4): the journal is the
     // single source, so there is nothing to repair or assert here.
 
@@ -3783,7 +3734,7 @@ async fn journal_replay_is_consistent_across_disk_reload() {
         .unwrap();
     let reloaded_records = reloaded.journal_range(0, u64::MAX).await.unwrap();
     let reloaded_replay = crate::replay::replay_thread_state(&reloaded_records);
-    let reloaded_rebuilt = rebuild_restored_state(&reloaded, &sessions, "t-1").await;
+    let reloaded_rebuilt = rebuild_restored_state(&reloaded, &sessions).await;
     let reloaded_entries = reloaded.context_entries().await.unwrap();
     let (reloaded_display, reloaded_notes) = adapt::entries_to_display(&reloaded_entries);
     let reloaded_cursor = reloaded.journal_cursor().await;
@@ -3878,9 +3829,10 @@ async fn journal_replay_is_consistent_across_disk_reload() {
 }
 
 /// K2 authority: the journal rebuild WINS over a diverging sidecar, and
-/// the sidecar cache is repaired toward the journal, while the access
-/// mode is read from the conversation's row (absent here) with the sidecar as
-/// its fallback — the chain carries no mode row at all.
+/// the sidecar cache is repaired toward the journal. The session-mutable
+/// config keys answer from the chain alone — a chain with no mode row
+/// restores the bounded default, and a sidecar's retired config copy is
+/// never read.
 #[tokio::test]
 async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
     let dir = tempfile::tempdir().unwrap();
@@ -3909,7 +3861,6 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
         meta.title = Some("stale sidecar title".into());
         meta.pinned = true;
         meta.archived = false;
-        meta.access_mode = Some("full-access".into());
         meta.project = Some("/stale/project".into());
     })
     .await
@@ -3942,15 +3893,15 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
         .await
         .unwrap();
 
-    let rebuilt = rebuild_restored_state(&session, &sessions, "t-1").await;
+    let rebuilt = rebuild_restored_state(&session, &sessions).await;
     assert_eq!(rebuilt.title.as_deref(), Some("journal title"));
     assert!(!rebuilt.pinned);
     assert!(rebuilt.archived);
     assert_eq!(
         rebuilt.access_mode,
-        AccessMode::FullAccess,
-        "no object row: the sidecar's value stands, and the chain carries \
-         no mode row"
+        AccessMode::Sandbox,
+        "no mode row on the chain: the bounded default stands — the sidecar \
+         holds no config answer anymore"
     );
     assert_eq!(rebuilt.project, Some(PathBuf::from("/journal/project")));
     // Goal stage ②: the rebuild passes the replayed journal snapshot
@@ -3974,35 +3925,38 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
         .unwrap();
     assert_eq!(repaired.title.as_deref(), Some("journal title"));
     assert!(!repaired.pinned && repaired.archived);
-    assert_eq!(
-        repaired.access_mode.as_deref(),
-        Some("full-access"),
-        "the stale cache is not re-stamped from a chain that carries no mode"
-    );
     assert_eq!(repaired.project.as_deref(), Some("/journal/project"));
     session.close().await.unwrap();
 }
 
-/// K2 migration window: a legacy chain without decision-point entries
-/// resolves from the sidecar for the fields that still cache there.
-#[tokio::test]
-async fn restored_state_falls_back_to_the_sidecar_for_a_conversation_without_a_row() {
+/// The sidecar fills only the fields the chain has never seen (title /
+/// plan / project). The session-mutable config keys are NOT among them:
+/// a chain without config rows restores the defaults — the retired
+/// sidecar copies are dead, no fallback read survives.
+#[test]
+fn restored_state_falls_back_to_the_sidecar_only_for_its_cache_fields() {
     let replayed = crate::replay::ReplayedThreadState::default();
     let meta = manox_harness::session_meta::SessionMeta {
         title: Some("sidecar title".into()),
         project: Some("/sidecar/project".into()),
-        access_mode: Some("full-access".into()),
-        reasoning_effort: Some("max".into()),
         plan_snapshot: Some(serde_json::json!([{ "content": "step" }])),
         pinned: true,
         archived: true,
         ..Default::default()
     };
-    let merged = merge_restored_state(&replayed, &meta, &NoPicks);
+    let merged = merge_restored_state(&replayed, &meta);
     assert_eq!(merged.title.as_deref(), Some("sidecar title"));
     assert_eq!(merged.project, Some(PathBuf::from("/sidecar/project")));
-    assert_eq!(merged.access_mode, AccessMode::FullAccess);
-    assert_eq!(merged.reasoning_effort, ReasoningEffort::Max);
+    assert_eq!(
+        merged.access_mode,
+        AccessMode::Sandbox,
+        "no mode row: the bounded default, never a sidecar answer"
+    );
+    assert_eq!(
+        merged.reasoning_effort,
+        ReasoningEffort::High,
+        "no effort row: the bounded default, never a sidecar answer"
+    );
     assert_eq!(
         merged.plan_snapshot,
         Some(serde_json::json!([{ "content": "step" }]))
@@ -4010,20 +3964,20 @@ async fn restored_state_falls_back_to_the_sidecar_for_a_conversation_without_a_r
     assert!(merged.pinned && merged.archived);
 }
 
-/// The row beats the sidecar. A conversation the store knows restores the
-/// picks its row holds, whatever a stale cache still says — one authority,
-/// with the cache as a fallback and never a competing answer.
+/// The chain's own config rows are the sole authority: wherever the replay
+/// carries a pick, the merge answers with it — a sidecar or an object row
+/// has no vote.
 #[test]
-fn the_conversations_row_beats_the_sidecar() {
-    let replayed = crate::replay::ReplayedThreadState::default();
-    let meta = manox_harness::session_meta::SessionMeta {
-        access_mode: Some("full-access".into()),
+fn the_chains_config_rows_resolve_the_merge() {
+    let replayed = crate::replay::ReplayedThreadState {
+        access_mode: Some("sandbox".into()),
         reasoning_effort: Some("max".into()),
         ..Default::default()
     };
-    let merged = merge_restored_state(&replayed, &meta, &Picks);
+    let meta = manox_harness::session_meta::SessionMeta::default();
+    let merged = merge_restored_state(&replayed, &meta);
     assert_eq!(merged.access_mode, AccessMode::Sandbox);
-    assert_eq!(merged.reasoning_effort, ReasoningEffort::High);
+    assert_eq!(merged.reasoning_effort, ReasoningEffort::Max);
 }
 
 /// A cleared plan (the empty `plan_update` snapshot the facade
@@ -4036,8 +3990,50 @@ fn cleared_plan_snapshot_normalizes_to_absence() {
         ..Default::default()
     };
     let meta = manox_harness::session_meta::SessionMeta::default();
-    let merged = merge_restored_state(&replayed, &meta, &NoPicks);
+    let merged = merge_restored_state(&replayed, &meta);
     assert_eq!(merged.plan_snapshot, None);
+}
+
+/// K3 (L3): the effort pick's durable row through the converged idle
+/// apply — a real change lands one `thinking_level_change` carrying the
+/// wire tier (the exact string the AHP fold reads back), a restate (the
+/// restore seed's re-apply shape) lands none.
+#[tokio::test]
+async fn set_thinking_level_lands_one_row_and_a_restate_lands_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = decision_rig_session(&dir).await;
+    let state = test_engine_state();
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+    let mut session = session;
+
+    async fn effort_rows(session: &AgentSession) -> Vec<String> {
+        session
+            .journal_range(0, u64::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|record| match record.entry {
+                manox_harness::session::SessionTreeEntry::ThinkingLevelChange {
+                    thinking_level,
+                    ..
+                } => Some(thinking_level),
+                _ => None,
+            })
+            .collect()
+    }
+
+    apply_thinking_level(&mut session, &state, &notice_tx, Some("max".to_string())).await;
+    assert_eq!(
+        effort_rows(&session).await,
+        vec!["max".to_string()],
+        "the pick lands exactly one durable row in the wire form"
+    );
+
+    // Restating the level in force lands no duplicate (this is the shape
+    // the restore seed's re-apply of the replayed value used to take).
+    apply_thinking_level(&mut session, &state, &notice_tx, Some("max".to_string())).await;
+    assert_eq!(effort_rows(&session).await.len(), 1);
+    session.close().await.unwrap();
 }
 
 /// K3 routing: a store-level decision row reaches the live actor's
@@ -4201,36 +4197,38 @@ async fn project_binding_journals_project_change_entry() {
     session.close().await.unwrap();
 }
 
-/// K3 (L3): the access-mode decision settles the gate and notifies the
-/// UI, and writes nothing durable. The conversation's object row is the
-/// mode's home — written by whoever made the pick, read live by the gate per
-/// tool call — so a second copy in the chain or the sidecar would only give
-/// "which one is in force" a second answer.
+/// K3 (L3): the access-mode decision settles the gate, notifies the UI,
+/// and lands its durable row — one `access_mode_change` per real change,
+/// nothing for a restate. The journal is the mode's authority; a second
+/// copy in the chain or the sidecar would only give "which one is in
+/// force" a second answer.
 #[tokio::test]
-async fn access_mode_decision_settles_the_gate_and_journals_nothing() {
+async fn access_mode_decision_lands_one_row_and_restates_land_none() {
     let dir = tempfile::tempdir().unwrap();
-    let sessions = dir.path().join("sessions");
     let session = decision_rig_session(&dir).await;
     let state = test_engine_state();
     let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
 
-    apply_access_mode(
-        &state,
-        &sessions,
-        session.path(),
-        AccessMode::FullAccess,
-        &notice_tx,
-    )
-    .await;
+    apply_access_mode(&session, &state, AccessMode::FullAccess, &notice_tx).await;
 
     assert_eq!(state.gate.mode(), AccessMode::FullAccess);
-    let meta = manox_harness::session_meta::load(&sessions, session.path())
-        .await
-        .unwrap();
-    assert_eq!(
-        meta.access_mode, None,
-        "the engine writes no sidecar copy: the conversation's row is the home"
-    );
+    {
+        let records = session.journal_range(0, u64::MAX).await.unwrap();
+        let modes: Vec<_> = records
+            .iter()
+            .filter_map(|record| match &record.entry {
+                manox_harness::session::SessionTreeEntry::AccessModeChange { mode, .. } => {
+                    Some(mode.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            modes,
+            vec!["full-access"],
+            "the decision lands exactly one durable row"
+        );
+    }
 
     // The decision still notifies — that is how the UI learns the switch.
     // Bounded: a missing emission must fail the test, not hang it.
@@ -4247,8 +4245,23 @@ async fn access_mode_decision_settles_the_gate_and_journals_nothing() {
     assert_eq!(mode, AccessMode::FullAccess);
     assert!(
         durable_journal_payload(&ThreadEvent::AccessModeChanged { mode }).is_none(),
-        "the mode decision must not map to a journal row"
+        "the actor's apply lands the row; the notice tap must not add a second one"
     );
+
+    // A restate of the mode the journal already carries is silent: no
+    // second row, the durable baseline having moved.
+    apply_access_mode(&session, &state, AccessMode::FullAccess, &notice_tx).await;
+    let records = session.journal_range(0, u64::MAX).await.unwrap();
+    let mode_rows = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                &record.entry,
+                manox_harness::session::SessionTreeEntry::AccessModeChange { .. }
+            )
+        })
+        .count();
+    assert_eq!(mode_rows, 1, "a restate lands no duplicate row");
     session.close().await.unwrap();
 }
 
@@ -4881,9 +4894,10 @@ async fn session_model_changes(session: &AgentSession) -> Vec<String> {
 /// The idle `SetModel` landing's durable half: a servable pick appends
 /// its `model_change` row synchronously — the exact link the silent-switch
 /// bug broke (an accepted echo with no journal row meant every reopen
-/// snapped back to the old model).
+/// snapped back to the old model). The journal is the pick's durable
+/// authority; a re-pick of the model already in force lands no second row.
 #[tokio::test]
-async fn an_idle_set_model_lands_without_journaling() {
+async fn an_idle_set_model_lands_its_row() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().join("proj");
     tokio::fs::create_dir_all(&cwd).await.unwrap();
@@ -4908,26 +4922,43 @@ async fn an_idle_set_model_lands_without_journaling() {
 
     let state = test_engine_state();
     let mut harness_model = test_model();
-    let switched = test_model_switched();
-    land_set_model(&mut session, &mut harness_model, &state, switched.clone()).await;
+    land_set_model(
+        &mut session,
+        &mut harness_model,
+        &state,
+        test_model_switched(),
+    )
+    .await;
 
     assert_eq!(harness_model.id, "new", "the mirrors follow the landing");
     assert_eq!(
         state.model.lock().unwrap().as_ref().map(|m| m.id.clone()),
         Some("new".to_string())
     );
-    assert!(
-        session_model_changes(&session).await.is_empty(),
-        "the pick's durable home is the conversation's configuration, not the \
-         transcript"
+    assert_eq!(
+        session_model_changes(&session).await,
+        vec!["new".to_string()],
+        "the pick's durable home is the journal: one row naming the switch"
     );
+
+    // A restate of the model already in force is a no-op at the actor's
+    // own guard (the working mirror), let alone a second row.
+    land_set_model(
+        &mut session,
+        &mut harness_model,
+        &state,
+        test_model_switched(),
+    )
+    .await;
+    assert_eq!(session_model_changes(&session).await.len(), 1);
 }
 
 /// The idle `SetModel` landing's fallback: when the session refuses the
 /// switch (here: its resolver cannot serve the pick), the queueing semantics
 /// of the mid-run arm take over — the mirrors land, effective at the next
 /// request boundary — instead of the switch dying after the dispatch was
-/// already echoed as accepted.
+/// already echoed as accepted. A durable refusal journals nothing: the
+/// queued switch's row, if any, is the boundary's business.
 #[tokio::test]
 async fn an_idle_set_model_refused_by_the_durable_path_lands_via_the_queue() {
     let dir = tempfile::tempdir().unwrap();
@@ -4976,6 +5007,6 @@ async fn an_idle_set_model_refused_by_the_durable_path_lands_via_the_queue() {
     );
     assert!(
         session_model_changes(&session).await.is_empty(),
-        "a model switch writes no transcript rows at all"
+        "a durable refusal queues only: the switch stays out of the journal"
     );
 }

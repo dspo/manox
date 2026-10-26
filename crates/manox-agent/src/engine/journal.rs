@@ -106,10 +106,10 @@ pub(super) fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde
             json!({ "callId": id, "chunk": chunk }),
         ),
         // ── state changes ────────────────────────────────────────────────
-        // The access mode is NOT here: its durable home is the
-        // conversation's object row, which the client writes, and the engine
-        // reads it live before every tool call. Journaling a second copy is
-        // what made "which one is in force" unanswerable.
+        // The access mode is NOT here: its durable row
+        // (`access_mode_change`) is landed by the actor's own apply, which
+        // is the only writer that can guard it against restates. Journaling
+        // the notice echo a second time would double the row.
         ThreadEvent::AccessModeChanged { .. } => return None,
         // Same shape as the access mode, a fortiori: the network switch has
         // NO durable home at all — session memory only, so a restored
@@ -194,7 +194,10 @@ pub(super) fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde
                 "data": serde_json::to_value(metric).unwrap_or(serde_json::Value::Null),
             }),
         ),
-        // Already durable through their owning flows / not journaled.
+        // Already durable through their owning flows / not journaled. The
+        // config rows land at their producers: `model_change` in
+        // `AgentSession::set_model` (the choke point), the effort row in the
+        // engine's `SetThinkingLevel` arms, `cwd_change` in the cwd moves.
         ThreadEvent::ModelChanged { .. }
         | ThreadEvent::ReasoningEffortChanged { .. }
         | ThreadEvent::CwdChanged { .. }

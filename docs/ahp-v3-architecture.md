@@ -111,7 +111,7 @@ manox 内核 ThreadCore + Journal v4（磁盘 .jsonl，生态工具仍可直读�
 
 **`ClientNote`（27 + 3 compat）**
 
-`DetachSession`→`unsubscribe`；`DisposeSession`→`disposeChat`/`disposeSession`；`DropQueued`→`chat/pendingMessageRemoved{kind:'queued'}`；`CancelTurn`→`chat/turnCancelled`；`SetModel`→`session/configChanged`（canonical 串）；`SetReasoningEffort`/`SetAccessMode`/`SetBrowserSuite`→`session/configChanged`（ConfigSchema 枚举；browser suite 仍由 `x-manox-work` 记状态）；`SetCwd`→`session/workingDirectorySet|Removed|Replaced`；`SetPlanMode`→`x-manox-plan/planModeChanged`；`PlanSeedExecution`→`x-manox/planExecute`（命令）；`Compact`→`x-manox/compact`（命令）；`Goal`→`x-manox/goal`（命令；状态落 `x-manox-work/goalChanged`）；`StopBackgroundTask`→无落点（`backgroundTaskStopped` 声明随声明面 v5 删除——它从未接派发臂，宿主也从不发）；`ArchiveThread`→`session/isArchivedChanged`；`PinThread`→`x-manox/pinnedChanged`（AHP 无 pin 位）；`InsertThreadBefore`/`InsertGroupBefore`→`x-manox/orderChanged`；`TerminalInput`/`TerminalResize`→`terminal/input`/`terminal/resized`；`CancelModelChat`→无落点（`x-manox/modelChatCancel` 随 v2 网关删除，`not-on-wire`）；`Shutdown`→无落点（连接关闭即断开，`not-on-wire`）；`AppendUserMessage`→`chat/pendingMessageSet{kind:'queued'}`；`AppendUiNote`→`chat/responsePart{kind:'systemNotification'}`；compat `CreateSession`/`Submit`/`Steer` 随 v2 一并删除（无兼容期）。
+`DetachSession`→`unsubscribe`；`DisposeSession`→`disposeChat`/`disposeSession`；`DropQueued`→`chat/pendingMessageRemoved{kind:'queued'}`；`CancelTurn`→`chat/turnCancelled`；`SetModel`→`session/configChanged`（canonical 串；durable 权威 = journal `model_change` 行，见 §H.8）；`SetReasoningEffort`/`SetAccessMode`/`SetBrowserSuite`→`session/configChanged`（ConfigSchema 枚举；effort/accessMode 的 durable 权威 = journal `thinking_level_change`/`access_mode_change` 行，见 §H.8；browser suite 仍由 `x-manox-work` 记状态）；`SetCwd`→`session/workingDirectorySet|Removed|Replaced`；`SetPlanMode`→`x-manox-plan/planModeChanged`；`PlanSeedExecution`→`x-manox/planExecute`（命令）；`Compact`→`x-manox/compact`（命令）；`Goal`→`x-manox/goal`（命令；状态落 `x-manox-work/goalChanged`）；`StopBackgroundTask`→无落点（`backgroundTaskStopped` 声明随声明面 v5 删除——它从未接派发臂，宿主也从不发）；`ArchiveThread`→`session/isArchivedChanged`；`PinThread`→`x-manox/pinnedChanged`（AHP 无 pin 位）；`InsertThreadBefore`/`InsertGroupBefore`→`x-manox/orderChanged`；`TerminalInput`/`TerminalResize`→`terminal/input`/`terminal/resized`；`CancelModelChat`→无落点（`x-manox/modelChatCancel` 随 v2 网关删除，`not-on-wire`）；`Shutdown`→无落点（连接关闭即断开，`not-on-wire`）；`AppendUserMessage`→`chat/pendingMessageSet{kind:'queued'}`；`AppendUiNote`→`chat/responsePart{kind:'systemNotification'}`；compat `CreateSession`/`Submit`/`Steer` 随 v2 一并删除（无兼容期）。
 
 **`ServerCall`（6）**
 
@@ -232,7 +232,7 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 ### W2 域翻译与状态收敛（manox）
 
-- `projection.rs`（manox-ahp-runtime）：kernel 会话记录 **全射** → AHP 动作（消息、流式 delta 的 create-then-append、tool-call 生命周期、usage、lifecycle、title/activity、workingDirectories、config 承载 model/effort/accessMode/browserSuite、compaction、分支/摘要）；projection 值 → 通道状态字段。**2026-10-09 起无中间 wire 词汇**：`manox-journal`（§C.2 v2 遗产词汇 crate）已删除，投影输入即 kernel `SessionTreeEntry` 记录（#878）。
+- `projection.rs`（manox-ahp-runtime）：kernel 会话记录 **全射** → AHP 动作（消息、流式 delta 的 create-then-append、tool-call 生命周期、usage、lifecycle、title/activity、workingDirectories、config 承载 model/effort/accessMode/browserSuite（行源 `model_change`/`thinking_level_change`/`access_mode_change`，见 §H.8）、compaction、分支/摘要）；projection 值 → 通道状态字段。**2026-10-09 起无中间 wire 词汇**：`manox-journal`（§C.2 v2 遗产词汇 crate）已删除，投影输入即 kernel `SessionTreeEntry` 记录（#878）。
 - 审批面：`Approve` → `toolCallReady`(+`options[]`)/`toolCallConfirmed`（含 mid-execution 再确认、可编辑参数、result confirmation 三态的映射取舍）；`AskUserQuestion` → elicitation；`PlanVerdict` → x-manox-plan。
 - 副作用派发：`chat/turnStarted|pendingMessageSet|turnCancelled|toolCallConfirmed|inputCompleted|isArchivedChanged|workingDirectory*` 等 → 现有内核调用（原 27 个 note 的落点）。
 - x-manox 全线 + `resource*` 最小面（`resourceRead/Write/List/Delete` + ContentRef，落在会话工作目录围栏内，fail-closed）。
@@ -979,3 +979,42 @@ VS Code 拿到的是一个普通单选问题，不是它的原生 plan-review �
 - **伴随义务**：dspo/manox-app 删 chip / `/plan` 本地命令 / plan 通道读面 / `plan-review:`
   特判，`pending_ask_from_ahp` 改读 `req.message`；dspo/manox-vscode-extension 的
   `plan-review-card.tsx`/`chatFold.ts` 等读 plan 通道的代码改读 `ChatInputRequest.message`。
+
+### H.8 session config 三键的 durable 权威回归 journal（2026-10-26）
+
+v0.6.5 把 session config 的权威放在 conversation 对象行（`conversation_config.rs` 旧注释
+「The journal carries no configuration of its own」），折叠器只认 journal 行但没有生产者：
+`model_change`/`thinking_level_change` 存在折叠臂（`SessionTreeEntry::ModelChange` /
+`ThinkingLevelChange` → `session/configChanged`）却无人落行，`accessMode` 连行类型都没有。
+后果：任何重订阅/宿主重启后 config 座位折不出这三键，客户端模型芯片与访问菜单回落默认值
+——纯显示漂移，但违反 L10（`快照 == fold(重放)`）。本节 as-built 把权威反转回来：
+
+- **行类型**：新增 journal 行 `access_mode_change`（`manox-harness` `session::event::Event`
+  的 `AccessModeChange { mode }`，kebab 行名 + camelCase envelope，`mode` 是 kebab wire
+  词汇 `sandbox`/`full-access`）。`replay.rs` 宿主 fold、`projection.rs` 的 `target_of`
+  全射门同步登记。
+- **生产者（仅真实变化时落行，带变更守卫）**：`model` 在 `AgentSession::set_model` 唯一
+  choke point 落 `model_change`（守卫 = 调用前 harness model；`land_set_model` 的 durable
+  拒绝回退只进镜像不落行，语义不变）；`reasoningEffort` 的 `SessionCmd::SetThinkingLevel`
+  两臂（actor 主循环 + run.rs 中段排队臂）收敛到同一落行词汇（`thinking_level_change`，
+  wire 形式字符串），守卫 = `EngineState::journaled_thinking_level`（journal 最后携带值，
+  clamp 无关；中段臂经 live serializer task 落行，绝不在 select 臂内 await append 锁——
+  round-11 自死锁禁区）；`accessMode` 的 `SessionCmd::SetAccessMode` 臂落
+  `access_mode_change`，守卫 = `EngineState::journaled_access_mode`（facade 会在 actor
+  排水前热写 gate，活镜像不能当守卫）。
+- **折叠消费**：`projection.rs` 新增 `AccessModeChange` → `configChanged{accessMode}` 臂；
+  `ThinkingLevelChange` 臂本就存在。
+- **权威反转（激进纪律，无兼容读）**：`adopt_session_model` 删 ObjectConfigSource 读取，
+  picked 直接取 kernel restore 投影出的 harness model（`model_change` 行已由 restore 折回）；
+  `ApprovalGate` 撤 `config_source`（构建/恢复时从 replay fold 播种 gate + durable 基线，
+  live `set_mode` 不变）；`merge_restored_state` 的 accessMode/effort 改从 chain 行解析，
+  无行恢复默认值——**旧 journal（无行）恢复到默认值，不迁移不做兼容读，用户重选一次即落行**。
+  sidecar 的 `access_mode`/`reasoning_effort` 缓存字段随第二答案一起删除（未知键照旧惰性忽略）。
+  `networkAccess` 不在本次范围（#953 沙箱网络重设计进行中），仍是 session-memory。
+- **config 模型**：session-mutable 三键中 `model`/`reasoningEffort`/`accessMode` 以 journal
+  行为 durable 权威，L10 门禁覆盖 config 座位（`config_seat_tests` 折叠回归：三行 → 座位
+  三键俱全，重折叠同）；conversation 对象行降级为**新建线程的 draft 意图**（app 在 create
+  前写 picks，`sync_object_config` 握手经正常 setter 派发落行）。
+- **伴随义务**：dspo/manox-app 零代码消费（AHP 面不变），随下一轨 tag bump 获取修复；
+  `createSession` 的 seed 缺口（工作目录/config 意图不落引擎，#904/#905 的补偿写入）不在
+  本轮范围、另行处理。

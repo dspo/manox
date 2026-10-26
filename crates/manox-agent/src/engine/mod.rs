@@ -128,7 +128,8 @@ pub(crate) enum SessionCmd {
     SetModel(HarnessModel),
     /// Map the reasoning effort onto the harness's thinking level.
     SetThinkingLevel(Option<String>),
-    /// Switch the access mode and persist it in the session sidecar.
+    /// Switch the access mode; a real change lands its
+    /// `access_mode_change` row (the mode's durable authority).
     SetAccessMode(AccessMode),
     /// Switch the sandbox network state (`networkAccess`; session memory).
     SetNetworkAccess(manox_harness::sandbox::NetworkAccess),
@@ -378,6 +379,18 @@ struct EngineState {
     /// UI's directory display tracks the session tail without per-turn
     /// chatter.
     last_cwd_note: Mutex<Option<String>>,
+    /// The access mode the journal's `access_mode_change` rows last carried
+    /// (seeded at restore from the replayed fold, advanced by every durable
+    /// switch). This — not the gate's live mirror, which the facade re-stamps
+    /// before the actor drains — is what the `SetAccessMode` arm diffs
+    /// against, so a restate lands no duplicate row.
+    journaled_access_mode: Mutex<AccessMode>,
+    /// The thinking level the journal's `thinking_level_change` rows last
+    /// carried (raw wire string; `None` = the journal carries no level).
+    /// Same contract as the access-mode baseline: the durable diff source
+    /// for the `SetThinkingLevel` arms, independent of the session's
+    /// clamp-adjusted in-force level.
+    journaled_thinking_level: Mutex<Option<String>>,
 }
 
 /// Live transcript snapshot maintained by the session listener so the engine
@@ -491,11 +504,6 @@ pub fn spawn_engine(
         notice_tx.clone(),
         Arc::clone(&model_slot),
     ));
-    // The conversation's row is the mode's authority: the gate reads it per
-    // tool call, so a switch governs the next call rather than the next turn.
-    gate.set_config_source(crate::conversation_config::ObjectConfigSource::for_session(
-        thread_id.clone(),
-    ));
     // The managed proxy's amendment ask parks through the same card
     // channel; the approver holds the gate WEAK (the gate owns the policy
     // that owns the approver — a strong back-reference would cycle).
@@ -537,6 +545,8 @@ pub fn spawn_engine(
         pending_session_cmds: Mutex::new(Vec::new()),
         current_appender: Mutex::new(None),
         current_resources: Mutex::new(None),
+        journaled_access_mode: Mutex::new(AccessMode::default()),
+        journaled_thinking_level: Mutex::new(None),
         gate,
         question_gate,
         held_settle: Mutex::new(None),
@@ -824,8 +834,9 @@ impl ThreadEngine for Engine {
     fn set_access_mode(&self, mode: AccessMode) {
         // The gate is the live authority every tool resolver reads per call,
         // so the mode lands on it directly — a mid-turn switch governs the
-        // very next tool call. The queued command still serializes the
-        // durable half (sidecar persist + journal echo) on the actor and
+        // very next tool call. The queued command serializes the durable
+        // half (the `access_mode_change` row, landed only against a real
+        // change of the journal's last carried mode) on the actor and
         // re-stamps the same value idempotently.
         self.state.gate.set_mode(mode);
         let _ = self.cmd_tx.send(SessionCmd::SetAccessMode(mode));
@@ -1106,7 +1117,7 @@ async fn run_actor(
                 attach_orchestrators(&mut s, &background);
                 attach_plugin_hooks(&mut s, &tool_cwd);
                 attach_prefix_gate(&mut s, &notice_tx, &thread_id);
-                adopt_session_model(&mut s, &mut harness_model, &state, &thread_id).await;
+                adopt_session_model(&mut s, &mut harness_model, &state).await;
                 restored = true;
                 // The restored file is the thread's active session.
                 crate::thread_registry::set_active(&thread_id, &header.id).await;
@@ -1204,7 +1215,7 @@ async fn run_actor(
     // authority for every field §C.2 entries carry, the sidecar fills the
     // fields the chain has never seen, and a diverging cache is repaired
     // toward the journal.
-    let restored_state = rebuild_restored_state(&session, &sessions_dir, &thread_id).await;
+    let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
     let title_scheduler = TitleScheduler::new(
         runtime.clone(),
         Arc::clone(&state.model),
@@ -1235,27 +1246,26 @@ async fn run_actor(
         &wakeup_tx,
     );
 
-    // The access mode rebuilds from the conversation's row (the sidecar
-    // fills the gap for a conversation the store has never seen): restore
-    // it so a reopened session keeps its mode.
+    // The access mode rebuilds from the journal's own rows (the fold's last
+    // `access_mode_change`): seed the gate's live mirror and the durable
+    // diff baseline with it, so a reopened session keeps its mode and the
+    // first restate after restore lands no duplicate row.
     let access_mode = restored_state.access_mode;
     state.gate.set_mode(access_mode);
+    *state.journaled_access_mode.lock().unwrap() = access_mode;
     repark_unsettled(&state, &restored_state);
     // The restore has landed — replayed parks are back on the gates. The
     // settle path awaits this watch, so a verdict issued during the
     // restore window waits here instead of hitting an empty gate.
     let _ = restore_ready.send(true);
-    // The reasoning effort rebuilds the same way: a reopened Max session
-    // keeps its effort. The engine clamps against the current model and
-    // persists the change in the transcript.
+    // The reasoning effort needs no re-apply: the kernel's own restore fold
+    // already read the chain's `thinking_level_change` rows onto the agent
+    // (clamped against the model — the clamp is kernel-owned), and the
+    // value below rides `Ready` for the facade's chip. The journal's raw
+    // last-carried level seeds the durable diff baseline, so the first
+    // restate after restore lands no duplicate row.
     let reasoning_effort = restored_state.reasoning_effort;
-    if reasoning_effort != ReasoningEffort::default()
-        && let Err(err) = session
-            .set_thinking_level(Some(reasoning_effort.wire_value().to_string()))
-            .await
-    {
-        tracing::warn!(error = %err, "failed to restore reasoning effort");
-    }
+    *state.journaled_thinking_level.lock().unwrap() = restored_state.thinking_level_row.clone();
     // The execution-plan snapshot (UpdatePlan) rides `Ready` so the facade
     // re-seeds its rail fallback after compaction.
     let plan_snapshot = restored_state.plan_snapshot.clone();
@@ -1680,7 +1690,7 @@ async fn run_actor(
                 land_set_model(&mut session, &mut harness_model, &state, new_model).await;
             }
             SessionCmd::SetAccessMode(mode) => {
-                apply_access_mode(&state, &sessions_dir, session.path(), mode, &notice_tx).await;
+                apply_access_mode(&session, &state, mode, &notice_tx).await;
             }
             SessionCmd::SetNetworkAccess(access) => {
                 apply_network_access(&state, access, &notice_tx).await;
@@ -1800,9 +1810,7 @@ async fn run_actor(
                 }
             }
             SessionCmd::SetThinkingLevel(level) => {
-                if let Err(err) = session.set_thinking_level(level.clone()).await {
-                    tracing::warn!("set_thinking_level failed: {err}");
-                }
+                apply_thinking_level(&mut session, &state, &notice_tx, level).await;
             }
             SessionCmd::Open { path } => {
                 // A re-open is a SECOND restore: drop the watch to false so
@@ -1828,8 +1836,7 @@ async fn run_actor(
                 // K2: the journal-first rebuild resolves the swapped-in
                 // session's observable state (authority: its active chain;
                 // gap-fill: its sidecar).
-                let restored_state =
-                    rebuild_restored_state(&session, &sessions_dir, &thread_id).await;
+                let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
                 title_scheduler.retarget(
                     path.clone(),
                     cwd.clone(),
@@ -1862,6 +1869,11 @@ async fn run_actor(
                 crate::thread_registry::set_active(&thread_id, opened_id).await;
                 *state.active_path.lock().unwrap() = Some(path);
                 resync_access_mode(&restored_state, &state, &notice_tx);
+                // The durable effort baseline follows the swapped-in chain
+                // too, or a restate of the opened session's pick would land
+                // a duplicate row.
+                *state.journaled_thinking_level.lock().unwrap() =
+                    restored_state.thinking_level_row.clone();
                 repark_unsettled(&state, &restored_state);
                 let _ = restore_ready.send(true);
                 // Opened sessions are resumed conversations: SessionStart
@@ -2344,14 +2356,15 @@ fn repark_unsettled(state: &Arc<EngineState>, restored: &RestoredThreadState) {
 }
 
 /// Re-apply the persisted access mode after a session switch (K2): the
-/// mode comes from the journal-first restore rebuild; align the gate and
-/// the facade's chip with it.
+/// mode comes from the journal-first restore rebuild; align the gate, the
+/// facade's chip, and the durable diff baseline with it.
 fn resync_access_mode(
     restored: &RestoredThreadState,
     state: &Arc<EngineState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) {
     state.gate.set_mode(restored.access_mode);
+    *state.journaled_access_mode.lock().unwrap() = restored.access_mode;
     send_notice(
         notice_tx,
         BackendNotice::Event(Box::new(ThreadEvent::AccessModeChanged {
@@ -2363,15 +2376,20 @@ fn resync_access_mode(
 
 /// The observable state of a restored thread (K2), resolved journal-first:
 /// every field a §C.2 state-change entry carries rebuilds from the active
-/// chain ([`crate::replay::replay_thread_state`]); the session sidecar is
-/// the derived cache that fills fields the chain has never seen (legacy
-/// journals predate the decision-point entries) and is repaired whenever
-/// it diverges from a journal-backed field (conflicts resolve toward the
-/// journal, never the reverse).
+/// chain ([`crate::replay::replay_thread_state`]) — the session-mutable
+/// config keys (`access_mode_change` / `thinking_level_change`) included —
+/// and the session sidecar is the derived cache that only fills the fields
+/// the chain has never seen, repaired whenever it diverges from a
+/// journal-backed field (conflicts resolve toward the journal, never the
+/// reverse).
 #[derive(Debug, Clone, PartialEq)]
 struct RestoredThreadState {
     access_mode: AccessMode,
     reasoning_effort: ReasoningEffort,
+    /// The raw wire string of the last `thinking_level_change` row (the
+    /// same value [`Self::reasoning_effort`] parses): the durable diff
+    /// baseline the effort arms reseed on this restore face.
+    thinking_level_row: Option<String>,
     /// Unsettled parks the restored chain still carries (a `request` with
     /// no `decision`): restore re-parks them so the verdict a park
     /// outlived its process can still settle and journal.
@@ -2400,40 +2418,38 @@ fn journal_plan_snapshot(
         .filter(|value| !value.as_array().is_some_and(|plan| plan.is_empty()))
 }
 
-/// Resolve the journal replay against the conversation's own configuration
-/// and the sidecar cache (the K2 merge): journal-backed fields win wherever
-/// the chain carries them; the sidecar fills exactly the fields the chain has
-/// never seen (legacy journals predate the decision-point entries). Pure and
-/// total — every restore face applies this resolution verbatim, and the
-/// replay-consistency regression asserts it across a disk round trip.
+/// Resolve the journal replay against the sidecar cache (the K2 merge):
+/// journal-backed fields win wherever the chain carries them; the sidecar
+/// fills exactly the fields the chain has never seen (title / plan /
+/// project). Pure and total — every restore face applies this resolution
+/// verbatim, and the replay-consistency regression asserts it across a disk
+/// round trip.
 ///
-/// The access mode and the reasoning effort come from `config` — the
-/// conversation's row — not from the chain and not from the sidecar. That is
-/// the same surface the request boundary reads and the access gate reads
-/// per tool call, so a restore and a mid-run switch cannot disagree about
-/// what is in force. The journal carries no configuration of its own. The
-/// sidecar stays as the fallback for a conversation the store has never
-/// seen (a retired three-tier wire string there parses as unknown and
-/// lands on the bounded default).
+/// The session-mutable config keys resolve from the chain alone:
+/// `access_mode_change` / `thinking_level_change` rows are their durable
+/// authority, and a chain that never saw a row restores the default — no
+/// sidecar fallback, no second answer for the gate or the request boundary
+/// to disagree with. The model follows the same rule one layer down: the
+/// harness's own restore projection reads `model_change` rows onto the
+/// agent, and `adopt_session_model` mirrors that.
 fn merge_restored_state(
     replayed: &crate::replay::ReplayedThreadState,
     meta: &manox_harness::session_meta::SessionMeta,
-    config: &dyn manox_harness::ConversationConfigSource,
 ) -> RestoredThreadState {
-    let access_mode = config
-        .access_mode()
-        .or_else(|| meta.access_mode.as_deref().and_then(AccessMode::from_wire))
+    let access_mode = replayed
+        .access_mode
+        .as_deref()
+        .and_then(AccessMode::from_wire)
         .unwrap_or_default();
-    let reasoning_effort = config
-        .reasoning_effort()
-        .and_then(|raw| parse_reasoning_effort(&raw))
-        .or_else(|| {
-            (meta.reasoning_effort.as_deref() == Some("max")).then_some(ReasoningEffort::Max)
-        })
+    let reasoning_effort = replayed
+        .reasoning_effort
+        .as_deref()
+        .and_then(parse_reasoning_effort)
         .unwrap_or_default();
     RestoredThreadState {
         access_mode,
         reasoning_effort,
+        thinking_level_row: replayed.reasoning_effort.clone(),
         plan_snapshot: journal_plan_snapshot(replayed).or_else(|| meta.plan_snapshot.clone()),
         title: replayed
             .title
@@ -2460,7 +2476,6 @@ fn merge_restored_state(
 async fn rebuild_restored_state(
     session: &AgentSession,
     sessions_dir: &Path,
-    conversation_id: &str,
 ) -> RestoredThreadState {
     let records = session.journal_range(0, u64::MAX).await.unwrap_or_default();
     let replayed = crate::replay::replay_thread_state(&records);
@@ -2469,17 +2484,15 @@ async fn rebuild_restored_state(
     let meta = manox_harness::session_meta::load(sessions_dir, session.path())
         .await
         .unwrap_or_default();
-    let config = crate::conversation_config::ObjectConfigSource::for_session(conversation_id);
-    let mut merged = merge_restored_state(&replayed, &meta, config.as_ref());
+    let mut merged = merge_restored_state(&replayed, &meta);
     merged.unsettled_approvals = unsettled_approvals;
     merged.unsettled_questions = unsettled_questions;
 
     // Cache repair: re-stamp every journal-backed field whose sidecar copy
     // diverges from the authority, in one write. Fields the journal has
     // never seen keep their sidecar value untouched. The permission mode and
-    // the reasoning effort are absent here — the conversation's row owns
-    // them, and re-stamping a cache from the journal would put a second copy
-    // back in play.
+    // the reasoning effort are absent here — the chain's own rows are their
+    // authority, and a sidecar copy would put a second answer back in play.
     let repair_snapshot =
         journal_plan_snapshot(&replayed).filter(|value| meta.plan_snapshot.as_ref() != Some(value));
     let repair_title = replayed
@@ -2838,19 +2851,95 @@ async fn apply_network_access(
     );
 }
 
+/// The shared `SetThinkingLevel` landing vocabulary (both the idle actor arm
+/// and the mid-run queue arm journal through it): the wire value a level
+/// requests (`None` reads as `"off"`) and the `thinking_level_change` payload
+/// carrying it — the exact shape the AHP projection's fold arm reads back
+/// into the config seat. The change guard is the journal's last carried
+/// level (`EngineState::journaled_thinking_level`, the durable baseline),
+/// shared by both arms, so a restate — of a clamped-to-off session
+/// included — lands no duplicate row.
+fn thinking_level_wire(level: &Option<String>) -> String {
+    level.clone().unwrap_or_else(|| "off".into())
+}
+
+fn thinking_level_row_payload(wire: &str) -> serde_json::Value {
+    serde_json::json!({ "thinkingLevel": wire })
+}
+
+/// The idle `SetThinkingLevel` landing: apply the level to the running
+/// session, then — when it actually moved the journal's carried level —
+/// land the `thinking_level_change` row that makes the pick durable (the
+/// fold and the restore read it back). The append runs inline through the
+/// actor's appender: no run holds the session while the actor is idle.
+async fn apply_thinking_level(
+    session: &mut AgentSession,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    level: Option<String>,
+) {
+    if let Err(err) = session.set_thinking_level(level.clone()).await {
+        tracing::warn!("set_thinking_level failed: {err}");
+        return;
+    }
+    let wire = thinking_level_wire(&level);
+    if state.journaled_thinking_level.lock().unwrap().as_deref() == Some(wire.as_str()) {
+        return;
+    }
+    let appender = session.journal_appender();
+    if let Err(err) = append_typed_resilient(
+        &appender,
+        "thinking_level_change",
+        thinking_level_row_payload(&wire),
+    )
+    .await
+    {
+        if let Some(row) = record_journal_loss(&appender, "thinking_level_change", &err).await {
+            state.pending_journal.lock().unwrap().push(row);
+        }
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
+                "journal append permanently failed for `thinking_level_change`: {err:#}; the entry was dropped"
+            )))),
+            "error notice",
+        );
+    }
+    *state.journaled_thinking_level.lock().unwrap() = Some(wire);
+}
+
 /// Apply the user's access-mode decision (K3): the gate mirror plus the
-/// notice the UI learns the switch from. Nothing durable is written here —
-/// the conversation's row is the mode's home, written by whoever made the
-/// pick, and the gate reads it live per tool call. The facade already
+/// notice the UI learns the switch from, and — for a real change against the
+/// journal's last carried mode — the `access_mode_change` row that makes the
+/// pick durable (the fold and the restore read it back; L10 covers the config
+/// seat). A restate (the facade re-stamps the gate before the actor drains,
+/// so the live mirror cannot tell) lands no row. The facade already
 /// broadcast its own synchronous copy of this event; the echo is idempotent.
 async fn apply_access_mode(
+    session: &AgentSession,
     state: &Arc<EngineState>,
-    _sessions_dir: &Path,
-    _session_path: &Path,
     mode: AccessMode,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) {
     state.gate.set_mode(mode);
+    let journaled = *state.journaled_access_mode.lock().unwrap();
+    if mode != journaled {
+        let appender = session.journal_appender();
+        let payload = serde_json::json!({ "mode": mode.wire() });
+        if let Err(err) = append_typed_resilient(&appender, "access_mode_change", payload).await {
+            if let Some(row) = record_journal_loss(&appender, "access_mode_change", &err).await {
+                state.pending_journal.lock().unwrap().push(row);
+            }
+            send_notice(
+                notice_tx,
+                BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
+                    "journal append permanently failed for `access_mode_change`: {err:#}; the entry was dropped"
+                )))),
+                "error notice",
+            );
+        }
+        *state.journaled_access_mode.lock().unwrap() = mode;
+    }
     send_notice(
         notice_tx,
         BackendNotice::Event(Box::new(ThreadEvent::AccessModeChanged { mode })),

@@ -2745,6 +2745,69 @@ mod tests {
         );
     }
 
+    /// The `access_mode_change` row round-trips: the on-disk camelCase wire
+    /// shape loads, and the producer face (`append_access_mode_change`)
+    /// writes the same vocabulary back — the row is the access mode's
+    /// durable authority, so a reopen must fold the pick out of it.
+    #[tokio::test]
+    async fn test_access_mode_change_round_trips() {
+        use crate::session::Session;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        // The wire shape a real session file carries: kebab row name,
+        // camelCase envelope, kebab `mode` value.
+        let contents = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"access_mode_change","id":"am1","parentId":null,"timestamp":"2026-05-28T07:13:46.617Z","mode":"sandbox"}"#,
+            "\n",
+            r#"{"type":"access_mode_change","id":"am2","parentId":"am1","timestamp":"2026-05-28T07:14:46.617Z","mode":"full-access"}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+
+        let storage = JsonlSessionStorage::open(&path).await.unwrap();
+        let entries = storage.get_entries(Default::default()).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        match &entries[0] {
+            SessionTreeEntry::AccessModeChange { mode, .. } => {
+                assert_eq!(mode, "sandbox");
+            }
+            other => panic!("expected AccessModeChange, got {other:?}"),
+        }
+        match &entries[1] {
+            SessionTreeEntry::AccessModeChange {
+                id,
+                parent_id,
+                mode,
+                ..
+            } => {
+                // camelCase `parentId` must deserialize into `parent_id` — a
+                // missing `rename_all` on the variant silently drops ancestry.
+                assert_eq!(id, "am2");
+                assert_eq!(parent_id.as_deref(), Some("am1"));
+                assert_eq!(mode, "full-access");
+            }
+            other => panic!("expected AccessModeChange, got {other:?}"),
+        }
+
+        // The producer face lands the same row vocabulary a reopen reads.
+        let session = Session::new(storage);
+        session.append_access_mode_change("sandbox").await.unwrap();
+        let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+        let entries = reopened.get_entries(Default::default()).await.unwrap();
+        let last = entries.last().unwrap();
+        match last {
+            SessionTreeEntry::AccessModeChange { mode, .. } => {
+                assert_eq!(mode, "sandbox", "the appended row round-trips");
+            }
+            other => panic!("expected AccessModeChange, got {other:?}"),
+        }
+        // The appended entry parents onto the previous leaf.
+        assert_eq!(last.parent_id().map(str::to_string), Some("am2".into()));
+    }
+
     /// A walk that cannot complete loudly fails: v4 load validation rejects
     /// a parent id with no entry at `open` time (earlier than the v3 walk,
     /// same guarantee — never a truncated path), and an explicit leaf
