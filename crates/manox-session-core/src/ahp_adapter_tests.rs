@@ -4428,3 +4428,562 @@ mod transport_parity {
         }
     }
 }
+
+/// The create intent's durable closure: belonging resolved from the object
+/// row (W1) and the session-mutable picks landing their journal rows (W2).
+///
+/// Both defects had the same shape — a create-time fact never reached the
+/// journal, so the journal's own fold disagreed with what the client showed:
+/// a filed conversation ran in `unfiled_workspace(id)` and sharded into
+/// `--unfiled--` (sidebar "Chats"), and a create carrying config dropped the
+/// picks, leaving the config seat empty until the user re-picked.
+mod create_intent {
+    use super::{install, uninstall};
+    use crate::agent_server::AgentServer;
+    use ahp_types::commands::CreateSessionParams;
+    use manox_ahp::backend::Backend;
+    use manox_ahp::channels::session;
+    use manox_harness::provider_registry::ProviderRegistry;
+    use manox_harness::provider_registry::{Api, Cost, ProviderConfig, ProviderModelConfig};
+    use manox_harness::session::SessionTreeEntry;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn create_params(
+        id: &str,
+        cwd: Option<&str>,
+        config: Option<serde_json::Value>,
+    ) -> CreateSessionParams {
+        CreateSessionParams {
+            channel: session::uri(id),
+            meta: None,
+            provider: None,
+            working_directories: cwd.map(|dir| vec![format!("file://{dir}")]),
+            config: config.map(|value| value.as_object().cloned().unwrap_or_default()),
+            active_client: None,
+            progress_token: None,
+        }
+    }
+
+    fn model_config(id: &str) -> ProviderModelConfig {
+        ProviderModelConfig {
+            id: id.into(),
+            name: id.into(),
+            reasoning: true,
+            input: vec![],
+            context_window: 200_000,
+            max_tokens: 8_192,
+            cost: Cost::default(),
+            api: None,
+            base_url: None,
+            metadata: Default::default(),
+        }
+    }
+
+    /// Two providers, one model each: the first registered model is the
+    /// registry default, so a create picking the second proves the intent
+    /// travelled (a dropped intent would silently run the default).
+    fn two_model_registry() -> Arc<ProviderRegistry> {
+        let registry = Arc::new(ProviderRegistry::new());
+        for (provider, model) in [("p-alpha", "alpha"), ("p-beta", "beta")] {
+            registry
+                .register_provider(
+                    provider,
+                    ProviderConfig {
+                        name: Some(provider.into()),
+                        base_url: Some("https://p.example".into()),
+                        api_key: Some("k".into()),
+                        api: Some(Api::AnthropicMessages),
+                        headers: None,
+                        auth_header: false,
+                        models: vec![model_config(model)],
+                    },
+                )
+                .expect("provider registers");
+        }
+        registry
+    }
+
+    fn journal_of(id: &str, project: Option<&Path>) -> PathBuf {
+        manox_agent::paths::core_session_file(project, id).expect("a journal path")
+    }
+
+    /// Drive the first Submit acceptance: the durable user append is what
+    /// materializes a deferred session, exactly as a real first turn does.
+    async fn materialize(server: &Arc<AgentServer>, id: &str) {
+        let thread = server
+            .ahp_inner()
+            .session_thread(id)
+            .expect("the created session has a thread");
+        let engine = thread
+            .read(|t| t.engine_handle())
+            .expect("the fresh create spawned an engine");
+        for _ in 0..500 {
+            if engine
+                .persist_user_submission("materialize", Vec::new(), None)
+                .await
+                .expect("the durable append runs")
+                .is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the engine never assembled its appender");
+    }
+
+    async fn rows(path: &Path) -> Vec<SessionTreeEntry> {
+        manox_harness::session::jsonl::JsonlSessionStorage::open(path)
+            .await
+            .expect("the journal opens")
+            .journal_range(0, u64::MAX)
+            .await
+            .expect("the journal reads")
+            .into_iter()
+            .map(|record| record.entry)
+            .collect()
+    }
+
+    /// Wait until the journal carries every row kind the create should have
+    /// landed (the actor applies queued config commands asynchronously).
+    async fn wait_for_config_rows(path: &Path) {
+        for _ in 0..500 {
+            if path.exists() {
+                let entries = rows(path).await;
+                let has = |want: fn(&SessionTreeEntry) -> bool| entries.iter().any(want);
+                if has(|e| matches!(e, SessionTreeEntry::ModelChange { .. }))
+                    && has(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. }))
+                    && has(|e| matches!(e, SessionTreeEntry::AccessModeChange { .. }))
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let entries = rows(path).await;
+        panic!("the create's config rows never landed: {entries:?}");
+    }
+
+    /// W1: a conversation row naming a project is the belonging authority for
+    /// the create. The engine runs in the project directory (not the unfiled
+    /// per-id workspace), the journal shards into the project bucket, and the
+    /// thread row/sidecar carries the project — so the sidebar grouping and
+    /// the composer's project chip cannot disagree.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_create_resolves_its_project_from_the_object_row() {
+        let _guards = install();
+        let _registry = manox_agent::provider_glue::install_for_test_scoped(two_model_registry());
+        let scratch = std::env::temp_dir().join(format!(
+            "manox-create-intent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        manox_agent::object_store::set_path_for_test(Some(scratch.join("objects.db")));
+        manox_agent::object_store::init();
+        let project = scratch.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let project_string = project.to_string_lossy().into_owned();
+
+        let id = format!("s-project-{}", uuid::Uuid::new_v4().simple());
+        manox_agent::object_store::ObjectStore.create_conversation(&id, Some(&project_string));
+
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+
+        backend
+            .create_session(&id, &create_params(&id, None, None))
+            .expect("the create resolves its project");
+
+        let thread = server
+            .ahp_inner()
+            .session_thread(&id)
+            .expect("the session is live");
+        assert_eq!(
+            thread.read(|t| t.cwd().to_path_buf()),
+            project,
+            "the engine runs in the project directory, not the unfiled workspace"
+        );
+        assert_eq!(
+            thread.read(|t| t.project().cloned()),
+            Some(project.clone()),
+            "the thread binding is the object row's project"
+        );
+
+        materialize(&server, &id).await;
+        let expected = journal_of(&id, Some(&project));
+        for _ in 0..500 {
+            if expected.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            expected.exists(),
+            "the journal shards into the project bucket: {}",
+            expected.display()
+        );
+        assert!(
+            !journal_of(&id, None).exists(),
+            "no journal is written into the unfiled bucket"
+        );
+        let entries = rows(&expected).await;
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                SessionTreeEntry::ProjectChange { path, .. }
+                    if path.as_deref() == Some(project_string.as_str())
+            )),
+            "the thread row's project binding is journaled: {entries:?}"
+        );
+        let meta = manox_harness::session_meta::load(
+            &manox_agent::thread_store::global_sessions_dir(),
+            &expected,
+        )
+        .await
+        .expect("the sidecar loads");
+        assert_eq!(meta.project.as_deref(), Some(project_string.as_str()));
+
+        manox_agent::object_store::set_path_for_test(None);
+        uninstall();
+    }
+
+    /// W1 seeded leg: a seeded create materializes its journal synchronously,
+    /// so the shard choice is visible before the response returns. It must
+    /// follow the object row too — the seeds belong in the project bucket the
+    /// conversation actually lives in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_seeded_create_lands_in_its_project_bucket() {
+        let _guards = install();
+        let _registry = manox_agent::provider_glue::install_for_test_scoped(two_model_registry());
+        let scratch = std::env::temp_dir().join(format!(
+            "manox-create-intent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        manox_agent::object_store::set_path_for_test(Some(scratch.join("objects.db")));
+        manox_agent::object_store::init();
+        let project = scratch.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let project_string = project.to_string_lossy().into_owned();
+
+        let id = format!("s-seeded-project-{}", uuid::Uuid::new_v4().simple());
+        manox_agent::object_store::ObjectStore.create_conversation(&id, Some(&project_string));
+
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let intent = crate::agent_server::SessionIntent {
+            session_id: Some(id.clone()),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            access_mode: None,
+            reasoning_effort: None,
+            seed: Some(vec![serde_json::json!({"type": "text", "text": "hidden"})]),
+            working_directories: Vec::new(),
+        };
+        let inner = Arc::clone(server.ahp_inner());
+        crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
+            .await
+            .expect("the seeded create opens");
+
+        let expected = journal_of(&id, Some(&project));
+        assert!(
+            expected.exists(),
+            "the seeded journal lands in the project bucket synchronously: {}",
+            expected.display()
+        );
+        assert!(
+            !journal_of(&id, None).exists(),
+            "no seeded journal is written into the unfiled bucket"
+        );
+        let first = std::fs::read_to_string(&expected).expect("the journal reads");
+        let header: serde_json::Value =
+            serde_json::from_str(first.lines().next().expect("the header line"))
+                .expect("the header parses");
+        assert_eq!(
+            header.get("cwd").and_then(|v| v.as_str()),
+            Some(project_string.as_str()),
+            "the header cwd is the project directory"
+        );
+        let thread = server
+            .ahp_inner()
+            .session_thread(&id)
+            .expect("the seeded session is live");
+        assert_eq!(thread.read(|t| t.project().cloned()), Some(project));
+
+        manox_agent::object_store::set_path_for_test(None);
+        uninstall();
+    }
+
+    /// W1 reverse leg: a create with no object row keeps the unfiled special
+    /// project — its own per-id workspace and the shared `--unfiled--` bucket.
+    /// A non-desktop client only ever had this shape; resolving belonging must
+    /// not invent one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_create_without_an_object_row_keeps_the_unfiled_workspace() {
+        let _guards = install();
+        let _registry = manox_agent::provider_glue::install_for_test_scoped(two_model_registry());
+        // The store may still hold another test's scratch db; drop it so this
+        // is the "no row" shape.
+        manox_agent::object_store::set_path_for_test(None);
+
+        let id = format!("s-unfiled-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+
+        backend
+            .create_session(&id, &create_params(&id, Some("/tmp"), None))
+            .expect("the create lands");
+
+        let thread = server
+            .ahp_inner()
+            .session_thread(&id)
+            .expect("the session is live");
+        assert_eq!(
+            thread.read(|t| t.cwd().to_path_buf()),
+            manox_agent::paths::unfiled_workspace(&id),
+            "no project means the per-id unfiled workspace, not the requested cwd"
+        );
+        assert_eq!(thread.read(|t| t.project().cloned()), None);
+
+        materialize(&server, &id).await;
+        let expected = journal_of(&id, None);
+        for _ in 0..500 {
+            if expected.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            expected.exists(),
+            "the unfiled journal lands in the shared bucket: {}",
+            expected.display()
+        );
+        uninstall();
+    }
+
+    /// W1 + the claim: a retried create still takes the claim's Reuse early
+    /// return. The id's journal is restored as-is; resolving belonging after
+    /// the claim must not re-mint or move it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retried_create_still_restores_before_project_resolution() {
+        let _guards = install();
+        let scratch = std::env::temp_dir().join(format!(
+            "manox-create-intent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        manox_agent::object_store::set_path_for_test(Some(scratch.join("objects.db")));
+        manox_agent::object_store::init();
+        let project = scratch.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+
+        let id = format!("s-retry-project-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let cwd_string = cwd.to_string_lossy().into_owned();
+        super::seed_session(
+            &id,
+            &id,
+            &cwd_string,
+            vec![("e-1", super::user("first prompt"))],
+        )
+        .await;
+        let seeded_path = super::core_journal(&id);
+        let before = std::fs::read(&seeded_path).expect("the seeded journal reads");
+        // The row names a project the seeded journal knows nothing about; the
+        // claim's Reuse must answer before belonging is ever consulted.
+        manox_agent::object_store::ObjectStore
+            .create_conversation(&id, Some(&project.to_string_lossy()));
+
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        backend
+            .create_session(&id, &create_params(&id, Some(&cwd_string), None))
+            .expect("the retry restores the id it already owns");
+        assert_eq!(
+            std::fs::read(&seeded_path).expect("the journal reads"),
+            before,
+            "the Reuse path never re-mints over the existing journal"
+        );
+        assert!(
+            server.ahp_inner().session_thread(&id).is_some(),
+            "the retry opened the restored session"
+        );
+
+        manox_agent::object_store::set_path_for_test(None);
+        uninstall();
+    }
+
+    /// W2 soul test (L10): a create carrying the three session-mutable picks
+    /// seats all of them from the journal alone. The first turn materializes
+    /// the chain; a cold fold (a fresh backend, no live seed) must resolve
+    /// model / access mode / reasoning effort from the rows — not from the
+    /// defaults chips snap back to when the intent was dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_create_intent_config_seats_all_three_keys_on_a_cold_fold() {
+        let _guards = install();
+        let _registry = manox_agent::provider_glue::install_for_test_scoped(two_model_registry());
+        manox_agent::object_store::set_path_for_test(None);
+
+        let id = format!("s-createcfg-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd.clone());
+        let params = create_params(
+            &id,
+            None,
+            Some(serde_json::json!({
+                "model": "p-beta/beta",
+                "accessMode": "full-access",
+                "reasoningEffort": "max",
+            })),
+        );
+        backend
+            .create_session(&id, &params)
+            .expect("the create lands");
+
+        materialize(&server, &id).await;
+        let path = journal_of(&id, None);
+        wait_for_config_rows(&path).await;
+        let entries = rows(&path).await;
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                SessionTreeEntry::ModelChange { provider, model_id, .. }
+                    if provider == "p-beta" && model_id == "beta"
+            )),
+            "the model pick journals its row: {entries:?}"
+        );
+
+        // The cold fold: a fresh backend has no live seed, so the config seat
+        // comes from the journal's own rows. The session half of the fold
+        // reads the store row (a real boot has it from the list scan).
+        manox_agent::thread_store::global().with_mut(|s| {
+            s.insert_summary_for_test(&id, None);
+            s.note_session_path(&id, &path);
+        });
+        let cold_gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let cold = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(cold_gateway, cwd);
+        let state = cold.session_state(&id).expect("the cold fold answers");
+        let values = state
+            .config
+            .expect("the fold carries the config seat")
+            .values;
+        assert_eq!(
+            values.get("model"),
+            Some(&serde_json::Value::String("p-beta/beta".into())),
+            "the model seats from its row: {values:?}"
+        );
+        assert_eq!(
+            values.get("accessMode"),
+            Some(&serde_json::Value::String("full-access".into())),
+            "the access mode seats from its row: {values:?}"
+        );
+        assert_eq!(
+            values.get("reasoningEffort"),
+            Some(&serde_json::Value::String("max".into())),
+            "the reasoning effort seats from its row: {values:?}"
+        );
+
+        uninstall();
+    }
+
+    /// W2 reverse leg: a create with no config writes nothing durable — the
+    /// lazy-materialization contract still holds (no journal file until the
+    /// first turn).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_create_without_config_writes_no_journal() {
+        let _guards = install();
+        manox_agent::object_store::set_path_for_test(None);
+
+        let id = format!("s-noconfig-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+
+        backend
+            .create_session(&id, &create_params(&id, None, None))
+            .expect("the create lands");
+        // Let the actor drain any queued command before asserting silence.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !journal_of(&id, None).exists(),
+            "an unconfigured create materializes nothing"
+        );
+        uninstall();
+    }
+
+    /// W2 refusal leg: a bad pick refuses the WHOLE create before anything is
+    /// created. An unresolvable model, an unknown key and a non-string value
+    /// each answer the client's error and leave zero durable state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bad_create_config_refuses_the_create_without_writing() {
+        let _guards = install();
+        let _registry = manox_agent::provider_glue::install_for_test_scoped(two_model_registry());
+        manox_agent::object_store::set_path_for_test(None);
+
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+
+        let unresolvable = format!("s-badmodel-{}", uuid::Uuid::new_v4().simple());
+        let err = backend
+            .create_session(
+                &unresolvable,
+                &create_params(
+                    &unresolvable,
+                    None,
+                    Some(serde_json::json!({ "model": "p-nope/nope" })),
+                ),
+            )
+            .expect_err("an unresolvable model refuses the create");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("unknown model") && message.contains("model/unresolvable"),
+            "the refusal uses the model-unresolvable vocabulary: {err:?}"
+        );
+        assert!(
+            !journal_of(&unresolvable, None).exists(),
+            "the refusal writes nothing"
+        );
+
+        let unknown = format!("s-badkey-{}", uuid::Uuid::new_v4().simple());
+        backend
+            .create_session(
+                &unknown,
+                &create_params(
+                    &unknown,
+                    None,
+                    Some(serde_json::json!({ "networkAccess": "on" })),
+                ),
+            )
+            .expect_err("a non-create key refuses the create");
+        assert!(!journal_of(&unknown, None).exists());
+
+        let nonstring = format!("s-badtype-{}", uuid::Uuid::new_v4().simple());
+        backend
+            .create_session(
+                &nonstring,
+                &create_params(&nonstring, None, Some(serde_json::json!({ "model": 42 }))),
+            )
+            .expect_err("a non-string value refuses the create");
+        assert!(!journal_of(&nonstring, None).exists());
+        assert!(
+            server.ahp_inner().session_thread(&nonstring).is_none(),
+            "no half-created session is left live"
+        );
+        uninstall();
+    }
+}
