@@ -155,6 +155,16 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
             id: i,
             parent_id: p,
             ..
+        }
+        | E::AccessModeChange {
+            id: i,
+            parent_id: p,
+            ..
+        }
+        | E::ThinkingLevelChange {
+            id: i,
+            parent_id: p,
+            ..
         } => {
             *i = id.to_string();
             *p = parent_id;
@@ -4996,6 +5006,439 @@ mod create_intent {
             server.ahp_inner().session_thread(&nonstring).is_none(),
             "no half-created session is left live"
         );
+        uninstall();
+    }
+
+    /// Soul test: a deferred create's session channel answers with its intent
+    /// before any journal row exists.
+    ///
+    /// The desktop writes the conversation row (project plus the three picks)
+    /// before `createSession`, and the composer chips must show those values
+    /// from the first subscribe — the engine buffers the create facts in
+    /// memory and writes nothing until the first turn, so while the session is
+    /// deferred the object row and the accepted create intent are the only
+    /// honest sources.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deferred_create_seeds_its_channel_from_its_intent() {
+        let _guards = install();
+        let _registry = manox_agent::provider_glue::install_for_test_scoped(two_model_registry());
+        let scratch = std::env::temp_dir().join(format!(
+            "manox-create-intent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        manox_agent::object_store::set_path_for_test(Some(scratch.join("objects.db")));
+        manox_agent::object_store::init();
+        let project = scratch.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let project_string = project.to_string_lossy().into_owned();
+
+        let id = format!("s-deferred-{}", uuid::Uuid::new_v4().simple());
+        // The client's draft intent, written BEFORE the create (the desktop
+        // sidebar does exactly this).
+        manox_agent::object_store::ObjectStore.create_conversation(&id, Some(&project_string));
+        manox_agent::object_store::ObjectStore.set_model(&id, Some("p-beta"), Some("beta"));
+        manox_agent::object_store::ObjectStore.set_access_mode(&id, Some("full-access"));
+        manox_agent::object_store::ObjectStore.set_reasoning_effort(&id, Some("max"));
+
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+
+        backend
+            .create_session(
+                &id,
+                &create_params(
+                    &id,
+                    Some(&project_string),
+                    Some(serde_json::json!({
+                        "model": "p-beta/beta",
+                        "accessMode": "full-access",
+                        "reasoningEffort": "max",
+                    })),
+                ),
+            )
+            .expect("the create lands");
+
+        // No Submit, no materialization wait: this is exactly the state the
+        // desktop's first subscribe sees.
+        let state = backend
+            .session_state(&id)
+            .expect("the deferred seed answers");
+        let values = state
+            .config
+            .expect("the seed carries the config seat")
+            .values;
+        assert_eq!(
+            values.get("model"),
+            Some(&serde_json::Value::String("p-beta/beta".into())),
+            "the model pick is the intent's: {values:?}"
+        );
+        assert_eq!(
+            values.get("accessMode"),
+            Some(&serde_json::Value::String("full-access".into())),
+            "the access pick is the intent's: {values:?}"
+        );
+        assert_eq!(
+            values.get("reasoningEffort"),
+            Some(&serde_json::Value::String("max".into())),
+            "the effort pick is the intent's: {values:?}"
+        );
+        assert_eq!(
+            values.get("workingDirectory"),
+            Some(&serde_json::Value::String(project_string.clone())),
+            "the effective cwd is the create intent's: {values:?}"
+        );
+        let project_uri = format!("file:///{}", project_string.trim_start_matches('/'));
+        assert_eq!(
+            state.project.as_ref().map(|info| info.uri.as_str()),
+            Some(project_uri.as_str()),
+            "the project chip shows the object row's project"
+        );
+        let dirs = state.working_directories.expect("granted dirs");
+        assert!(
+            dirs.contains(&project_uri),
+            "the create's granted set seats the intent: {dirs:?}"
+        );
+
+        // Lazy materialization is untouched: no journal file until the first
+        // turn, in either the project or the unfiled bucket.
+        assert!(
+            !journal_of(&id, Some(&project)).exists(),
+            "the create writes no journal"
+        );
+        assert!(
+            !journal_of(&id, None).exists(),
+            "and nothing in the unfiled bucket"
+        );
+
+        manox_agent::object_store::set_path_for_test(None);
+        uninstall();
+    }
+
+    /// Authority order: the object row is intent, the journal is truth.
+    ///
+    /// The same session row that seeds a deferred channel is no match for a
+    /// journal row that says otherwise: the overlay is applied first and the
+    /// fold after it, so the journal is always the last writer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_journal_overrides_the_object_row_once_it_has_rows() {
+        let _guards = install();
+        let scratch = std::env::temp_dir().join(format!(
+            "manox-create-intent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        manox_agent::object_store::set_path_for_test(Some(scratch.join("objects.db")));
+        manox_agent::object_store::init();
+        let project = scratch.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let project_string = project.to_string_lossy().into_owned();
+
+        let id = format!("s-authority-{}", uuid::Uuid::new_v4().simple());
+        manox_agent::object_store::ObjectStore.create_conversation(&id, Some(&project_string));
+        manox_agent::object_store::ObjectStore.set_model(&id, Some("p-beta"), Some("beta"));
+        manox_agent::object_store::ObjectStore.set_access_mode(&id, Some("full-access"));
+        manox_agent::object_store::ObjectStore.set_reasoning_effort(&id, Some("max"));
+
+        // A materialized journal that disagrees with every pick.
+        super::seed_session(
+            &id,
+            &id,
+            &project_string,
+            vec![
+                (
+                    "e-model",
+                    super::E::ModelChange {
+                        id: String::new(),
+                        parent_id: None,
+                        timestamp: super::stamp(),
+                        provider: "p-alpha".into(),
+                        model_id: "alpha".into(),
+                    },
+                ),
+                (
+                    "e-access",
+                    super::E::AccessModeChange {
+                        id: String::new(),
+                        parent_id: None,
+                        timestamp: super::stamp(),
+                        mode: "sandbox".into(),
+                    },
+                ),
+                (
+                    "e-effort",
+                    super::E::ThinkingLevelChange {
+                        id: String::new(),
+                        parent_id: None,
+                        timestamp: super::stamp(),
+                        thinking_level: "high".into(),
+                    },
+                ),
+            ],
+        )
+        .await;
+        manox_agent::thread_store::global().with_mut(|state| {
+            state.insert_summary_for_test(&id, None);
+            state.note_session_path(&id, &super::core_journal(&id));
+        });
+
+        let state = super::session_state(&id)
+            .await
+            .expect("the materialized fold answers");
+        let values = state.config.expect("config seat").values;
+        assert_eq!(
+            values.get("model"),
+            Some(&serde_json::Value::String("p-alpha/alpha".into())),
+            "the journal's model row wins over the object row: {values:?}"
+        );
+        assert_eq!(
+            values.get("accessMode"),
+            Some(&serde_json::Value::String("sandbox".into())),
+            "the journal's access row wins over the object row: {values:?}"
+        );
+        assert_eq!(
+            values.get("reasoningEffort"),
+            Some(&serde_json::Value::String("high".into())),
+            "the journal's effort row wins over the object row: {values:?}"
+        );
+
+        manox_agent::object_store::set_path_for_test(None);
+        uninstall();
+    }
+
+    /// The overlay survives a re-seed without any process-scoped memory.
+    ///
+    /// Disposing the session drops the live engine, the thread store's
+    /// pending grants and the in-memory create intent — everything but the
+    /// durable object row. A fresh backend (the host-restart shape: no
+    /// `Seeded` cache, no live thread) must still answer with the intent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reseed_answers_from_the_durable_object_row() {
+        let _guards = install();
+        let _registry = manox_agent::provider_glue::install_for_test_scoped(two_model_registry());
+        let scratch = std::env::temp_dir().join(format!(
+            "manox-create-intent-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        manox_agent::object_store::set_path_for_test(Some(scratch.join("objects.db")));
+        manox_agent::object_store::init();
+        let project = scratch.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let project_string = project.to_string_lossy().into_owned();
+
+        let id = format!("s-reseed-{}", uuid::Uuid::new_v4().simple());
+        manox_agent::object_store::ObjectStore.create_conversation(&id, Some(&project_string));
+        manox_agent::object_store::ObjectStore.set_model(&id, Some("p-beta"), Some("beta"));
+        manox_agent::object_store::ObjectStore.set_access_mode(&id, Some("full-access"));
+        manox_agent::object_store::ObjectStore.set_reasoning_effort(&id, Some("max"));
+
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd.clone());
+        backend
+            .create_session(
+                &id,
+                &create_params(
+                    &id,
+                    Some(&project_string),
+                    Some(serde_json::json!({
+                        "model": "p-beta/beta",
+                        "accessMode": "full-access",
+                        "reasoningEffort": "max",
+                    })),
+                ),
+            )
+            .expect("the create lands");
+        // Drop every process-scoped trace of the deferred session.
+        backend.dispose_session(&id).expect("the session disposes");
+
+        let reseeded_gateway =
+            Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let reseeded = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(reseeded_gateway, cwd);
+        let state = reseeded
+            .session_state(&id)
+            .expect("the durable intent still answers");
+        let values = state.config.expect("config seat").values;
+        assert_eq!(
+            values.get("model"),
+            Some(&serde_json::Value::String("p-beta/beta".into())),
+            "the model survives from the object row: {values:?}"
+        );
+        assert_eq!(
+            values.get("accessMode"),
+            Some(&serde_json::Value::String("full-access".into())),
+            "the access pick survives from the object row: {values:?}"
+        );
+        assert_eq!(
+            values.get("reasoningEffort"),
+            Some(&serde_json::Value::String("max".into())),
+            "the effort pick survives from the object row: {values:?}"
+        );
+        assert_eq!(
+            values.get("workingDirectory"),
+            Some(&serde_json::Value::String(project_string.clone())),
+            "the project still seats the effective cwd: {values:?}"
+        );
+        assert_eq!(
+            state.project.as_ref().map(|info| info.uri.clone()),
+            Some(format!(
+                "file:///{}",
+                project_string.trim_start_matches('/')
+            )),
+            "the project chip survives from the object row"
+        );
+
+        manox_agent::object_store::set_path_for_test(None);
+        uninstall();
+    }
+
+    /// A non-desktop client has no object row: the create intent this process
+    /// accepted is the seed's source for the session it just created.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_without_an_object_row_sees_its_create_intent() {
+        let _guards = install();
+        let _registry = manox_agent::provider_glue::install_for_test_scoped(two_model_registry());
+        manox_agent::object_store::set_path_for_test(None);
+
+        let id = format!("s-intent-only-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        backend
+            .create_session(
+                &id,
+                &create_params(
+                    &id,
+                    Some("/tmp"),
+                    Some(serde_json::json!({
+                        "model": "p-beta/beta",
+                        "accessMode": "full-access",
+                        "reasoningEffort": "max",
+                    })),
+                ),
+            )
+            .expect("the create lands");
+
+        let state = backend
+            .session_state(&id)
+            .expect("the create intent seeds the session");
+        let values = state.config.expect("config seat").values;
+        assert_eq!(
+            values.get("model"),
+            Some(&serde_json::Value::String("p-beta/beta".into())),
+            "the model pick travels from the create intent: {values:?}"
+        );
+        assert_eq!(
+            values.get("accessMode"),
+            Some(&serde_json::Value::String("full-access".into())),
+            "the access pick travels from the create intent: {values:?}"
+        );
+        assert_eq!(
+            values.get("reasoningEffort"),
+            Some(&serde_json::Value::String("max".into())),
+            "the effort pick travels from the create intent: {values:?}"
+        );
+        // No project: the engine runs a fresh session in its own unfiled
+        // workspace, and the seed states exactly that.
+        let unfiled = manox_agent::paths::unfiled_workspace(&id)
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            values.get("workingDirectory"),
+            Some(&serde_json::Value::String(unfiled)),
+            "a project-less create seeds the unfiled workspace: {values:?}"
+        );
+        let dirs = state.working_directories.expect("granted dirs");
+        assert!(
+            dirs.contains(&"file:///tmp".to_string()),
+            "the create's working directory is granted: {dirs:?}"
+        );
+        assert!(
+            state.project.is_none(),
+            "no object row means no project, not an invented one"
+        );
+
+        uninstall();
+    }
+
+    /// A seed that arrives after a deferred session's rows were appended
+    /// still folds them.
+    ///
+    /// The rows exist only in the engine's in-memory storage (no journal
+    /// until the first turn), and a broadcast subscriber only sees what is
+    /// appended after it subscribes. The seed therefore takes its snapshot
+    /// from the engine itself, which is what closes the window between
+    /// `createSession`'s answer and the bridge's attach.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_seed_folds_a_deferred_sessions_in_memory_rows() {
+        let _guards = install();
+        // The engine exits without a model; the note only lands when the
+        // actor boots, so this needs a resolvable default.
+        let _registry = manox_agent::provider_glue::install_for_test_scoped(two_model_registry());
+        manox_agent::object_store::set_path_for_test(None);
+
+        let id = format!("s-late-seed-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let first =
+            manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway.clone(), cwd.clone());
+        first
+            .create_session(&id, &create_params(&id, Some("/tmp"), None))
+            .expect("the create lands");
+
+        // Append a chat row that lands in the deferred storage only.
+        let thread = server
+            .ahp_inner()
+            .session_thread(&id)
+            .expect("the created session is live");
+        thread.with_mut(|t| {
+            t.append_ui_note(manox_agent::db::UiNoteRecord {
+                kind: manox_agent::db::UiNoteKind::Notice,
+                data: serde_json::json!({"text": "in-memory note"}),
+            })
+        });
+        let mut landed = false;
+        for _ in 0..500 {
+            if let Some(snapshot) = thread.journal_snapshot().await
+                && snapshot.records.iter().any(|record| {
+                    matches!(
+                        &record.entry,
+                        SessionTreeEntry::Custom { custom_type, .. }
+                            if custom_type == manox_agent::db::UI_NOTE_CUSTOM_TYPE
+                    )
+                })
+            {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(landed, "the note lands in the engine's journal");
+        assert!(
+            !journal_of(&id, None).exists(),
+            "still deferred: the row exists only in memory"
+        );
+
+        // A fresh backend = a subscriber arriving after those rows landed.
+        let late_gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let late = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(late_gateway, cwd);
+        let chat = late.chat_state(&id).expect("the late seed answers");
+        assert!(
+            serde_json::to_string(&chat)
+                .expect("the chat serializes")
+                .contains("in-memory note"),
+            "the deferred row reaches the seed: {chat:?}"
+        );
+
         uninstall();
     }
 }
