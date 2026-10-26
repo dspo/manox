@@ -4511,6 +4511,15 @@ mod create_intent {
 
     /// Drive the first Submit acceptance: the durable user append is what
     /// materializes a deferred session, exactly as a real first turn does.
+    ///
+    /// The poll is only for engine boot, and it is complete when it answers:
+    /// the engine publishes its acceptance-time appender (`run_actor`) only
+    /// AFTER the create facts — the project binding and the established-cwd
+    /// witness — are on the chain (buffered by the deferred storage), and
+    /// the materializing append flushes that buffer under the append lock.
+    /// So the first successful `Some(id)` here cannot produce a journal that
+    /// was born without the create facts, and reading the rows right after
+    /// needs no further wait.
     async fn materialize(server: &Arc<AgentServer>, id: &str) {
         let thread = server
             .ahp_inner()
@@ -4797,6 +4806,9 @@ mod create_intent {
         )
         .await;
         let seeded_path = super::core_journal(&id);
+        // `seed_session` appends through the storage's fenced write, which
+        // flushes before returning — the row is on disk when this snapshots,
+        // and a Reuse restore appends nothing, so the comparison is exact.
         let before = std::fs::read(&seeded_path).expect("the seeded journal reads");
         // The row names a project the seeded journal knows nothing about; the
         // claim's Reuse must answer before belonging is ever consulted.

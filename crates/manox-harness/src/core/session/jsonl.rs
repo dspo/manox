@@ -422,6 +422,15 @@ impl JsonlSessionStorage {
         match fence.as_mut() {
             Some(fenced) => {
                 fenced.file.write_all(lines.as_bytes()).await?;
+                // `tokio::fs::File` buffers the write and completes it on a
+                // blocking-pool thread: `write_all` returning means the
+                // bytes were copied into that buffer, not that the kernel
+                // has them. Flush waits for the in-flight write, so the row
+                // this call reports is visible to a cold reader (a sibling
+                // storage, the sidebar scan, another process) before the
+                // lock is released, and two appends can never hit the file
+                // out of the order their locks were held in.
+                fenced.file.flush().await?;
                 *self.disk_size.lock().await += lines.len() as u64;
             }
             None => {
@@ -578,6 +587,11 @@ impl JsonlSessionStorage {
                 .as_mut()
                 .expect("a fence-less non-deferred append takes the rewrite arm");
             fenced.file.write_all(line.as_bytes()).await?;
+            // Same buffering contract as `append_entries`: the write is only
+            // in tokio's userspace buffer until the flush completes it, and
+            // an append that reported success must be readable from the path
+            // (cold restore, sibling process, the caller's own read-back).
+            fenced.file.flush().await?;
             *self.disk_size.lock().await += line.len() as u64;
         }
         // A buffered (pre-materialization) row needs no disk write: the index
@@ -4046,5 +4060,55 @@ mod append_entries_tests {
             0,
             "the in-memory state is untouched too"
         );
+    }
+
+    /// An append that returned is readable from the path immediately.
+    ///
+    /// `tokio::fs::File` buffers writes and completes them on a
+    /// blocking-pool thread, so `write_all` alone can return before the
+    /// bytes reach the kernel. A cold reader — a second storage instance, a
+    /// restore of the id, the sidebar scan, another process — would then
+    /// observe a journal missing a row the append already reported (and two
+    /// appends could land out of their lock-ordered sequence). The fence
+    /// arms flush before returning; repeated fresh-target cycles pin it
+    /// (each iteration exercises the buffering window, not an amortized
+    /// one).
+    #[tokio::test]
+    async fn an_append_is_readable_from_the_path_before_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..100 {
+            let path = dir.path().join(format!("visible-{i}.jsonl"));
+            let storage = JsonlSessionStorage::create(&path, batch_meta())
+                .await
+                .unwrap();
+            storage
+                .append_entry(&SessionTreeEntry::ModelChange {
+                    id: "m0".into(),
+                    parent_id: None,
+                    timestamp: chrono::Utc::now(),
+                    provider: "p".into(),
+                    model_id: "m".into(),
+                })
+                .await
+                .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(
+                bytes.iter().filter(|b| **b == b'\n').count(),
+                2,
+                "iteration {i}: the appended row is on disk when the append returns ({} bytes)",
+                bytes.len()
+            );
+            storage
+                .append_entries(&[chain_entry("e1", Some("m0"))])
+                .await
+                .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(
+                bytes.iter().filter(|b| **b == b'\n').count(),
+                3,
+                "iteration {i}: a batch append is visible too ({} bytes)",
+                bytes.len()
+            );
+        }
     }
 }
