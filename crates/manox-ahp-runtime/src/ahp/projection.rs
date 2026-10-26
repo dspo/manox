@@ -748,6 +748,22 @@ impl Translator {
         Self::default()
     }
 
+    /// Backfill the subagent roster from the host's folded chat state.
+    ///
+    /// A bridge reset (restart or lag resync) installs a fresh translator whose
+    /// roster is empty, while the client's fold keeps every background-work
+    /// entry published before the reset — the `run/started` rows that opened
+    /// them sit below the resume watermark and are never replayed. Primed ids
+    /// make the later `run/settled` (and a cancelled turn's #812 sweep) see
+    /// those entries as listed, so their removals go out instead of orphaning
+    /// the client's rows. Bookkeeping only: no edge is published, the client
+    /// already holds these entries.
+    pub fn prime_subagent_roster(&mut self, ids: impl IntoIterator<Item = String>) {
+        for id in ids {
+            self.subagents.insert(id, ());
+        }
+    }
+
     /// Adopt an already-folded transcript as the starting view.
     ///
     /// Used when the host starts against an existing journal: the durable fold has
@@ -4916,5 +4932,113 @@ mod tool_input_publication_tests {
             running.invocation_message,
             StringOrMarkdown::Plain("test".into())
         );
+    }
+}
+
+/// The subagent roster survives a translator reset: a bridge restart or lag
+/// resync skips the `run/started` rows below its resume point, so the roster
+/// must be primed from the host's fold for the later `run/settled` to remove
+/// the entries the client still holds.
+#[cfg(test)]
+mod subagent_roster_tests {
+    use super::*;
+
+    fn kernel(mut fields: Value) -> SessionTreeEntry {
+        let mut base = json!({
+            "id": "e-1",
+            "parentId": None::<String>,
+            "timestamp": "2026-10-09T00:00:00.000Z",
+        });
+        let object = base.as_object_mut().expect("base is an object");
+        if let Some(extra) = fields.as_object_mut() {
+            object.append(extra);
+        }
+        serde_json::from_value(base.clone())
+            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
+    }
+
+    fn started(run_id: &str) -> SessionTreeEntry {
+        kernel(json!({
+            "type": "run/started",
+            "id": "e-2",
+            "runId": run_id,
+            "kind": "Explore",
+            "label": "survey the fold",
+            "childSession": run_id,
+            "toolCallId": "",
+            "budgets": {},
+            "depth": 1,
+        }))
+    }
+
+    fn settled(run_id: &str) -> SessionTreeEntry {
+        kernel(json!({
+            "type": "run/settled",
+            "id": "e-9",
+            "runId": run_id,
+            "settlement": "completed",
+            "verdict": "done",
+            "turns": 1,
+            "toolCalls": 1,
+        }))
+    }
+
+    fn background_work_edges(out: &[Emitted]) -> (usize, usize) {
+        let chat = manox_ahp::channels::chat::uri("c-1");
+        let mut sets = 0;
+        let mut removed = 0;
+        for emitted in out {
+            if emitted.channel != chat {
+                continue;
+            }
+            match &emitted.action {
+                StateAction::ChatBackgroundWorkSet(_) => sets += 1,
+                StateAction::ChatBackgroundWorkRemoved(_) => removed += 1,
+                _ => {}
+            }
+        }
+        (sets, removed)
+    }
+
+    /// A primed roster settles: the removal goes out with no `run/started`
+    /// in the translator's past — the shape of a bridge restart whose resume
+    /// point sits above the start row.
+    #[test]
+    fn a_primed_roster_settles_without_a_replayed_start_row() {
+        let mut t = Translator::new();
+        t.prime_subagent_roster(["sub-9".to_string()]);
+        let out = t.on_entry("c-1", "s-1", 0, &settled("sub-9"));
+        let (sets, removed) = background_work_edges(&out);
+        assert_eq!(sets, 0, "priming publishes no edge: {out:?}");
+        assert_eq!(removed, 1, "the settle removes the client's entry: {out:?}");
+    }
+
+    /// A primed roster absorbs the replayed start row: the entry is already
+    /// listed, so no second Set edge goes out — the client already holds it.
+    #[test]
+    fn a_primed_roster_does_not_republish_a_replayed_start_row() {
+        let mut t = Translator::new();
+        t.prime_subagent_roster(["sub-9".to_string()]);
+        let out = t.on_entry("c-1", "s-1", 0, &started("sub-9"));
+        let (sets, removed) = background_work_edges(&out);
+        assert_eq!(sets, 0, "the entry is already listed: {out:?}");
+        assert_eq!(removed, 0);
+        // The replayed run still settles to exactly one removal.
+        let out = t.on_entry("c-1", "s-1", 1, &settled("sub-9"));
+        let (sets, removed) = background_work_edges(&out);
+        assert_eq!(sets, 0);
+        assert_eq!(removed, 1, "the settle still lands exactly once: {out:?}");
+    }
+
+    /// Without priming the settle stays silent — the pre-fix behavior kept
+    /// as the honest baseline: an unlisted id has nothing to remove on the
+    /// client, which is exactly why the roster must be primed.
+    #[test]
+    fn an_unprimed_roster_settles_to_nothing() {
+        let mut t = Translator::new();
+        let out = t.on_entry("c-1", "s-1", 0, &settled("sub-9"));
+        let (sets, removed) = background_work_edges(&out);
+        assert_eq!(sets, 0);
+        assert_eq!(removed, 0, "an unlisted settle publishes no removal");
     }
 }

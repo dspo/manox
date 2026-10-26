@@ -179,6 +179,19 @@ impl Host {
         self.inner.store.read().open_asks_on_active_turn(chat_id)
     }
 
+    /// The background-work entries `chat_id`'s fold holds, without the rest of
+    /// the chat. [`Host::chat_state`] answers the same question only by
+    /// cloning every archived turn into the bargain — a bridge reset pays that
+    /// on each lag resync, exactly when the delta flood already has the store
+    /// under pressure.
+    pub fn background_work(&self, chat_id: &str) -> Option<Vec<ahp_types::state::BackgroundWork>> {
+        self.inner
+            .store
+            .read()
+            .chat(chat_id)
+            .and_then(|chat| chat.background_work.clone())
+    }
+
     /// The host's authoritative session state. See [`Host::chat_state`].
     pub fn session_state(&self, session_id: &str) -> Option<ahp_types::state::SessionState> {
         self.inner.store.read().session(session_id).cloned()

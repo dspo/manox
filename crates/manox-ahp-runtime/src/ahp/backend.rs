@@ -27,8 +27,8 @@ use ahp_types::actions::{
 };
 use ahp_types::commands::{CreateChatParams, CreateSessionParams};
 use ahp_types::state::{
-    AgentInfo, ChatInputResponseKind, ChatState, RootState, SessionModelInfo, SessionState,
-    SessionSummary, TerminalState, Turn,
+    AgentInfo, BackgroundWork, ChatInputResponseKind, ChatState, RootState, SessionModelInfo,
+    SessionState, SessionSummary, TerminalState, Turn,
 };
 use manox_ahp::backend::{Backend, DispatchOutcome};
 #[cfg(feature = "terminal")]
@@ -158,6 +158,44 @@ fn is_state_bearing(event: &SessionTreeEntry) -> bool {
             | SessionTreeEntry::Stop { .. }
             | SessionTreeEntry::SubagentChild { .. }
     )
+}
+
+/// Re-list the subagent runs a client's fold still holds into a freshly built
+/// translator. A bridge reset skips the `run/started` rows below its resume
+/// point, so the roster those rows opened is lost and the later `run/settled`
+/// would never remove the client's background-work entry. The source is the
+/// host's own fold — the same state the client converges to — read through
+/// the roster accessor so the reset does not clone the whole chat. Bookkeeping
+/// only: no edge is published, the client already holds these entries.
+fn prime_bridge_roster(
+    host: &manox_ahp::Host,
+    session_id: &str,
+    translator: &mut Translator,
+    replay_from: u64,
+) {
+    translator.prime_subagent_roster(primed_roster_ids(
+        host.background_work(session_id),
+        replay_from,
+    ));
+}
+
+/// The ids a reset bridge re-lists from the fold. A `replay_from` of zero
+/// means a full replay, which rebuilds the roster from the journal itself:
+/// pre-listed ids there would swallow their Set edges, so priming is a no-op
+/// by rule. Only subagent entries have a roster entry — shell work settles on
+/// its own row. Extra ids are harmless: a removal for an entry the client does
+/// not hold reduces to a no-op.
+fn primed_roster_ids(work: Option<Vec<BackgroundWork>>, replay_from: u64) -> Vec<String> {
+    if replay_from == 0 {
+        return Vec::new();
+    }
+    work.unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            BackgroundWork::Subagent(sub) => Some(sub.id),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One session's folded state plus the journal tail it was taken at.
@@ -615,6 +653,7 @@ impl RuntimeBackend {
         watermark: Arc<AtomicU64>,
     ) {
         let mut translator = Translator::new();
+        prime_bridge_roster(&host, &session_id, &mut translator, resume_from);
         let mut cursor = Cursor {
             tail: resume_from.saturating_sub(1),
             watermark,
@@ -655,6 +694,7 @@ impl RuntimeBackend {
                     );
                     translator = Translator::new();
                     let replay_from = cursor.tail + 1;
+                    prime_bridge_roster(&host, &session_id, &mut translator, replay_from);
                     self.replay_journal(
                         &session_id,
                         &host,
@@ -732,6 +772,7 @@ impl RuntimeBackend {
         // filter drops the overlap.
         let mut feed = thread.subscribe_journal_feed();
         let mut translator = Translator::new();
+        prime_bridge_roster(&host, &session_id, &mut translator, resume_from);
         let mut cursor = Cursor {
             tail: resume_from.saturating_sub(1),
             watermark,
@@ -775,6 +816,7 @@ impl RuntimeBackend {
                     );
                     translator = Translator::new();
                     let replay_from = cursor.tail + 1;
+                    prime_bridge_roster(&host, &session_id, &mut translator, replay_from);
                     self.replay_journal(
                         &session_id,
                         &host,
@@ -3775,5 +3817,65 @@ mod turn_cancel_ask_settlement_tests {
             host.chat_state("s-1")
                 .is_none_or(|s| s.active_turn.is_none())
         );
+    }
+}
+
+/// The one decision a reset bridge's priming makes, pinned at the helper
+/// seam: a full replay primes nothing, a resumed bridge takes exactly the
+/// subagent entries its fold holds, and shell work never enters the roster.
+#[cfg(test)]
+mod primed_roster_ids_tests {
+    use super::*;
+
+    fn subagent(id: &str) -> BackgroundWork {
+        BackgroundWork::Subagent(ahp_types::state::BackgroundSubagentWork {
+            id: id.to_string(),
+            label: "survey".to_string(),
+            started_at: "2026-10-26T00:00:00.000Z".to_string(),
+            meta: None,
+            chat: format!("ahp-chat:/{id}"),
+        })
+    }
+
+    fn shell(id: &str) -> BackgroundWork {
+        BackgroundWork::Shell(ahp_types::state::BackgroundShellWork {
+            id: id.to_string(),
+            label: "build".to_string(),
+            started_at: "2026-10-26T00:00:00.000Z".to_string(),
+            meta: None,
+            command: "cargo build".to_string(),
+            terminal: None,
+        })
+    }
+
+    /// A full replay rebuilds the roster from the journal; pre-listing ids
+    /// there would swallow their own Set edges.
+    #[test]
+    fn a_full_replay_primes_nothing() {
+        assert!(primed_roster_ids(Some(vec![subagent("sub-1")]), 0).is_empty());
+    }
+
+    /// Only subagent entries have a roster entry: shell work settles on its
+    /// own row, and a primed id would make its settle emit a removal the
+    /// client cannot hold.
+    #[test]
+    fn a_resumed_bridge_takes_the_folds_subagent_ids() {
+        let work = Some(vec![
+            shell("task-1"),
+            subagent("sub-1"),
+            shell("task-2"),
+            subagent("sub-2"),
+        ]);
+        assert_eq!(
+            primed_roster_ids(work, 7),
+            ["sub-1".to_string(), "sub-2".to_string()]
+        );
+    }
+
+    /// No fold (a chat the host has never seeded) is nothing to prime — not a
+    /// failure.
+    #[test]
+    fn no_fold_primes_nothing() {
+        assert!(primed_roster_ids(None, 7).is_empty());
     }
 }
