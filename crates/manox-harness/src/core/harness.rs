@@ -475,9 +475,17 @@ impl HarnessHandle {
     }
 
     /// Queue a thinking-level change for the next turn boundary of the
-    /// in-flight run, same semantics as [`HarnessHandle::set_model`].
+    /// in-flight run. Idempotent by target: a re-pick of the level already
+    /// queued (or resting in the snapshot) is a no-op and re-emits nothing —
+    /// the queue target IS this snapshot.
     pub fn set_thinking_level(&self, level: Option<String>) {
-        self.control.turn_runtime.lock().unwrap().thinking_level = level.clone();
+        {
+            let mut runtime = self.control.turn_runtime.lock().unwrap();
+            if runtime.thinking_level == level {
+                return;
+            }
+            runtime.thinking_level = level.clone();
+        }
         self.control
             .emit_harness(HarnessEvent::ThinkingLevelUpdate {
                 level: level.clone(),
@@ -1779,11 +1787,10 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.active_tool_names.as_deref()
     }
 
-    /// Switch the model the next turn runs against. The choice's durable
-    /// home is the conversation's configuration (the host's object store),
-    /// which the host reads back through `ConversationConfigSource` — the
-    /// transcript carries no configuration of its own, so a reopen asks the
-    /// conversation rather than folding rows back out of its history.
+    /// Switch the model the next turn runs against. The pick's durable
+    /// authority is the session journal: [`AgentSession::set_model`] lands
+    /// the `model_change` row, and a reopen folds it back out through the
+    /// restore projection.
     pub async fn set_model(&mut self, model: Model) -> Result<(), anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!(
@@ -1841,10 +1848,10 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         Ok(())
     }
 
-    /// Set the reasoning tier for following turns. Like the model pick, the
-    /// durable home is the conversation's configuration. `None` reads as
-    /// `"off"` on the session path. Mid-run changes go through
-    /// [`HarnessHandle::set_thinking_level`] instead.
+    /// Set the reasoning tier for following turns. The durable row is the
+    /// engine's apply's business; this path touches the running harness
+    /// only. `None` reads as `"off"` on the session path. Mid-run changes
+    /// go through [`HarnessHandle::set_thinking_level`] instead.
     pub async fn set_thinking_level(
         &mut self,
         thinking_level: Option<String>,

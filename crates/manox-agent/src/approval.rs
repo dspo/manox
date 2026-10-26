@@ -64,13 +64,6 @@ pub struct ApprovalGate {
     /// policy beside it owns the managed proxy the route may name.
     network: Mutex<manox_harness::sandbox::NetworkAccess>,
     network_policy: crate::sandbox::netpolicy::NetworkPolicy,
-    /// The conversation's configuration authority. When installed it answers
-    /// [`Self::mode`], so every per-call reader — this gate's own tool
-    /// wrapper, the bash seatbelt's standing resolver, the Write/Edit
-    /// escalation baseline — sees a mid-turn switch on the very next tool
-    /// call. The `mode` mirror above remains the answer only for a gate with
-    /// no source (bare constructions, tests).
-    config_source: Mutex<Option<Arc<dyn manox_harness::ConversationConfigSource>>>,
     pending: Mutex<HashMap<String, PendingAuth>>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     model: Arc<Mutex<Option<HarnessModel>>>,
@@ -97,21 +90,12 @@ impl ApprovalGate {
             mode: Mutex::new(AccessMode::default()),
             network: Mutex::new(manox_harness::sandbox::NetworkAccess::default()),
             network_policy: crate::sandbox::netpolicy::NetworkPolicy::new(),
-            config_source: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             notice_tx,
             model: model_slot,
             journal_sink: Mutex::new(None),
             delegated: false,
         }
-    }
-
-    /// Install the conversation's configuration authority. From here on
-    /// [`Self::mode`] answers from it, so the mode a tool call is gated on is
-    /// whatever the conversation's row says at that instant — not a value
-    /// cached when the request began.
-    pub fn set_config_source(&self, source: Arc<dyn manox_harness::ConversationConfigSource>) {
-        *self.config_source.lock().unwrap() = Some(source);
     }
 
     /// Mark this gate as belonging to a delegated (subagent) tool — the
@@ -134,15 +118,11 @@ impl ApprovalGate {
         *self.journal_sink.lock().unwrap() = Some(tx);
     }
 
-    /// The mode governing the *next* tool call. With a configuration source
-    /// installed this is a fresh read of the conversation's row, so a switch
-    /// that lands mid-turn governs the very next call rather than the next
-    /// turn.
+    /// The mode governing the *next* tool call: the live mirror every
+    /// switch lands on (engine apply at the actor, the facade's hot-stamp
+    /// before the actor drains), seeded at restore from the journal's
+    /// `access_mode_change` rows.
     pub fn mode(&self) -> AccessMode {
-        let source = self.config_source.lock().unwrap().clone();
-        if let Some(mode) = source.as_ref().and_then(|source| source.access_mode()) {
-            return mode;
-        }
         *self.mode.lock().unwrap()
     }
 
@@ -1690,36 +1670,6 @@ mod tests {
         ));
     }
 
-    /// A stand-in for the conversation's configuration surface. The test
-    /// flips `mode` between calls to stand in for the user's write landing
-    /// mid-run; the real object-store implementation is covered by
-    /// `conversation_config`'s own tests.
-    struct FakeConfigSource {
-        mode: Mutex<Option<AccessMode>>,
-    }
-
-    impl manox_harness::ConversationConfigSource for FakeConfigSource {
-        fn model(&self) -> Option<manox_harness::types::Model> {
-            None
-        }
-
-        fn model_ref(&self) -> Option<String> {
-            None
-        }
-
-        fn access_mode(&self) -> Option<AccessMode> {
-            *self.mode.lock().unwrap()
-        }
-
-        fn reasoning_effort(&self) -> Option<String> {
-            None
-        }
-
-        fn config_version(&self) -> i64 {
-            0
-        }
-    }
-
     fn gated_mutating_tool(
         gate: Arc<ApprovalGate>,
     ) -> (Arc<dyn HarnessAgentTool>, Arc<AtomicUsize>) {
@@ -1733,22 +1683,16 @@ mod tests {
         (Arc::new(ApprovalGatedTool::new(inner, gate)), ran)
     }
 
-    /// The permission gate reads the conversation's configuration before
-    /// EVERY tool call: a mode the user flips mid-run governs the very next
-    /// call, not the next turn. Without the live read the gate would keep the
-    /// mode it was handed when the run began, and a user who notices the
-    /// model heading somewhere dangerous would have to stop the run to be
-    /// obeyed.
+    /// The permission gate answers from the mode mirror before EVERY tool
+    /// call: a mode the user flips mid-run (the facade hot-stamps the gate
+    /// before the actor drains) governs the very next call, not the next
+    /// turn. Without the live read the gate would keep the mode it was
+    /// handed when the run began, and a user who notices the model heading
+    /// somewhere dangerous would have to stop the run to be obeyed.
     #[tokio::test]
     async fn a_mode_flip_governs_the_very_next_tool_call() {
-        let source = Arc::new(FakeConfigSource {
-            mode: Mutex::new(Some(AccessMode::Sandbox)),
-        });
         let gate = gate();
-        gate.set_config_source(source.clone());
-        // A stale mirror must not win over the source: this is the value the
-        // gate was handed when the run began.
-        gate.set_mode(AccessMode::FullAccess);
+        gate.set_mode(AccessMode::Sandbox);
 
         let (tool, ran) = gated_mutating_tool(Arc::clone(&gate));
         let ctx = tool_ctx();
@@ -1765,12 +1709,13 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string().contains(&sandbox_denial()),
-            "the source's sandbox governs the first call: {err}"
+            "the sandbox mode governs the first call: {err}"
         );
         assert_eq!(ran.load(Ordering::SeqCst), 0);
 
-        // The user's write lands while the run is in flight.
-        *source.mode.lock().unwrap() = Some(AccessMode::FullAccess);
+        // The user's switch lands while the run is in flight: the facade's
+        // hot-stamp (`set_access_mode`) hits the gate ahead of the actor.
+        gate.set_mode(AccessMode::FullAccess);
 
         let result = tool
             .execute("c2", args, CancellationToken::new(), &ctx)
@@ -1782,30 +1727,5 @@ mod tests {
             1,
             "the flipped mode governs the very next call"
         );
-    }
-
-    /// A gate with no source keeps the mirror as its answer — the bare
-    /// constructions (subagent seats, tests) still work.
-    #[tokio::test]
-    async fn a_gate_without_a_source_keeps_its_mirror() {
-        let gate = gate();
-        gate.set_mode(AccessMode::Sandbox);
-        let (tool, ran) = gated_mutating_tool(Arc::clone(&gate));
-        let ctx = tool_ctx();
-        let err = tool
-            .execute(
-                "c1",
-                serde_json::json!({
-                    "path": "/etc/manox-mirror-test/x.txt",
-                    "cwd": [""],
-                    "content": "x"
-                }),
-                CancellationToken::new(),
-                &ctx,
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains(&sandbox_denial()));
-        assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 }

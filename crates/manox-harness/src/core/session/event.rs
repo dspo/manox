@@ -113,6 +113,16 @@ pub enum Event {
         /// Always a string — `null` would drop the field on the wire.
         thinking_level: String,
     },
+    /// A change of the access mode the following tool calls run under.
+    #[serde(rename = "access_mode_change", rename_all = "camelCase")]
+    AccessModeChange {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        /// The file-effect policy for following calls — the kebab wire
+        /// vocabulary (`sandbox` / `full-access`).
+        mode: String,
+    },
     /// A change of the working directory the following tool calls run in.
     ///
     /// The header cwd is immutable (append-only file), so this entry is the

@@ -170,9 +170,25 @@ where
                 }
                 Some(SessionCmd::SetThinkingLevel(level)) => {
                     // Mid-run switch: the change lands on the runtime snapshot
-                    // at once and governs the next request. Nothing durable is
-                    // written — the conversation's row owns the pick.
+                    // at once and governs the next request. The row decision
+                    // is the same durable baseline the idle arm diffs against
+                    // — a restate of the journal's carried level lands no
+                    // row — and a real switch journals through the shared
+                    // landing vocabulary via the serializer task (never an
+                    // inline append-lock await, which would deadlock this
+                    // select against the run branch holding the lock: the
+                    // round-11 stall).
                     handle.set_thinking_level(level.clone());
+                    let wire = thinking_level_wire(&level);
+                    if state.journaled_thinking_level.lock().unwrap().as_deref()
+                        != Some(wire.as_str())
+                    {
+                        let _ = live_row_tx.send((
+                            "thinking_level_change".into(),
+                            thinking_level_row_payload(&wire),
+                        ));
+                        *state.journaled_thinking_level.lock().unwrap() = Some(wire);
+                    }
                 }
                 Some(SessionCmd::PersistGeneratedTitle {
                     session_path: target,

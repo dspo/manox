@@ -1,10 +1,21 @@
-//! The object store as the conversation's configuration authority.
+//! The object row as a NEW thread's draft configuration intent.
 //!
-//! [`ConversationConfigSource`] is the harness's single read surface for a
-//! conversation's picks; this is the implementation the desktop app's engine
-//! installs — one per conversation, keyed by session id, reading the
-//! `conversations` row. The journal carries no configuration of its own, so
-//! there is no second answer to disagree with this one.
+//! The session-mutable config picks (model / reasoning effort / access
+//! mode) are durably owned by the session journal's own rows
+//! (`model_change` / `thinking_level_change` / `access_mode_change`): their
+//! producers land the rows at the switch, restore folds them back out, and
+//! the AHP projection reads them into the config seat (the L10 gate covers
+//! it). This module is NOT that authority and answers none of the restore
+//! faces.
+//!
+//! What the row still carries is draft intent for a thread that does not
+//! exist yet: the client writes picks to the conversation's row before the
+//! engine materializes, and the thread's request-boundary handshake
+//! (`thread.rs` `sync_object_config`, via [`ConversationConfigSource`])
+//! diffs the row and dispatches the picks through the normal setters —
+//! which are what land the durable journal rows. From the first landed
+//! switch on, the journal answers; the row and the chain agree, and the
+//! version watermark keeps the handshake silent.
 
 use std::sync::Arc;
 
@@ -20,9 +31,9 @@ pub struct ObjectConfigSource {
 }
 
 impl ObjectConfigSource {
-    /// The source for one conversation. Installing this on the engine's
-    /// permission gate makes the row the live authority every tool resolver
-    /// reads per call.
+    /// The source for one conversation. Read by the thread's
+    /// request-boundary handshake (the draft-intent consumer); the engine's
+    /// restore faces and the permission gate answer from the journal now.
     pub fn for_session(session_id: impl Into<String>) -> Arc<dyn ConversationConfigSource> {
         Arc::new(Self {
             session_id: session_id.into(),

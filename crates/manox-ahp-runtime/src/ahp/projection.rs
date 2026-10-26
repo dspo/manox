@@ -226,6 +226,7 @@ pub(crate) fn target_of(entry: &SessionTreeEntry) -> Target {
         | E::CwdChange { .. }
         | E::ProjectChange { .. }
         | E::ThinkingLevelChange { .. }
+        | E::AccessModeChange { .. }
         | E::Title { .. }
         // `PinnedArchived` lands here for its native archived half; the
         // extension pin half re-targets the thread channel at its emit site.
@@ -1271,6 +1272,10 @@ impl Translator {
             SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => out.push(Emitted::new(
                 &session,
                 config_changed(json!({config_keys::REASONING_EFFORT: thinking_level})),
+            )),
+            SessionTreeEntry::AccessModeChange { mode, .. } => out.push(Emitted::new(
+                &session,
+                config_changed(json!({config_keys::ACCESS_MODE: mode})),
             )),
             SessionTreeEntry::PinnedArchived {
                 pinned, archived, ..
@@ -5040,5 +5045,115 @@ mod subagent_roster_tests {
         let (sets, removed) = background_work_edges(&out);
         assert_eq!(sets, 0);
         assert_eq!(removed, 0, "an unlisted settle publishes no removal");
+    }
+}
+
+/// The session-mutable config seat: the journal rows are the durable
+/// authority for model / reasoningEffort / accessMode, so a fold — a fresh
+/// subscribe, a resubscribe, a host restart, any replay of the same chain —
+/// must seat all three values. This is the L10 gate (`快照 == fold(重放)`)
+/// covering the config model.
+#[cfg(test)]
+mod config_seat_tests {
+    use super::*;
+
+    /// The session state a subscriber starts from: the declared schema with
+    /// no values — exactly what `session_state` seeds (`empty_config`), the
+    /// seat the reducer merges `session/configChanged` values into.
+    fn seated_session() -> ahp_types::state::SessionState {
+        manox_ahp::channels::session::initial("manox", None, Some(crate::ahp::empty_config()))
+    }
+
+    fn fold_config(records: &[SessionTreeEntry]) -> serde_json::Map<String, Value> {
+        let mut translator = Translator::new();
+        let mut session = seated_session();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                ahp::reducers::apply_action_to_session(&mut session, &emitted.action);
+            }
+        }
+        session
+            .config
+            .expect("the schema seat survives the fold")
+            .values
+            .into_iter()
+            .collect()
+    }
+
+    /// The user-symptom regression: the three picks a session carried land
+    /// as rows, and every fold of that chain seats all three. On the
+    /// pre-row authority this is red twice over — an `access_mode_change`
+    /// row is not even in the vocabulary (the journal refuses it), and the
+    /// fold had no arm to seat it, so a resubscribed client watched the
+    /// model chip and the access menu drift back to the defaults.
+    #[test]
+    fn the_config_rows_seat_all_three_keys_on_every_fold() {
+        let records = [
+            kernel(json!({
+                "type": "model_change",
+                "provider": "anthropic",
+                "modelId": "claude-opus-4-7",
+            })),
+            kernel(json!({
+                "type": "thinking_level_change",
+                "thinkingLevel": "max",
+            })),
+            kernel(json!({
+                "type": "access_mode_change",
+                "mode": "full-access",
+            })),
+        ];
+        let expected = |key: &str, value: &str| {
+            (
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            )
+        };
+        let want = [
+            expected(config_keys::MODEL, "anthropic/claude-opus-4-7"),
+            expected(config_keys::REASONING_EFFORT, "max"),
+            expected(config_keys::ACCESS_MODE, "full-access"),
+        ];
+
+        let first = fold_config(&records);
+        for (key, value) in &want {
+            assert_eq!(
+                first.get(key),
+                Some(value),
+                "the first subscribe seats `{key}` from the journal rows"
+            );
+        }
+
+        // Resubscribe: a fresh fold of the same chain (a new translator, a
+        // fresh seat) — the unsubscribe→subscribe path replays the journal
+        // and must converge on the same three values, not the defaults.
+        let resubscribed = fold_config(&records);
+        for (key, value) in &want {
+            assert_eq!(
+                resubscribed.get(key),
+                Some(value),
+                "the resubscribe seats `{key}` from the journal rows"
+            );
+        }
+    }
+
+    /// Last-wins per key, in chain order: a later row overrides an earlier
+    /// pick in the seat, the same fold the engine's restore reads.
+    #[test]
+    fn a_later_config_row_wins_in_the_seat() {
+        let values = fold_config(&[
+            kernel(json!({
+                "type": "access_mode_change",
+                "mode": "full-access",
+            })),
+            kernel(json!({
+                "type": "access_mode_change",
+                "mode": "sandbox",
+            })),
+        ]);
+        assert_eq!(
+            values.get(config_keys::ACCESS_MODE),
+            Some(&serde_json::Value::String("sandbox".to_string())),
+        );
     }
 }

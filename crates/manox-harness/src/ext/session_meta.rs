@@ -29,21 +29,11 @@ pub struct SessionMeta {
     /// fence keeps admitting them. Empty (the default) = single-cwd.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub working_directories: Vec<String>,
-    /// The access mode the session runs under (`"sandbox"` or
-    /// `"full-access"`), as chosen in the access chip. Absent = the harness
-    /// default. Stored as the mode's wire string; the harness parses it
-    /// leniently and falls back to its bounded default on unknown values
-    /// (sidecars carrying a retired three-tier wire string restore at the
-    /// default).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub access_mode: Option<String>,
-    /// The reasoning effort the session runs at (`"high"` or `"max"`), as
-    /// chosen in the model dropdown. Absent = the harness default (High).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
-    /// Note: pre-W4 sidecars may still carry `plan_mode` / `plan_file` keys.
-    /// Both fields are gone and `SessionMeta` ignores unknown keys, so the
-    /// stale values are inert — never read them as state.
+    /// Note: pre-W4 sidecars may still carry `plan_mode` / `plan_file`
+    /// keys, and retired copies of the access mode / reasoning effort
+    /// picks. All those fields are gone and `SessionMeta` ignores unknown
+    /// keys, so the stale values are inert — never read them as state (the
+    /// session-mutable config picks live in the journal's own rows).
     /// Last execution plan the model published via `UpdatePlan`, persisted so
     /// it survives compaction (the transcript's tool calls are summarized
     /// away) and restarts. Serialized `manox_agent::plan::PlanSnapshot`; `None`
@@ -403,24 +393,6 @@ mod tests {
             Some("/gitwork:deliver fast")
         );
         assert!(!loaded.registry_displays.contains_key(&0));
-    }
-
-    #[tokio::test]
-    async fn reasoning_effort_round_trips_and_defaults_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("abc.jsonl");
-
-        // Fresh sidecar: no persisted effort.
-        let fresh = load(dir.path(), &session).await.unwrap();
-        assert!(fresh.reasoning_effort.is_none());
-
-        let meta = SessionMeta {
-            reasoning_effort: Some("max".into()),
-            ..Default::default()
-        };
-        save(dir.path(), &session, &meta).await.unwrap();
-        let loaded = load(dir.path(), &session).await.unwrap();
-        assert_eq!(loaded.reasoning_effort.as_deref(), Some("max"));
     }
 
     #[tokio::test]

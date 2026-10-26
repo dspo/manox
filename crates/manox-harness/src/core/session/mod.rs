@@ -102,6 +102,7 @@ impl SessionTreeEntry {
             Compaction,
             ModelChange,
             ThinkingLevelChange,
+            AccessModeChange,
             CwdChange,
             ActiveToolsChange,
             BranchSummary,
@@ -520,6 +521,26 @@ impl<S: SessionStorage> Session<S> {
             parent_id,
             timestamp: Utc::now(),
             thinking_level: level.to_string(),
+        };
+        self.storage.append_entry(&entry).await?;
+        Ok(id)
+    }
+
+    /// Append an `access_mode_change` entry and return the entry ID.
+    ///
+    /// The access mode a path carries round-trips through these entries:
+    /// restore projects the latest one onto the permission gate. `mode` is
+    /// the kebab wire vocabulary (`sandbox` / `full-access`).
+    pub async fn append_access_mode_change(&self, mode: &str) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+
+        let entry = SessionTreeEntry::AccessModeChange {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            mode: mode.to_string(),
         };
         self.storage.append_entry(&entry).await?;
         Ok(id)
@@ -1492,6 +1513,7 @@ pub enum EntryType {
     ModelChange,
     CwdChange,
     ThinkingLevelChange,
+    AccessModeChange,
     ActiveToolsChange,
     BranchSummary,
     Custom,
@@ -1541,6 +1563,7 @@ impl EntryType {
             EntryType::ModelChange => "model_change",
             EntryType::CwdChange => "cwd_change",
             EntryType::ThinkingLevelChange => "thinking_level_change",
+            EntryType::AccessModeChange => "access_mode_change",
             EntryType::ActiveToolsChange => "active_tools_change",
             EntryType::BranchSummary => "branch_summary",
             EntryType::Custom => "custom",
@@ -1746,6 +1769,7 @@ pub fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
         SessionTreeEntry::ModelChange { .. } => EntryType::ModelChange,
         SessionTreeEntry::CwdChange { .. } => EntryType::CwdChange,
         SessionTreeEntry::ThinkingLevelChange { .. } => EntryType::ThinkingLevelChange,
+        SessionTreeEntry::AccessModeChange { .. } => EntryType::AccessModeChange,
         SessionTreeEntry::ActiveToolsChange { .. } => EntryType::ActiveToolsChange,
         SessionTreeEntry::BranchSummary { .. } => EntryType::BranchSummary,
         SessionTreeEntry::Custom { .. } => EntryType::Custom,
