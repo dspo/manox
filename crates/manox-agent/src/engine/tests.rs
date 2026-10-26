@@ -1410,14 +1410,18 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
         "switched-turn usage must enter the per-model stats: {:?}",
         stats.per_model
     );
-    // The mid-run switch writes no transcript rows: the kernel boundary
-    // applies the queued pick to the agent only (the boundary's row write
-    // is a known kernel-side gap — the idle choke point owns journaling).
+    // The mid-run switch is durable: the queued pick lands exactly one
+    // `model_change` row at the turn boundary, and the re-pick of the model
+    // already in play adds none.
     let jsonl = tokio::fs::read_to_string(session.path()).await.unwrap();
     assert_eq!(
         jsonl.matches("\"type\":\"model_change\"").count(),
-        0,
-        "the mid-run switch must not be journaled: {jsonl}"
+        1,
+        "the mid-run switch lands exactly one model_change row: {jsonl}"
+    );
+    assert!(
+        jsonl.contains("\"modelId\":\"new\""),
+        "the row names the switched model: {jsonl}"
     );
 }
 
