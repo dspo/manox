@@ -996,6 +996,14 @@ impl ThreadStore {
         self.flush_working_dirs_if_materialized(id);
     }
 
+    /// The session's create-time grants while its journal is still deferred.
+    /// `None` once they flushed into the sidecar (or when the create never
+    /// named any): the disk read is the durable authority by then, and this
+    /// in-memory set is all a deferred session has.
+    pub fn working_directories(&self, id: &str) -> Option<Vec<String>> {
+        self.pending_working_dirs.get(id).cloned()
+    }
+
     /// Flush the pending grants for one session when its journal exists.
     fn flush_working_dirs_if_materialized(&mut self, id: &str) {
         if self.session_paths.get(id).is_some_and(|path| path.exists())

@@ -368,12 +368,43 @@ impl RuntimeBackend {
         }
         let own_thread = super::thread_of_session(session_id).await;
         let thread_id = own_thread.clone().unwrap_or_else(|| session_id.to_string());
-        // A session created moments ago has no journal line yet: it is an empty
-        // chat, not an unknown one. Subscribing to a brand-new session must work,
-        // and the bridge picks its entries up from seq 0 onward.
-        let (mut chat, tail) = match fold_journal(session_id, &thread_id).await {
-            Some(fold) => (fold.chat, fold.tail),
-            None => (chat::initial(session_id), 0),
+        // One live read, ordered so no row can fall between the seams: the
+        // feed subscription comes FIRST, then the snapshot. A row appended
+        // after the subscription is buffered in the feed even when it lands
+        // before (or while) the snapshot reads the storage; a row appended
+        // before it is in the snapshot. The bridge then starts at
+        // `snapshot.cursor + 1` with this same receiver, and its `seq <= tail`
+        // filter drops the buffered copies the fold already consumed. A
+        // deferred session's create rows exist only in this storage (nothing
+        // on disk before the first turn), so the snapshot is what makes
+        // `createSession`'s answer carry them; the cold read remains the
+        // fallback for a session no engine in this process drives.
+        let live = self.server.journal_feed(session_id);
+        let live_feed = live.as_ref().map(|thread| thread.subscribe_journal_feed());
+        let live_snapshot = match live.as_ref() {
+            Some(thread) => thread.journal_snapshot().await,
+            None => None,
+        };
+        // The intent is only the deferred answer. Once the journal has rows
+        // (live memory here, or the file the fold below would read), the
+        // journal is the authority — drop the record so a long-lived host
+        // does not accumulate one per create.
+        if live_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.records.is_empty())
+            || crate::paths::persisted_session_file(session_id).is_some_and(|path| path.exists())
+        {
+            super::create_intent::forget(session_id);
+        }
+        let (mut chat, tail) = match &live_snapshot {
+            Some(snapshot) => {
+                let fold = super::fold_journal_snapshot(session_id, &thread_id, snapshot).await;
+                (fold.chat, fold.tail)
+            }
+            None => match fold_journal(session_id, &thread_id).await {
+                Some(fold) => (fold.chat, fold.tail),
+                None => (chat::initial(session_id), 0),
+            },
         };
         // A turn the journal shows as started but never settled is dead by
         // construction when no live leg exists AND nothing user-answerable
@@ -473,7 +504,14 @@ impl RuntimeBackend {
         // `createSession` answer `session not found` for the session it had just
         // created. An empty state is what the session *is* at this point, and the
         // fold replaces it as soon as the row appears.
-        let session_state = match super::session_state(&thread_id).await {
+        let session_state = match super::session_state_with_live(
+            &thread_id,
+            live_snapshot
+                .as_ref()
+                .map(|snapshot| (session_id, snapshot)),
+        )
+        .await
+        {
             Some(state) => state,
             None => session::initial_empty(&thread_id),
         };
@@ -503,15 +541,19 @@ impl RuntimeBackend {
         if let Some(host) = self.host() {
             host.seed_session(&seeded.thread_id, seeded.session.clone());
             host.seed_chat(&seeded.thread_id, session_id, seeded.chat.clone());
-            // A live engine bridges through its thread feed; a running
-            // sub-agent child bridges through its registry feed (the run
-            // registers the child journal's broadcast at dispatch). A
-            // settled child has neither — it serves snapshot-only from its
-            // durable journal, and a re-subscribe refreshes it.
-            if own_thread.is_some()
+            // A live engine bridges through the feed this seed already
+            // subscribed (see above), so the rows it folded and the rows the
+            // bridge forwards are one contiguous range. A running sub-agent
+            // child bridges through its registry feed (the run registers the
+            // child journal's broadcast at dispatch). A settled child has
+            // neither — it serves snapshot-only from its durable journal, and
+            // a re-subscribe refreshes it.
+            let feeds_live = live_feed.is_some();
+            if feeds_live
+                || own_thread.is_some()
                 || manox_harness::subagent::feeds::child_journal_feed(session_id).is_some()
             {
-                self.ensure_bridge(session_id);
+                self.start_bridge_with_feed(session_id, None, live_feed);
             }
         }
         Some(seeded)
@@ -559,6 +601,22 @@ impl RuntimeBackend {
     /// watermark, or the seed's tail when no bridge has run. Every arm means
     /// the same thing, since the replay's rows are inclusive.
     fn start_bridge(&self, session_id: &str, resume: Option<u64>) {
+        self.start_bridge_with_feed(session_id, resume, None);
+    }
+
+    /// [`Self::start_bridge`] with a feed the caller already subscribed.
+    ///
+    /// A seed subscribes to the feed BEFORE it reads its snapshot, so the rows
+    /// appended between the two must enter the bridge through that same
+    /// receiver. Subscribing again here would open after them — and a deferred
+    /// session has no durable file for the replay leg to recover them from, so
+    /// they would be in neither the seed nor the feed.
+    fn start_bridge_with_feed(
+        &self,
+        session_id: &str,
+        resume: Option<u64>,
+        pre_subscribed: Option<tokio::sync::broadcast::Receiver<manox_agent::engine::JournalFeed>>,
+    ) {
         let mut bridges = self.bridges.lock();
         let resume_from = match resume {
             Some(seq) => seq,
@@ -572,23 +630,27 @@ impl RuntimeBackend {
             },
         };
         enum Feed {
+            Subscribed(tokio::sync::broadcast::Receiver<manox_agent::engine::JournalFeed>),
             Thread(manox_agent::thread::ThreadHandle),
             Child(tokio::sync::broadcast::Receiver<manox_harness::session::jsonl::JournalEvent>),
         }
-        let feed = match self.server.journal_feed(session_id) {
-            Some(thread) => Feed::Thread(thread),
-            None => match manox_harness::subagent::feeds::child_journal_feed(session_id) {
-                Some(child) => Feed::Child(child),
-                // A cold session (no live engine, no running child) has no
-                // feed to bridge; its state still answers from the journal,
-                // and a submit (or a dispatch) materializes one, which
-                // re-runs this path. The entry (and the watermark it
-                // carries) stays, so that later start still resumes where
-                // this one meant to.
-                None => {
-                    tracing::debug!(session = %session_id, "bridge: no live feed yet (cold session)");
-                    return;
-                }
+        let feed = match pre_subscribed {
+            Some(feed) => Feed::Subscribed(feed),
+            None => match self.server.journal_feed(session_id) {
+                Some(thread) => Feed::Thread(thread),
+                None => match manox_harness::subagent::feeds::child_journal_feed(session_id) {
+                    Some(child) => Feed::Child(child),
+                    // A cold session (no live engine, no running child) has no
+                    // feed to bridge; its state still answers from the journal,
+                    // and a submit (or a dispatch) materializes one, which
+                    // re-runs this path. The entry (and the watermark it
+                    // carries) stays, so that later start still resumes where
+                    // this one meant to.
+                    None => {
+                        tracing::debug!(session = %session_id, "bridge: no live feed yet (cold session)");
+                        return;
+                    }
+                },
             },
         };
         let Some(host) = self.host() else {
@@ -603,6 +665,11 @@ impl RuntimeBackend {
         let task_watermark = Arc::clone(&watermark);
         let task = manox_agent::runtime::handle().spawn(async move {
             match feed {
+                Feed::Subscribed(feed) => {
+                    backend
+                        .run_bridge(host, feed, id, resume_from, task_watermark)
+                        .await;
+                }
                 Feed::Thread(thread) => {
                     backend
                         .bridge(host, thread, id, resume_from, task_watermark)
@@ -770,7 +837,23 @@ impl RuntimeBackend {
         // Subscribe before replaying: the broadcast receiver buffers whatever
         // lands while the replay reads the journal, and the `seq <= tail`
         // filter drops the overlap.
-        let mut feed = thread.subscribe_journal_feed();
+        let feed = thread.subscribe_journal_feed();
+        self.run_bridge(host, feed, session_id, resume_from, watermark)
+            .await;
+    }
+
+    /// The bridge loop over an already-subscribed feed. A seed passes the
+    /// receiver it subscribed before reading its snapshot
+    /// ([`Self::start_bridge_with_feed`]); every other start subscribes in
+    /// [`Self::bridge`] right before the replay.
+    async fn run_bridge(
+        &self,
+        host: Arc<manox_ahp::Host>,
+        mut feed: tokio::sync::broadcast::Receiver<manox_agent::engine::JournalFeed>,
+        session_id: String,
+        resume_from: u64,
+        watermark: Arc<AtomicU64>,
+    ) {
         let mut translator = Translator::new();
         prime_bridge_roster(&host, &session_id, &mut translator, resume_from);
         let mut cursor = Cursor {
@@ -1805,6 +1888,16 @@ impl Backend for RuntimeBackend {
             .map(|client| client.client_id.clone())
             .unwrap_or_else(|| "ahp".to_string());
         let intent_config = create_intent_config(params)?;
+        // What the seed answers with while the create is deferred: the engine
+        // buffers these facts in memory rather than writing a journal, and a
+        // client without a conversation row has no durable place for them.
+        let recorded = super::create_intent::Intent {
+            project: None,
+            model: intent_config.model.clone(),
+            access_mode: intent_config.access_mode.clone(),
+            reasoning_effort: intent_config.reasoning_effort.clone(),
+            working_directories: working_directories.clone(),
+        };
         let intent = crate::runtime_trait::SessionIntent {
             session_id: Some(session_id.to_string()),
             cwd: working_directories.first().cloned(),
@@ -1825,6 +1918,7 @@ impl Backend for RuntimeBackend {
                 Some(code) => HostError::Backend(format!("{} [{code}]", error.message)),
                 None => HostError::Backend(error.message),
             })?;
+        super::create_intent::note(session_id, recorded);
         // Seed and bridge the new session now, so a client that subscribes after
         // creating it gets a snapshot and then live actions.
         let _ = block_on(self.seeded(session_id));
@@ -1833,6 +1927,10 @@ impl Backend for RuntimeBackend {
 
     fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
         let _ = self.server.dispose_session("ahp", session_id);
+        // The intent only exists to answer a seed of a session this process
+        // drives; a disposed session will not be subscribed again, and the
+        // object row (when the desktop wrote one) stays the durable intent.
+        super::create_intent::forget(session_id);
         // The engine caches this session's directories and full patch
         // bodies; a disposed session must not keep them.
         super::changeset::Engine::global().forget(session_id);
