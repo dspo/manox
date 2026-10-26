@@ -37,6 +37,6 @@ pub use spawn::{
 };
 pub use types::{
     AgentOptions, Budgets, Capabilities, DelegationToolConfig, Event, HUMAN_INTERACTION_TOOLS,
-    MIN_BUDGET_MS, RunEndInfo, RunInfo, RunResult, RunSnapshot, StartRequest, StopReason,
-    SubagentError, ToolFilter, test_request,
+    MAX_BUDGET_MS, MIN_BUDGET_MS, RunEndInfo, RunInfo, RunResult, RunSnapshot, StartRequest,
+    StopReason, SubagentError, ToolFilter, test_request,
 };

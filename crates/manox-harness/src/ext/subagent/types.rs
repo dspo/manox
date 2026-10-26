@@ -19,6 +19,13 @@ use crate::core::types::Model;
 /// rather than an enforceable limit.
 pub const MIN_BUDGET_MS: u64 = 1_000;
 
+/// The largest wall-clock or idle budget a delegation may arm (30 days) —
+/// past it the budget is indistinguishable from unbounded while still
+/// holding an active-run slot, so a wedged delegation would keep its slot
+/// for years. The settlement net's own cap is derived from this bound, so a
+/// capped net can never fire before a budget this validator admits.
+pub const MAX_BUDGET_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+
 /// Which START-TIME features a provider supports. Checked by the runtime
 /// before delegating to [`crate::ext::subagent::SubagentProvider::start`].
 /// Each flag corresponds one-to-one to a [`StartRequest`] option.
@@ -99,7 +106,8 @@ pub struct Budgets {
 }
 
 impl Budgets {
-    /// Reject budgets below [`MIN_BUDGET_MS`]; `Ok(())` when enforceable.
+    /// Enforce the armed range [`MIN_BUDGET_MS`]..=[`MAX_BUDGET_MS`];
+    /// `Ok(())` when every armed axis is enforceable.
     pub fn validate(&self) -> Result<(), SubagentError> {
         for (name, budget) in [
             ("timeout", self.timeout_ms),
@@ -108,6 +116,11 @@ impl Budgets {
             if budget.is_some_and(|t| t < MIN_BUDGET_MS) {
                 return Err(SubagentError::InvalidRequest(format!(
                     "{name} must be at least {MIN_BUDGET_MS}ms"
+                )));
+            }
+            if budget.is_some_and(|t| t > MAX_BUDGET_MS) {
+                return Err(SubagentError::InvalidRequest(format!(
+                    "{name} must be at most {MAX_BUDGET_MS}ms (30 days)"
                 )));
             }
         }
@@ -527,5 +540,39 @@ mod tests {
         };
         let err = validate_filter_names(&filter, &snapshot).unwrap_err();
         assert!(err.to_string().contains("`Raed`"), "{err}");
+    }
+
+    /// Budgets are armed inside a closed range: below it the child cannot land
+    /// one turn, above it the run is effectively unbounded while still holding
+    /// its active-run slot — and the settlement net's cap is derived from the
+    /// upper bound, so admitting a larger budget would let the cap fire before
+    /// the caller's own deadline.
+    #[test]
+    fn budgets_enforce_the_armed_range() {
+        let at_min = Budgets {
+            timeout_ms: Some(MIN_BUDGET_MS),
+            idle_timeout_ms: Some(MIN_BUDGET_MS),
+        };
+        assert!(at_min.validate().is_ok());
+        let at_max = Budgets {
+            timeout_ms: Some(MAX_BUDGET_MS),
+            idle_timeout_ms: Some(MAX_BUDGET_MS),
+        };
+        assert!(at_max.validate().is_ok());
+        assert!(Budgets::default().validate().is_ok(), "no budget is valid");
+
+        let below = Budgets {
+            timeout_ms: Some(MIN_BUDGET_MS - 1),
+            idle_timeout_ms: None,
+        };
+        let err = below.validate().unwrap_err();
+        assert!(err.to_string().contains("at least"), "{err}");
+
+        let above = Budgets {
+            timeout_ms: None,
+            idle_timeout_ms: Some(MAX_BUDGET_MS + 1),
+        };
+        let err = above.validate().unwrap_err();
+        assert!(err.to_string().contains("at most"), "{err}");
     }
 }
