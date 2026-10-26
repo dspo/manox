@@ -1017,4 +1017,39 @@ v0.6.5 把 session config 的权威放在 conversation 对象行（`conversation
   前写 picks，`sync_object_config` 握手经正常 setter 派发落行）。
 - **伴随义务**：dspo/manox-app 零代码消费（AHP 面不变），随下一轨 tag bump 获取修复；
   `createSession` 的 seed 缺口（工作目录/config 意图不落引擎，#904/#905 的补偿写入）不在
-  本轮范围、另行处理。
+  本轮范围、另行处理（后续补口见 §H.9）。
+
+### H.9 create 意图与中段 model 切换补上 durable 行（2026-10-26）
+
+H.8 把「已物化会话的 config 切换」接回了 journal。本节治同家族剩下的三个缺口：create 的
+project 从未解析、create 的 config 被丢弃、中段排队的 `SetModel` 不落行。
+
+- **W1：create 的 project 从 belonging 解析**。`createSession` 的 wire 参数没有 project
+  字段，宿主原先也不从别处解析（`SessionIntent.project` 恒 `None`），deferred-fresh 建线程
+  时 `Thread::open` 的 `(None, fresh)` 分支强制改用 `unfiled_workspace(id)`（
+  `/tmp/steer-<id>`）：journal header/cwd、journal 桶（`--unfiled--`）、线程行全部与
+  conversation 对象行的真实项目分叉（桌面侧栏落 "Chats"，composer 项目芯片却读授权
+  grant）。现在 `agent_server` 在 claim 之后解析
+  `project = intent.project.or_else(|| object_project_of(session_id))`——**belonging 的权威
+  是对象行，`workingDirectories` 只是授权集**，intent.project 保留显式覆盖语义；deferred 与
+  seeded 两条路径都走 `Thread::new_in_project`（cwd = 项目目录、journal 落项目桶、线程绑定
+  项目）。无对象行的 create（非桌面客户端）保持 unfiled 行为；claim 的 Reuse 早退在解析之前，
+  已物化会话绝不因解析而重铸或迁移。
+- **W2：create 的 config 接上并落行**。`backend.rs::create_session` 解析
+  `CreateSessionParams.config` 的 session-mutable 三键（`model`/`reasoningEffort`/
+  `accessMode`；`networkAccess` 与 §H.8 一样不在范围），纪律同 `apply_session_config`：
+  先整单校验（未知键、非字符串值 → 拒绝整个 create），model 串经注册表解析，失败以
+  `model/unresolvable` 拒绝，全部发生在任何状态创建之前（零落盘）。intent 一接上，
+  `Thread::set_model`/`set_access_mode`/`set_reasoning_effort` 的既有 choke point 就会为
+  真实变化落行（deferred 会话的行先缓冲，随首条 assistant 消息物化，懒物化契约不破）；无
+  config 的 create 依旧零落盘。
+- **W3：中段排队的 `SetModel` 落行**。run.rs 中段臂的 `HarnessHandle::set_model` 原先只更新
+  turn runtime 快照；现在同时把 `PendingMutation::Model` 入队，由 turn 边界
+  （`prepare_next_turn`）或 settle 的 `flush_pending_mutations_inner` 落 `model_change`
+  行——行先于同一 `TurnUpdate` 把新 model 写入下一请求，写失败即中止该 run。守卫沿用 handle
+  的按目标幂等（同一目标不重复入队），idle 路径仍走 `AgentSession::set_model` 的 choke
+  point，不产生第二行。
+- **验证**：`ahp_adapter_tests::create_intent`（对象行 → 项目 cwd/桶/线程行；无对象行 →
+  unfiled 不变；Reuse 不受影响；seeded create 同步落项目桶；create config → 首 turn 物化 →
+  冷读折叠三键俱全；无 config 零落盘；坏 model/未知键/非字符串拒绝且零落盘）与 harness 的
+  `test_handle_set_model_applies_next_turn`（中段排队 → 恰好一行 `model_change`）。

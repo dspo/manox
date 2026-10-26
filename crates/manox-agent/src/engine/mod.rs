@@ -1183,10 +1183,15 @@ async fn run_actor(
     // The journal relay for this session (exits by itself when a swap drops
     // the storage; the next establishment spawns its own relay).
     spawn_journal_relay(&session, &state.journal_tx);
-    // K5: publish the acceptance-time writer for this session.
-    *state.current_appender.lock().unwrap() = Some(session.journal_appender());
-    *state.current_resources.lock().unwrap() = Some(session.resources().clone());
-    *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
+    // The create facts land on the chain BEFORE the acceptance-time writer
+    // becomes visible. The writer is what a facade-side first `Submit`
+    // uses to persist its user message durably, and that append
+    // materializes a deferred journal — so a writer published earlier lets
+    // a fast submit write a journal that appears to have been born without
+    // the project binding / established-cwd rows that follow. Publishing
+    // after these appends (they are buffered on a deferred storage, and
+    // read-only otherwise) keeps "a session is born carrying its create
+    // facts" an invariant, not a race.
     if let Some(project) = &project {
         bind_project(&sessions_dir, &session, project, &state, &notice_tx).await;
     }
@@ -1197,6 +1202,10 @@ async fn run_actor(
     if !restored {
         announce_established_cwd(&session, &state, &notice_tx).await;
     }
+    // K5: publish the acceptance-time writer for this session.
+    *state.current_appender.lock().unwrap() = Some(session.journal_appender());
+    *state.current_resources.lock().unwrap() = Some(session.resources().clone());
+    *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
     spawn_session_list_refresh(&sessions_dir, &state);
 
     // Idle-wakeup channel: the harness listener signals when steered events

@@ -1450,13 +1450,23 @@ impl AgentServerInner {
             let session_id = claimed_id
                 .clone()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            // Belonging is the object row's answer (the one place it lives);
+            // the intent's explicit project only overrides it. A desktop
+            // create lands its conversation row BEFORE this request, so the
+            // shard key, the header cwd and the thread binding all agree
+            // with the client's project chip instead of sharding a filed
+            // conversation into the unfiled bucket.
+            let project = intent
+                .project
+                .clone()
+                .map(PathBuf::from)
+                .or_else(|| object_project_of(&session_id));
             let cwd = intent
                 .cwd
                 .clone()
                 .map(PathBuf::from)
-                .or_else(|| intent.project.clone().map(PathBuf::from))
+                .or_else(|| project.clone())
                 .unwrap_or_else(|| inner.cwd.clone());
-            let project = object_project_of(&session_id);
             let Some(path) =
                 manox_ahp_runtime::paths::session_file_under(&session_id, project.as_deref())
             else {
@@ -1542,8 +1552,8 @@ impl AgentServerInner {
                     if let Some(effort) = effort {
                         t.set_reasoning_effort(effort);
                     }
-                    if let Some(project) = &intent.project {
-                        t.bind_at_creation(PathBuf::from(project));
+                    if let Some(project) = &project {
+                        t.bind_at_creation(project.clone());
                     }
                 });
             }
@@ -1556,7 +1566,18 @@ impl AgentServerInner {
         }
 
         let session_id = claimed_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let project = intent.project.as_ref().map(PathBuf::from);
+        // Belonging is the object row's answer (the one place it lives);
+        // the intent's explicit project only overrides it. A desktop create
+        // lands its conversation row BEFORE this request, so resolving here
+        // is what keeps the journal header/cwd, the shard key and the
+        // sidebar grouping on the client's real project — without it a
+        // filed conversation ran in `unfiled_workspace(id)` and sharded into
+        // `--unfiled--` while the composer chip showed the real project.
+        let project = intent
+            .project
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| object_project_of(&session_id));
         let cwd = intent
             .cwd
             .as_ref()
@@ -1577,10 +1598,8 @@ impl AgentServerInner {
         // (the journal materializes lazily at the first turn) so the
         // sidecar write is addressable.
         if !intent.working_directories.is_empty()
-            && let Some(path) = manox_ahp_runtime::paths::session_file_under(
-                &session_id,
-                object_project_of(&session_id).as_deref(),
-            )
+            && let Some(path) =
+                manox_ahp_runtime::paths::session_file_under(&session_id, project.as_deref())
         {
             let dirs = intent.working_directories.clone();
             manox_agent::thread_store::global().with_mut(|s| {

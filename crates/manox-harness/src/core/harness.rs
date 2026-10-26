@@ -212,15 +212,19 @@ struct HarnessControl {
     shutdown: std::sync::atomic::AtomicBool,
 }
 
-/// A runtime mutation queued mid-run; applied to the shared snapshot
-/// immediately and persisted by the harness once the run settles.
+/// A durable mutation queued mid-run: applied to the shared snapshot
+/// immediately and persisted by the harness at the next turn boundary (or
+/// once the run settles, whichever comes first).
 ///
-/// Model and thinking-level changes are not here: their durable home is the
-/// conversation's configuration — the host's object store — so the harness
-/// holds no copy to write and nothing to defer.
+/// A model change queued through the mid-run handle is here because its
+/// durable authority is the journal's `model_change` row: the idle path lands
+/// it at [`AgentSession::set_model`], and this is the mid-run producer.
 #[derive(Clone)]
 enum PendingMutation {
     ActiveTools(Vec<String>),
+    /// A model pick queued for the next turn boundary; flushes as the
+    /// session's `model_change` row.
+    Model(Model),
     /// Boxed: a queued message is an order of magnitude larger than any
     /// other entry, and the queue holds them by value.
     Message(Box<AgentMessage>),
@@ -442,8 +446,8 @@ impl HarnessHandle {
 
     /// Queue a model change for the next turn boundary of the in-flight run.
     /// The shared runtime snapshot updates immediately — the next provider
-    /// request and the next run both see it — and the change is persisted
-    /// once the run settles.
+    /// request and the next run both see it — and the change is persisted at
+    /// that boundary as the journal's `model_change` row.
     ///
     /// Whether the change was queued is the return value: a model outside the
     /// one api a fixed stream serves is refused and mutates nothing, so a
@@ -468,6 +472,11 @@ impl HarnessHandle {
             }
             runtime.model = model.clone();
         }
+        self.control
+            .pending_mutations
+            .lock()
+            .unwrap()
+            .push(PendingMutation::Model(model.clone()));
         self.control.emit_harness(HarnessEvent::ModelUpdate {
             model: model.clone(),
         });
@@ -1947,6 +1956,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 PendingMutation::ActiveTools(names) => {
                     self.session.append_active_tools_change(&names).await?;
                 }
+                PendingMutation::Model(model) => {
+                    self.session
+                        .append_model_change(&model.provider, &model.id)
+                        .await?;
+                }
                 PendingMutation::Message(message) => {
                     let message = *message;
                     let entry_id = self.session.append_message(message.clone()).await?;
@@ -3031,6 +3045,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                     PendingMutation::ActiveTools(names) => {
                         snapshot.active_tool_names = Some(names.clone())
                     }
+                    PendingMutation::Model(model) => snapshot.model = model.clone(),
                     // A queued message has no runtime effect — it flushes to
                     // the session at the next turn boundary like any mutation.
                     PendingMutation::Message(_) => {}
@@ -3928,6 +3943,15 @@ fn build_loop_hooks<S: SessionStorage + 'static>(
                 match &mutation {
                     PendingMutation::ActiveTools(names) => {
                         durable.append_active_tools_change(names).await?;
+                    }
+                    // The queued model's durable row lands here, at the turn
+                    // boundary the pick takes effect on — ahead of the
+                    // `TurnUpdate` below writing the same model into the next
+                    // request's context.
+                    PendingMutation::Model(model) => {
+                        durable
+                            .append_model_change(&model.provider, &model.id)
+                            .await?;
                     }
                     PendingMutation::Message(message) => {
                         let message = message.as_ref();
@@ -5920,8 +5944,10 @@ pub(crate) mod tests {
             vec!["test".to_string(), "claude-opus".to_string()],
             "prepare_next_turn must refresh the context before the next request"
         );
-        // The harness state caught up, and nothing about the switch was
-        // journaled — the conversation's configuration owns the pick.
+        // The harness state caught up, and the pick is durable: exactly one
+        // `model_change` row names it (the mid-run boundary's producer), so a
+        // reopen folds the switch back out instead of drifting to the
+        // construction model.
         assert_eq!(harness.model().id, "claude-opus");
         let entries = harness
             .session()
@@ -5929,11 +5955,17 @@ pub(crate) mod tests {
             .get_entries(Default::default())
             .await
             .unwrap();
-        assert!(
-            !entries
-                .iter()
-                .any(|e| matches!(e, SessionTreeEntry::ModelChange { .. })),
-            "a queued model change must not be journaled: {entries:?}"
+        let rows: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::ModelChange { model_id, .. } => Some(model_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["claude-opus"],
+            "a queued model change lands exactly one model_change row: {entries:?}"
         );
     }
 

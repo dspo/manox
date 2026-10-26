@@ -1804,19 +1804,27 @@ impl Backend for RuntimeBackend {
             .as_ref()
             .map(|client| client.client_id.clone())
             .unwrap_or_else(|| "ahp".to_string());
+        let intent_config = create_intent_config(params)?;
         let intent = crate::runtime_trait::SessionIntent {
             session_id: Some(session_id.to_string()),
             cwd: working_directories.first().cloned(),
             project: None,
-            initial_model: None,
-            access_mode: None,
-            reasoning_effort: None,
+            initial_model: intent_config.model,
+            access_mode: intent_config.access_mode,
+            reasoning_effort: intent_config.reasoning_effort,
             seed: None,
             working_directories,
         };
         self.server
             .create_session(&owner, intent)
-            .map_err(|error| HostError::Backend(error.message))?;
+            // The refusal carries its stable code in the message when one
+            // applies (`[model-unresolvable]`, …), the same vocabulary
+            // `apply_session_config` puts on the wire — a create refused on
+            // its config must be as branchable as a mid-session switch.
+            .map_err(|error| match &error.code {
+                Some(code) => HostError::Backend(format!("{} [{code}]", error.message)),
+                None => HostError::Backend(error.message),
+            })?;
         // Seed and bridge the new session now, so a client that subscribes after
         // creating it gets a snapshot and then live actions.
         let _ = block_on(self.seeded(session_id));
@@ -2909,6 +2917,74 @@ fn extension_session(params: &Value) -> Result<String, HostError> {
 /// `file://` URI → filesystem path (`None` for other schemes).
 pub(crate) fn file_uri_to_path(uri: &str) -> Option<String> {
     uri.strip_prefix("file://").map(str::to_string)
+}
+
+/// The config keys a `createSession` intent may carry.
+///
+/// Create is the same seat as a live switch, so it accepts exactly the
+/// session-mutable keys (`config_keys::MUTABLE`) minus `networkAccess`: that
+/// one is session memory with no journal row and no create-time wiring
+/// (#953's sandbox redesign owns it), and accepting it here would answer
+/// `Accepted` for a pick nothing applies. A client sending it is a client
+/// bug the create reports, not a value to drop silently.
+const CREATE_CONFIG_KEYS: &[&str] = &[
+    config_keys::MODEL,
+    config_keys::REASONING_EFFORT,
+    config_keys::ACCESS_MODE,
+];
+
+/// The three session-mutable picks a `createSession` intent carries.
+#[derive(Debug, Default)]
+struct CreateIntentConfig {
+    model: Option<String>,
+    access_mode: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+/// Validate and decode `CreateSessionParams.config` before anything is
+/// created — the same validate-everything-then-land-nothing discipline
+/// `apply_session_config` runs, so one bad key refuses the whole create
+/// rather than leaving a half-configured session behind. Model strings are
+/// resolved later by the runtime's create path (the same registry resolution
+/// `set_model` uses), so an unresolvable model also refuses with zero
+/// durable state.
+fn create_intent_config(params: &CreateSessionParams) -> Result<CreateIntentConfig, HostError> {
+    let Some(config) = params.config.as_ref() else {
+        return Ok(CreateIntentConfig::default());
+    };
+    if let Some(key) = config
+        .keys()
+        .find(|key| !CREATE_CONFIG_KEYS.contains(&key.as_str()))
+    {
+        return Err(HostError::InvalidParams(format!(
+            "config key `{key}` is not a create-session key on this host"
+        )));
+    }
+    // The declared schema types every mutable key as a string; a non-string
+    // value is a client bug the create must report, not a silent no-op.
+    for key in CREATE_CONFIG_KEYS {
+        if let Some(value) = config.get(*key)
+            && !value.is_string()
+        {
+            return Err(HostError::InvalidParams(format!(
+                "config key `{key}` must be a string, got {value}"
+            )));
+        }
+    }
+    Ok(CreateIntentConfig {
+        model: config
+            .get(config_keys::MODEL)
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        access_mode: config
+            .get(config_keys::ACCESS_MODE)
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        reasoning_effort: config
+            .get(config_keys::REASONING_EFFORT)
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 /// The session's working directories as paths — the changeset engine's scan
