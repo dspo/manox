@@ -4214,6 +4214,9 @@ pub(crate) mod tests {
     /// (cancel, fail, steer) funnels through, with no AHP client required.
     #[tokio::test]
     async fn a_settled_turn_stamps_the_store_and_the_sidecar() {
+        let _store_lock = crate::thread_store::store_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::runtime::init_hermetic_for_test();
         crate::thread_store::init_for_test();
         let store = crate::thread_store::try_global().expect("the override is installed");

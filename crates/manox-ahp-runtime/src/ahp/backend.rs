@@ -3822,6 +3822,13 @@ mod mcp_dispatch_tests {
     /// the two stamps.
     #[test]
     fn a_viewed_declaration_stamps_the_derived_read() {
+        // The store override is process-global and the suite runs in
+        // parallel: hold the same serialization the cold-seed tests do, or
+        // a swap mid-test answers another test's lookup with nothing.
+        let _globals = crate::test_support::lock_globals();
+        let _store_lock = manox_agent::thread_store::store_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::test_support::init_globals();
         manox_agent::thread_store::init_for_test();
         let store = manox_agent::thread_store::try_global().expect("the override is installed");

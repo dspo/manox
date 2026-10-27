@@ -67,7 +67,6 @@ impl ThreadSummary {
         &self.project
     }
 
-
     /// Fold `other`'s monotone stamps into `self` (take the max each), then
     /// re-derive the attention bit. Returns whether the bit flipped.
     pub fn merge_stamps(&mut self, settled: Option<i64>, viewed: Option<i64>) -> bool {
