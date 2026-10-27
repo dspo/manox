@@ -2669,17 +2669,40 @@ impl Backend for RuntimeBackend {
                         .to_string(),
                 )
             }
+            // The view observation is the read rule's second input: a
+            // client declaring `isReadChanged(true)` stamps the sidecar's
+            // view time (monotone max), so a settled-after-viewed session
+            // reads back as read everywhere. The false leg — an explicit
+            // mark-unread — has no derived semantics: the rule has nothing
+            // to clear for a session with no settled turn, and
+            // materializing the intent would build a second read truth
+            // beside the two stamps. It stays a reducer-only echo until a
+            // caller needs it.
+            StateAction::SessionIsReadChanged(changed) => {
+                let Some(session_id) = session::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                if !changed.is_read {
+                    tracing::debug!(session_id, "explicit mark-unread: derived read has no clear leg yet");
+                    return DispatchOutcome::Ignored;
+                }
+                if let Some(store) = manox_agent::thread_store::try_global() {
+                    store.with_mut(|s| {
+                        s.mark_viewed(session_id, chrono::Utc::now().timestamp());
+                    });
+                }
+                DispatchOutcome::Accepted
+            }
             // Actions the acceptance table admits and the reducer folds, but
             // that describe client-side state the runtime does not own (draft
-            // text, read flags, turn resumption, result confirmation). They are
-            // echoed as accepted so every subscriber observes the same sequence,
-            // and no runtime work follows.
+            // text, the chat-level read flag, turn resumption, result
+            // confirmation). They are echoed as accepted so every subscriber
+            // observes the same sequence, and no runtime work follows.
             StateAction::ChatDraftChanged(_)
             | StateAction::ChatTurnResume(_)
             | StateAction::ChatToolCallResultConfirmed(_)
             | StateAction::ChatInputAnswerChanged(_)
             | StateAction::ChatQueuedMessagesReordered(_)
-            | StateAction::SessionIsReadChanged(_)
             | StateAction::ChatIsReadChanged(_)
             | StateAction::SessionActiveClientRemoved(_) => DispatchOutcome::Ignored,
             other => DispatchOutcome::Rejected(format!(
@@ -3787,6 +3810,57 @@ mod mcp_dispatch_tests {
                 "the one chat is the default chat"
             );
         });
+    }
+
+    /// The view declaration is the read rule's second input: a focus
+    /// stamps the view time (monotone max), so a settled session reads
+    /// back as read everywhere. The explicit mark-unread leg stays a
+    /// reducer-only echo — the derived rule has no clear leg, and
+    /// materializing the intent would build a second read truth beside
+    /// the two stamps.
+    #[test]
+    fn a_viewed_declaration_stamps_the_derived_read() {
+        crate::test_support::init_globals();
+        manox_agent::thread_store::init_for_test();
+        let store = manox_agent::thread_store::try_global().expect("the override is installed");
+        store.with_mut(|st| {
+            st.insert_summary_for_test("s-derived", None);
+            st.note_settled("s-derived", 1_000);
+        });
+        let unread = |store: &manox_agent::thread_store::StoreHandle| {
+            store
+                .read(|st| st.summary_by_id("s-derived").expect("seeded").has_unread)
+        };
+        assert!(unread(&store), "the settle lights the bit (no view yet)");
+
+        let backend = backend(McpOnlyRuntime::serving());
+        let declare = |backend: &RuntimeBackend, is_read: bool| {
+            backend.dispatch(
+                "ahp-session:/s-derived",
+                &StateAction::SessionIsReadChanged(
+                    ahp_types::actions::SessionIsReadChangedAction { is_read },
+                ),
+                &ActionOrigin {
+                    client_id: "client-1".to_string(),
+                    client_seq: 1,
+                },
+            )
+        };
+        assert_eq!(declare(&backend, true), DispatchOutcome::Accepted);
+        assert!(!unread(&store), "the focus declaration clears the bit");
+
+        let now = chrono::Utc::now().timestamp();
+        store.with_mut(|st| {
+            st.note_settled("s-derived", now + 60);
+        });
+        assert!(unread(&store), "a settle after the view re-lights it");
+
+        assert_eq!(declare(&backend, false), DispatchOutcome::Ignored);
+        assert!(
+            unread(&store),
+            "the mark-unread echo has no derived semantics to change"
+        );
+        manox_agent::thread_store::drop_for_test();
     }
 }
 

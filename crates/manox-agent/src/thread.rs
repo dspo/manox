@@ -1181,6 +1181,11 @@ impl Thread {
                 steered,
                 stranded,
             } => {
+                // The read rule's first input: the process that ran the
+                // turn stamps the settle — at the one point every settle
+                // (cancel, fail, steer) funnels through, with no AHP
+                // client required.
+                self.stamp_settled();
                 for message_id in steered {
                     self.pending_events
                         .push(ThreadEvent::SteerInjected { message_id });
@@ -2698,6 +2703,33 @@ impl Thread {
         persist_interaction_spawn(sessions_dir, session_path, chrono::Utc::now().timestamp());
     }
 
+    /// Stamp the session's settle time — the read rule's first input. The
+    /// store note flips the driving process's sidebar at once; the sidecar
+    /// write is what every other process (and the next boot) reads, max on
+    /// disk so a peer's fresher stamp survives. Unconditional: a subagent
+    /// session's sidecar gains a stamp no sidebar ever renders (the scan
+    /// skips subagent journals), which is cheaper than misjudging a main
+    /// session and silently losing its unread.
+    fn stamp_settled(&self) {
+        let at = chrono::Utc::now().timestamp();
+        if let Some(store) = crate::thread_store::try_global() {
+            let id = self.id.0.clone();
+            store.with_mut(|s| {
+                s.note_settled(&id, at);
+            });
+        }
+        let Some(sessions_dir) = crate::paths::manox_config_dir()
+            .ok()
+            .map(|dir| dir.join("sessions"))
+        else {
+            return;
+        };
+        let Some(session_path) = self.active_session_path() else {
+            return;
+        };
+        persist_settled_spawn(sessions_dir, session_path, at);
+    }
+
     /// Whether the harness backend restored an existing session at startup.
     pub fn restored(&self) -> bool {
         self.restored
@@ -2783,6 +2815,26 @@ fn persist_interaction_spawn(
             .await
         {
             tracing::warn!(error = %err, "failed to persist the interaction stamp");
+        }
+    })
+}
+
+/// Stamp the session's last settle in the sidecar — the read rule's durable
+/// input, written by the process that ran the turn. Max on disk: concurrent
+/// writers converge without ordering assumptions.
+fn persist_settled_spawn(
+    sessions_dir: PathBuf,
+    session_path: PathBuf,
+    at: i64,
+) -> tokio::task::JoinHandle<()> {
+    crate::runtime::handle().spawn(async move {
+        if let Err(err) =
+            manox_harness::session_meta::update(&sessions_dir, &session_path, |meta| {
+                meta.last_settled_at = Some(meta.last_settled_at.map_or(at, |prev| prev.max(at)));
+            })
+            .await
+        {
+            tracing::warn!(error = %err, "failed to persist the settle stamp");
         }
     })
 }
@@ -4153,5 +4205,73 @@ pub(crate) mod tests {
             listed,
             "SessionListDirty must land the materialized session in the sidebar list"
         );
+    }
+
+    /// The settle stamp: the read rule's first input lands where the turn
+    /// ran. The store note flips the driving process's sidebar bit; the
+    /// sidecar write is what every OTHER process (and the next boot) reads.
+    /// Both legs ride the Settled notice — the one point every settle
+    /// (cancel, fail, steer) funnels through, with no AHP client required.
+    #[tokio::test]
+    async fn a_settled_turn_stamps_the_store_and_the_sidecar() {
+        crate::runtime::init_hermetic_for_test();
+        crate::thread_store::init_for_test();
+        let store = crate::thread_store::try_global().expect("the override is installed");
+        store.with_mut(|s| s.insert_summary_for_test("t-settle-stamp", None));
+
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+            access_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("t-settle-stamp.jsonl");
+        std::fs::write(&session, b"{}\n").unwrap();
+        engine.set_session_path(session.clone());
+        let thread = thread_with_engine_id(HistoryPhase::Ready, engine, "t-settle-stamp");
+
+        thread.handle_notice(BackendNotice::Settled {
+            cancelled: true,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        });
+
+        let stamped = store.read(|s| {
+            s.summary_by_id("t-settle-stamp")
+                .map(|row| (row.last_settled_at, row.has_unread))
+                .expect("the seeded row")
+        });
+        assert!(
+            stamped.0.is_some(),
+            "the settle notice stamped the store row (a cancel settles too)"
+        );
+        assert!(
+            stamped.1,
+            "a settle with no view stamp is unread"
+        );
+
+        // The sidecar write is spawned; poll for it.
+        let sidecar = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let meta = manox_harness::session_meta::load(dir.path(), &session)
+                    .await
+                    .expect("the sidecar loads");
+                if meta.last_settled_at.is_some() {
+                    return meta.last_settled_at;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the settle stamp lands in the sidecar");
+        assert_eq!(sidecar, stamped.0, "one stamp, two homes, one value");
+        crate::thread_store::drop_for_test();
     }
 }
