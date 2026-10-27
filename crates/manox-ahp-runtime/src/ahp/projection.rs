@@ -455,8 +455,14 @@ struct OpenTurn {
     synthetic: bool,
     text_part: Option<String>,
     reasoning_part: Option<String>,
-    /// A text delta streamed since the last settled assistant row.
+    /// A text delta streamed since the last settled assistant row: the row
+    /// stays silent about text (first-writer-wins).
     streamed_text: bool,
+    /// A thinking delta streamed since the last settled assistant row: like
+    /// [`OpenTurn::streamed_text`], it marks the row as the non-first writer
+    /// of a streamed reply, whose tail deltas must rejoin the runs they
+    /// streamed into instead of opening fresh parts.
+    streamed_thinking: bool,
     /// The opening user message the turn currently carries: empty until a
     /// user row lands (journal order puts `turnStart` before the user row).
     message_text: String,
@@ -482,6 +488,7 @@ impl OpenTurn {
             text_part: None,
             reasoning_part: None,
             streamed_text: false,
+            streamed_thinking: false,
             calls: BTreeMap::new(),
             open_asks: Vec::new(),
         }
@@ -1605,8 +1612,24 @@ impl Translator {
                     ));
                 }
                 if let Some(turn) = self.open.as_mut() {
-                    turn.close_runs();
+                    // A run streamed on this reply keeps its slot across the
+                    // row: the journal's write paths race (deltas ride the
+                    // notice tap's actor queue, the settled row is written
+                    // directly), so a reply's tail deltas can land after the
+                    // row that already carries their text. Those deltas are
+                    // that reply's own suffix — rejoining them into the open
+                    // part rebuilds exactly the settled text — while a delta
+                    // opening a fresh part here would split one reply in two,
+                    // and replay the split forever. The closers the fold owns
+                    // (the other stream, a tool call, a notification, the turn
+                    // boundary) still fire, so an open slot never reaches an
+                    // unrelated response; a row that is itself the first
+                    // writer closes the runs as before.
+                    if !streamed && !turn.streamed_thinking {
+                        turn.close_runs();
+                    }
                     turn.streamed_text = false;
+                    turn.streamed_thinking = false;
                 }
             }
             "tool" => {
@@ -1692,6 +1715,7 @@ impl Translator {
                 }
                 Run::Thinking => {
                     turn.text_part = None;
+                    turn.streamed_thinking = true;
                     &mut turn.reasoning_part
                 }
             };
@@ -3854,6 +3878,250 @@ mod fold_semantics_tests {
         assert!(
             state.active_turn.is_none(),
             "the turnFinish closed the turn"
+        );
+    }
+
+    /// A streamed reply whose tail deltas lost the journal-write race against
+    /// the settled row.
+    ///
+    /// The deltas and the settled row reach the journal through different
+    /// write paths (deltas via the notice tap's actor queue, the row via the
+    /// persistence middleware), so the row can overtake the reply's last
+    /// deltas. Those deltas are the reply's own suffix — the settled text
+    /// already carries them — so they must rejoin the part they streamed
+    /// into: a second markdown part here is one reply the client renders as
+    /// two, and part ids are replay-stable, so replaying the already-written
+    /// journal keeps it split. The fixture is the real journal's shape: two
+    /// deltas, the settled row (full text, usage), the tail deltas, then
+    /// `stop` / `turn_finish`.
+    #[test]
+    fn tail_text_deltas_after_a_streamed_settled_row_rejoin_the_same_part() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "check the ingress"}]},
+                "origin": "rpc-1",
+            })),
+            kernel(json!({"type": "agent_text_delta", "id": "sentry-1",
+                          "delta": "…则 ALB 控制台手动加 "})),
+            kernel(json!({"type": "agent_text_delta", "id": "sentry-2", "delta": "44"})),
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-3",
+                "message": {"role": "assistant",
+                            "content": [{"type": "text",
+                                         "text": "…则 ALB 控制台手动加 443 转发规则。"}],
+                            "model": "test-model", "provider": "test", "api": "anthropic",
+                            "usage": {"input": 120, "output": 30}},
+            })),
+            kernel(json!({"type": "agent_text_delta", "id": "sentry-4", "delta": "3"})),
+            kernel(json!({"type": "agent_text_delta", "id": "sentry-5",
+                          "delta": " 转发规则。"})),
+            kernel(json!({"type": "stop", "id": "sentry-6", "reason": "end_turn"})),
+            kernel(json!({"type": "turn_finish", "id": "sentry-7",
+                          "cancelled": false, "failed": false, "strandedSteerIds": []})),
+        ];
+
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut markdown_parts = Vec::new();
+        let mut delta_part_ids = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                match &emitted.action {
+                    StateAction::ChatResponsePart(part) => {
+                        if let ResponsePart::Markdown(m) = &part.part {
+                            markdown_parts.push((m.id.clone(), m.content.clone()));
+                        }
+                    }
+                    StateAction::ChatDelta(delta) => delta_part_ids.push(delta.part_id.clone()),
+                    _ => {}
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        assert_eq!(
+            markdown_parts.len(),
+            1,
+            "one streamed reply is one markdown part, tail included: {markdown_parts:?}"
+        );
+        assert!(
+            !delta_part_ids.is_empty(),
+            "the fixture streamed deltas for the tail to trail"
+        );
+        let (part_id, _) = &markdown_parts[0];
+        assert!(
+            delta_part_ids.iter().all(|id| id == part_id),
+            "every delta appends into the run's own part: deltas {delta_part_ids:?} vs part {part_id}"
+        );
+        let turn = state
+            .turns
+            .last()
+            .expect("the turn_finish archived the turn");
+        let markdown: Vec<_> = turn
+            .response_parts
+            .iter()
+            .filter_map(|p| match p {
+                ResponsePart::Markdown(m) => Some(m.content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            markdown,
+            ["…则 ALB 控制台手动加 443 转发规则。"],
+            "the rejoined part is exactly the settled reply text: {markdown:?}"
+        );
+    }
+
+    /// The thinking mirror: a reply that streamed only reasoning keeps its
+    /// reasoning run across the streamed row, so a thinking tail that lost
+    /// the write race rejoins the part instead of minting a second one. The
+    /// row is the first writer of the reply's TEXT (none streamed), so its
+    /// text still publishes as the reply's markdown part.
+    #[test]
+    fn a_thinking_tail_after_a_streamed_settled_row_stays_in_its_part() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "plan the ports"}]},
+                "origin": "rpc-1",
+            })),
+            kernel(json!({"type": "agent_thinking_delta", "id": "sentry-1",
+                          "delta": "weighing 443 vs 8443."})),
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-2",
+                "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "Use 443."}],
+                            "model": "test-model", "provider": "test", "api": "anthropic",
+                            "usage": {"input": 120, "output": 30}},
+            })),
+            kernel(json!({"type": "agent_thinking_delta", "id": "sentry-3",
+                          "delta": " 8443 needs the upstream too."})),
+            kernel(json!({"type": "stop", "id": "sentry-4", "reason": "end_turn"})),
+            kernel(json!({"type": "turn_finish", "id": "sentry-5",
+                          "cancelled": false, "failed": false, "strandedSteerIds": []})),
+        ];
+
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut reasoning_parts = Vec::new();
+        let mut reasoning_ids = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                match &emitted.action {
+                    StateAction::ChatResponsePart(part) => {
+                        if let ResponsePart::Reasoning(r) = &part.part {
+                            reasoning_parts.push((r.id.clone(), r.content.clone()));
+                        }
+                    }
+                    StateAction::ChatReasoning(reasoning) => {
+                        reasoning_ids.push(reasoning.part_id.clone())
+                    }
+                    _ => {}
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        assert_eq!(
+            reasoning_parts.len(),
+            1,
+            "one streamed reasoning run is one part, tail included: {reasoning_parts:?}"
+        );
+        let (part_id, _) = &reasoning_parts[0];
+        assert!(
+            reasoning_ids.iter().all(|id| id == part_id),
+            "every reasoning delta appends into the run's own part: {reasoning_ids:?} vs {part_id}"
+        );
+        let turn = state
+            .turns
+            .last()
+            .expect("the turn_finish archived the turn");
+        let reasoning: Vec<_> = turn
+            .response_parts
+            .iter()
+            .filter_map(|p| match p {
+                ResponsePart::Reasoning(r) => Some(r.content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasoning,
+            ["weighing 443 vs 8443. 8443 needs the upstream too."],
+            "the rejoined part carries the full thinking run: {reasoning:?}"
+        );
+        let markdown = turn
+            .response_parts
+            .iter()
+            .filter(|p| matches!(p, ResponsePart::Markdown(_)))
+            .count();
+        assert_eq!(
+            markdown, 1,
+            "the row is the text's first writer and still publishes the reply's markdown"
+        );
+    }
+
+    /// A settled row that is the reply's first writer closes the runs: a
+    /// delta arriving after it opens a fresh part, not the row's own. This
+    /// is the boundary the streamed-row exception must not erode — a fresh
+    /// reply's text must not silently merge into the previous row's part.
+    #[test]
+    fn a_delta_after_a_settled_first_writer_row_opens_a_fresh_part() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "answer plainly"}]},
+                "origin": "rpc-1",
+            })),
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-1",
+                "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "The port is 443."}],
+                            "model": "test-model", "provider": "test", "api": "anthropic",
+                            "usage": {"input": 120, "output": 30}},
+            })),
+            kernel(json!({"type": "agent_text_delta", "id": "sentry-2",
+                          "delta": "Also 8443."})),
+            kernel(json!({"type": "stop", "id": "sentry-3", "reason": "end_turn"})),
+            kernel(json!({"type": "turn_finish", "id": "sentry-4",
+                          "cancelled": false, "failed": false, "strandedSteerIds": []})),
+        ];
+
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut markdown_parts = Vec::new();
+        let mut delta_part_ids = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                match &emitted.action {
+                    StateAction::ChatResponsePart(part) => {
+                        if let ResponsePart::Markdown(m) = &part.part {
+                            markdown_parts.push(m.id.clone());
+                        }
+                    }
+                    StateAction::ChatDelta(delta) => delta_part_ids.push(delta.part_id.clone()),
+                    _ => {}
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        assert_eq!(
+            markdown_parts.len(),
+            2,
+            "the row's settled part and the delta's fresh part stay distinct: {markdown_parts:?}"
+        );
+        let settled_part = markdown_parts[0].as_str();
+        assert_ne!(
+            delta_part_ids.first().map(String::as_str),
+            Some(settled_part),
+            "the delta must not append into the settled row's part"
         );
     }
 
