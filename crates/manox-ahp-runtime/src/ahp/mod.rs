@@ -1693,7 +1693,9 @@ mod row_status_bits_tests {
         );
         assert_eq!(
             row_status_bits(None, &row(false, true, false), false, false),
-            SessionStatus::Idle.bits() | SessionStatus::IsRead.bits() | SessionStatus::IsArchived.bits(),
+            SessionStatus::Idle.bits()
+                | SessionStatus::IsRead.bits()
+                | SessionStatus::IsArchived.bits(),
             "the row's archive state shows through the parked answer"
         );
     }
@@ -1714,7 +1716,9 @@ mod row_status_bits_tests {
         );
         assert_eq!(
             row_status_bits(Some(&folded_archived), &base, false, false),
-            SessionStatus::Idle.bits() | SessionStatus::IsRead.bits() | SessionStatus::IsArchived.bits(),
+            SessionStatus::Idle.bits()
+                | SessionStatus::IsRead.bits()
+                | SessionStatus::IsArchived.bits(),
             "the fold's archive bit joins the row's"
         );
     }

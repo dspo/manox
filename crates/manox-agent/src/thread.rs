@@ -4252,10 +4252,7 @@ pub(crate) mod tests {
             stamped.0.is_some(),
             "the settle notice stamped the store row (a cancel settles too)"
         );
-        assert!(
-            stamped.1,
-            "a settle with no view stamp is unread"
-        );
+        assert!(stamped.1, "a settle with no view stamp is unread");
 
         // The sidecar write is spawned; poll for it.
         let sidecar = tokio::time::timeout(std::time::Duration::from_secs(5), async {

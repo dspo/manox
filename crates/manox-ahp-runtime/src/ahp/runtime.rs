@@ -56,6 +56,12 @@ pub fn install_builder(
 pub struct AhpRuntime {
     host: Arc<Host>,
     server: Arc<dyn SessionRuntime>,
+    /// The catalogue as last announced. Each id is published ONCE as a
+    /// lifecycle `sessionAdded`; every later pass is a delta against this
+    /// map — a republish that changes nothing announces nothing, which is
+    /// the licence the peer sweep's 5s tick polls under.
+    published:
+        parking_lot::Mutex<std::collections::HashMap<String, ahp_types::state::SessionSummary>>,
 }
 
 impl AhpRuntime {
@@ -70,6 +76,7 @@ impl AhpRuntime {
         let runtime = Arc::new(Self {
             host: Arc::clone(&host),
             server: Arc::clone(&server),
+            published: parking_lot::Mutex::new(std::collections::HashMap::new()),
         });
         // The provider registry loads asynchronously; the root channel's agent
         // catalogue is state, so it arrives as an action once it is ready rather
@@ -96,24 +103,20 @@ impl AhpRuntime {
         Arc::clone(&self.host)
     }
 
-    /// Republish every session summary whose row exists, as a `sessionAdded`
-    /// for a session the host has never seen and a `sessionSummaryChanged`
-    /// delta for one it knows.
+    /// Publish the catalogue as a DIFF against what this host last
+    /// announced: `sessionAdded` for a session never announced before (the
+    /// lifecycle event, exactly once per host), `sessionSummaryChanged`
+    /// for a known session whose fields moved (the derived read bit's
+    /// flip rides the delta), `sessionRemoved` for a row that left the
+    /// active catalogue (a peer's archive, a dispose) — without it a
+    /// diff-gated subscriber would keep the stale row forever. A pass
+    /// that changes nothing announces nothing: the peer sweep polls on
+    /// this licence, and a replaying catalogue is a 0.2Hz re-announce
+    /// storm (re-ranked sidebars, resurrected rows).
     ///
-    /// The session id lives in the store row, not in [`SessionSummary`] — the
-    /// protocol keys a summary by its channel URI — so this walks the rows
-    /// rather than the summaries the paging call returns. Sending
-    /// `sessionAdded` twice would make a client insert a second sidebar row for
-    /// one session, which is why the two cases are distinguished at all.
-    /// Republish every session summary whose row exists: `sessionAdded` for a
-    /// session the host has never seen, `sessionSummaryChanged` for one it
-    /// knows.
-    ///
-    /// The session id lives in the store row, not in the summary — AHP keys a
-    /// summary by its channel URI — so this walks the rows rather than the
-    /// summaries the paging call returns. Sending `sessionAdded` twice would
-    /// make a client insert a second sidebar row for one session, which is why
-    /// the two cases are distinguished at all.
+    /// The session id lives in the store row, not in the summary — AHP
+    /// keys a summary by its channel URI — so this walks the rows rather
+    /// than the summaries the paging call returns.
     pub fn catalogue_changed(&self) {
         let host = Arc::clone(&self.host);
         let Some(store) = manox_agent::thread_store::try_global() else {
@@ -121,15 +124,28 @@ impl AhpRuntime {
         };
         let rows: Vec<String> =
             store.read(|state| state.summaries().iter().map(|row| row.id.clone()).collect());
-        for session_id in rows {
-            let Some(summary) = self.host.backend().session_summary(&session_id) else {
+        let mut published = self.published.lock();
+        for session_id in &rows {
+            let Some(summary) = self.host.backend().session_summary(session_id) else {
                 continue;
             };
-            if host.session_state(&session_id).is_some() {
-                host.summary_changed(&session_id, super::backend::summary_delta(&summary));
-            } else {
-                host.session_added(summary);
+            match published.get(session_id.as_str()) {
+                None => host.session_added(summary.clone()),
+                Some(prev) if prev != &summary => {
+                    host.summary_changed(session_id, super::backend::summary_delta(&summary));
+                }
+                Some(_) => continue,
             }
+            published.insert(session_id.clone(), summary);
+        }
+        let departed: Vec<String> = published
+            .keys()
+            .filter(|id| !rows.contains(id))
+            .cloned()
+            .collect();
+        for session_id in departed {
+            published.remove(&session_id);
+            host.session_removed(&session_id);
         }
     }
 

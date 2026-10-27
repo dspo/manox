@@ -70,7 +70,10 @@ impl ThreadSummary {
     /// Re-derive the two monotone inputs into the attention bit, folding the
     /// stamps this process may hold beyond its last scan (`pending_viewed`).
     pub fn derive_has_unread(&self, pending_viewed: Option<i64>) -> bool {
-        derive_unread(self.last_settled_at, self.last_viewed_at.max(pending_viewed))
+        derive_unread(
+            self.last_settled_at,
+            self.last_viewed_at.max(pending_viewed),
+        )
     }
 
     /// Fold `other`'s monotone stamps into `self` (take the max each), then

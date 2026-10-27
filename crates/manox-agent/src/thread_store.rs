@@ -113,6 +113,20 @@ struct MetaWrite {
     update: Box<dyn FnOnce(&mut manox_harness::session_meta::SessionMeta) + Send + Sync + 'static>,
 }
 
+/// The weak half of [`StoreHandle`], for long-lived pollers: the peer
+/// sweep holds this and retires when the core it points at drops (a
+/// replaced global, a test teardown) instead of pinning every stale core
+/// forever — `init` runs more than once in a process's lifetime.
+#[derive(Clone)]
+pub struct WeakStoreHandle(std::sync::Weak<StoreCore>);
+
+impl WeakStoreHandle {
+    /// Upgrade; `None` once the store core is gone — the poller exits then.
+    pub fn upgrade(&self) -> Option<StoreHandle> {
+        self.0.upgrade().map(StoreHandle)
+    }
+}
+
 /// The gpui-free handle to the thread store. Cheap to clone (`Arc`); state
 /// lives behind a lock and events broadcast to channel subscribers. This is
 /// the kernel-side unit the AgentServer and (transitionally) the frontends
@@ -170,6 +184,14 @@ impl StoreHandle {
         let (tx, rx) = async_channel::unbounded();
         self.0.subscribers.lock().push(tx);
         rx
+    }
+
+    /// The weak view for long-lived pollers (the catalogue sweep). A strong
+    /// handle there would pin every stale core: `init` runs more than once
+    /// in a process's lifetime, and a replaced global must let the old
+    /// loop die.
+    pub fn downgrade(&self) -> WeakStoreHandle {
+        WeakStoreHandle(Arc::downgrade(&self.0))
     }
 
     /// Shared-read the state.
@@ -345,10 +367,7 @@ impl StoreHandle {
             // top; a park whose stamp the disk now carries retires.
             let mut held: HashMap<String, (Option<i64>, Option<i64>)> = HashMap::new();
             for row in s.summaries.iter().chain(s.archived_summaries.iter()) {
-                held.insert(
-                    row.id.clone(),
-                    (row.last_settled_at, row.last_viewed_at),
-                );
+                held.insert(row.id.clone(), (row.last_settled_at, row.last_viewed_at));
             }
             for summary in &mut summaries {
                 if let Some((settled, viewed)) = held.get(&summary.id) {
@@ -3568,12 +3587,18 @@ mod tests {
             "a settled turn nobody viewed is unread"
         );
         assert!(!derive_unread(None, Some(100)), "nothing settled is clear");
-        assert!(!derive_unread(Some(100), Some(200)), "viewed after settle is clear");
+        assert!(
+            !derive_unread(Some(100), Some(200)),
+            "viewed after settle is clear"
+        );
         assert!(
             !derive_unread(Some(200), Some(200)),
             "a same-second settle+view reads viewed (second precision, conservative)"
         );
-        assert!(derive_unread(Some(201), Some(200)), "settled after view is unread");
+        assert!(
+            derive_unread(Some(201), Some(200)),
+            "settled after view is unread"
+        );
     }
 
     /// The stamps are monotone (max) and the bit re-derives on every merge;
@@ -3595,7 +3620,10 @@ mod tests {
             !row.merge_stamps(None, Some(100)),
             "a stale view never re-lights it"
         );
-        assert!(row.merge_stamps(Some(300), None), "a fresh settle re-lights");
+        assert!(
+            row.merge_stamps(Some(300), None),
+            "a fresh settle re-lights"
+        );
         assert_eq!(row.last_settled_at, Some(300));
         assert_eq!(row.last_viewed_at, Some(200));
     }
@@ -3613,16 +3641,20 @@ mod tests {
 
         // No row, no path: the view parks and lights nothing.
         store.with_mut(|s| assert!(!s.mark_viewed("t-parked", 500)));
-        assert_eq!(store.read(|s| s.pending_viewed.get("t-parked").copied()), Some(500));
+        assert_eq!(
+            store.read(|s| s.pending_viewed.get("t-parked").copied()),
+            Some(500)
+        );
 
         let dir = store.read(|s| s.sessions_dir.clone());
         write_session_fixture(&dir, "t-parked", "hello");
         store.refresh_now().await;
         let stamps = |store: &StoreHandle| {
             store
-                .read(|s| s.summary_by_id("t-parked").map(|row| {
-                    (row.last_viewed_at, row.has_unread)
-                }))
+                .read(|s| {
+                    s.summary_by_id("t-parked")
+                        .map(|row| (row.last_viewed_at, row.has_unread))
+                })
                 .expect("the scan materialized the row")
         };
         assert_eq!(
@@ -3695,5 +3727,20 @@ mod tests {
             count += usize::from(matches!(*ev, ThreadStoreEvent::SummariesUpdated));
         }
         count
+    }
+
+    /// The sweep's weak handle must not pin the core: a replaced global or
+    /// a test teardown drops the old store, and the poller retires on its
+    /// next upgrade instead of keeping a stale core alive forever.
+    #[test]
+    fn a_downgraded_handle_releases_the_core() {
+        let store = standalone_for_test();
+        let weak = store.downgrade();
+        assert!(weak.upgrade().is_some());
+        drop(store);
+        assert!(
+            weak.upgrade().is_none(),
+            "a dropped core is not kept alive by the poller's handle"
+        );
     }
 }

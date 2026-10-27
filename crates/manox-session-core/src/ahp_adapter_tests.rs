@@ -5441,4 +5441,89 @@ mod create_intent {
 
         uninstall();
     }
+
+    /// The catalogue publishes a DIFF against what the host last announced,
+    /// not a replay: a quiet pass announces nothing, a new row lands exactly
+    /// one lifecycle `sessionAdded`, a moved field (the derived read bit's
+    /// flip) lands exactly one delta, a departed row lands one
+    /// `sessionRemoved`. The peer sweep polls on this licence — a replaying
+    /// catalogue is a 0.2Hz re-announce storm (re-ranked sidebars,
+    /// resurrected rows).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_catalogue_publishes_a_diff_not_a_replay() {
+        let _guards = install();
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        let store = manox_agent::thread_store::global();
+
+        let client = ahp::Client::connect(runtime.inproc(), ahp::ClientConfig::default())
+            .await
+            .expect("the in-process client connects");
+        client
+            .initialize(
+                "desktop".to_string(),
+                vec![ahp_types::version::PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes holding the catalogue root");
+        let mut root_sub = client
+            .attach_subscription(ahp_types::common::ROOT_RESOURCE_URI)
+            .await;
+
+        // A row the host never announced: exactly one lifecycle event.
+        store.with_mut(|st| st.insert_summary_for_test("s-diff", None));
+        runtime.catalogue_changed();
+        let event = next_root_event(&mut root_sub).await;
+        assert!(
+            matches!(event, ahp::SubscriptionEvent::SessionAdded(_)),
+            "a new row is a lifecycle announcement: {event:?}"
+        );
+
+        // A pass that changes nothing announces nothing.
+        runtime.catalogue_changed();
+        let quiet =
+            tokio::time::timeout(std::time::Duration::from_millis(300), root_sub.recv()).await;
+        assert!(quiet.is_err(), "a quiet pass is silent: {quiet:?}");
+
+        // The derived read bit's flip rides one delta.
+        store.with_mut(|st| {
+            assert!(st.note_settled("s-diff", chrono::Utc::now().timestamp()));
+        });
+        runtime.catalogue_changed();
+        let event = next_root_event(&mut root_sub).await;
+        assert!(
+            matches!(event, ahp::SubscriptionEvent::SessionSummaryChanged(_)),
+            "a known row's move is a delta: {event:?}"
+        );
+
+        // A row that leaves the active catalogue (an archive) is announced
+        // as removed — a diff-gated subscriber would keep it forever.
+        store.with_mut(|st| st.archive_thread("s-diff", true));
+        runtime.catalogue_changed();
+        let event = next_root_event(&mut root_sub).await;
+        assert!(
+            matches!(event, ahp::SubscriptionEvent::SessionRemoved(_)),
+            "the departure is announced: {event:?}"
+        );
+        uninstall();
+    }
+
+    async fn next_root_event(sub: &mut ahp::SessionSubscription) -> ahp::SubscriptionEvent {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, sub.recv())
+                .await
+                .expect("the event arrives")
+                .expect("the subscription stays open");
+            // Dispatch echoes land on the root sub too; the catalogue
+            // assertions care about the notification vocabulary only.
+            if !matches!(event, ahp::SubscriptionEvent::Action(_)) {
+                return event;
+            }
+        }
+    }
 }

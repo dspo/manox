@@ -2682,7 +2682,10 @@ impl Backend for RuntimeBackend {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
                 if !changed.is_read {
-                    tracing::debug!(session_id, "explicit mark-unread: derived read has no clear leg yet");
+                    tracing::debug!(
+                        session_id,
+                        "explicit mark-unread: derived read has no clear leg yet"
+                    );
                     return DispatchOutcome::Ignored;
                 }
                 if let Some(store) = manox_agent::thread_store::try_global() {
@@ -3827,8 +3830,7 @@ mod mcp_dispatch_tests {
             st.note_settled("s-derived", 1_000);
         });
         let unread = |store: &manox_agent::thread_store::StoreHandle| {
-            store
-                .read(|st| st.summary_by_id("s-derived").expect("seeded").has_unread)
+            store.read(|st| st.summary_by_id("s-derived").expect("seeded").has_unread)
         };
         assert!(unread(&store), "the settle lights the bit (no view yet)");
 
@@ -3873,8 +3875,7 @@ mod mcp_dispatch_tests {
         let is_read_bit = |id: &str| {
             store.read(|state| {
                 let row = state.summary_by_id(id).expect("the seeded row exists");
-                let summary =
-                    summary_from_row(row, state, None);
+                let summary = summary_from_row(row, state, None);
                 summary.status & ahp_types::state::SessionStatus::IsRead.bits() != 0
             })
         };

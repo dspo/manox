@@ -141,6 +141,12 @@ struct QueuedSubmit {
     origin: Option<String>,
 }
 
+/// How often the catalogue-serving process stat-sweeps the store for
+/// writes another process landed (a peer's view stamp, a run's settle).
+/// The stamps are already on disk, so this is a freshness knob, never a
+/// correctness premise — a missed tick only delays the surface.
+const PEER_SWEEP_CADENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The single gateway. Cloning shares the inner state.
 pub struct AgentServer(Arc<AgentServerInner>);
 
@@ -625,6 +631,29 @@ impl AgentServer {
                     inner.broadcast_threads_after_store_change();
                 }
             });
+            // The peer sweep: a process serving the catalogue polls the
+            // store so writes another process landed surface here (read
+            // stamps are sidecar facts — a peer's focus, a run's settle).
+            // Freshness, never correctness: the stamps are already on
+            // disk, a missed tick only delays. Weak on the store core — a
+            // replaced global or a test teardown retires the loop instead
+            // of pinning every stale core (`init` runs more than once in
+            // a process's lifetime).
+            let weak_store = store.downgrade();
+            manox_agent::runtime::handle().spawn(async move {
+                let mut tick = tokio::time::interval(PEER_SWEEP_CADENCE);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // The first tick fires immediately; the startup refresh
+                // already covered that pass.
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let Some(store) = weak_store.upgrade() else {
+                        return;
+                    };
+                    store.refresh();
+                }
+            });
         }
         let server = Self(inner);
         // The host wiring the engine's tool assembly consults: install
@@ -751,13 +780,16 @@ impl AgentServerInner {
     /// Announce that the session catalogue moved (a session appeared, was
     /// renamed, pinned, reordered or archived).
     ///
-    /// The adapter owns the delta vocabulary, so the gateway only raises the
-    /// event; see `SessionRuntime::catalogue_changed`.
+    /// The runtime's host owns the delta vocabulary — the published-map
+    /// diff lives on `AhpRuntime::catalogue_changed`. The old call routed
+    /// through the GATEWAY's trait method, whose default is a no-op: the
+    /// republish path never fired, which a replaying catalogue would have
+    /// hidden and a quiet one cannot.
     fn broadcast_threads_after_store_change(&self) {
         let Some(runtime) = manox_ahp_runtime::ahp::runtime::try_runtime() else {
             return;
         };
-        runtime.server().catalogue_changed();
+        runtime.catalogue_changed();
     }
 
     /// Drop one session's embedder tool registrations. Called wherever the
