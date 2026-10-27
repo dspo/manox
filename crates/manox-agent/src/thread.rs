@@ -4212,8 +4212,8 @@ pub(crate) mod tests {
     /// sidecar write is what every OTHER process (and the next boot) reads.
     /// Both legs ride the Settled notice — the one point every settle
     /// (cancel, fail, steer) funnels through, with no AHP client required.
-    #[tokio::test]
-    async fn a_settled_turn_stamps_the_store_and_the_sidecar() {
+    #[test]
+    fn a_settled_turn_stamps_the_store_and_the_sidecar() {
         let _store_lock = crate::thread_store::store_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4257,21 +4257,25 @@ pub(crate) mod tests {
         );
         assert!(stamped.1, "a settle with no view stamp is unread");
 
-        // The sidecar write is spawned; poll for it.
-        let sidecar = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let meta = manox_harness::session_meta::load(dir.path(), &session)
-                    .await
-                    .expect("the sidecar loads");
-                if meta.last_settled_at.is_some() {
-                    return meta.last_settled_at;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the settle stamp lands in the sidecar");
-        assert_eq!(sidecar, stamped.0, "one stamp, two homes, one value");
+        // The sidecar write is spawned; poll for it. Sync loop + block_on
+        // per read: the store lock is held for the whole test, so no await
+        // may appear in scope.
+        let sidecar = (0..250)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                crate::runtime::handle().block_on(async {
+                    manox_harness::session_meta::load(dir.path(), &session)
+                        .await
+                        .ok()?
+                        .last_settled_at
+                })
+            })
+            .expect("the settle stamp lands in the sidecar");
+        assert_eq!(
+            sidecar,
+            stamped.0.expect("stamped above"),
+            "one stamp, two homes, one value"
+        );
         crate::thread_store::drop_for_test();
     }
 }
