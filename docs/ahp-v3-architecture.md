@@ -878,6 +878,8 @@ claim 已入队的行，落到 `initial_path`。（该路径在 hermetic 测试 
 `pendingMessageRemoved{kind:Steering}`；为此 `steer` 的 receipt 新增 `injected` 字段——
 **这个事实无法从 journal 推出**：`ThreadEvent::SteerInjected` 被显式排除在落盘之外
 （`engine.rs` 的 `durable_journal_payload` 早退分支），宿主没有第二条途径得知。
+这条 `Steering` 折叠只是过渡形态：mid-run steer 的最终映射改为 turn 分区（§H.10，
+2026-10-27），pending 槽位只保留 wire `pendingMessageSet` 的寿命。
 
 **⑨ 门禁**：`script/gates.sh` 六腿全绿；grep 门禁（生产区零
 `manox_protocol|FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）
@@ -1053,3 +1055,47 @@ project 从未解析、create 的 config 被丢弃、中段排队的 `SetModel` 
   unfiled 不变；Reuse 不受影响；seeded create 同步落项目桶；create config → 首 turn 物化 →
   冷读折叠三键俱全；无 config 零落盘；坏 model/未知键/非字符串拒绝且零落盘）与 harness 的
   `test_handle_set_model_applies_next_turn`（中段排队 → 恰好一行 `model_change`）。
+
+### H.10 mid-run steer 折成 turn 分区：journal 顺序即阅读顺序（2026-10-27）
+
+- **症状**：桌面端（dspo/manox-app）在 agent 运行中发引导消息（⌘↩ →
+  `chat/pendingMessageSet{kind:'steering'}`），注入本身正确，但 transcript 把 agent 对引导的
+  回复（思考 + 长答）整体显示在引导消息**前面**，且永不逃逸——尾部 optimistic bubble 永远配
+  不上一个 turn。恢复（restore）后同样如此。
+- **根因**：journal 的 `turnStart` 每次 run 只有一条（内核每轮的 `TurnStart` 被
+  `adapt.rs` 压掉，`TurnStarted` 由 facade 每 run 发一次），注入的 user 行确实落在 journal 的
+  正确位置。病在 fold：`on_message` 的 user 分支在 turn 已开且已有内容时把该行折成
+  `ChatPendingMessageSet{Steering}`，落进 `ChatState.steeringMessage`——一个 journal 没有的
+  槽位。宿主在注入回执后发 Removed 清掉它（live 路径），而 restore 重放没有 Removed，槽位
+  残留；两种情况下 steer 文本都**没有持久行**，回复继续流进注入前的 turn，阅读顺序因此
+  反向。
+- **映射（本项目唯一事实源）**：`projection.rs::on_message` 的 user 行按 turn 状态分三路，与
+  §B.3 的客户端命令映射互不影响：
+  1. **无 turn 打开** → `chat/pendingMessageSet{kind:'queued'}`，进 `pending_user`，由下一个
+     `turnStart` 作为开场消息携带（不变）。
+  2. **turn 已开、尚无任何内容** → 该行是该 turn 的开场消息（journal 顺序 `turnStart` 在
+     前），以同 `turnId` 重发 `chat/turnStarted` 携带正文（不变）。
+  3. **turn 已开、已有真实内容** → mid-run steer：先按 turn 边界结清当前 turn（
+     `ChatTurnComplete`，Outcome=Complete——上一轮内容已完成、被 steer 接续），再以该 journal
+     行开新 turn：`chat/turnStarted{turnId:'t-<entry.id>', message: steer 文本,
+     queuedMessageId: 客户端 steer id（`originRpc`，缺失时 `m-<entry.id>`）}`。steer 行不再发
+     `pendingMessageSet`，也不进 `pending_user`。
+- **wire 生命周期不变**：客户端 Set 打开 `steeringMessage` 槽位；新 turn 的
+  `queuedMessageId` 与槽位 id 相同，reducer 在 `chat/turnStarted` 上按 id 清槽（与 idle wake
+  回执同一形状）。注入回执的 `pendingMessageRemoved` 仍照发，此时为 NoOp。
+- **不是 run 的终点**：分区的 `chat/turnCompleted` 携带
+  `_meta.x-manox.steerBoundary = true`。run 在同一条 journal 行上继续，所以客户端按「完成」
+  触发的 run 级动作（例如把排队消息冲成下一轮 turn）必须跳过该边界；run 自己的 `turnFinish`
+  不带此标记。
+- **边界**：连续多条 steer 各自开一个 turn（每条 user 行都必须可见；同一条回复落到最后一条
+  steer 的 turn）；steer 落在 turn 开场（initiating）仍走第 2 路；非 steering 的排队行为完全
+  不变。**附带收益**：restore 重放老 journal 时 mid-run steer 行同样折成 turn 行——不再依赖
+  下游对槽位的补偿清理。
+- **验证**：`projection.rs` 的 `fold_semantics_tests`（分区内容与顺序、steer turn 的
+  `queuedMessageId`、连续 steer、origin 缺失兜底、wire 槽位按 id 退休、重放确定性、idle
+  排队与 initiating 回归）与 `manox-ahp/tests/e2e_in_process.rs` 的
+  `a_steer_turn_started_retires_the_steering_slot`。
+- **伴随义务**：dspo/manox-app 停推 retire 时刻的尾部 optimistic bubble（改由 fold 行承载
+  显示）、按新语义重写 "steered bubble lands" 断言族、steered 徽章改由 `queuedMessageId`
+  行盖章、`steerBoundary` 的完成不触发 follow-up 队列结算；修复经 release/0.6 的下一个
+  v0.6.x tag bump 消费。
