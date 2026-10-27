@@ -57,7 +57,6 @@ pub struct ConversationRow {
     pub title: Option<String>,
     pub pinned: bool,
     pub archived: bool,
-    pub unread: bool,
     pub errored: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -477,17 +476,6 @@ impl ObjectStore {
         })
     }
 
-    /// The unread / errored display bits.
-    pub fn set_unread(&self, id: &str, unread: bool) {
-        with(|conn| {
-            conn.execute(
-                "UPDATE conversations SET unread = ?1, updated_at = ?2 WHERE id = ?3",
-                params![unread, now(), id],
-            )
-            .expect("unread update");
-        })
-    }
-
     pub fn set_errored(&self, id: &str, errored: bool) {
         with(|conn| {
             conn.execute(
@@ -516,7 +504,7 @@ impl ObjectStore {
         with(|conn| {
             conn.query_row(
                 "SELECT id, project_id, model_provider, model_id, permission_mode, \
-                 reasoning_effort, draft, title, pinned, archived, unread, errored, \
+                 reasoning_effort, draft, title, pinned, archived, errored, \
                  created_at, updated_at, last_human_message_at, config_version \
                  FROM conversations WHERE id = ?1",
                 params![id],
@@ -535,7 +523,7 @@ impl ObjectStore {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, project_id, model_provider, model_id, permission_mode, \
-                     reasoning_effort, draft, title, pinned, archived, unread, errored, \
+                     reasoning_effort, draft, title, pinned, archived, errored, \
                      created_at, updated_at, last_human_message_at, config_version \
                      FROM conversations \
                      WHERE last_human_message_at IS NOT NULL \
@@ -567,7 +555,7 @@ impl ObjectStore {
         with(|conn| {
             conn.query_row(
                 "SELECT id, project_id, model_provider, model_id, permission_mode, \
-                 reasoning_effort, draft, title, pinned, archived, unread, errored, \
+                 reasoning_effort, draft, title, pinned, archived, errored, \
                  created_at, updated_at, last_human_message_at, config_version \
                  FROM conversations \
                  WHERE last_human_message_at IS NULL AND \
@@ -594,12 +582,11 @@ fn conversation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversati
         title: row.get(7)?,
         pinned: row.get::<_, i64>(8)? != 0,
         archived: row.get::<_, i64>(9)? != 0,
-        unread: row.get::<_, i64>(10)? != 0,
-        errored: row.get::<_, i64>(11)? != 0,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
-        last_human_message_at: row.get(14)?,
-        config_version: row.get(15)?,
+        errored: row.get::<_, i64>(10)? != 0,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        last_human_message_at: row.get(13)?,
+        config_version: row.get(14)?,
     })
 }
 
@@ -661,7 +648,7 @@ impl ObjectStore {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, project_id, model_provider, model_id, permission_mode, \
-                     reasoning_effort, draft, title, pinned, archived, unread, errored, \
+                     reasoning_effort, draft, title, pinned, archived, errored, \
                      created_at, updated_at, last_human_message_at, config_version \
                      FROM conversations",
                 )

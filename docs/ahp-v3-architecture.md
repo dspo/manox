@@ -406,11 +406,26 @@ confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
   `chat/toolCallConfirmed`→`respond_authorization`；`chat/inputCompleted`→`respond_question`；
   `session/configChanged`→`set_model`/`set_reasoning_effort`/`set_access_mode` 扇出；
   `session/workingDirectorySet`→`set_cwd`；`session/isArchivedChanged`→`archive_thread`。
-  实施期修订：`SessionIsReadChanged`/`ChatDraftChanged`/`ChatTurnResume`/
+  实施期修订：`ChatDraftChanged`/`ChatTurnResume`/
   `ChatToolCallResultConfirmed`/`ChatInputAnswerChanged`/`ChatQueuedMessagesReordered`/
-  `SessionActiveClientRemoved` 归 **`Ignored`**（reducer 已折叠、运行时无对应 intent），
-  回显而非拒绝——拒绝会告诉订阅者「你看得见的状态不是真的」。
+  `SessionActiveClientRemoved`（及 chat 级 `ChatIsReadChanged`）归 **`Ignored`**
+  （reducer 已折叠、运行时无对应 intent），回显而非拒绝——拒绝会告诉订阅者「你看得见的
+  状态不是真的」。
   **`SessionTitleChanged` 不在此列**：重命名实现为真动作（见 §H.2d）。
+  **`SessionIsReadChanged` 亦不在此列（2026-10-27 起为派生 read 的 view 输入）**：read 是
+  宿主的派生事实——`IsRead` 由 sidecar 的两个单调时间戳比较得出（`last_settled_at` 与
+  `last_viewed_at`，规则唯一一份在 `manox_agent::db::derive_unread`：**有 turn 在上次查看
+  之后落定 = 未读**）。`isReadChanged(true)` 腿 = 记一次查看（`mark_viewed`，单调 max）；
+  `false` 腿（显式标未读）**无派生语义、保持 reducer-only 回显**——纯派生模型下显式未读
+  对无 settled 事实的会话无物可标，物化它会造出第二个 read 真相源。落定戳由宿主在
+  `BackendNotice::Settled`（每次 run 唯一通用落定点，取消/失败同臂）写入，与是否有 AHP
+  客户端在场无关；跨进程靠宿主 peer sweep（5s，新鲜度不是正确性——时间戳已在盘上）。
+  停靠行（本进程未 fold 的会话）与 live 行共用同一张位表（`row_status_bits`），read 位从
+  派生来，从未订阅过的会话不再一律读成未读。catalogue 传播为 published-map diff：
+  `sessionAdded` 每宿主一次（生命周期）、已知行走 `sessionSummaryChanged` delta（read 翻转
+  随行）、离开 active 目录（对端归档/dispose）发 `sessionRemoved`——**removed 表达「离开
+  目录」而非严格 dispose**（拍板见 §H.2c 备注：与下游行处理吻合；带 IsArchived 的 delta
+  要下游先合并 delta 才有意义）。安静 pass 零通知——这是 sweep 的轮询许可。
 - **审批身份单源**：settle key 走 action 的 `_meta["x-manox"]["authId"]`——即 translator 生成
   `toolCallReady` 时盖的同一个 key。**没有 authId 的确认不 settle**（`Ignored`）：猜一个身份会去
   回答**另一个** pending call。
