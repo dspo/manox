@@ -31,7 +31,15 @@ pub struct ThreadSummary {
     pub pinned: bool,
     /// User-assigned tag shown as a chip on the sidebar row.
     pub tag: Option<String>,
-    /// Unread flag: the thread finished a turn the user has not yet viewed.
+    /// Unix seconds of the last turn that settled in this session. Never
+    /// written by a viewer; the merge takes the max with what this process
+    /// already holds.
+    pub last_settled_at: Option<i64>,
+    /// Unix seconds of the last observed view. Merge takes the max.
+    pub last_viewed_at: Option<i64>,
+    /// Derived attention bit: a turn settled after the last observed view
+    /// ([`derive_unread`]). Never write it directly — recompute from the
+    /// two inputs.
     pub has_unread: bool,
     /// Error flag: the last turn ended in a fatal error.
     pub errored: bool,
@@ -58,6 +66,36 @@ impl ThreadSummary {
         }
         &self.project
     }
+
+    /// Re-derive the two monotone inputs into the attention bit, folding the
+    /// stamps this process may hold beyond its last scan (`pending_viewed`).
+    pub fn derive_has_unread(&self, pending_viewed: Option<i64>) -> bool {
+        derive_unread(self.last_settled_at, self.last_viewed_at.max(pending_viewed))
+    }
+
+    /// Fold `other`'s monotone stamps into `self` (take the max each), then
+    /// re-derive the attention bit. Returns whether the bit flipped.
+    pub fn merge_stamps(&mut self, settled: Option<i64>, viewed: Option<i64>) -> bool {
+        if let Some(at) = settled {
+            self.last_settled_at = Some(self.last_settled_at.map_or(at, |prev| prev.max(at)));
+        }
+        if let Some(at) = viewed {
+            self.last_viewed_at = Some(self.last_viewed_at.map_or(at, |prev| prev.max(at)));
+        }
+        let was = self.has_unread;
+        self.has_unread = derive_unread(self.last_settled_at, self.last_viewed_at);
+        self.has_unread != was
+    }
+}
+
+/// The one read rule: a session is unread when a turn settled after the last
+/// time it was viewed. Both inputs are monotone wall-clock stamps; a missing
+/// view stamp means "never looked", so any settled turn reads unread; a
+/// missing settle stamp means "nothing settled since tracking began" (the
+/// upgrade path), which reads clear. Strict comparison, second precision —
+/// a settle and a view in the same second read as viewed (conservative).
+pub fn derive_unread(settled: Option<i64>, viewed: Option<i64>) -> bool {
+    settled.is_some_and(|at| at > viewed.unwrap_or(i64::MIN))
 }
 
 /// The `custom_type` tag of session entries carrying a [`UiNoteRecord`].

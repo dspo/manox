@@ -92,6 +92,17 @@ pub struct ThreadStore {
     /// a meta with no log (the v1 black-hole class). Flushed the moment the
     /// journal file appears.
     pending_working_dirs: HashMap<String, Vec<String>>,
+    /// View stamps observed before the session's sidecar path materialized
+    /// (a brand-new session the AHP face focused before its first scan):
+    /// id → stamp. Written to the sidecar the moment the path appears, and
+    /// merged into the derived bit until a scan OBSERVES the stamp on disk
+    /// (the `decision_overlay` discipline — a scan that read a stale
+    /// sidecar must never publish over a fresher in-memory stamp).
+    pending_viewed: HashMap<String, i64>,
+    /// Set once the first reconcile has landed. The broadcast gate keys on
+    /// a real row-set change, but the very first pass must announce — the
+    /// subscribers start with empty partitions.
+    scanned_once: bool,
 }
 
 /// One queued sidecar write, drained by [`StoreHandle::with_mut`] once the
@@ -326,6 +337,47 @@ impl StoreHandle {
             let (session_paths, summaries, archived) = group_by_thread(rows, &registry);
             let mut summaries = summaries;
             resolve_depths(&mut summaries);
+            // The scan read the sidecars as of the pass's head; stamps this
+            // process holds beyond that (a queued view write not yet
+            // observed, a settle stamped in memory ahead of its disk write)
+            // must not be published over. Merge the old in-memory rows'
+            // monotone inputs into the fresh rows, then the parked views on
+            // top; a park whose stamp the disk now carries retires.
+            let mut held: HashMap<String, (Option<i64>, Option<i64>)> = HashMap::new();
+            for row in s.summaries.iter().chain(s.archived_summaries.iter()) {
+                held.insert(
+                    row.id.clone(),
+                    (row.last_settled_at, row.last_viewed_at),
+                );
+            }
+            for summary in &mut summaries {
+                if let Some((settled, viewed)) = held.get(&summary.id) {
+                    summary.merge_stamps(*settled, *viewed);
+                }
+                let Some(parked) = s.pending_viewed.get(&summary.id).copied() else {
+                    continue;
+                };
+                if summary.last_viewed_at.is_some_and(|at| at >= parked) {
+                    s.pending_viewed.remove(&summary.id);
+                } else {
+                    summary.merge_stamps(None, Some(parked));
+                    // The sidecar path materialized since the view was
+                    // parked: the stamp can finally land on disk.
+                    if session_paths.contains_key(&summary.id)
+                        && !s.session_paths.contains_key(&summary.id)
+                    {
+                        s.persist_view_stamp(&summary.id, parked);
+                    }
+                }
+            }
+            // Broadcast only on a real change: a quiet pass (a sweep tick
+            // over an idle store, a fingerprint-identical rescan) must not
+            // re-rank sidebars or re-announce the catalogue. The first pass
+            // announces unconditionally — the subscribers start empty.
+            let changed = s.scanned_once
+                && (s.summaries != summaries
+                    || s.archived_summaries != archived
+                    || s.session_paths != session_paths);
             s.session_paths = session_paths;
             s.flush_materialized_working_dirs();
             s.summaries = summaries;
@@ -335,7 +387,10 @@ impl StoreHandle {
             s.order = order;
             s.rerank();
             s.apply_decision_overlay();
-            s.pending_events.push(ThreadStoreEvent::SummariesUpdated);
+            if changed || !s.scanned_once {
+                s.pending_events.push(ThreadStoreEvent::SummariesUpdated);
+            }
+            s.scanned_once = true;
         });
     }
 
@@ -434,6 +489,8 @@ pub fn init() {
         pending_events: Vec::new(),
         pending_meta_writes: Vec::new(),
         pending_working_dirs: HashMap::new(),
+        pending_viewed: HashMap::new(),
+        scanned_once: false,
     });
     handle.refresh();
     *GLOBAL.lock().unwrap() = Some(handle);
@@ -783,17 +840,54 @@ impl ThreadStore {
         }
     }
 
-    /// Set the unread flag on a session (persisted in its sidecar).
-    pub fn set_unread(&mut self, id: &str, unread: bool) {
-        if let Some(s) = self.summary_mut(id)
-            && s.has_unread == unread
-        {
-            return;
+    /// A turn settled: record the stamp and re-derive the attention bit.
+    /// Monotone (max); returns whether the bit flipped — the sidebar
+    /// re-renders then. A row this store has not scanned yet no-ops here:
+    /// the host's own sidecar write (independent of this store) lands the
+    /// stamp on disk, and the next scan derives from it.
+    pub fn note_settled(&mut self, id: &str, at: i64) -> bool {
+        let Some(summary) = self.summary_mut(id) else {
+            return false;
+        };
+        if summary.merge_stamps(Some(at), None) {
+            self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
+            true
+        } else {
+            false
         }
-        if let Some(s) = self.summary_mut(id) {
-            s.has_unread = unread;
+    }
+
+    /// A view observation from the AHP face (`isReadChanged(true)`):
+    /// monotone, idempotent, never lowers the stamp. Rows whose sidecar
+    /// path has not materialized yet (a brand-new session focused before
+    /// its first scan) park the stamp in memory — [`Self::refresh_now`]
+    /// lands it on disk the moment the path appears. Returns whether the
+    /// attention bit flipped.
+    pub fn mark_viewed(&mut self, id: &str, at: i64) -> bool {
+        let flipped = match self.summary_mut(id) {
+            Some(summary) => {
+                let flipped = summary.merge_stamps(None, Some(at));
+                if self.session_paths.contains_key(id) {
+                    self.persist_view_stamp(id, at);
+                }
+                flipped
+            }
+            None => false,
+        };
+        let parked = self.pending_viewed.entry(id.to_string()).or_insert(0);
+        *parked = (*parked).max(at);
+        if flipped {
+            self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
         }
-        self.write_meta(id, move |meta| meta.unread = unread);
+        flipped
+    }
+
+    /// Queue the view stamp's sidecar write: max against disk, never a
+    /// lowering (a peer's fresher stamp survives a stale dispatch).
+    fn persist_view_stamp(&mut self, id: &str, at: i64) {
+        self.write_meta(id, move |meta| {
+            meta.last_viewed_at = Some(meta.last_viewed_at.map_or(at, |prev| prev.max(at)));
+        });
     }
 
     /// Rename a session: the user's title, durable in the journal and the
@@ -1156,6 +1250,8 @@ impl ThreadStore {
             archived: false,
             pinned: false,
             tag: None,
+            last_settled_at: None,
+            last_viewed_at: None,
             has_unread: false,
             errored: false,
             created_at: 0,
@@ -1718,7 +1814,11 @@ fn summary_from_cached(
         archived: meta.archived,
         pinned: meta.pinned,
         tag: meta.tag.clone(),
-        has_unread: meta.unread,
+        // The two monotone read inputs; the bit derives from them (§ the one
+        // read rule in `crate::db`).
+        last_settled_at: meta.last_settled_at,
+        last_viewed_at: meta.last_viewed_at,
+        has_unread: crate::db::derive_unread(meta.last_settled_at, meta.last_viewed_at),
         errored: meta.errored,
         created_at: entry.created_at.timestamp(),
         interacted_at: meta.interacted_at.unwrap_or(modified_at.timestamp()),
@@ -1995,6 +2095,8 @@ pub fn standalone_for_test() -> StoreHandle {
         pending_events: Vec::new(),
         pending_meta_writes: Vec::new(),
         pending_working_dirs: HashMap::new(),
+        pending_viewed: HashMap::new(),
+        scanned_once: false,
     })
 }
 
@@ -2229,6 +2331,8 @@ mod tests {
             pending_events: Vec::new(),
             pending_meta_writes: Vec::new(),
             pending_working_dirs: HashMap::new(),
+            pending_viewed: HashMap::new(),
+            scanned_once: false,
         })
     }
 
@@ -2439,6 +2543,8 @@ mod tests {
             pending_events: Vec::new(),
             pending_meta_writes: Vec::new(),
             pending_working_dirs: HashMap::new(),
+            pending_viewed: HashMap::new(),
+            scanned_once: false,
         });
         restarted.refresh_now().await;
         assert_eq!(
@@ -2476,6 +2582,8 @@ mod tests {
             pending_events: Vec::new(),
             pending_meta_writes: Vec::new(),
             pending_working_dirs: HashMap::new(),
+            pending_viewed: HashMap::new(),
+            scanned_once: false,
         });
         assert!(reopened.read(|s| s.known_projects.contains(&"/p/a".to_string())));
     }
@@ -2586,6 +2694,8 @@ mod tests {
             archived,
             pinned: false,
             tag: None,
+            last_settled_at: None,
+            last_viewed_at: None,
             has_unread: false,
             errored: false,
             created_at: 0,
@@ -2984,6 +3094,8 @@ mod tests {
             archived: false,
             pinned: false,
             tag: None,
+            last_settled_at: None,
+            last_viewed_at: None,
             has_unread: false,
             errored: false,
             created_at: 0,
@@ -3438,5 +3550,150 @@ mod tests {
         assert_eq!(ids(&store), vec!["t2", "t1"]);
         std::fs::remove_file(&scratch).ok();
         crate::sidebar_order::set_order_path_for_test(None);
+    }
+
+    // ── the read rule: two monotone stamps, one derived bit ────────────────
+
+    /// The one read rule's table: a session is unread when a turn settled
+    /// after the last time it was viewed. Missing stamps mean "never
+    /// looked" (any settle reads unread) and "nothing settled since
+    /// tracking" (the upgrade path, clear), and the strict comparison makes
+    /// a same-second settle+view read as viewed.
+    #[test]
+    fn the_read_rule_is_settled_after_viewed() {
+        use crate::db::derive_unread;
+        assert!(!derive_unread(None, None), "the upgrade path reads clear");
+        assert!(
+            derive_unread(Some(100), None),
+            "a settled turn nobody viewed is unread"
+        );
+        assert!(!derive_unread(None, Some(100)), "nothing settled is clear");
+        assert!(!derive_unread(Some(100), Some(200)), "viewed after settle is clear");
+        assert!(
+            !derive_unread(Some(200), Some(200)),
+            "a same-second settle+view reads viewed (second precision, conservative)"
+        );
+        assert!(derive_unread(Some(201), Some(200)), "settled after view is unread");
+    }
+
+    /// The stamps are monotone (max) and the bit re-derives on every merge;
+    /// stale writes — a late settle older than the view, a late view older
+    /// than the settle — change nothing.
+    #[test]
+    fn stamps_merge_monotone_and_rederive_the_bit() {
+        let mut row = crate::db::ThreadSummary {
+            id: "t-merge".to_string(),
+            ..Default::default()
+        };
+        assert!(row.merge_stamps(Some(100), None), "the first settle lights");
+        assert!(
+            !row.merge_stamps(Some(50), None),
+            "a stale settle neither lowers the stamp nor flips the bit"
+        );
+        assert!(row.merge_stamps(None, Some(200)), "the view clears it");
+        assert!(
+            !row.merge_stamps(None, Some(100)),
+            "a stale view never re-lights it"
+        );
+        assert!(row.merge_stamps(Some(300), None), "a fresh settle re-lights");
+        assert_eq!(row.last_settled_at, Some(300));
+        assert_eq!(row.last_viewed_at, Some(200));
+    }
+
+    /// A view the store cannot persist yet (the session's sidecar path has
+    /// not materialized) parks in memory and survives the first scan that
+    /// materializes the row — without it, "watched from birth" sessions
+    /// would light as unread on their first settle. The park retires only
+    /// once the disk carries the stamp (the decision-overlay discipline).
+    #[tokio::test]
+    async fn a_view_for_an_unscanned_session_parks_until_the_scan_materializes_it() {
+        let _db_path = temp_db();
+        let store = standalone_for_test();
+        crate::runtime::init_hermetic_for_test();
+
+        // No row, no path: the view parks and lights nothing.
+        store.with_mut(|s| assert!(!s.mark_viewed("t-parked", 500)));
+        assert_eq!(store.read(|s| s.pending_viewed.get("t-parked").copied()), Some(500));
+
+        let dir = store.read(|s| s.sessions_dir.clone());
+        write_session_fixture(&dir, "t-parked", "hello");
+        store.refresh_now().await;
+        let stamps = |store: &StoreHandle| {
+            store
+                .read(|s| s.summary_by_id("t-parked").map(|row| {
+                    (row.last_viewed_at, row.has_unread)
+                }))
+                .expect("the scan materialized the row")
+        };
+        assert_eq!(
+            stamps(&store),
+            (Some(500), false),
+            "the parked view survives the scan that materializes the row: \
+             the session reads viewed (nothing settled yet), not 'never looked'"
+        );
+        assert!(
+            !store.read(|s| s.pending_viewed.is_empty()),
+            "the park holds until the disk carries the stamp"
+        );
+
+        // The queued sidecar write drains at the next pass's head; the scan
+        // then OBSERVES the stamp on disk and retires the park.
+        store.refresh_now().await;
+        assert_eq!(
+            stamps(&store),
+            (Some(500), false),
+            "the disk carries the view now — still read"
+        );
+        assert!(
+            store.read(|s| s.pending_viewed.is_empty()),
+            "an observed park retires"
+        );
+
+        // And the rule the park existed for: a settle after the view lights.
+        store.with_mut(|s| assert!(s.note_settled("t-parked", 600)));
+        assert!(stamps(&store).1, "a settle after the view is unread");
+    }
+
+    /// The sweep's licence to poll: a pass over an unchanged store
+    /// broadcasts nothing. Quiet passes are what keep the 5s tick a
+    /// freshness knob instead of a re-announce storm (a re-ranked sidebar,
+    /// a re-published catalogue row).
+    #[tokio::test]
+    async fn a_quiet_pass_broadcasts_nothing() {
+        let _db_path = temp_db();
+        let store = standalone_for_test();
+        crate::runtime::init_hermetic_for_test();
+        let dir = store.read(|s| s.sessions_dir.clone());
+        write_session_fixture(&dir, "t-quiet", "hello");
+        let rx = store.subscribe();
+
+        store.refresh_now().await;
+        let announced = count_summaries_updated(&rx);
+        assert!(announced >= 1, "the first pass announces unconditionally");
+
+        store.refresh_now().await;
+        assert_eq!(
+            count_summaries_updated(&rx),
+            0,
+            "a fingerprint-identical pass is silent"
+        );
+
+        // A real change still announces: a settle flips the derived bit.
+        store.with_mut(|s| {
+            assert!(s.note_settled("t-quiet", 42));
+        });
+        assert_eq!(
+            count_summaries_updated(&rx),
+            1,
+            "the derived bit's flip is announced"
+        );
+    }
+
+    fn count_summaries_updated(rx: &async_channel::Receiver<Arc<ThreadStoreEvent>>) -> usize {
+        let mut count = 0;
+        while let Ok(ev) = rx.try_recv() {
+            count += usize::from(matches!(*ev, ThreadStoreEvent::SummariesUpdated));
+        }
+        count
     }
 }

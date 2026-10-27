@@ -3229,6 +3229,8 @@ fn session_info_to_summary(
         pinned: false,
         // The actor's mirror never reads the sidecar; tags stay sidebar-only.
         tag: None,
+        last_settled_at: None,
+        last_viewed_at: None,
         has_unread: false,
         errored: false,
         created_at: info.created_at.timestamp(),
