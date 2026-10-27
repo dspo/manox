@@ -1659,14 +1659,13 @@ fn summary_from_row(
     let facts_title = seeded.as_ref().map(|facts| facts.title.clone());
     let (status, activity, directories) = match seeded {
         Some(facts) => (facts.status, facts.activity, facts.directories),
-        // A session the store knows and this host has not folded: idle unless a
-        // turn is live in this process.
+        // A session the store knows and this host has not folded: the
+        // shared bit table answers from the row alone — the derived read
+        // bit included, so a never-folded session does not read as unread
+        // (the 99+ class). One table for the parked and the live answer:
+        // two tables drift.
         None => (
-            if store.is_running(&row.id) {
-                ahp_types::state::SessionStatus::InProgress.bits()
-            } else {
-                ahp_types::state::SessionStatus::Idle.bits()
-            },
+            super::row_status_bits(None, row, store.is_running(&row.id), false),
             None,
             None,
         ),
@@ -3861,6 +3860,34 @@ mod mcp_dispatch_tests {
             "the mark-unread echo has no derived semantics to change"
         );
         manox_agent::thread_store::drop_for_test();
+    }
+
+    /// The parked list answer carries the row's derived read state: an
+    /// unread row keeps `IsRead` down (it counts as attention), a read row
+    /// carries `IsRead` — a session this host never subscribed must not
+    /// read as unread just because it never subscribed.
+    #[test]
+    fn a_parked_row_serves_its_scanned_read_bit() {
+        crate::test_support::init_globals();
+        let store = manox_agent::thread_store::standalone_for_test();
+        let is_read_bit = |id: &str| {
+            store.read(|state| {
+                let row = state.summary_by_id(id).expect("the seeded row exists");
+                let summary =
+                    summary_from_row(row, state, None);
+                summary.status & ahp_types::state::SessionStatus::IsRead.bits() != 0
+            })
+        };
+        store.with_mut(|st| {
+            st.insert_summary_for_test("s-unread", None);
+            st.insert_summary_for_test("s-read", None);
+            st.note_settled("s-unread", 42);
+        });
+        assert!(
+            !is_read_bit("s-unread"),
+            "the unread parked row keeps IsRead down"
+        );
+        assert!(is_read_bit("s-read"), "the read parked row carries IsRead");
     }
 }
 
