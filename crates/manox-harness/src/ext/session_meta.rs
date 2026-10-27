@@ -329,14 +329,19 @@ mod tests {
             title: Some("fix the widget".into()),
             project: Some("/p/a".into()),
             pinned: true,
-            unread: true,
+            last_settled_at: Some(1_700_000_000),
             ..Default::default()
         };
         save(dir.path(), &session, &meta).await.unwrap();
         let loaded = load(dir.path(), &session).await.unwrap();
         assert_eq!(loaded.title.as_deref(), Some("fix the widget"));
         assert_eq!(loaded.project.as_deref(), Some("/p/a"));
-        assert!(loaded.pinned && loaded.unread && !loaded.archived && !loaded.errored);
+        assert!(
+            loaded.pinned
+                && loaded.last_settled_at == Some(1_700_000_000)
+                && !loaded.archived
+                && !loaded.errored
+        );
     }
 
     #[tokio::test]
