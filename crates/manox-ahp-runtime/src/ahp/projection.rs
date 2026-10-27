@@ -5867,3 +5867,130 @@ mod config_seat_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tool_output_content_tests {
+    use super::*;
+
+    fn kernel(mut fields: Value) -> SessionTreeEntry {
+        let mut base = json!({
+            "id": "e-1",
+            "parentId": None::<String>,
+            "timestamp": "2026-10-21T00:00:00.000Z",
+        });
+        let object = base.as_object_mut().expect("base is an object");
+        if let Some(extra) = fields.as_object_mut() {
+            object.append(extra);
+        }
+        serde_json::from_value(base.clone())
+            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
+    }
+
+    fn records() -> Vec<SessionTreeEntry> {
+        vec![
+            kernel(json!({"type": "turn_start", "id": "e-1"})),
+            kernel(json!({
+                "type": "tool_call", "id": "e-2", "callId": "t-1",
+                "name": "Bash", "title": "test", "status": "running",
+            })),
+            kernel(json!({
+                "type": "tool_output_chunk", "id": "e-3", "callId": "t-1", "chunk": "a",
+            })),
+            kernel(json!({
+                "type": "tool_output_chunk", "id": "e-4", "callId": "t-1", "chunk": "b",
+            })),
+            kernel(json!({
+                "type": "tool_output_chunk", "id": "e-5", "callId": "t-1", "chunk": "c",
+            })),
+            kernel(json!({
+                "type": "tool_result", "id": "e-6", "callId": "t-1",
+                "output": "abc", "isError": false,
+            })),
+        ]
+    }
+
+    /// The partial text one `chat/toolCallContentChanged` emission carried.
+    fn content_text(changed: &ChatToolCallContentChangedAction) -> String {
+        changed
+            .content
+            .iter()
+            .map(|block| match block {
+                ToolResultContent::Text(text) => text.text.clone(),
+                other => panic!("unexpected content block: {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// The client reducer REPLACES a running call's content array on every
+    /// `chat/toolCallContentChanged`, so each emission must carry the whole
+    /// partial text so far — a latest-chunk emission would leave the fold
+    /// holding only the newest fragment.
+    #[test]
+    fn content_changed_carries_the_accumulated_output_not_the_latest_chunk() {
+        let mut translator = Translator::new();
+        let mut texts = Vec::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        for (seq, entry) in records().iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatToolCallContentChanged(changed) = &emitted.action {
+                    texts.push(content_text(changed));
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        assert_eq!(texts, vec!["a", "ab", "abc"]);
+        let settled = match tool_call_part(&state) {
+            ToolCallState::Completed(completed) => completed,
+            other => panic!("the result row settles the call: {other:?}"),
+        };
+        assert_eq!(
+            settled.content,
+            Some(vec![ToolResultContent::Text(ToolResultTextContent {
+                text: "abc".into()
+            })]),
+            "the settled call keeps the full content its emissions accumulated"
+        );
+    }
+
+    /// The accumulation lives in the projection's own bookkeeping, so a fresh
+    /// translator folding the same journal must reproduce the emission stream
+    /// byte for byte — that equality is what makes a re-subscribe's baseline
+    /// and a live subscriber's stream agree.
+    #[test]
+    fn replaying_the_journal_reproduces_the_content_emissions_byte_for_byte() {
+        let mut live = Translator::new();
+        let mut replay = Translator::new();
+        let mut live_emissions = Vec::new();
+        let mut replayed_emissions = Vec::new();
+        for (seq, entry) in records().iter().enumerate() {
+            live_emissions.extend(live.on_entry("c-1", "s-1", seq as u64, entry));
+            replayed_emissions.extend(replay.on_entry("c-1", "s-1", seq as u64, entry));
+        }
+        assert_eq!(live_emissions, replayed_emissions);
+        let content: Vec<_> = replayed_emissions
+            .iter()
+            .filter_map(|emitted| match &emitted.action {
+                StateAction::ChatToolCallContentChanged(changed) => Some(content_text(changed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, vec!["a", "ab", "abc"]);
+    }
+
+    /// The turn's tool-call part, for the fold-state assertions.
+    fn tool_call_part(state: &ChatState) -> &ahp_types::state::ToolCallState {
+        let parts = &state
+            .active_turn
+            .as_ref()
+            .expect("an active turn")
+            .response_parts;
+        parts
+            .iter()
+            .find_map(|part| match part {
+                ahp_types::state::ResponsePart::ToolCall(call) => Some(&call.tool_call),
+                _ => None,
+            })
+            .expect("a tool call part")
+    }
+}
