@@ -272,6 +272,87 @@ async fn derived_actions_follow_the_accepted_echo() {
     );
 }
 
+/// A mid-run steer's journal row folds into a turn that retires the client's
+/// steering slot by id.
+///
+/// The wire shape is unchanged: the client's optimistic
+/// `pendingMessageSet{Steering}` opens the slot. The row that follows is a new
+/// `turnStarted` carrying the same id as `queuedMessageId` — not a second
+/// pending message — and the reducer matches that id against the slot. This is
+/// the whole lifetime of the slot: nothing clears `steeringMessage` on turn
+/// end, so a row that did not name the id would leave it rendering forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steer_turn_started_retires_the_steering_slot() {
+    use ahp_types::actions::{ChatPendingMessageSetAction, ChatTurnStartedAction};
+    use ahp_types::state::{Message, MessageKind, MessageOrigin, PendingMessageKind};
+
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![TestBackend::chat_uri()],
+        )
+        .await
+        .expect("initializes");
+    let mut sub = client.attach_subscription(&TestBackend::chat_uri()).await;
+
+    let steer = Message {
+        text: "use the fast suite".to_string(),
+        origin: MessageOrigin {
+            kind: MessageKind::User,
+        },
+        attachments: None,
+        model: None,
+        agent: None,
+        meta: None,
+    };
+    client
+        .dispatch(
+            TestBackend::chat_uri(),
+            StateAction::ChatPendingMessageSet(ChatPendingMessageSetAction {
+                kind: PendingMessageKind::Steering,
+                id: "steer-1".to_string(),
+                message: steer.clone(),
+            }),
+        )
+        .await
+        .expect("dispatches");
+    let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("echo arrives")
+        .expect("subscription open");
+    assert!(matches!(event, ahp::SubscriptionEvent::Action(_)));
+    let chat = host.chat_state("c-1").expect("the chat is seeded");
+    assert_eq!(
+        chat.steering_message.as_ref().map(|m| m.id.as_str()),
+        Some("steer-1"),
+        "the optimistic echo opened the slot"
+    );
+
+    host.publish(
+        &TestBackend::chat_uri(),
+        StateAction::ChatTurnStarted(ChatTurnStartedAction {
+            turn_id: "t-e-9".to_string(),
+            started_at: "2026-10-27T00:00:00.000Z".to_string(),
+            message: steer,
+            queued_message_id: Some("steer-1".to_string()),
+            meta: None,
+        }),
+        None,
+    );
+
+    let chat = host.chat_state("c-1").expect("the chat is seeded");
+    assert!(
+        chat.steering_message.is_none(),
+        "the steer's turnStarted retired the slot by id: {:?}",
+        chat.steering_message
+    );
+    let active = chat.active_turn.expect("the steer opened a turn");
+    assert_eq!(active.message.text, "use the fast suite");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn undeclared_action_is_echoed_with_a_rejection_reason() {
     let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
