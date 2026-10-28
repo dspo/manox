@@ -426,6 +426,15 @@ confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
   随行）、离开 active 目录（对端归档/dispose）发 `sessionRemoved`——**removed 表达「离开
   目录」而非严格 dispose**（拍板见 §H.2c 备注：与下游行处理吻合；带 IsArchived 的 delta
   要下游先合并 delta 才有意义）。安静 pass 零通知——这是 sweep 的轮询许可。
+  2026-10-28 补 session 摘要的 status 来源（第二处 review 收尾）：摘要的
+  `InProgress`/`InputNeeded` 不再从**订阅快照**里取。`InProgress` 来自 store 的
+  running 集（由宿主的 turn 边维护；只覆盖**本进程驱动**的会话，对端驱动的 turn
+  在本进程不亮——进程内事实，已知边界）；`InputNeeded` 来自 store 的 pending-auth
+  集（tool authorization 卡进入/裁决时维护）**并**叠加宿主 fold 里 journalled 的
+  `InputNeeded`（审批行折出的位，`row_status_bits` 只从 fold 取
+  `InputNeeded`/`IsArchived` 两位，`InProgress` 绝不从 fold 取以免把陈旧的订阅快照
+  复活成运行中）；seeded 摘要的 `activity`/`working_directories` 取宿主**当前**
+  fold（`session_summary_live`），订阅快照只作为宿主状态缺失时的兜底。
   2026-10-28 补三句（review/addendum 定稿）：**① 读位翻转由宿主 publish 到 session 通道**
   （`catalogue_changed` 在 IsRead 相对 published 翻转且宿主持有该会话状态时发
   `session/isReadChanged`；host publish 不经 dispatch，不回环）——fold-first 的 attached
