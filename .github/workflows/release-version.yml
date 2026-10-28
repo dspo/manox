@@ -1,0 +1,26 @@
+# The release identity gate: a `v*` tag is only valid when its name equals
+# the tagged commit's workspace version. This is the mechanical half of the
+# release convention (AGENTS.md, 发版（release）): a chore(release) PR bumps
+# [workspace.package].version, the tag is cut on that main commit, and this
+# workflow refuses any tag whose name and manifest disagree.
+name: release-version
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  tag-matches-manifest:
+    name: tag name == workspace version
+    runs-on: ubuntu-latest
+    steps:
+      # On a tag push event, actions/checkout checks out the tagged commit,
+      # so the manifest read here is the one the tag claims to name.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify the tag name equals the manifest version
+        run: ./script/check_release_version.sh --tag "$GITHUB_REF_NAME"

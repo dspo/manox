@@ -6,22 +6,26 @@
 # false-green incidents inside PR 765: 9a508733, 2c544a30, f1a22f1f). The
 # legs mirror CI plus the one thing CI cannot see on a developer machine:
 #
-#   1. fmt        — cargo fmt --all -- --check
-#   2. prod-libs  — cargo check of the production lib units (no dev-deps,
+#   1. version    — script/check_release_version.sh: the workspace root's
+#                   [workspace.package].version is the only version
+#                   declaration in the repo (release bumps touch one line;
+#                   the v-tag ↔ manifest identity stays checkable)
+#   2. fmt        — cargo fmt --all -- --check
+#   3. prod-libs  — cargo check of the production lib units (no dev-deps,
 #                   no reverse-dependency feature enablement)
-#   3. lean-libs  — the lean napi edge (--no-default-features): the compile
+#   4. lean-libs  — the lean napi edge (--no-default-features): the compile
 #                   gate for every cfg-gated-off production arm
-#   4. clippy     — cargo clippy --workspace --all-targets -- -D warnings,
+#   5. clippy     — cargo clippy --workspace --all-targets -- -D warnings,
 #                   under CI's own RUSTFLAGS (CI sets `-D warnings`, which
 #                   promotes `clippy::let_unit_value` and friends from
 #                   warnings to errors; without it this leg passed while CI
 #                   failed on a `let _ =` whose call returns `()`).
-#   5. test-real  — cargo test --workspace --all-targets --no-fail-fast
+#   6. test-real  — cargo test --workspace --all-targets --no-fail-fast
 #                   under the developer's real HOME
-#   6. test-clean — the same under a pristine temp HOME (the CI-equivalent
+#   7. test-clean — the same under a pristine temp HOME (the CI-equivalent
 #                   hermeticity leg: no ~/.manox config, no provider
 #                   registry, no session journals)
-#   7. examples   — the offline example smoke (crates/manox-harness/scripts/
+#   8. examples   — the offline example smoke (crates/manox-harness/scripts/
 #                   check_examples.sh): cargo test only COMPILES examples,
 #                   so a synthesized tool call that no longer satisfies a
 #                   tool's schema stays green here and only dies in CI's
@@ -63,6 +67,7 @@ run_leg() {
     fi
 }
 
+run_leg "version" ./script/check_release_version.sh
 run_leg "fmt" cargo fmt --all -- --check
 # The production-unit shape: no dev-deps, no reverse-dependency feature
 # enablement — cfg-gated items whose consumers are all gated are

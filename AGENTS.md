@@ -44,8 +44,15 @@ crates/                    # Rust workspace 成员（全部 gpui-free）
 ### 仓库边界（manox / manox-app 拆分）
 
 - 本仓库**不得引入 gpui 或任何 UI 依赖**；apps、cx 启动器、ext-agents、terminal-ui（GPUI 渲染层）已迁至 `dspo/manox-app`。终端仿真核心 `manox-terminal` 与 `hyperlinks` 已回流本仓，由 manox-app 经 git 依赖消费。
-- manox-app 经 git 依赖（branch=main + Cargo.lock 锁 rev）消费本仓库；本仓库 main 的每次 push 都可能被下游锁定引用——破坏性 API 变更须在 commit message 标注。下游约定：manox-app 合并前会把对本仓的依赖 bump 到最新兼容 commit，故 main 上任何提交都可能很快进入下游合并，保持 main 常绿。
+- manox-app 经 git 依赖（tag pin `tag = "vX.Y.Z"` + Cargo.lock 锁 rev）消费本仓库；本仓库 main 的每次 push 都可能很快成为下一个发布 tag 的内容——破坏性 API 变更须在 commit message 标注（`!`）。下游约定：manox-app 合并前会把对本仓的依赖 bump 到最新发布 tag，故 main 上任何提交都可能很快进入下游合并，保持 main 常绿。
 - 本仓库运行时状态根 `~/.manox/` 与 manox-app 共享（见下）；协议/磁盘格式（journal、db、sessions）的变更即两仓联合变更。
+
+### 发版（release）
+
+- **版本单源**：全部成员继承根 `[workspace.package].version`（`version.workspace = true`；成员自带 `version` 会被 `script/check_release_version.sh` 拒绝）。版本号是发布序号，不是 semver 契约（下游 pin 死 tag 等价 `=X.Y.Z`）；破坏性变更在 commit subject 标 `!`。
+- **发布动作**：内容合入 main 后，开 `chore(release): vX.Y.Z` PR 只改一行版本号；**合并后立刻在该 main commit 上打 `vX.Y.Z` tag 并 push**。tag 一律打在 main 的 commit 上，无 release 分支（v0.6.9 及更早打在 `release/0.6` 分支上的 tag 属历史遗留——勿模仿、勿移动，v0.6.10 起生效）。
+- **CI 守卫**：`.github/workflows/release-version.yml` 在 `v*` tag push 时校验 tag 名 == 该 commit 的 manifest 版本，不符即红；build 工作流同步跑单源检查。
+- **下游**：manox-app 一次 bump 其全部 manox 依赖的 `tag = "vX.Y.Z"`（`chore(deps): consume manox vX.Y.Z`）。
 
 ## 构建与开发命令
 
