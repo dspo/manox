@@ -692,6 +692,16 @@ pub(super) fn fs_write_verdict(
     granted_roots: Option<&crate::granted_roots::GrantedRoots>,
     deny: &dyn Fn() -> ToolError,
 ) -> Result<(), ToolError> {
+    // Task tools mutate session runtime state, not the filesystem: there is
+    // no path to prove inside the writable roots, and the registry is
+    // session-scoped (a model can only stop tasks its own session owns).
+    // They are gated because they are not read-only, so they land here —
+    // where the path fence would (a) demand a `cwd` argument the tool never
+    // takes and (b) deny it for having no in-workspace proof. Neither is a
+    // permission fact, so admit them before any path reasoning.
+    if tool_name == crate::tools::TASK_STOP {
+        return Ok(());
+    }
     let refuse = || Err(deny());
     let cwd = match manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd")) {
         Ok(cwd) => cwd,
@@ -757,11 +767,9 @@ pub(super) fn fs_write_verdict(
         // `require_escalated`+`justification` grant widens the mode for
         // exactly that call.
         crate::tools::PY => refuse(),
-        // Session/repo-scoped coordination (task tools) was removed in the
-        // tools-optimization cycle — they were retired with the
-        // Steer-based team architecture.
         // Every other gated call (escalated bash, unknown mutating tools) has
-        // no in-workspace proof.
+        // no in-workspace proof. TaskStop never reaches this arm — the
+        // session-scoped task tools are admitted at the top of the verdict.
         _ => refuse(),
     }
 }
@@ -1370,6 +1378,50 @@ mod tests {
             "{err}"
         );
         assert!(!err.to_string().contains(&sandbox_denial()));
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
+    /// A gated task tool takes no `cwd` argument (its schema has `task_id`
+    /// only) and touches no filesystem path: the fence must admit it in
+    /// sandbox mode instead of demanding a `cwd` it never took, or denying an
+    /// operation with no path to prove. Regression: TaskStop was unusable at
+    /// the default access mode — every call failed with "cwd is required"
+    /// before reaching the tool.
+    #[tokio::test]
+    async fn sandbox_admits_task_stop_without_a_cwd() {
+        let (gate, _rx) = gate_with_events();
+        gate.set_mode(AccessMode::Sandbox);
+        let (tool, ran) = gated_named(crate::tools::TASK_STOP, false, false, Arc::clone(&gate));
+        let ctx = tool_ctx();
+        tool.execute(
+            "c1",
+            serde_json::json!({ "task_id": "bg_1" }),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .expect("TaskStop must reach its own execute under sandbox");
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    /// The admission is scoped to the task tool: another pathless mutating
+    /// tool still fails closed (no in-workspace proof).
+    #[tokio::test]
+    async fn sandbox_still_denies_other_pathless_mutating_tools() {
+        let (gate, _rx) = gate_with_events();
+        gate.set_mode(AccessMode::Sandbox);
+        let (tool, ran) = gated_named("Mock", false, false, Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let err = tool
+            .execute(
+                "c1",
+                serde_json::json!({ "cwd": [""] }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(&sandbox_denial()), "{err}");
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
