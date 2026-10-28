@@ -664,6 +664,17 @@ impl ApprovalGatedTool {
         params: &serde_json::Value,
         ctx: &dyn ToolContext,
     ) -> Result<(), ToolError> {
+        // A tool whose side effects are not filesystem writes declares it, and
+        // the path ruling does not apply: it takes no `cwd` (so peeking one
+        // would reject the call as a malformed argument) and touches no path
+        // (so there is nothing to prove inside the writable roots). Such a
+        // tool's authority is scoped elsewhere — the task registry is
+        // session-owned. Everything else, including unknown mutating tools and
+        // MCP tools whose schema comes from a remote server, keeps the
+        // fail-closed path ruling.
+        if !self.inner.mutates_through_fs_paths() {
+            return Ok(());
+        }
         fs_write_verdict(
             self.inner.name(),
             params,
@@ -692,16 +703,6 @@ pub(super) fn fs_write_verdict(
     granted_roots: Option<&crate::granted_roots::GrantedRoots>,
     deny: &dyn Fn() -> ToolError,
 ) -> Result<(), ToolError> {
-    // Task tools mutate session runtime state, not the filesystem: there is
-    // no path to prove inside the writable roots, and the registry is
-    // session-scoped (a model can only stop tasks its own session owns).
-    // They are gated because they are not read-only, so they land here —
-    // where the path fence would (a) demand a `cwd` argument the tool never
-    // takes and (b) deny it for having no in-workspace proof. Neither is a
-    // permission fact, so admit them before any path reasoning.
-    if tool_name == crate::tools::TASK_STOP {
-        return Ok(());
-    }
     let refuse = || Err(deny());
     let cwd = match manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd")) {
         Ok(cwd) => cwd,
@@ -768,8 +769,8 @@ pub(super) fn fs_write_verdict(
         // exactly that call.
         crate::tools::PY => refuse(),
         // Every other gated call (escalated bash, unknown mutating tools) has
-        // no in-workspace proof. TaskStop never reaches this arm — the
-        // session-scoped task tools are admitted at the top of the verdict.
+        // no in-workspace proof. A tool that does not mutate through fs paths
+        // never reaches this ruling — `sandbox_verdict` admits it first.
         _ => refuse(),
     }
 }
@@ -830,6 +831,10 @@ impl HarnessAgentTool for ApprovalGatedTool {
 
     fn is_read_only(&self) -> bool {
         self.inner.is_read_only()
+    }
+
+    fn mutates_through_fs_paths(&self) -> bool {
+        self.inner.mutates_through_fs_paths()
     }
 
     fn execution_mode(&self) -> ExecutionMode {
@@ -899,6 +904,9 @@ mod tests {
         name: &'static str,
         approval: bool,
         read_only: bool,
+        /// Whether the tool writes through fs paths (the trait default). A
+        /// session-state tool declares false to bypass the path ruling.
+        fs_paths: bool,
         ran: Arc<AtomicUsize>,
     }
 
@@ -919,6 +927,9 @@ mod tests {
         fn is_read_only(&self) -> bool {
             self.read_only
         }
+        fn mutates_through_fs_paths(&self) -> bool {
+            self.fs_paths
+        }
         async fn execute(
             &self,
             _tool_call_id: &str,
@@ -929,6 +940,26 @@ mod tests {
             self.ran.fetch_add(1, Ordering::SeqCst);
             Ok(AgentToolResult::text("ran"))
         }
+    }
+
+    /// A gated tool that declares its mutations bypass the filesystem fence.
+    fn gated_declaring(
+        name: &'static str,
+        read_only: bool,
+        gate: Arc<ApprovalGate>,
+    ) -> (ApprovalGatedTool, Arc<AtomicUsize>) {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let tool = ApprovalGatedTool::new(
+            Arc::new(MockTool {
+                name,
+                approval: false,
+                read_only,
+                fs_paths: false,
+                ran: Arc::clone(&ran),
+            }),
+            gate,
+        );
+        (tool, ran)
     }
 
     fn gated_named(
@@ -943,6 +974,7 @@ mod tests {
                 name,
                 approval,
                 read_only,
+                fs_paths: true,
                 ran: Arc::clone(&ran),
             }),
             gate,
@@ -1108,6 +1140,7 @@ mod tests {
                 name: "Write",
                 approval: false,
                 read_only: false,
+                fs_paths: true,
                 ran: Arc::clone(&ran),
             }),
             Arc::clone(&gate),
@@ -1184,6 +1217,7 @@ mod tests {
                 name: "Write",
                 approval: false,
                 read_only: false,
+                fs_paths: true,
                 ran: Arc::clone(&ran),
             }),
             Arc::clone(&gate),
@@ -1381,17 +1415,16 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
-    /// A gated task tool takes no `cwd` argument (its schema has `task_id`
-    /// only) and touches no filesystem path: the fence must admit it in
-    /// sandbox mode instead of demanding a `cwd` it never took, or denying an
-    /// operation with no path to prove. Regression: TaskStop was unusable at
-    /// the default access mode — every call failed with "cwd is required"
-    /// before reaching the tool.
+    /// A tool whose side effects are not filesystem writes declares it and
+    /// takes no `cwd`; the path ruling must not run at all for it. Otherwise
+    /// the peek rejects the call with the `cwd` how-to (regression: TaskStop
+    /// was unusable at the default access mode) and the default arm denies it
+    /// for having no in-workspace proof.
     #[tokio::test]
-    async fn sandbox_admits_task_stop_without_a_cwd() {
+    async fn sandbox_admits_a_tool_that_does_not_mutate_through_fs_paths() {
         let (gate, _rx) = gate_with_events();
         gate.set_mode(AccessMode::Sandbox);
-        let (tool, ran) = gated_named(crate::tools::TASK_STOP, false, false, Arc::clone(&gate));
+        let (tool, ran) = gated_declaring("TaskStop", false, Arc::clone(&gate));
         let ctx = tool_ctx();
         tool.execute(
             "c1",
@@ -1400,22 +1433,43 @@ mod tests {
             &ctx,
         )
         .await
-        .expect("TaskStop must reach its own execute under sandbox");
+        .expect("a non-fs tool must reach its own execute under sandbox");
         assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
-    /// The admission is scoped to the task tool: another pathless mutating
-    /// tool still fails closed (no in-workspace proof).
+    /// The contract defaults to `true`: a mutating tool that does not declare
+    /// itself fs-free (an unknown tool, or an MCP write tool whose schema
+    /// comes from a remote server) keeps the fail-closed path ruling — it is
+    /// still judged as a path writer and never runs without a provable
+    /// target. This is the guard that keeps the fix from becoming a bypass.
     #[tokio::test]
-    async fn sandbox_still_denies_other_pathless_mutating_tools() {
+    async fn sandbox_still_rules_on_undeclared_mutating_tools() {
         let (gate, _rx) = gate_with_events();
         gate.set_mode(AccessMode::Sandbox);
-        let (tool, ran) = gated_named("Mock", false, false, Arc::clone(&gate));
+        let (tool, ran) = gated_named("mcp__srv__write_file", false, false, Arc::clone(&gate));
         let ctx = tool_ctx();
+        // No `cwd`: the path ruling refuses before the tool runs (fail-closed).
         let err = tool
             .execute(
                 "c1",
-                serde_json::json!({ "cwd": [""] }),
+                serde_json::json!({ "path": "/etc/passwd", "content": "x" }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(manox_harness::tools::path_utils::CWD_REQUIRED_DOC),
+            "{err}"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+
+        // With a cwd, an out-of-roots target is denied as a sandbox violation.
+        let err = tool
+            .execute(
+                "c2",
+                serde_json::json!({ "path": "/etc/passwd", "content": "x", "cwd": [""] }),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1431,6 +1485,7 @@ mod tests {
                 name: "Mutating",
                 approval: false,
                 read_only: false,
+                fs_paths: true,
                 ran: Arc::new(AtomicUsize::new(0)),
             }),
             gate(),
@@ -1751,6 +1806,7 @@ mod tests {
             name: "Write",
             approval: false,
             read_only: false,
+            fs_paths: true,
             ran: Arc::clone(&ran),
         });
         (Arc::new(ApprovalGatedTool::new(inner, gate)), ran)
