@@ -1213,12 +1213,30 @@ impl RuntimeBackend {
     }
 
     /// The live facts for a session this host has already folded, if any.
+    ///
+    /// The HOST's current state wins over the seed: `self.seeds` is a
+    /// subscription-time snapshot that actions never advance, so its
+    /// `InputNeeded`/`IsArchived` bits and its activity/directories would go
+    /// stale the moment the session moved. The seed remains the fallback for
+    /// a session whose host state is gone (a dropped/rebuilt host) and for the
+    /// title.
     fn seeded_status(&self, session_id: &str) -> Option<SeededFacts> {
         let seeded = self.seeds.lock().get(session_id).cloned()?;
+        let live = self
+            .host()
+            .and_then(|host| host.session_summary_live(session_id));
+        let (status, activity, directories) = match live {
+            Some((status, activity, directories)) => (status, activity, directories),
+            None => (
+                seeded.session.status,
+                seeded.session.activity.clone(),
+                seeded.session.working_directories.clone(),
+            ),
+        };
         Some(SeededFacts {
-            status: seeded.session.status,
-            activity: seeded.session.activity.clone(),
-            directories: seeded.session.working_directories.clone(),
+            status,
+            activity,
+            directories,
             title: seeded.session.title.clone(),
         })
     }
@@ -1657,30 +1675,33 @@ fn summary_from_row(
     seeded: Option<SeededFacts>,
 ) -> SessionSummary {
     let facts_title = seeded.as_ref().map(|facts| facts.title.clone());
-    // The per-session flags come from the store's CURRENT row on both legs
-    // (the parked one and the seeded one): a seeded summary that echoed the
-    // fold's subscription-time status would serve last week's read state
-    // and — being equal to what was already published — suppress the very
-    // delta that should announce the change. The seed contributes only its
-    // LIVE-ONLY bits (InProgress, InputNeeded — the fold saw them at
-    // subscribe time and the store cannot answer for them) and its
-    // journalled IsArchived, which the table joins; the seed's IsRead is
-    // exactly the stale bit this overlay exists to remove.
-    let row_status = super::row_status_bits(
-        None,
-        row,
-        store.is_running(&row.id),
-        store.pending_auth_contains(&row.id),
-    );
+    // One table answers both legs: the row's bits (read/error/archive), the
+    // store's LIVE running/pending-auth facts, and — for a folded session —
+    // the host's current fold bits (InputNeeded/IsArchived; the seed reaches
+    // here already refreshed from that state). Nothing subscription-time is
+    // served as if it were current: the seed's stale copies were exactly the
+    // read/dirs blindness this overlay removes.
     let (status, activity, directories) = match seeded {
-        Some(facts) => {
-            let live_bits = facts.status
-                & (ahp_types::state::SessionStatus::InProgress.bits()
-                    | ahp_types::state::SessionStatus::InputNeeded.bits()
-                    | ahp_types::state::SessionStatus::IsArchived.bits());
-            (row_status | live_bits, facts.activity, facts.directories)
-        }
-        None => (row_status, None, None),
+        Some(facts) => (
+            super::row_status_bits(
+                Some(facts.status),
+                row,
+                store.is_running(&row.id),
+                store.pending_auth_contains(&row.id),
+            ),
+            facts.activity,
+            facts.directories,
+        ),
+        None => (
+            super::row_status_bits(
+                None,
+                row,
+                store.is_running(&row.id),
+                store.pending_auth_contains(&row.id),
+            ),
+            None,
+            None,
+        ),
     };
     // Belonging comes from the OBJECT STORE (the user's attach decision),
     // never from any cwd: a conversation whose working directory wandered
@@ -4220,5 +4241,91 @@ mod primed_roster_ids_tests {
     #[test]
     fn no_fold_primes_nothing() {
         assert!(primed_roster_ids(None, 7).is_empty());
+    }
+}
+
+/// The summary's live bits: the store answers running/pending-auth on BOTH
+/// legs, and the fold contributes only the bits the store cannot know
+/// (`InputNeeded` from a journalled approval, `IsArchived`). A seeded
+/// summary must never serve the subscription-time copy as current.
+#[cfg(test)]
+mod summary_live_bits_tests {
+    use super::*;
+    use ahp_types::state::SessionStatus;
+
+    fn facts(status: u32) -> SeededFacts {
+        SeededFacts {
+            status,
+            activity: Some("seed-activity".to_string()),
+            directories: Some(vec!["/seed".to_string()]),
+            title: "seeded".to_string(),
+        }
+    }
+
+    fn summary_bits(
+        store: &manox_agent::thread_store::StoreHandle,
+        seeded: Option<SeededFacts>,
+    ) -> (u32, Option<String>, Option<Vec<String>>) {
+        store.read(|state| {
+            let row = state.summary_by_id("s-live").expect("seeded");
+            let summary = summary_from_row(row, state, seeded);
+            (
+                summary.status,
+                summary.activity,
+                summary.working_directories,
+            )
+        })
+    }
+
+    #[test]
+    fn the_store_s_running_and_auth_facts_reach_both_summary_legs() {
+        crate::test_support::init_globals();
+        let store = manox_agent::thread_store::standalone_for_test();
+        store.with_mut(|s| {
+            s.insert_summary_for_test("s-live", None);
+            s.mark_running("s-live");
+            s.mark_pending_auth("s-live", true);
+        });
+        for (leg, status, activity, directories) in [
+            ("parked", summary_bits(&store, None).0, None, None),
+            (
+                "seeded",
+                summary_bits(&store, Some(facts(SessionStatus::Idle.bits()))).0,
+                summary_bits(&store, Some(facts(SessionStatus::Idle.bits()))).1,
+                summary_bits(&store, Some(facts(SessionStatus::Idle.bits()))).2,
+            ),
+        ] {
+            assert!(
+                status & SessionStatus::InProgress.bits() != 0,
+                "{leg}: the store's running flag reaches the summary"
+            );
+            assert!(
+                status & SessionStatus::InputNeeded.bits() != 0,
+                "{leg}: the store's pending authorization reaches the summary"
+            );
+            if leg == "seeded" {
+                assert_eq!(activity.as_deref(), Some("seed-activity"));
+                assert_eq!(directories.as_deref(), Some(&["/seed".to_string()][..]));
+            }
+        }
+
+        // The fold's journalled bits still join a seeded answer: `InputNeeded`
+        // outlives the store's live flag when the host folded an approval.
+        store.with_mut(|s| {
+            s.mark_idle("s-live");
+            s.mark_pending_auth("s-live", false);
+        });
+        let folded = SessionStatus::Idle.bits()
+            | SessionStatus::InputNeeded.bits()
+            | SessionStatus::IsArchived.bits();
+        let (status, _, _) = summary_bits(&store, Some(facts(folded)));
+        assert!(
+            status & SessionStatus::InputNeeded.bits() != 0,
+            "a journalled InputNeeded survives the overlay"
+        );
+        assert!(
+            status & SessionStatus::IsArchived.bits() != 0,
+            "a journalled archive survives the overlay"
+        );
     }
 }
