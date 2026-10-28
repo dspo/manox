@@ -1657,19 +1657,30 @@ fn summary_from_row(
     seeded: Option<SeededFacts>,
 ) -> SessionSummary {
     let facts_title = seeded.as_ref().map(|facts| facts.title.clone());
+    // The per-session flags come from the store's CURRENT row on both legs
+    // (the parked one and the seeded one): a seeded summary that echoed the
+    // fold's subscription-time status would serve last week's read state
+    // and — being equal to what was already published — suppress the very
+    // delta that should announce the change. The seed contributes only its
+    // LIVE-ONLY bits (InProgress, InputNeeded — the fold saw them at
+    // subscribe time and the store cannot answer for them) and its
+    // journalled IsArchived, which the table joins; the seed's IsRead is
+    // exactly the stale bit this overlay exists to remove.
+    let row_status = super::row_status_bits(
+        None,
+        row,
+        store.is_running(&row.id),
+        store.pending_auth_contains(&row.id),
+    );
     let (status, activity, directories) = match seeded {
-        Some(facts) => (facts.status, facts.activity, facts.directories),
-        // A session the store knows and this host has not folded: idle unless a
-        // turn is live in this process.
-        None => (
-            if store.is_running(&row.id) {
-                ahp_types::state::SessionStatus::InProgress.bits()
-            } else {
-                ahp_types::state::SessionStatus::Idle.bits()
-            },
-            None,
-            None,
-        ),
+        Some(facts) => {
+            let live_bits = facts.status
+                & (ahp_types::state::SessionStatus::InProgress.bits()
+                    | ahp_types::state::SessionStatus::InputNeeded.bits()
+                    | ahp_types::state::SessionStatus::IsArchived.bits());
+            (row_status | live_bits, facts.activity, facts.directories)
+        }
+        None => (row_status, None, None),
     };
     // Belonging comes from the OBJECT STORE (the user's attach decision),
     // never from any cwd: a conversation whose working directory wandered
@@ -2669,17 +2680,39 @@ impl Backend for RuntimeBackend {
                         .to_string(),
                 )
             }
+            // The read rule's client legs: `isReadChanged(true)` stamps
+            // the view time (monotone max) so a settled-after-viewed
+            // session reads back as read everywhere; `isReadChanged(false)`
+            // lowers the view stamp to the sentinel so every recorded
+            // settle reads un-viewed. BOTH persist — the reducer folded
+            // the action for every subscriber, and a fold the disk will
+            // not confirm is the never-happened state the fail-closed
+            // rule forbids.
+            StateAction::SessionIsReadChanged(changed) => {
+                let Some(session_id) = session::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                if let Some(store) = manox_agent::thread_store::try_global() {
+                    store.with_mut(|s| {
+                        if changed.is_read {
+                            s.mark_viewed(session_id, chrono::Utc::now().timestamp());
+                        } else {
+                            s.mark_unread(session_id);
+                        }
+                    });
+                }
+                DispatchOutcome::Accepted
+            }
             // Actions the acceptance table admits and the reducer folds, but
             // that describe client-side state the runtime does not own (draft
-            // text, read flags, turn resumption, result confirmation). They are
-            // echoed as accepted so every subscriber observes the same sequence,
-            // and no runtime work follows.
+            // text, the chat-level read flag, turn resumption, result
+            // confirmation). They are echoed as accepted so every subscriber
+            // observes the same sequence, and no runtime work follows.
             StateAction::ChatDraftChanged(_)
             | StateAction::ChatTurnResume(_)
             | StateAction::ChatToolCallResultConfirmed(_)
             | StateAction::ChatInputAnswerChanged(_)
             | StateAction::ChatQueuedMessagesReordered(_)
-            | StateAction::SessionIsReadChanged(_)
             | StateAction::ChatIsReadChanged(_)
             | StateAction::SessionActiveClientRemoved(_) => DispatchOutcome::Ignored,
             other => DispatchOutcome::Rejected(format!(
@@ -3787,6 +3820,142 @@ mod mcp_dispatch_tests {
                 "the one chat is the default chat"
             );
         });
+    }
+
+    /// The read rule's client legs: a focus stamps the view time
+    /// (monotone max) so a settled session reads back as read everywhere;
+    /// the explicit mark-unread lowers the view stamp to the sentinel so
+    /// every recorded settle reads un-viewed. Both PERSIST — the reducer
+    /// folded the action for every subscriber, and a fold the disk will
+    /// not confirm is the never-happened state the fail-closed rule
+    /// forbids.
+    #[test]
+    fn a_viewed_declaration_stamps_the_derived_read() {
+        // The store override is process-global and the suite runs in
+        // parallel: hold the same serialization the cold-seed tests do, or
+        // a swap mid-test answers another test's lookup with nothing.
+        let _globals = crate::test_support::lock_globals();
+        let _store_lock = manox_agent::thread_store::store_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::test_support::init_globals();
+        manox_agent::thread_store::init_for_test();
+        let store = manox_agent::thread_store::try_global().expect("the override is installed");
+        store.with_mut(|st| {
+            st.insert_summary_for_test("s-derived", None);
+            st.note_settled("s-derived", 1_000);
+        });
+        let unread = |store: &manox_agent::thread_store::StoreHandle| {
+            store.read(|st| st.summary_by_id("s-derived").expect("seeded").has_unread)
+        };
+        assert!(unread(&store), "the settle lights the bit (no view yet)");
+
+        let backend = backend(McpOnlyRuntime::serving());
+        let declare = |backend: &RuntimeBackend, is_read: bool| {
+            backend.dispatch(
+                "ahp-session:/s-derived",
+                &StateAction::SessionIsReadChanged(
+                    ahp_types::actions::SessionIsReadChangedAction { is_read },
+                ),
+                &ActionOrigin {
+                    client_id: "client-1".to_string(),
+                    client_seq: 1,
+                },
+            )
+        };
+        assert_eq!(declare(&backend, true), DispatchOutcome::Accepted);
+        assert!(!unread(&store), "the focus declaration clears the bit");
+
+        let now = chrono::Utc::now().timestamp();
+        store.with_mut(|st| {
+            st.note_settled("s-derived", now + 60);
+        });
+        assert!(unread(&store), "a settle after the view re-lights it");
+
+        assert_eq!(declare(&backend, false), DispatchOutcome::Accepted);
+        assert!(
+            unread(&store),
+            "the mark-unread sentinel keeps the recorded settle un-viewed"
+        );
+        assert_eq!(
+            store.read(|st| {
+                st.summary_by_id("s-derived")
+                    .expect("seeded")
+                    .last_viewed_at
+            }),
+            Some(0),
+            "the sentinel view stamp is the persisted leg"
+        );
+        manox_agent::thread_store::drop_for_test();
+    }
+
+    /// The seeded summary serves the row's DERIVED bits, not the fold's
+    /// subscription-time status: the seed's IsRead was exactly the stale
+    /// bit that froze attached sessions' read state (and suppressed the
+    /// catalogue delta). The seed keeps only its live-only bits —
+    /// InProgress, InputNeeded — and the journalled IsArchived.
+    #[test]
+    fn a_seeded_summary_serves_the_derived_read_bit() {
+        crate::test_support::init_globals();
+        let store = manox_agent::thread_store::standalone_for_test();
+        use ahp_types::state::SessionStatus;
+        let seed_read = SessionStatus::Idle.bits() | SessionStatus::IsRead.bits();
+        let seed_running = seed_read | SessionStatus::InProgress.bits();
+        store.with_mut(|st| {
+            st.insert_summary_for_test("s-seeded", None);
+            st.note_settled("s-seeded", 42);
+        });
+        let facts = |status: u32| SeededFacts {
+            status,
+            activity: None,
+            directories: None,
+            title: "seeded".to_string(),
+        };
+        store.read(|state| {
+            let row = state.summary_by_id("s-seeded").expect("seeded");
+            let summary = summary_from_row(row, state, Some(facts(seed_read)));
+            assert!(
+                summary.status & SessionStatus::IsRead.bits() == 0,
+                "the seeded summary carries the DERIVED bit (unread), not the seed's stale IsRead: {:?}",
+                summary.status
+            );
+            let summary = summary_from_row(row, state, Some(facts(seed_running)));
+            assert!(
+                summary.status & SessionStatus::InProgress.bits() != 0,
+                "the seed's live-only InProgress bit survives the overlay"
+            );
+            assert!(
+                summary.status & SessionStatus::IsRead.bits() == 0,
+                "the overlay never resurrects the seed's IsRead"
+            );
+        });
+    }
+
+    /// The parked list answer carries the row's derived read state: an    /// The parked list answer carries the row's derived read state: an
+    /// unread row keeps `IsRead` down (it counts as attention), a read row
+    /// carries `IsRead` — a session this host never subscribed must not
+    /// read as unread just because it never subscribed.
+    #[test]
+    fn a_parked_row_serves_its_scanned_read_bit() {
+        crate::test_support::init_globals();
+        let store = manox_agent::thread_store::standalone_for_test();
+        let is_read_bit = |id: &str| {
+            store.read(|state| {
+                let row = state.summary_by_id(id).expect("the seeded row exists");
+                let summary = summary_from_row(row, state, None);
+                summary.status & ahp_types::state::SessionStatus::IsRead.bits() != 0
+            })
+        };
+        store.with_mut(|st| {
+            st.insert_summary_for_test("s-unread", None);
+            st.insert_summary_for_test("s-read", None);
+            st.note_settled("s-unread", 42);
+        });
+        assert!(
+            !is_read_bit("s-unread"),
+            "the unread parked row keeps IsRead down"
+        );
+        assert!(is_read_bit("s-read"), "the read parked row carries IsRead");
     }
 }
 

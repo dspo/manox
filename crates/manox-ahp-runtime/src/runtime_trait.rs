@@ -346,15 +346,6 @@ pub trait SessionRuntime: Send + Sync + 'static {
         HostError::Backend(error.message)
     }
 
-    /// Announce that the session catalogue moved (a session appeared,
-    /// disappeared, was renamed, pinned, reordered or archived).
-    ///
-    /// The runtime raises the event where the change happens — it owns the
-    /// store — and the AHP adapter turns it into the root-channel
-    /// notification, because only the adapter knows the protocol's delta
-    /// vocabulary. A backend with no host attached does nothing.
-    fn catalogue_changed(&self) {}
-
     /// Start (or restart) an MCP server by registry key.
     ///
     /// The AHP reducer has already folded the optimistic `starting` state by

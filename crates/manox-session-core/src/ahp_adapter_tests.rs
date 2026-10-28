@@ -5441,4 +5441,293 @@ mod create_intent {
 
         uninstall();
     }
+
+    /// The catalogue publishes a DIFF against what the host last announced,
+    /// not a replay: a quiet pass announces nothing, a new row lands exactly
+    /// one lifecycle `sessionAdded`, a moved field (the derived read bit's
+    /// flip) lands exactly one delta, a departed row lands one
+    /// `sessionRemoved`. The peer sweep polls on this licence — a replaying
+    /// catalogue is a 0.2Hz re-announce storm (re-ranked sidebars,
+    /// resurrected rows).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_catalogue_publishes_a_diff_not_a_replay() {
+        let _guards = install();
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        let store = manox_agent::thread_store::global();
+
+        let client = ahp::Client::connect(runtime.inproc(), ahp::ClientConfig::default())
+            .await
+            .expect("the in-process client connects");
+        client
+            .initialize(
+                "desktop".to_string(),
+                vec![ahp_types::version::PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes holding the catalogue root");
+        let mut root_sub = client
+            .attach_subscription(ahp_types::common::ROOT_RESOURCE_URI)
+            .await;
+
+        // A row the host never announced: exactly one lifecycle event.
+        store.with_mut(|st| st.insert_summary_for_test("s-diff", None));
+        runtime.catalogue_changed();
+        let event = next_root_event(&mut root_sub).await;
+        assert!(
+            matches!(event, ahp::SubscriptionEvent::SessionAdded(_)),
+            "a new row is a lifecycle announcement: {event:?}"
+        );
+
+        // A pass that changes nothing announces nothing.
+        runtime.catalogue_changed();
+        let quiet =
+            tokio::time::timeout(std::time::Duration::from_millis(300), root_sub.recv()).await;
+        assert!(quiet.is_err(), "a quiet pass is silent: {quiet:?}");
+
+        // The derived read bit's flip rides one delta.
+        store.with_mut(|st| {
+            assert!(st.note_settled("s-diff", chrono::Utc::now().timestamp()));
+        });
+        runtime.catalogue_changed();
+        let event = next_root_event(&mut root_sub).await;
+        assert!(
+            matches!(event, ahp::SubscriptionEvent::SessionSummaryChanged(_)),
+            "a known row's move is a delta: {event:?}"
+        );
+
+        // A row that leaves the active catalogue (an archive) is announced
+        // as removed — a diff-gated subscriber would keep it forever.
+        store.with_mut(|st| st.archive_thread("s-diff", true));
+        runtime.catalogue_changed();
+        let event = next_root_event(&mut root_sub).await;
+        assert!(
+            matches!(event, ahp::SubscriptionEvent::SessionRemoved(_)),
+            "the departure is announced: {event:?}"
+        );
+        uninstall();
+    }
+
+    /// The blocking seam the parked summary cannot cover: an ATTACHED
+    /// session (the host holds folded state) reads its fold FIRST, so a
+    /// derived read flip must (a) ride the root delta with the fresh bits
+    /// and (b) reach the session channel as `session/isReadChanged` — a
+    /// fold that never sees it keeps the bit it subscribed with, and the
+    /// badge never lights for exactly the sessions the user has open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_derived_read_flip_reaches_the_folded_session() {
+        let _guards = install();
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        let store = manox_agent::thread_store::global();
+
+        store.with_mut(|st| st.insert_summary_for_test("s-fold", None));
+        // The host holds folded state for the session (the subscribe-time
+        // seed), status carrying IsRead — the fold's standing assumption.
+        let seeded = manox_ahp::channels::session::initial("manox", None, None);
+        runtime.host().seed_session("s-fold", seeded);
+        assert!(runtime.host().has_session("s-fold"));
+
+        let client = ahp::Client::connect(runtime.inproc(), ahp::ClientConfig::default())
+            .await
+            .expect("the in-process client connects");
+        // The connection HOLDS the session channel (as a desktop does for
+        // an attached session): channel actions only fan out to holders.
+        client
+            .initialize(
+                "desktop".to_string(),
+                vec![ahp_types::version::PROTOCOL_VERSION.to_string()],
+                vec![
+                    ahp_types::common::ROOT_RESOURCE_URI.to_string(),
+                    manox_ahp::channels::session::uri("s-fold"),
+                ],
+            )
+            .await
+            .expect("initializes holding the root and the session channel");
+        let mut root_sub = client
+            .attach_subscription(ahp_types::common::ROOT_RESOURCE_URI)
+            .await;
+        let mut session_sub = client
+            .attach_subscription(&manox_ahp::channels::session::uri("s-fold"))
+            .await;
+
+        runtime.catalogue_changed();
+        let event = next_root_event(&mut root_sub).await;
+        assert!(
+            matches!(event, ahp::SubscriptionEvent::SessionAdded(_)),
+            "the announce: {event:?}"
+        );
+
+        // A settle flips the derived bit: the root delta carries IsRead
+        // DOWN, and the session channel carries the flip itself.
+        store.with_mut(|st| {
+            assert!(st.note_settled("s-fold", 42));
+        });
+        runtime.catalogue_changed();
+
+        let event = next_root_event(&mut root_sub).await;
+        let ahp::SubscriptionEvent::SessionSummaryChanged(params) = event else {
+            panic!("the flip rides a summary delta: {event:?}");
+        };
+        let carries_read = params
+            .changes
+            .status
+            .is_some_and(|status| status & ahp_types::state::SessionStatus::IsRead.bits() != 0);
+        assert!(
+            !carries_read,
+            "the delta's status carries the DERIVED bit (IsRead down): {:?}",
+            params.changes.status
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let envelope = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, session_sub.recv())
+                .await
+                .expect("the session-channel flip arrives")
+                .expect("the subscription stays open");
+            let ahp::SubscriptionEvent::Action(envelope) = event else {
+                continue;
+            };
+            if matches!(
+                envelope.action,
+                ahp_types::actions::StateAction::SessionIsReadChanged(_)
+            ) {
+                break envelope;
+            }
+        };
+        let ahp_types::actions::StateAction::SessionIsReadChanged(changed) = &envelope.action
+        else {
+            unreachable!("matched above");
+        };
+        assert!(
+            !changed.is_read,
+            "the flip publishes as the derived value: is_read=false"
+        );
+        // The host's own reducer folded the publish: a client joining (or
+        // re-folding) now reads the session with IsRead down.
+        let folded = runtime
+            .host()
+            .session_state("s-fold")
+            .expect("the host holds the session");
+        assert!(
+            folded.status & ahp_types::state::SessionStatus::IsRead.bits() == 0,
+            "the folded state's IsRead came down: {:?}",
+            folded.status
+        );
+
+        // The reverse direction: a view declaration on the store row
+        // re-derives the bit and publishes the flip back up.
+        store.with_mut(|st| {
+            assert!(st.mark_viewed("s-fold", 100));
+        });
+        runtime.catalogue_changed();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let envelope = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, session_sub.recv())
+                .await
+                .expect("the reverse flip arrives")
+                .expect("the subscription stays open");
+            let ahp::SubscriptionEvent::Action(envelope) = event else {
+                continue;
+            };
+            if matches!(
+                envelope.action,
+                ahp_types::actions::StateAction::SessionIsReadChanged(_)
+            ) {
+                break envelope;
+            }
+        };
+        let ahp_types::actions::StateAction::SessionIsReadChanged(changed) = &envelope.action
+        else {
+            unreachable!("matched above");
+        };
+        assert!(
+            changed.is_read,
+            "the view declaration publishes as is_read=true"
+        );
+
+        // ...and the fold is back up: read.
+        let folded = runtime
+            .host()
+            .session_state("s-fold")
+            .expect("the host holds the session");
+        assert!(
+            folded.status & ahp_types::state::SessionStatus::IsRead.bits() != 0,
+            "the reverse flip folded IsRead back up: {:?}",
+            folded.status
+        );
+        uninstall();
+    }
+
+    /// A dispose must FORGET the published entry: a rebuild of the same id
+    /// announces as the lifecycle event again, not as a delta for a row the
+    /// client dropped — and the diff's departure sweep must not remove it a
+    /// second time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_disposed_then_rebuilt_session_announces_added_again() {
+        let _guards = install();
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        let store = manox_agent::thread_store::global();
+
+        let client = ahp::Client::connect(runtime.inproc(), ahp::ClientConfig::default())
+            .await
+            .expect("the in-process client connects");
+        client
+            .initialize(
+                "desktop".to_string(),
+                vec![ahp_types::version::PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes holding the catalogue root");
+        let mut root_sub = client
+            .attach_subscription(ahp_types::common::ROOT_RESOURCE_URI)
+            .await;
+
+        store.with_mut(|st| st.insert_summary_for_test("s-rebuild", None));
+        runtime.catalogue_changed();
+        let event = next_root_event(&mut root_sub).await;
+        assert!(matches!(event, ahp::SubscriptionEvent::SessionAdded(_)));
+
+        // Dispose: the removal forgets the published entry.
+        runtime.catalogue_removed("s-rebuild");
+        let event = next_root_event(&mut root_sub).await;
+        assert!(matches!(event, ahp::SubscriptionEvent::SessionRemoved(_)));
+
+        // Rebuild on the same id: a lifecycle announcement again.
+        store.with_mut(|st| st.insert_summary_for_test("s-rebuild", None));
+        runtime.catalogue_changed();
+        let event = next_root_event(&mut root_sub).await;
+        assert!(
+            matches!(event, ahp::SubscriptionEvent::SessionAdded(_)),
+            "a rebuilt id announces as added, not as a delta: {event:?}"
+        );
+        uninstall();
+    }
+
+    async fn next_root_event(sub: &mut ahp::SessionSubscription) -> ahp::SubscriptionEvent {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, sub.recv())
+                .await
+                .expect("the event arrives")
+                .expect("the subscription stays open");
+            // Dispatch echoes land on the root sub too; the catalogue
+            // assertions care about the notification vocabulary only.
+            if !matches!(event, ahp::SubscriptionEvent::Action(_)) {
+                return event;
+            }
+        }
+    }
 }
