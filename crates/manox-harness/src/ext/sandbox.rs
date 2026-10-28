@@ -374,7 +374,7 @@ pub fn is_temp_scratch(path: &Path) -> bool {
 /// The closed outcome vocabulary of one escalation ask — structurally identical
 /// to the host approval seam's `PermissionDecision` so the host impl maps
 /// without translation.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum EscalationOutcome {
     /// The user approved the wider mode for this one call.
     AllowedOnce,

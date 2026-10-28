@@ -240,8 +240,9 @@ pub fn delegation_description(description: &str, capability: &str, name: &str) -
          network: inherit|off|on }}) narrows the child's access for this \
          dispatch only — it can never exceed the agent's own declared \
          ceiling or this session's authority; wider requests are refused. \
-         A child's approval-requiring operations are auto-rejected; it \
-         cannot delegate further.",
+         Under a sandboxed dispatch the child may escalate a denied command \
+         or write through an approval card on this conversation (bounded \
+         per run). It cannot delegate further.",
         manox_harness::subagent::MIN_BUDGET_MS
     )
 }

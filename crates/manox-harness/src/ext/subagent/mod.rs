@@ -17,6 +17,7 @@
 
 pub mod ask;
 pub mod descriptor;
+pub mod escalation;
 pub mod feeds;
 pub mod journal;
 pub mod provider;
@@ -28,6 +29,7 @@ pub mod thinking;
 pub mod types;
 
 pub use descriptor::Descriptor;
+pub use escalation::ChildAuthority;
 pub use provider::{
     ContinuableCreateRequest, ContinuableCreateSpec, RunObserver, SubagentProvider, SubagentRun,
 };

@@ -616,42 +616,13 @@ impl ApprovalGatedTool {
     }
 
     /// The nearest existing ancestor directory of the call's write target —
-    /// the root an approved escalation covers. Resolved with the same chain
-    /// the tool itself will use (the `cwd` `[anchor, ...route]` array, peeked
-    /// read-only so the fence neither advances the sticky cwd nor re-anchors
-    /// it).
+    /// the root an approved escalation covers.
     fn call_target_root(
         &self,
         params: &serde_json::Value,
         ctx: &dyn ToolContext,
     ) -> Option<std::path::PathBuf> {
-        let cwd =
-            manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd")).ok()?;
-        let target = match self.inner.name() {
-            "Write" => {
-                let path = params.get("path")?.as_str()?;
-                if Path::new(path).is_absolute() {
-                    std::path::PathBuf::from(path)
-                } else {
-                    cwd.join(path)
-                }
-            }
-            "Edit" => {
-                let patch = params.get("patch")?.as_str()?;
-                let first = manox_harness::hashline::parse_patch(patch)
-                    .ok()?
-                    .files
-                    .into_iter()
-                    .next()?;
-                if first.path.is_absolute() {
-                    first.path
-                } else {
-                    cwd.join(first.path)
-                }
-            }
-            _ => return None,
-        };
-        Some(nearest_existing_ancestor(&target))
+        fs_call_target_root(self.inner.name(), params, ctx)
     }
 
     /// Sandbox verdict for one gated call: `Ok` when the operation
@@ -773,6 +744,44 @@ pub(super) fn fs_write_verdict(
         // never reaches this ruling — `sandbox_verdict` admits it first.
         _ => refuse(),
     }
+}
+
+/// The nearest existing ancestor of the call's write target — the root an
+/// approved escalation covers, for the host gate and the subagent fence
+/// alike. Resolved with the same chain the tool itself will use (the `cwd`
+/// `[anchor, ...route]` array, peeked read-only so a fence neither advances
+/// the sticky cwd nor re-anchors it).
+pub(crate) fn fs_call_target_root(
+    tool_name: &str,
+    params: &serde_json::Value,
+    ctx: &dyn ToolContext,
+) -> Option<std::path::PathBuf> {
+    let cwd = manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd")).ok()?;
+    let target = match tool_name {
+        "Write" => {
+            let path = params.get("path")?.as_str()?;
+            if Path::new(path).is_absolute() {
+                std::path::PathBuf::from(path)
+            } else {
+                cwd.join(path)
+            }
+        }
+        "Edit" => {
+            let patch = params.get("patch")?.as_str()?;
+            let first = manox_harness::hashline::parse_patch(patch)
+                .ok()?
+                .files
+                .into_iter()
+                .next()?;
+            if first.path.is_absolute() {
+                first.path
+            } else {
+                cwd.join(first.path)
+            }
+        }
+        _ => return None,
+    };
+    Some(nearest_existing_ancestor(&target))
 }
 
 /// The nearest ancestor of `target` that exists on disk. An escalation
