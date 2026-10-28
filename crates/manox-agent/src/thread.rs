@@ -2710,6 +2710,14 @@ impl Thread {
     /// session's sidecar gains a stamp no sidebar ever renders (the scan
     /// skips subagent journals), which is cheaper than misjudging a main
     /// session and silently losing its unread.
+    ///
+    /// Ordering contract the clients lean on: this runs at the TOP of the
+    /// `Settled` arm, before `TurnFinished` is pushed — a viewer that
+    /// reacts to the turn's end already sees the stamp, so its view
+    /// declaration lands at or after the settle (derive reads it as
+    /// viewed). A turn the process DIED during has no settle stamp at all
+    /// (recovery closes it at the fold level, no notice fires): that turn
+    /// never lights the badge — known, accepted edge.
     fn stamp_settled(&self) {
         let at = chrono::Utc::now().timestamp();
         if let Some(store) = crate::thread_store::try_global() {

@@ -1657,33 +1657,30 @@ fn summary_from_row(
     seeded: Option<SeededFacts>,
 ) -> SessionSummary {
     let facts_title = seeded.as_ref().map(|facts| facts.title.clone());
-    // The status comes from ONE table on both legs, fed by the store's
-    // CURRENT row: a seeded summary that echoed the fold's subscription-time
-    // bits would serve last week's read state and — being equal to what was
-    // already published — suppress the very delta that should announce the
-    // change. Only the fold's IsArchived (a journalled decision) joins the
-    // row's facts; activity/directories stay the fold's own live facts.
+    // The per-session flags come from the store's CURRENT row on both legs
+    // (the parked one and the seeded one): a seeded summary that echoed the
+    // fold's subscription-time status would serve last week's read state
+    // and — being equal to what was already published — suppress the very
+    // delta that should announce the change. The seed contributes only its
+    // LIVE-ONLY bits (InProgress, InputNeeded — the fold saw them at
+    // subscribe time and the store cannot answer for them) and its
+    // journalled IsArchived, which the table joins; the seed's IsRead is
+    // exactly the stale bit this overlay exists to remove.
+    let row_status = super::row_status_bits(
+        None,
+        row,
+        store.is_running(&row.id),
+        store.pending_auth_contains(&row.id),
+    );
     let (status, activity, directories) = match seeded {
-        Some(facts) => (
-            super::row_status_bits(
-                Some(facts.status),
-                row,
-                store.is_running(&row.id),
-                store.pending_auth_contains(&row.id),
-            ),
-            facts.activity,
-            facts.directories,
-        ),
-        None => (
-            super::row_status_bits(
-                None,
-                row,
-                store.is_running(&row.id),
-                store.pending_auth_contains(&row.id),
-            ),
-            None,
-            None,
-        ),
+        Some(facts) => {
+            let live_bits = facts.status
+                & (ahp_types::state::SessionStatus::InProgress.bits()
+                    | ahp_types::state::SessionStatus::InputNeeded.bits()
+                    | ahp_types::state::SessionStatus::IsArchived.bits());
+            (row_status | live_bits, facts.activity, facts.directories)
+        }
+        None => (row_status, None, None),
     };
     // Belonging comes from the OBJECT STORE (the user's attach decision),
     // never from any cwd: a conversation whose working directory wandered
@@ -3892,7 +3889,49 @@ mod mcp_dispatch_tests {
         manox_agent::thread_store::drop_for_test();
     }
 
-    /// The parked list answer carries the row's derived read state: an
+    /// The seeded summary serves the row's DERIVED bits, not the fold's
+    /// subscription-time status: the seed's IsRead was exactly the stale
+    /// bit that froze attached sessions' read state (and suppressed the
+    /// catalogue delta). The seed keeps only its live-only bits —
+    /// InProgress, InputNeeded — and the journalled IsArchived.
+    #[test]
+    fn a_seeded_summary_serves_the_derived_read_bit() {
+        crate::test_support::init_globals();
+        let store = manox_agent::thread_store::standalone_for_test();
+        use ahp_types::state::SessionStatus;
+        let seed_read = SessionStatus::Idle.bits() | SessionStatus::IsRead.bits();
+        let seed_running = seed_read | SessionStatus::InProgress.bits();
+        store.with_mut(|st| {
+            st.insert_summary_for_test("s-seeded", None);
+            st.note_settled("s-seeded", 42);
+        });
+        let facts = |status: u32| SeededFacts {
+            status,
+            activity: None,
+            directories: None,
+            title: "seeded".to_string(),
+        };
+        store.read(|state| {
+            let row = state.summary_by_id("s-seeded").expect("seeded");
+            let summary = summary_from_row(row, state, Some(facts(seed_read)));
+            assert!(
+                summary.status & SessionStatus::IsRead.bits() == 0,
+                "the seeded summary carries the DERIVED bit (unread), not the seed's stale IsRead: {:?}",
+                summary.status
+            );
+            let summary = summary_from_row(row, state, Some(facts(seed_running)));
+            assert!(
+                summary.status & SessionStatus::InProgress.bits() != 0,
+                "the seed's live-only InProgress bit survives the overlay"
+            );
+            assert!(
+                summary.status & SessionStatus::IsRead.bits() == 0,
+                "the overlay never resurrects the seed's IsRead"
+            );
+        });
+    }
+
+    /// The parked list answer carries the row's derived read state: an    /// The parked list answer carries the row's derived read state: an
     /// unread row keeps `IsRead` down (it counts as attention), a read row
     /// carries `IsRead` — a session this host never subscribed must not
     /// read as unread just because it never subscribed.

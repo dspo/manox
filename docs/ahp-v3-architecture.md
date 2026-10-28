@@ -426,6 +426,14 @@ confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
   随行）、离开 active 目录（对端归档/dispose）发 `sessionRemoved`——**removed 表达「离开
   目录」而非严格 dispose**（拍板见 §H.2c 备注：与下游行处理吻合；带 IsArchived 的 delta
   要下游先合并 delta 才有意义）。安静 pass 零通知——这是 sweep 的轮询许可。
+  2026-10-28 补三句（review/addendum 定稿）：**① 读位翻转由宿主 publish 到 session 通道**
+  （`catalogue_changed` 在 IsRead 相对 published 翻转且宿主持有该会话状态时发
+  `session/isReadChanged`；host publish 不经 dispatch，不回环）——fold-first 的 attached
+  客户端靠它变红，客户端只声明「我在看」，永远不发起 rise。**② settle 是未读的唯一升起
+  来源**：`BackendNotice::Settled` 的覆盖面是正确性前提（盖章先于 TurnFinished 推送）；不
+  经 Settled 的收尾（进程崩溃的 turn，恢复期在 fold 层结清、无 notice）不亮角标——已知
+  且接受的边界。**③ focused = viewed 是 app 的定义**（窗口可见性不参与）；
+  `sessionRemoved` 下游必须按 `params.session` 处理（`channel` 是 root）。
 - **审批身份单源**：settle key 走 action 的 `_meta["x-manox"]["authId"]`——即 translator 生成
   `toolCallReady` 时盖的同一个 key。**没有 authId 的确认不 settle**（`Ignored`）：猜一个身份会去
   回答**另一个** pending call。

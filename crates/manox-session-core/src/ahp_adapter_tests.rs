@@ -5609,7 +5609,6 @@ mod create_intent {
             !changed.is_read,
             "the flip publishes as the derived value: is_read=false"
         );
-
         // The host's own reducer folded the publish: a client joining (or
         // re-folding) now reads the session with IsRead down.
         let folded = runtime
@@ -5619,6 +5618,49 @@ mod create_intent {
         assert!(
             folded.status & ahp_types::state::SessionStatus::IsRead.bits() == 0,
             "the folded state's IsRead came down: {:?}",
+            folded.status
+        );
+
+        // The reverse direction: a view declaration on the store row
+        // re-derives the bit and publishes the flip back up.
+        store.with_mut(|st| {
+            assert!(st.mark_viewed("s-fold", 100));
+        });
+        runtime.catalogue_changed();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let envelope = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, session_sub.recv())
+                .await
+                .expect("the reverse flip arrives")
+                .expect("the subscription stays open");
+            let ahp::SubscriptionEvent::Action(envelope) = event else {
+                continue;
+            };
+            if matches!(
+                envelope.action,
+                ahp_types::actions::StateAction::SessionIsReadChanged(_)
+            ) {
+                break envelope;
+            }
+        };
+        let ahp_types::actions::StateAction::SessionIsReadChanged(changed) = &envelope.action
+        else {
+            unreachable!("matched above");
+        };
+        assert!(
+            changed.is_read,
+            "the view declaration publishes as is_read=true"
+        );
+
+        // ...and the fold is back up: read.
+        let folded = runtime
+            .host()
+            .session_state("s-fold")
+            .expect("the host holds the session");
+        assert!(
+            folded.status & ahp_types::state::SessionStatus::IsRead.bits() != 0,
+            "the reverse flip folded IsRead back up: {:?}",
             folded.status
         );
         uninstall();

@@ -356,7 +356,7 @@ impl StoreHandle {
             reconcile_summaries(&dir, &mut index).await
         };
         self.with_mut(|s| {
-            let (session_paths, summaries, archived) = group_by_thread(rows, &registry);
+            let (session_paths, summaries, mut archived) = group_by_thread(rows, &registry);
             let mut summaries = summaries;
             resolve_depths(&mut summaries);
             // The scan read the sidecars as of the pass's head; stamps this
@@ -369,7 +369,10 @@ impl StoreHandle {
             for row in s.summaries.iter().chain(s.archived_summaries.iter()) {
                 held.insert(row.id.clone(), (row.last_settled_at, row.last_viewed_at));
             }
-            for summary in &mut summaries {
+            // Archived rows join the merge: a view parked before an
+            // archive must still retire against the disk, or it lingers
+            // (and re-fires its sidecar write) forever.
+            for summary in summaries.iter_mut().chain(archived.iter_mut()) {
                 if let Some((settled, viewed)) = held.get(&summary.id) {
                     summary.merge_stamps(*settled, *viewed);
                 }
@@ -2143,6 +2146,13 @@ pub fn init_for_test() {
 #[cfg(any(test, feature = "test-support"))]
 pub fn standalone_for_test() -> StoreHandle {
     let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+    standalone_for_test_at(&dir)
+}
+
+/// [`Self::standalone_for_test`] over an EXPLICIT root — the cross-process
+/// shape: two stores sharing one sessions dir are two peers on one disk.
+#[cfg(any(test, feature = "test-support"))]
+pub fn standalone_for_test_at(dir: &std::path::Path) -> StoreHandle {
     let projects_path = dir.join("projects.json");
     StoreHandle::new(ThreadStore {
         project_aliases: HashMap::new(),
@@ -2155,7 +2165,7 @@ pub fn standalone_for_test() -> StoreHandle {
         running: HashSet::new(),
         pending_auth: HashSet::new(),
         live_threads: HashMap::new(),
-        sessions_dir: dir,
+        sessions_dir: dir.to_path_buf(),
         projects_path,
         decision_overlay: HashMap::new(),
         pending_events: Vec::new(),
@@ -3782,6 +3792,11 @@ mod tests {
         write_session_fixture(&dir, "t-quiet-a", "a");
         write_session_fixture(&dir, "t-quiet-b", "b");
         write_session_fixture(&dir, "t-quiet-c", "c");
+        // Pin one row: the rerank then orders it ahead of the scan's
+        // recency walk, so held order and fresh walk order structurally
+        // disagree — exactly the false-change the gate must not fire on.
+        let pin = manox_harness::session_meta::meta_path(&dir, &dir.join("t-quiet-b.jsonl"));
+        std::fs::write(&pin, "{\"pinned\": true}").unwrap();
         let rx = store.subscribe();
 
         store.refresh_now().await;
@@ -3796,9 +3811,54 @@ mod tests {
         assert_eq!(
             count_summaries_updated(&rx),
             0,
-            "five unchanged passes over three rows: the HashMap walk order \
+            "five unchanged passes over three rows (one pinned): the HashMap walk order \
              must not read as change"
         );
+    }
+
+    /// The cross-process leg — the whole derived model's premise: A's
+    /// settle stamp (the host's sidecar write) surfaces through B's plain
+    /// scan of the shared root, and B's view declaration clears A's badge
+    /// on the next pass. No dispatch, no notice, one disk.
+    #[tokio::test]
+    async fn a_peer_settle_surfaces_through_a_shared_root_scan() {
+        let _db_path = temp_db();
+        crate::runtime::init_hermetic_for_test();
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = standalone_for_test_at(&dir);
+        let b = standalone_for_test_at(&dir);
+        write_session_fixture(&dir, "s-cross", "hello");
+
+        // A scans the row in; the host leg then stamps the sidecar (the
+        // settle write belongs to the host, not to any store).
+        a.refresh_now().await;
+        let path = a
+            .read(|s| s.journal_path("s-cross"))
+            .expect("the row's journal");
+        manox_harness::session_meta::update(&dir, &path, |meta| {
+            meta.last_settled_at = Some(42);
+        })
+        .await
+        .expect("the peer stamp writes");
+
+        // B's pass reads the stamp off the shared root and derives unread.
+        b.refresh_now().await;
+        assert!(
+            b.read(|s| s.summary_by_id("s-cross").expect("listed").has_unread),
+            "B derives unread from A's stamped sidecar"
+        );
+
+        // B's viewer declares the view; the queued sidecar write drains at
+        // B's next pass head, and A's re-scan reads the shared truth.
+        b.with_mut(|s| assert!(s.mark_viewed("s-cross", 100)));
+        b.refresh_now().await;
+        a.refresh_now().await;
+        assert!(
+            !a.read(|s| s.summary_by_id("s-cross").expect("listed").has_unread),
+            "B's view clears A's badge too — one shared read fact"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn count_summaries_updated(rx: &async_channel::Receiver<Arc<ThreadStoreEvent>>) -> usize {
