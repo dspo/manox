@@ -178,6 +178,9 @@ impl manox_harness::tool::AgentTool for SubagentWriteFence {
     fn is_read_only(&self) -> bool {
         self.inner.is_read_only()
     }
+    fn mutates_through_fs_paths(&self) -> bool {
+        self.inner.mutates_through_fs_paths()
+    }
     fn execution_mode(&self) -> manox_harness::tool::ExecutionMode {
         self.inner.execution_mode()
     }
@@ -378,6 +381,14 @@ impl manox_harness::tool::AgentTool for HostTaskStop {
         TASKSTOP_DESCRIPTION
     }
     fn is_read_only(&self) -> bool {
+        false
+    }
+    /// Stopping a task mutates session runtime state, not the filesystem:
+    /// the tool takes no `cwd` and touches no path. Its authority is the
+    /// session-owned registry (a model can only stop its own session's
+    /// tasks), so the sandbox has nothing to confine and the path fence
+    /// must not rule on it.
+    fn mutates_through_fs_paths(&self) -> bool {
         false
     }
     fn parameters_schema(&self) -> serde_json::Value {
