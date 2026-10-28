@@ -2,7 +2,8 @@
 //!
 //! The kernel owns the conversation (the jsonl journal is a session
 //! directory's only durable content); sidebar-only flags — pin, archive,
-//! unread, error, display title — have no home in the transcript schema,
+//! error, display title — and the two monotone read inputs (last view, last
+//! settle) have no home in the transcript schema,
 //! so they live in a small cache-row sidecar under the core root's
 //! `cache/` directory, keyed by session id (dsh's storages/projcache
 //! concern separation). Loading tolerates a missing file (a fresh session
@@ -44,8 +45,16 @@ pub struct SessionMeta {
     pub pinned: bool,
     #[serde(default)]
     pub archived: bool,
-    #[serde(default)]
-    pub unread: bool,
+    /// Unix seconds of the last turn that SETTLED in this session. Written
+    /// by the process that ran the turn (host layer, on the settle notice),
+    /// never by a viewer. Absent = no turn has settled since tracking began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_settled_at: Option<i64>,
+    /// Unix seconds of the last time a client observed this session being
+    /// looked at (the `isReadChanged(true)` declaration). Written by whoever
+    /// views; readers take the max. Absent = never observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_viewed_at: Option<i64>,
     #[serde(default)]
     pub errored: bool,
     /// User-assigned tag shown as a chip on the sidebar row. Absent = no tag.
@@ -320,14 +329,19 @@ mod tests {
             title: Some("fix the widget".into()),
             project: Some("/p/a".into()),
             pinned: true,
-            unread: true,
+            last_settled_at: Some(1_700_000_000),
             ..Default::default()
         };
         save(dir.path(), &session, &meta).await.unwrap();
         let loaded = load(dir.path(), &session).await.unwrap();
         assert_eq!(loaded.title.as_deref(), Some("fix the widget"));
         assert_eq!(loaded.project.as_deref(), Some("/p/a"));
-        assert!(loaded.pinned && loaded.unread && !loaded.archived && !loaded.errored);
+        assert!(
+            loaded.pinned
+                && loaded.last_settled_at == Some(1_700_000_000)
+                && !loaded.archived
+                && !loaded.errored
+        );
     }
 
     #[tokio::test]
@@ -462,14 +476,17 @@ mod tests {
             Some(1_700_000_500)
         );
 
-        update(dir.path(), &session, |meta| meta.unread = true)
-            .await
-            .unwrap();
+        update(dir.path(), &session, |meta| {
+            meta.last_settled_at = Some(1_700_000_600)
+        })
+        .await
+        .unwrap();
         let settled = load(dir.path(), &session).await.unwrap();
         assert_eq!(
             settled.interacted_at,
             Some(1_700_000_500),
             "an unrelated flag write must not drop the interaction stamp"
         );
+        assert_eq!(settled.last_settled_at, Some(1_700_000_600));
     }
 }
