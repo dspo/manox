@@ -978,6 +978,15 @@ pub(crate) fn row_status_bits(
     {
         bits |= SessionStatus::IsArchived.bits();
     }
+    // The fold contributes the bits only IT can know: a journalled approval
+    // raises `InputNeeded` (which implies in-progress), and a journalled
+    // archive raises `IsArchived`. `InProgress` deliberately comes from the
+    // `running` argument alone — a fold snapshot may be stale (a subscription-
+    // time copy), and ORing its activity bit would resurrect a finished turn
+    // as a running one.
+    if let Some(folded) = folded_status {
+        bits |= folded & (SessionStatus::InputNeeded.bits() | SessionStatus::IsArchived.bits());
+    }
     bits
 }
 

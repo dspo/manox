@@ -1048,6 +1048,19 @@ impl Thread {
     fn handle_notice_inner(&mut self, notice: BackendNotice) {
         match notice {
             BackendNotice::Event(event) => {
+                // The sidebar's live bits follow the same events the facade
+                // mirrors: a turn edge toggles `InProgress`, an authorization
+                // card raises `InputNeeded` (the store is the parked-row
+                // source; a subscribed client reads its own fold).
+                match &*event {
+                    ThreadEvent::TurnStarted => self.note_store_running(true),
+                    ThreadEvent::TurnFinished { .. } => {
+                        self.note_store_running(false);
+                        self.note_store_pending_auth(false);
+                    }
+                    ThreadEvent::ToolCallAuthorization { .. } => self.note_store_pending_auth(true),
+                    _ => {}
+                }
                 // Mirror the gate policy before the chip hears about the
                 // change.
                 if let ThreadEvent::AccessModeChanged { mode } = *event {
@@ -1191,6 +1204,8 @@ impl Thread {
                         .push(ThreadEvent::SteerInjected { message_id });
                 }
                 self.running = false;
+                self.note_store_running(false);
+                self.note_store_pending_auth(false);
                 self.pending_steers.clear();
                 self.refresh_history();
                 self.pending_events.push(ThreadEvent::TurnFinished {
@@ -1458,6 +1473,7 @@ impl Thread {
         let origin = self.pending_turn_origin.take();
         let accepted_entry = self.pending_turn_accepted_entry.take();
         self.running = true;
+        self.note_store_running(true);
         self.pending_events.push(ThreadEvent::TurnStarted);
         self.engine
             .as_ref()
@@ -2119,6 +2135,39 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.respond_tool_authorization(id, response);
         }
+        // The verdict retired the card: drop the sidebar attention bit once
+        // nothing is parked. The gate entry is removed by the response, so
+        // this reads the post-verdict set.
+        if self.pending_auth_entries().is_empty() {
+            self.note_store_pending_auth(false);
+        }
+    }
+
+    /// Mirror this thread's running slot into the process store (the
+    /// catalogue's `InProgress` source).
+    fn note_store_running(&self, running: bool) {
+        let Some(store) = crate::thread_store::try_global() else {
+            return;
+        };
+        let id = self.id.0.clone();
+        store.with_mut(|s| {
+            if running {
+                s.mark_running(&id);
+            } else {
+                s.mark_idle(&id);
+            }
+        });
+    }
+
+    /// Mirror the parked-authorization attention bit into the process store
+    /// (the catalogue's `InputNeeded` source for rows this host never
+    /// subscribed).
+    fn note_store_pending_auth(&self, pending: bool) {
+        let Some(store) = crate::thread_store::try_global() else {
+            return;
+        };
+        let id = self.id.0.clone();
+        store.with_mut(|s| s.mark_pending_auth(&id, pending));
     }
 
     /// Pending authorizations with their card metadata, so the workspace can
@@ -4283,6 +4332,79 @@ pub(crate) mod tests {
             sidecar,
             stamped.0.expect("stamped above"),
             "one stamp, two homes, one value"
+        );
+        crate::thread_store::drop_for_test();
+    }
+
+    /// The catalogue's live bits follow the events the facade mirrors: a turn
+    /// edge toggles the store's running flag, an authorization card raises the
+    /// pending-auth flag, and the verdict clears it once nothing is parked.
+    /// These are the `InProgress`/`InputNeeded` sources `row_status_bits`
+    /// serves on both summary legs.
+    #[test]
+    fn a_turn_edge_and_an_authorization_update_the_store_bits() {
+        let _store_lock = crate::thread_store::store_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::runtime::init_hermetic_for_test();
+        crate::thread_store::init_for_test();
+        let store = crate::thread_store::try_global().expect("the override is installed");
+        store.with_mut(|s| s.insert_summary_for_test("t-bits", None));
+
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+            access_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
+        });
+        let thread = thread_with_engine_id(HistoryPhase::Ready, engine, "t-bits");
+
+        thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
+        assert!(
+            store.read(|s| s.is_running("t-bits")),
+            "the turn edge marks the row running"
+        );
+
+        thread.handle_notice(BackendNotice::Event(Box::new(
+            ThreadEvent::ToolCallAuthorization {
+                id: "auth-1".to_string(),
+                tool_name: "bash".to_string(),
+                summary: "run the tests".to_string(),
+                input: serde_json::json!({}),
+            },
+        )));
+        assert!(
+            store.read(|s| s.pending_auth_contains("t-bits")),
+            "an authorization card raises the attention bit"
+        );
+
+        thread.with_mut(|t| {
+            t.respond_authorization(
+                "auth-1",
+                crate::permission::ToolAuthorizationResponse::Decision(
+                    crate::permission::PermissionDecision::AllowOnce,
+                ),
+            );
+        });
+        assert!(
+            !store.read(|s| s.pending_auth_contains("t-bits")),
+            "the verdict clears the attention bit (no card is parked)"
+        );
+
+        thread.handle_notice(BackendNotice::Settled {
+            cancelled: false,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        });
+        assert!(
+            !store.read(|s| s.is_running("t-bits")),
+            "the settle clears the running bit"
         );
         crate::thread_store::drop_for_test();
     }

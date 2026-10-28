@@ -197,6 +197,27 @@ impl Host {
         self.inner.store.read().session(session_id).cloned()
     }
 
+    /// The live facts a session SUMMARY carries for a session this host has
+    /// folded: status bits, activity string, granted directories. They are
+    /// cloned individually — the list path must not clone a whole
+    /// [`ahp_types::state::SessionState`] per row.
+    ///
+    /// The store is the authority for these once a session is subscribed (the
+    /// fold is advanced by actions); the runtime's subscribe-time snapshot is
+    /// only the fallback for a session with no host state.
+    pub fn session_summary_live(
+        &self,
+        session_id: &str,
+    ) -> Option<(u32, Option<String>, Option<Vec<String>>)> {
+        let store = self.inner.store.read();
+        let state = store.session(session_id)?;
+        Some((
+            state.status,
+            state.activity.clone(),
+            state.working_directories.clone(),
+        ))
+    }
+
     /// Whether the host holds state for `session_id` — the existence check
     /// without the clone, for publish fan-out over many sessions.
     pub fn has_session(&self, session_id: &str) -> bool {

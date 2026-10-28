@@ -99,6 +99,15 @@ pub struct ThreadStore {
     /// (the `decision_overlay` discipline — a scan that read a stale
     /// sidecar must never publish over a fresher in-memory stamp).
     pending_viewed: HashMap<String, i64>,
+    /// Lowerings awaiting their durable write (`mark_unread`): id → the view
+    /// stamp the disk held when the lowering was made. The sentinel
+    /// `last_viewed_at = Some(0)` is forced over the scan merge while the
+    /// disk still shows that prior value; a max-merge cannot hold a stamp
+    /// BELOW the scanned one (that is why `pending_viewed` cannot serve this
+    /// leg), so the overlay is applied AFTER the merge. It retires as soon as
+    /// the disk moves — to the sentinel (this write) or to anything else (a
+    /// peer's later view, which wins) — so it can never pin a row unread.
+    pending_unread: HashMap<String, Option<i64>>,
     /// Set once the first reconcile has landed. The broadcast gate keys on
     /// a real row-set change, but the very first pass must announce — the
     /// subscribers start with empty partitions.
@@ -373,8 +382,28 @@ impl StoreHandle {
             // archive must still retire against the disk, or it lingers
             // (and re-fires its sidecar write) forever.
             for summary in summaries.iter_mut().chain(archived.iter_mut()) {
+                // The scan's own value, before the held/park merges: the
+                // lowering overlay below retires only against THIS (the disk),
+                // never against an in-memory stamp.
+                let scanned_viewed = summary.last_viewed_at;
                 if let Some((settled, viewed)) = held.get(&summary.id) {
                     summary.merge_stamps(*settled, *viewed);
+                }
+                // An explicit mark-unread is a LOWERING: force the sentinel
+                // over the max merge until the disk carries it, or a pass
+                // that read the sidecar before the queued write landed would
+                // republish the old view.
+                if let Some(prior) = s.pending_unread.get(&summary.id).copied() {
+                    if scanned_viewed == prior {
+                        summary.last_viewed_at = Some(0);
+                        summary.has_unread =
+                            crate::db::derive_unread(summary.last_settled_at, Some(0));
+                    } else {
+                        // The disk moved (this sentinel's write landed, or a
+                        // peer wrote a later view): the overlay has done its
+                        // job and must never outlive the race it covers.
+                        s.pending_unread.remove(&summary.id);
+                    }
                 }
                 let Some(parked) = s.pending_viewed.get(&summary.id).copied() else {
                     continue;
@@ -517,6 +546,7 @@ pub fn init() {
         pending_meta_writes: Vec::new(),
         pending_working_dirs: HashMap::new(),
         pending_viewed: HashMap::new(),
+        pending_unread: HashMap::new(),
         scanned_once: false,
     });
     handle.refresh();
@@ -854,16 +884,24 @@ impl ThreadStore {
     }
 
     /// Mark a thread as running (turn started).
+    ///
+    /// The running set feeds the status bits the catalogue serves
+    /// (`row_status_bits`), so a change also announces the summaries — the
+    /// `RunningChanged` event alone would leave the list's `InProgress` bit
+    /// stale until some unrelated write asked for a pass.
     pub fn mark_running(&mut self, id: &str) {
         if self.running.insert(id.to_string()) {
             self.pending_events.push(ThreadStoreEvent::RunningChanged);
+            self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
         }
     }
 
-    /// Mark a thread as idle (turn ended).
+    /// Mark a thread as idle (turn ended). See [`Self::mark_running`] for why
+    /// the summaries ride along.
     pub fn mark_idle(&mut self, id: &str) {
         if self.running.remove(id) {
             self.pending_events.push(ThreadStoreEvent::RunningChanged);
+            self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
         }
     }
 
@@ -891,6 +929,10 @@ impl ThreadStore {
     /// lands it on disk the moment the path appears. Returns whether the
     /// attention bit flipped.
     pub fn mark_viewed(&mut self, id: &str, at: i64) -> bool {
+        // A view supersedes an explicit mark-unread: the viewer is looking
+        // now, and the queued lowering must not force the sentinel back over
+        // this stamp on the next scan.
+        self.pending_unread.remove(id);
         let flipped = match self.summary_mut(id) {
             Some(summary) => {
                 let flipped = summary.merge_stamps(None, Some(at));
@@ -925,6 +967,17 @@ impl ThreadStore {
     /// session with no settled turn reads clear afterwards (nothing to
     /// mark): the derivation says so, not a second stored bit.
     pub fn mark_unread(&mut self, id: &str) -> bool {
+        // A lowering is not monotone: hold the sentinel over the next scan
+        // merge until the disk moves (see `pending_unread`). The prior stamp
+        // is what tells a later pass whether the disk still holds the value
+        // this lowering replaced.
+        let prior = self
+            .summary_mut(id)
+            .and_then(|summary| summary.last_viewed_at);
+        self.pending_unread.insert(id.to_string(), prior);
+        // An explicit unread supersedes a view this process has parked but
+        // not yet landed; keeping the park would re-raise the stamp below.
+        self.pending_viewed.remove(id);
         let flipped = match self.summary_mut(id) {
             Some(summary) => {
                 summary.last_viewed_at = Some(0);
@@ -1102,6 +1155,7 @@ impl ThreadStore {
         // A parked view for a dropped row would resurrect the stamp (and
         // its sidecar write) against whatever reuses the id next.
         self.pending_viewed.remove(id);
+        self.pending_unread.remove(id);
         self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
     }
 
@@ -2190,6 +2244,7 @@ pub fn standalone_for_test_at(dir: &std::path::Path) -> StoreHandle {
         pending_meta_writes: Vec::new(),
         pending_working_dirs: HashMap::new(),
         pending_viewed: HashMap::new(),
+        pending_unread: HashMap::new(),
         scanned_once: false,
     })
 }
@@ -2426,6 +2481,7 @@ mod tests {
             pending_meta_writes: Vec::new(),
             pending_working_dirs: HashMap::new(),
             pending_viewed: HashMap::new(),
+            pending_unread: HashMap::new(),
             scanned_once: false,
         })
     }
@@ -2638,6 +2694,7 @@ mod tests {
             pending_meta_writes: Vec::new(),
             pending_working_dirs: HashMap::new(),
             pending_viewed: HashMap::new(),
+            pending_unread: HashMap::new(),
             scanned_once: false,
         });
         restarted.refresh_now().await;
@@ -2677,6 +2734,7 @@ mod tests {
             pending_meta_writes: Vec::new(),
             pending_working_dirs: HashMap::new(),
             pending_viewed: HashMap::new(),
+            pending_unread: HashMap::new(),
             scanned_once: false,
         });
         assert!(reopened.read(|s| s.known_projects.contains(&"/p/a".to_string())));
@@ -2757,20 +2815,34 @@ mod tests {
         let _path = temp_db();
         let store = store_handle();
         let events = store.subscribe();
+        // One transition announces both the marker and the catalogue: the
+        // running set feeds the summary's `InProgress` bit, so a
+        // `RunningChanged` alone would leave the list stale.
+        let drain = || {
+            let mut running = 0;
+            let mut summaries = 0;
+            while let Ok(event) = events.try_recv() {
+                match *event {
+                    ThreadStoreEvent::RunningChanged => running += 1,
+                    ThreadStoreEvent::SummariesUpdated => summaries += 1,
+                }
+            }
+            (running, summaries)
+        };
         store.with_mut(|s| s.mark_running("t1"));
         assert!(store.read(|s| s.is_running("t1")));
-        assert_eq!(events.len(), 1);
+        assert_eq!(drain(), (1, 1));
         // Idempotent mark: no event, no duplicate work.
         store.with_mut(|s| s.mark_running("t1"));
-        assert_eq!(events.len(), 1);
+        assert_eq!(drain(), (0, 0));
         // A second thread marks independently.
         store.with_mut(|s| s.mark_running("t2"));
         assert!(store.read(|s| s.is_running("t2")));
-        assert_eq!(events.len(), 2);
+        assert_eq!(drain(), (1, 1));
         store.with_mut(|s| s.mark_idle("t1"));
         assert!(!store.read(|s| s.is_running("t1")));
         assert!(store.read(|s| s.is_running("t2")));
-        assert_eq!(events.len(), 3);
+        assert_eq!(drain(), (1, 1));
     }
 
     fn sample_summary(id: &str, archived: bool) -> ThreadSummary {
@@ -3894,6 +3966,77 @@ mod tests {
             "B's view clears A's badge too — one shared read fact"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The explicit mark-unread is a LOWERING: a pass that reads the sidecar
+    /// before the queued write lands would win the max merge and republish the
+    /// old view. The overlay forces the sentinel over that merge and retires
+    /// only when a scan observes it on disk; a later view supersedes it.
+    #[tokio::test]
+    async fn a_marked_unread_holds_the_sentinel_over_a_stale_scan() {
+        let _db_path = temp_db();
+        crate::runtime::init_hermetic_for_test();
+        let store = standalone_for_test();
+        let dir = store.read(|s| s.sessions_dir.clone());
+
+        // A recorded settle and an old view: read. The row has no scan path
+        // yet, so neither stamp has a durable write to race.
+        store.with_mut(|s| {
+            s.insert_summary_for_test("s-unread", None);
+            s.note_settled("s-unread", 42);
+            s.mark_viewed("s-unread", 1_000);
+        });
+        assert!(!store.read(|s| s.summary_by_id("s-unread").expect("row").has_unread));
+
+        // The disk still says "viewed" — what a scan that started before the
+        // lowering's queued write would read.
+        write_session_fixture(&dir, "s-unread", "hello");
+        let path = dir.join("s-unread.jsonl");
+        manox_harness::session_meta::update(&dir, &path, |meta| {
+            meta.last_settled_at = Some(42);
+            meta.last_viewed_at = Some(1_000);
+        })
+        .await
+        .expect("the stale sidecar writes");
+
+        // The lowering cannot persist yet (no scan path when it ran), so the
+        // overlay is the only thing holding it.
+        store.with_mut(|s| assert!(s.mark_unread("s-unread")));
+        store.refresh_now().await;
+        assert!(
+            store.read(|s| s.summary_by_id("s-unread").expect("listed").has_unread),
+            "the overlay holds the sentinel over the stale scan"
+        );
+        assert!(
+            !store.read(|s| s.pending_unread.is_empty()),
+            "the overlay waits for the disk"
+        );
+
+        // The deferred write lands: the disk carries the sentinel and the
+        // overlay retires.
+        manox_harness::session_meta::update(&dir, &path, |meta| {
+            meta.last_viewed_at = Some(0);
+        })
+        .await
+        .expect("the lowered sidecar writes");
+        store.refresh_now().await;
+        assert!(
+            store.read(|s| s.summary_by_id("s-unread").expect("listed").has_unread),
+            "the sentinel keeps the row unread"
+        );
+        assert!(
+            store.read(|s| s.pending_unread.is_empty()),
+            "an observed sentinel retires the overlay"
+        );
+
+        // A view supersedes the lowering (and drops its overlay).
+        assert!(store.with_mut(|s| s.mark_viewed("s-unread", 2_000)));
+        assert!(store.read(|s| s.pending_unread.is_empty()));
+        store.refresh_now().await;
+        assert!(
+            !store.read(|s| s.summary_by_id("s-unread").expect("listed").has_unread),
+            "a later view clears the bit"
+        );
     }
 
     fn count_summaries_updated(rx: &async_channel::Receiver<Arc<ThreadStoreEvent>>) -> usize {
