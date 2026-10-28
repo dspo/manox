@@ -62,7 +62,9 @@ pub use core::agent::RunHandle;
 pub use core::agent_loop::run_loop;
 pub use core::agent_loop::{EventSink, StreamFn};
 pub use core::env::ExecutionEnv;
-pub use core::ext_point_agent::{AgentDef, AgentRegistry};
+pub use core::ext_point_agent::{
+    AgentDef, AgentPermissions, AgentRegistry, NetworkPermission, PermissionMode,
+};
 pub use core::ext_point_background::{BackgroundTaskRegistry, PollResult, TaskError, TaskId};
 pub use core::harness::AgentHarness;
 pub use core::harness::{NavigateTreeOptions, NavigateTreeResult};

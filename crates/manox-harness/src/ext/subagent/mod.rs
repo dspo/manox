@@ -34,8 +34,8 @@ pub use provider::{
 pub use runtime::{ProviderGuard, SubagentRuntime};
 pub use settlement::{NO_CLOSING_MESSAGE, kind_of, verdict};
 pub use spawn::{
-    SpawnProvider, Worktree, auto_deny_gated, explore_agent_def, register_defaults,
-    sailor_agent_def,
+    ChildToolFactory, SpawnProvider, Worktree, auto_deny_gated, explore_agent_def,
+    register_defaults, sailor_agent_def,
 };
 pub use types::{
     AgentOptions, Budgets, Capabilities, DelegationToolConfig, Event, HUMAN_INTERACTION_TOOLS,

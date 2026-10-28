@@ -27,7 +27,16 @@ type Feeds = RwLock<HashMap<String, broadcast::Sender<JournalEvent>>>;
 /// drive loop's listener appends through.
 type ChildWriter = Arc<Session<JsonlSessionStorage>>;
 
-type Writers = RwLock<HashMap<String, ChildWriter>>;
+/// One run's writer entry: the append face plus whether the run's mode is
+/// declaratively pinned. A pinned run's effective mode cannot change, so a
+/// parent mid-turn flip is a no-op for its journal — the opening row
+/// already declares the only mode it will ever run under.
+struct ChildWriterEntry {
+    writer: ChildWriter,
+    pinned: Option<AccessMode>,
+}
+
+type Writers = RwLock<HashMap<String, ChildWriterEntry>>;
 
 fn feeds() -> &'static Feeds {
     static FEEDS: OnceLock<Feeds> = OnceLock::new();
@@ -50,13 +59,15 @@ pub fn register_child_feed(run_id: &str, feed: &broadcast::Sender<JournalEvent>)
 }
 
 /// Register a run's child journal writer (the read half's twin): the append
-/// face the host's mode propagation lands rows through. Same dispatch-time
+/// face the host's mode propagation lands rows through, plus the run's mode
+/// pin (`Some` when a declarative `mode: sandbox` fixed the child's mode —
+/// such a run's journal takes no flip rows). Same dispatch-time
 /// registration, same settle-time removal.
-pub fn register_child_writer(run_id: &str, writer: ChildWriter) {
+pub fn register_child_writer(run_id: &str, writer: ChildWriter, pinned: Option<AccessMode>) {
     writers()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(run_id.to_string(), writer);
+        .insert(run_id.to_string(), ChildWriterEntry { writer, pinned });
 }
 
 /// Drop a run's registry entry (the drive loop's exit path, every ending
@@ -104,16 +115,21 @@ pub fn child_journal_writer(run_id: &str) -> bool {
 /// is its durable witness, carrying the mode now in force. `Ok(false)` when
 /// the id names no running child — the run settled between the caller's
 /// roster read and this call, and a settled journal takes no propagation
-/// rows.
+/// rows. A mode-pinned run answers `Ok(true)` without a row: its effective
+/// mode cannot change, and its opening declaration already names the only
+/// mode it will ever run under — a flip row would be a false change.
 pub async fn journal_access_mode(run_id: &str, mode: AccessMode) -> anyhow::Result<bool> {
-    let writer = writers()
+    let entry = writers()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(run_id)
-        .map(Arc::clone);
-    let Some(writer) = writer else {
+        .map(|e| (Arc::clone(&e.writer), e.pinned));
+    let Some((writer, pinned)) = entry else {
         return Ok(false);
     };
+    if pinned.is_some() {
+        return Ok(true);
+    }
     writer.append_access_mode_change(mode.wire()).await?;
     Ok(true)
 }
@@ -177,7 +193,11 @@ mod tests {
         .await
         .expect("storage creates");
         let run_id = format!("writer-{}", uuid::Uuid::new_v4());
-        register_child_writer(&run_id, Arc::new(crate::session::Session::new(storage)));
+        register_child_writer(
+            &run_id,
+            Arc::new(crate::session::Session::new(storage)),
+            None,
+        );
 
         assert!(
             journal_access_mode(&run_id, AccessMode::Sandbox)
@@ -213,5 +233,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(entries.len(), 1, "the post-settle flip wrote nothing");
+    }
+
+    /// A mode-pinned run stays live for propagation (`Ok(true)`) but lands
+    /// no row: its opening declaration already names the only mode it will
+    /// ever run under, and a flip row would be a false change.
+    #[tokio::test]
+    async fn a_mode_pinned_child_answers_live_but_takes_no_flip_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pinned.jsonl");
+        let storage = crate::session::jsonl::JsonlSessionStorage::create(
+            &path,
+            crate::session::jsonl::JsonlSessionMetadata {
+                id: "pinned-writer-test".into(),
+                cwd: dir.path().display().to_string(),
+                created_at: chrono::Utc::now(),
+                parent_session_path: None,
+                metadata: Some(serde_json::json!({})),
+            },
+        )
+        .await
+        .expect("storage creates");
+        let run_id = format!("pinned-{}", uuid::Uuid::new_v4());
+        register_child_writer(
+            &run_id,
+            Arc::new(crate::session::Session::new(storage)),
+            Some(AccessMode::Sandbox),
+        );
+
+        assert!(
+            journal_access_mode(&run_id, AccessMode::FullAccess)
+                .await
+                .expect("the pinned child answers live"),
+            "a pinned child is a live run — handled, not skipped"
+        );
+        let entries = crate::session::jsonl::JsonlSessionStorage::open(&path)
+            .await
+            .unwrap()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            entries.len(),
+            0,
+            "a pinned run's journal takes no flip rows: {entries:?}"
+        );
     }
 }

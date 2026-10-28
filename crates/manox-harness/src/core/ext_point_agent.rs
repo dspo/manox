@@ -11,9 +11,9 @@ use serde::Deserialize;
 
 /// Static agent definition parsed from a manifest.
 ///
-/// `name`/`description`/`tools`/`model` come from the YAML frontmatter; the
-/// markdown body becomes the agent's system prompt. Unknown frontmatter
-/// fields are rejected rather than silently ignored.
+/// `name`/`description`/`tools`/`model`/`permissions` come from the YAML
+/// frontmatter; the markdown body becomes the agent's system prompt. Unknown
+/// frontmatter fields are rejected rather than silently ignored.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDef {
@@ -30,9 +30,168 @@ pub struct AgentDef {
     /// self-describing.
     #[serde(default)]
     pub model: Option<String>,
+    /// Declared access permissions for the children this definition
+    /// dispatches. Defaults to inheriting everything from the dispatcher.
+    #[serde(default)]
+    pub permissions: AgentPermissions,
     /// The agent's system prompt (manifest body).
     #[serde(skip)]
     pub system_prompt: String,
+}
+
+/// The `permissions:` frontmatter block: how far a dispatched child may reach.
+///
+/// Both axes are *upper-bound declarations*: a child's effective permissions
+/// are always a subset of its dispatcher's, whatever the definition declares.
+/// A definition can therefore only narrow what it asks for, never widen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPermissions {
+    #[serde(default)]
+    pub mode: PermissionMode,
+    #[serde(default)]
+    pub network: NetworkPermission,
+}
+
+impl AgentPermissions {
+    /// The stricter declaration on both axes. Used to intersect definition
+    /// declarations with dispatch-time overrides.
+    pub fn narrowest(self, other: Self) -> Self {
+        Self {
+            mode: self.mode.narrowest(other.mode),
+            network: self.network.narrowest(other.network),
+        }
+    }
+}
+
+/// Declared access-mode intent. The two non-confining values are the same
+/// ceiling — the dispatcher's live mode — so only `sandbox` actually narrows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermissionMode {
+    /// Confined regardless of the dispatcher: a read-only agent stays
+    /// read-only even when a `full-access` session dispatches it.
+    Sandbox,
+    /// Mirror the dispatcher's mode live (mid-turn switches included).
+    #[default]
+    Inherit,
+    /// Ask for the dispatcher's mode, explicitly. Never wider than it: a
+    /// `sandbox` dispatcher still yields a confined child.
+    FullAccess,
+}
+
+impl PermissionMode {
+    /// Permissiveness rank: only `sandbox` is narrower than the dispatcher's
+    /// own ceiling.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Sandbox => 0,
+            Self::Inherit | Self::FullAccess => 1,
+        }
+    }
+
+    /// Whether `self` stays within `ceiling` — `inherit` and `full-access`
+    /// name the same ceiling (the dispatcher's own), so restating one as the
+    /// other is not a widening; only a non-sandbox naming exceeds a
+    /// `sandbox` one.
+    pub fn is_at_most(self, ceiling: Self) -> bool {
+        self.rank() <= ceiling.rank()
+    }
+
+    /// The stricter of two declarations; on equal ceilings the first (the
+    /// declaration being intersected) is kept.
+    pub fn narrowest(self, other: Self) -> Self {
+        if other.rank() < self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// The kebab wire string (the manifest and tool-schema enum value).
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Sandbox => "sandbox",
+            Self::Inherit => "inherit",
+            Self::FullAccess => "full-access",
+        }
+    }
+
+    /// Parse a wire string; `None` for anything outside the closed
+    /// vocabulary.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "sandbox" => Some(Self::Sandbox),
+            "inherit" => Some(Self::Inherit),
+            "full-access" => Some(Self::FullAccess),
+            _ => None,
+        }
+    }
+}
+
+/// Declared network intent. `inherit` and `on` are the same ceiling — the
+/// dispatcher's live route, which is closed when the dispatcher's is — so
+/// only `off` actually narrows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkPermission {
+    /// No network for the child's confined calls, whatever the dispatcher
+    /// allows.
+    Off,
+    /// Mirror the dispatcher's network route live.
+    #[default]
+    Inherit,
+    /// Ask for the dispatcher's network route, explicitly. Never wider than
+    /// it.
+    On,
+}
+
+impl NetworkPermission {
+    /// Permissiveness rank: only `off` is narrower than the dispatcher's own
+    /// route.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Inherit | Self::On => 1,
+        }
+    }
+
+    /// Whether `self` stays within `ceiling` — `inherit` and `on` name the
+    /// same ceiling (the dispatcher's own route), so restating one as the
+    /// other is not a widening; only a non-off naming exceeds an `off` one.
+    pub fn is_at_most(self, ceiling: Self) -> bool {
+        self.rank() <= ceiling.rank()
+    }
+
+    /// The stricter of two declarations; on equal ceilings the first (the
+    /// declaration being intersected) is kept.
+    pub fn narrowest(self, other: Self) -> Self {
+        if other.rank() < self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// The kebab wire string (the manifest and tool-schema enum value).
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Inherit => "inherit",
+            Self::On => "on",
+        }
+    }
+
+    /// Parse a wire string; `None` for anything outside the closed
+    /// vocabulary.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "inherit" => Some(Self::Inherit),
+            "on" => Some(Self::On),
+            _ => None,
+        }
+    }
 }
 
 impl AgentDef {
@@ -168,6 +327,89 @@ mod tests {
         let def = AgentDef::parse_md(manifest).unwrap();
         assert_eq!(def.model.as_deref(), Some("qwen3.7-max"));
         assert!(def.tools.is_empty());
+        assert_eq!(
+            def.permissions,
+            AgentPermissions::default(),
+            "an undeclared permissions block means inherit on both axes"
+        );
+    }
+
+    /// The `permissions:` block is a closed vocabulary: a declared value
+    /// outside it fails the parse (so registration fails), never silently
+    /// degrades to a default.
+    #[test]
+    fn parse_md_reads_permissions_and_rejects_unknown_values() {
+        let manifest = "---\nname: X\ndescription: d\npermissions:\n  mode: sandbox\n  network: off\n---\nbody";
+        let def = AgentDef::parse_md(manifest).unwrap();
+        assert_eq!(def.permissions.mode, PermissionMode::Sandbox);
+        assert_eq!(def.permissions.network, NetworkPermission::Off);
+
+        let partial = "---\nname: X\ndescription: d\npermissions:\n  mode: full-access\n---\nbody";
+        let def = AgentDef::parse_md(partial).unwrap();
+        assert_eq!(def.permissions.mode, PermissionMode::FullAccess);
+        assert_eq!(
+            def.permissions.network,
+            NetworkPermission::Inherit,
+            "an omitted axis keeps its inherit default"
+        );
+
+        let bad_mode = "---\nname: X\ndescription: d\npermissions:\n  mode: readonly\n---\nbody";
+        let err = AgentDef::parse_md(bad_mode).unwrap_err();
+        assert!(err.contains("readonly"), "{err}");
+
+        let bad_network =
+            "---\nname: X\ndescription: d\npermissions:\n  network: partial\n---\nbody";
+        assert!(AgentDef::parse_md(bad_network).is_err());
+
+        let unknown_axis =
+            "---\nname: X\ndescription: d\npermissions:\n  filesystem: none\n---\nbody";
+        assert!(
+            AgentDef::parse_md(unknown_axis).is_err(),
+            "an unknown permissions axis is a schema error"
+        );
+    }
+
+    /// The declaration vocabulary is ordered by permissiveness so an
+    /// intersection has one spelling: the narrower of any pair wins.
+    #[test]
+    fn permission_declarations_narrow_by_permissiveness() {
+        use NetworkPermission::{Inherit as NetInherit, Off as NetOff, On as NetOn};
+        use PermissionMode::{FullAccess, Inherit, Sandbox};
+
+        assert_eq!(Sandbox.narrowest(Inherit), Sandbox);
+        assert_eq!(Sandbox.narrowest(FullAccess), Sandbox);
+        assert_eq!(Inherit.narrowest(FullAccess), Inherit);
+        assert_eq!(FullAccess.narrowest(FullAccess), FullAccess);
+
+        assert_eq!(NetOff.narrowest(NetOn), NetOff);
+        assert_eq!(NetInherit.narrowest(NetOn), NetInherit);
+        assert_eq!(NetOn.narrowest(NetOn), NetOn);
+
+        let declared = AgentPermissions {
+            mode: Sandbox,
+            network: NetInherit,
+        };
+        let override_ = AgentPermissions {
+            mode: FullAccess,
+            network: NetOff,
+        };
+        assert_eq!(
+            declared.narrowest(override_),
+            AgentPermissions {
+                mode: Sandbox,
+                network: NetOff
+            }
+        );
+        assert!(
+            !FullAccess.is_at_most(Sandbox) && !NetOn.is_at_most(NetOff),
+            "the live names still exceed a pinned axis"
+        );
+        assert!(
+            Inherit.is_at_most(FullAccess)
+                && NetInherit.is_at_most(NetOn)
+                && Sandbox.is_at_most(Sandbox),
+            "restating the same ceiling is not a widening"
+        );
     }
 
     #[test]
@@ -203,6 +445,7 @@ mod tests {
             description: "one".into(),
             tools: vec![],
             model: None,
+            permissions: AgentPermissions::default(),
             system_prompt: "p".into(),
         };
         registry.register(a.clone());
@@ -211,6 +454,7 @@ mod tests {
             description: "two".into(),
             tools: vec!["Read".into()],
             model: None,
+            permissions: AgentPermissions::default(),
             system_prompt: "p2".into(),
         });
         assert_eq!(registry.names(), vec!["A"]);
