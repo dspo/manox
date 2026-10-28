@@ -1096,28 +1096,48 @@ project 从未解析、create 的 config 被丢弃、中段排队的 `SetModel` 
   §B.3 的客户端命令映射互不影响：
   1. **无 turn 打开** → `chat/pendingMessageSet{kind:'queued'}`，进 `pending_user`，由下一个
      `turnStart` 作为开场消息携带（不变）。
-  2. **turn 已开、尚无任何内容** → 该行是该 turn 的开场消息（journal 顺序 `turnStart` 在
-     前），以同 `turnId` 重发 `chat/turnStarted` 携带正文（不变）。
-  3. **turn 已开、已有真实内容** → mid-run steer：先按 turn 边界结清当前 turn（
-     `ChatTurnComplete`，Outcome=Complete——上一轮内容已完成、被 steer 接续），再以该 journal
-     行开新 turn：`chat/turnStarted{turnId:'t-<entry.id>', message: steer 文本,
-     queuedMessageId: 客户端 steer id（`originRpc`，缺失时 `m-<entry.id>`）}`。steer 行不再发
-     `pendingMessageSet`，也不进 `pending_user`。
+  2. **turn 已开、尚无开场消息**（`turnStart` 没携带 pending user——deferred create 的形状）
+     → 该行是该 turn 的开场消息，以同 `turnId` 重发 `chat/turnStarted` 携带正文（不变）。
+  3. **turn 已开、已有开场消息** → mid-run user 行（客户端 steer、peer 投递、agent 注入都在
+     此列——journal 不区分它们；**不要求已有 assistant 内容**）：先按 turn 边界结清当前 turn
+     （`ChatTurnComplete`，Outcome=Complete——被该行接续），再以该 journal 行开新 turn：
+     `chat/turnStarted{turnId:'t-<entry.id>', message: 行文本,
+     queuedMessageId: <entry.id>}`。该行不再发 `pendingMessageSet`，也不进 `pending_user`。
+- **身份就是 journal 行 id**：S3 让 caller-minted 的 user 消息**以客户端 id 作为行 id**
+    落盘（`user_entry_id`），而 `AgentMessage::User.id` **不过 wire**、该行也**没有
+     `origin`**（origin pin 属 submit 路径，steer 行不带）——所以 fold 可读的唯一身份是行
+     id：客户端 steer 行的行 id 就等于它 `pendingMessageSet{Steering}` 用的 id，直接用作
+     `queuedMessageId` 即可；投影器再 mint 一个 `m-<id>` 会与客户端槽位、reducer 的**精确
+     id 清槽**都对不上（peer/agent 注入行的存储 id 匹配不到任何槽位，清白无害）。
 - **wire 生命周期不变**：客户端 Set 打开 `steeringMessage` 槽位；新 turn 的
-  `queuedMessageId` 与槽位 id 相同，reducer 在 `chat/turnStarted` 上按 id 清槽（与 idle wake
-  回执同一形状）。注入回执的 `pendingMessageRemoved` 仍照发，此时为 NoOp。
+  `queuedMessageId` 与槽位 id 相同（行 id = 客户端 steer id），reducer 在
+  `chat/turnStarted` 上按 id 清槽（与 idle wake 回执同一形状）。注入回执的
+  `pendingMessageRemoved` 仍照发，此时为 NoOp。parked steer 被下一个 run 消费时没有注入
+  回执，清槽完全靠这条 turnStarted——身份错了就会在 live 状态里留下一个无人清除的槽位。
 - **不是 run 的终点**：分区的 `chat/turnCompleted` 携带
   `_meta.x-manox.steerBoundary = true`。run 在同一条 journal 行上继续，所以客户端按「完成」
-  触发的 run 级动作（例如把排队消息冲成下一轮 turn）必须跳过该边界；run 自己的 `turnFinish`
-  不带此标记。
-- **边界**：连续多条 steer 各自开一个 turn（每条 user 行都必须可见；同一条回复落到最后一条
-  steer 的 turn）；steer 落在 turn 开场（initiating）仍走第 2 路；非 steering 的排队行为完全
-  不变。**附带收益**：restore 重放老 journal 时 mid-run steer 行同样折成 turn 行——不再依赖
+  触发的 run 级动作（例如把排队消息冲成下一轮 turn）**MUST** 跳过该边界；run 自己的
+  `turnFinish` 不带此标记。一个 run 现在可以产出多个 turn：不读该标记的客户端会把边界当
+  run 结束（提前 flush follow-up、结算 run 级状态）。
+- **边界**：
+  - 连续多条 steer 各自开一个 turn（每条 user 行都必须可见；同一条回复落到最后一条 steer
+    的 turn）；非 steering 的排队行为完全不变。
+  - **parked steer 在下一个 run 的 turn 1 被消费时**（wake 流程：submit 的 durable 行先于
+    `turn_start`，turn 以它为开场，steer 行随后到达且尚无任何 assistant 内容）同样走第 3
+    路：`on_turn_start` 把携带的开场文本记进 `OpenTurn.message_text`，所以该 steer 行不会
+    被误判成「还没有开场消息」而**覆盖 prompt**；pre-steer turn 只带着开场消息、以
+    `steerBoundary` 完成（零内容 turn），回复落到 steer 的 turn。第 2 路只适用于
+    **`turn_start` 未携带开场消息**的 window。客户端（桌面按 `turnCompleted` 触发的 run
+    级动作）必须跳过该边界，并自行决定零内容 turn 的渲染。
+  - steer 行只会落在内核的**回合边界**（`agent_loop.rs` 在每轮顶部轮询 steering 队列，工具的
+    tool result 已落盘、审批不在等待中），所以边界 `finish_turn` 对未结算 tool call / 未回答
+    ask 的 settle 是防御性规则（不许悬挂），不是对活工作的取消。
+- **附带收益**：restore 重放老 journal 时 mid-run steer 行同样折成 turn 行——不再依赖
   下游对槽位的补偿清理。
 - **验证**：`projection.rs` 的 `fold_semantics_tests`（分区内容与顺序、steer turn 的
-  `queuedMessageId`、连续 steer、origin 缺失兜底、wire 槽位按 id 退休、重放确定性、idle
-  排队与 initiating 回归）与 `manox-ahp/tests/e2e_in_process.rs` 的
-  `a_steer_turn_started_retires_the_steering_slot`。
+  `queuedMessageId` 等于行 id、连续 steer、peer/agent 注入行、wake 的零内容 pre-steer turn、
+  wire 槽位按行 id 退休、重放确定性、idle 排队与 initiating 回归）与
+  `manox-ahp/tests/e2e_in_process.rs` 的 `a_steer_turn_started_retires_the_steering_slot`。
 - **伴随义务**：dspo/manox-app 停推 retire 时刻的尾部 optimistic bubble（改由 fold 行承载
   显示）、按新语义重写 "steered bubble lands" 断言族、steered 徽章改由 `queuedMessageId`
   行盖章、`steerBoundary` 的完成不触发 follow-up 队列结算；修复经 release/0.6 的下一个
