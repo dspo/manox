@@ -463,8 +463,11 @@ struct OpenTurn {
     /// of a streamed reply, whose tail deltas must rejoin the runs they
     /// streamed into instead of opening fresh parts.
     streamed_thinking: bool,
-    /// The opening user message the turn currently carries: empty until a
-    /// user row lands (journal order puts `turnStart` before the user row).
+    /// The opening user message the turn carries: the `turnStart`'s carried
+    /// pending user when there was one, else empty until the initiating user
+    /// row lands. Recording the carried text is what keeps a later pre-content
+    /// user row (a parked steer consumed at run start) from reading as "no
+    /// opening yet" and replacing it.
     message_text: String,
     /// Tool calls by handle, in a sorted map so turn-boundary settlement is
     /// deterministic.
@@ -1540,22 +1543,34 @@ impl Translator {
                     // running turn's content where it was produced and open the
                     // next turn on the steer row, so every fold (live or
                     // replayed from the journal) reads in journal order.
+                    //
+                    // A steer row lands at a kernel round boundary, never inside
+                    // a tool call or a parked ask: the loop polls its steering
+                    // queue at the top of each round (`agent_loop.rs`), after the
+                    // round's tools have settled. `finish_turn`'s boundary
+                    // settlement of open calls/asks is therefore defensive
+                    // (a must-not-hang rule), not a reachable cancel of live
+                    // work.
                     if let Some(open) = self.open.take() {
                         // The pre-steer round had completed its work; the steer
                         // continues the run in a new turn.
                         self.finish_turn(&open, chat, Outcome::Complete, entry, true, out);
                     }
                     let turn_id = format!("t-{}", entry.id);
-                    // The steer id is the client's, not one this translator
-                    // mints: the engine keys the injected row by it, the host's
-                    // `steer` intent receives it as the pending id, and the
-                    // client retires its optimistic echo against it. The reducer
-                    // also clears the steering slot the wire
-                    // `pendingMessageSet` opened when a `turnStarted` carries
-                    // this id, so the slot's live lifetime is unchanged.
-                    let queued_message_id = origin_rpc
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("m-{}", entry.id));
+                    // The row id IS the steer id: the kernel appends a
+                    // caller-minted user message under that id (S3
+                    // `user_entry_id`), and the client's
+                    // `chat/pendingMessageSet{kind: steering}` used the same id —
+                    // the host's `steer` intent keys the injected row by it. The
+                    // row carries no `origin` (the origin pin belongs to the
+                    // submit path), so `originRpc` cannot name the slot; a
+                    // projector-minted `m-<id>` names nothing the client holds.
+                    // Using the row id also covers non-client injections (a peer
+                    // delivery's storage id matches no slot, which is harmless)
+                    // and lets the reducer clear the steering slot a
+                    // `turnStarted` names, so the slot's live lifetime is
+                    // unchanged live and needs no removal on replay.
+                    let queued_message_id = entry.id.clone();
                     out.push(Emitted::new(
                         chat,
                         StateAction::ChatTurnStarted(ChatTurnStartedAction {
@@ -1695,9 +1710,12 @@ impl Translator {
             self.finish_turn(&open, chat, Outcome::Complete, entry, false, out);
         }
         let carried = self.pending_user.pop_front();
-        let (message, queued_message_id) = match carried {
-            Some(pending) => (pending.message, Some(pending.id)),
-            None => (no_user_row(entry), None),
+        let (message, queued_message_id, opening_text) = match carried {
+            Some(pending) => {
+                let text = pending.message.text.clone();
+                (pending.message, Some(pending.id), text)
+            }
+            None => (no_user_row(entry), None, String::new()),
         };
         let id = format!("t-{}", entry.id);
         out.push(Emitted::new(
@@ -1710,7 +1728,16 @@ impl Translator {
                 meta: Some(manox_meta(json!({"entryId": entry.id}))),
             }),
         ));
-        self.open = Some(OpenTurn::new(id, entry.timestamp.clone(), false));
+        let mut open = OpenTurn::new(id, entry.timestamp.clone(), false);
+        // Record the opening message the turn now carries. Without it a later
+        // user row that arrives before any assistant content (a parked steer
+        // consumed at run start) reads as "the turn has no opening yet" and
+        // REPLACES the carried text — the prompt would vanish from the fold
+        // while its journal row stays behind. With it recorded, such a row
+        // partitions instead: the carried opening becomes its own (empty)
+        // turn and the steer opens the next one.
+        open.message_text = opening_text;
+        self.open = Some(open);
     }
 
     /// One streaming delta: create-then-append on the run's part.
@@ -3622,14 +3649,16 @@ mod fold_semantics_tests {
             kernel(json!({"type": "turn_start", "id": "sentry-1"})),
             kernel(json!({"type": "agent_text_delta", "id": "sentry-2", "delta": "Starting."})),
             // The steer: a user row that arrives with the turn still open.
-            // The id is the client's steer id, which is also the id its
-            // `chat/pendingMessageSet{kind: steering}` echo carried.
+            // The row id IS the client's steer id (the kernel appends a
+            // caller-minted user message under it); the row carries no
+            // `origin` — that pin belongs to the submit path, and
+            // `AgentMessage::User.id` never crosses the wire, so the row id
+            // is the only durable identity the fold can read.
             kernel(json!({
                 "type": "message",
                 "id": "steer-1",
                 "message": {"role": "user",
                             "content": [{"type": "text", "text": "use the fast suite"}]},
-                "origin": "steer-1",
             })),
             kernel(json!({"type": "agent_text_delta", "id": "sentry-4",
                           "delta": "Using the fast suite."})),
@@ -3835,29 +3864,19 @@ mod fold_semantics_tests {
         );
     }
 
-    /// A steer row with no client id falls back to its journal entry id, the
-    /// same formula the initiating branch uses.
+    /// The steer turn's `queuedMessageId` is the ROW id, not a
+    /// projector-minted pending id.
+    ///
+    /// A steer row carries no `origin` (the origin pin is the submit path's)
+    /// and its `AgentMessage::User.id` is not serialized, so the row id is the
+    /// only durable identity: for a client steer that id IS the id its
+    /// `pendingMessageSet{kind: steering}` used. Prefixing it with `m-` names
+    /// nothing the client (or the reducer's exact-match slot clear) holds.
     #[test]
-    fn a_steer_without_a_client_id_falls_back_to_the_entry_id() {
+    fn the_steer_turn_names_the_row_id_as_the_queued_id() {
         let mut translator = Translator::new();
         let mut started = Vec::new();
         for (seq, entry) in mid_run_steer_records().into_iter().enumerate() {
-            let entry = match entry {
-                SessionTreeEntry::Message {
-                    id,
-                    parent_id,
-                    timestamp,
-                    message,
-                    ..
-                } if id == "steer-1" => SessionTreeEntry::Message {
-                    id,
-                    parent_id,
-                    timestamp,
-                    message,
-                    origin: None,
-                },
-                other => other,
-            };
             for emitted in translator.on_entry("c-1", "s-1", seq as u64, &entry) {
                 if let StateAction::ChatTurnStarted(action) = &emitted.action
                     && action.message.text == "use the fast suite"
@@ -3868,8 +3887,149 @@ mod fold_semantics_tests {
         }
         assert_eq!(
             started,
-            [Some("m-steer-1".to_string())],
-            "a row without an origin is named after its entry"
+            [Some("steer-1".to_string())],
+            "the steer turn names the journal row id (the client's steer id)"
+        );
+    }
+
+    /// A user row injected with no client identity (a peer delivery, an
+    /// agent-authored row) partitions too: the journal cannot tell it from a
+    /// client steer, and journal order is reading order either way. Its
+    /// `queuedMessageId` is its storage id — no client slot or queued entry
+    /// matches, so the reducer's clear is a no-op.
+    #[test]
+    fn an_injected_row_partitions_with_its_storage_id_as_the_queued_id() {
+        let records = [
+            kernel(json!({"type": "turn_start", "id": "ts-1"})),
+            kernel(json!({
+                "type": "message",
+                "id": "u-1",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "run the tests"}]},
+            })),
+            kernel(json!({"type": "agent_text_delta", "id": "d-2", "delta": "Starting."})),
+            kernel(json!({
+                "type": "message",
+                "id": "peer-7",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "the lead says hi"}]},
+            })),
+            kernel(json!({"type": "agent_text_delta", "id": "d-4", "delta": "Noted."})),
+            kernel(json!({"type": "turn_finish", "id": "tf-5",
+                          "cancelled": false, "failed": false, "strandedSteerIds": []})),
+        ];
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut queued_ids = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatTurnStarted(action) = &emitted.action {
+                    queued_ids.push((
+                        action.message.text.clone(),
+                        action.queued_message_id.clone(),
+                    ));
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        assert_eq!(
+            queued_ids.last(),
+            Some(&("the lead says hi".to_string(), Some("peer-7".to_string()))),
+            "an injected row names its storage id, matching no client slot: {queued_ids:?}"
+        );
+        assert_eq!(state.turns.len(), 2, "the injected row opens its own turn");
+        assert_eq!(
+            markdown_text(&state.turns[1].response_parts),
+            "Noted.",
+            "the reply follows the injected row"
+        );
+    }
+
+    /// A parked steer consumed at the next run's start partitions BEFORE any
+    /// assistant content, so the pre-steer turn completes with only its
+    /// opening message (a boundary, not a run end). This is the wake flow:
+    /// the journal cannot fold the steer into the prompt's turn (AHP gives a
+    /// turn one opening message), and keeping a wire-only slot would strand
+    /// it on replay. Pinned so the boundary semantics are explicit.
+    #[test]
+    fn a_parked_steer_consumed_at_run_start_partitions_a_contentless_turn() {
+        let records = [
+            // The submit's durable row lands BEFORE turn_start (K5), so the
+            // turn opens carrying it; the steer then arrives with no content.
+            kernel(json!({
+                "type": "message",
+                "id": "u-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "wake the run"}]},
+            })),
+            kernel(json!({"type": "turn_start", "id": "ts-1"})),
+            kernel(json!({
+                "type": "message",
+                "id": "steer-1",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "and skip the flaky one"}]},
+            })),
+            kernel(json!({"type": "agent_text_delta", "id": "d-3", "delta": "Skipped."})),
+            kernel(json!({"type": "turn_finish", "id": "tf-4",
+                          "cancelled": false, "failed": false, "strandedSteerIds": []})),
+        ];
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut boundaries: Vec<(String, bool)> = Vec::new();
+        let mut steer_ids = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                match &emitted.action {
+                    StateAction::ChatTurnStarted(action)
+                        if action.message.text == "and skip the flaky one" =>
+                    {
+                        steer_ids.push(action.queued_message_id.clone());
+                    }
+                    StateAction::ChatTurnComplete(action) => {
+                        let boundary = action
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.get("x-manox"))
+                            .and_then(|meta| meta.get("steerBoundary"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        boundaries.push((action.turn_id.clone(), boundary));
+                    }
+                    _ => {}
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        assert_eq!(
+            steer_ids,
+            [Some("steer-1".to_string())],
+            "the wake steer names the client's id: {:?}",
+            steer_ids
+        );
+        assert_eq!(
+            boundaries,
+            [
+                ("t-ts-1".to_string(), true),
+                ("t-steer-1".to_string(), false),
+            ],
+            "the wake boundary is flagged; the run's own finish is not"
+        );
+        let pre = &state.turns[0];
+        assert_eq!(pre.message.text, "wake the run");
+        assert_eq!(
+            markdown_text(&pre.response_parts),
+            "",
+            "the pre-steer turn produced nothing before the steer"
+        );
+        assert_eq!(
+            pre.state,
+            ahp_types::state::TurnState::Complete,
+            "it settles as a boundary completion"
+        );
+        assert_eq!(
+            markdown_text(&state.turns[1].response_parts),
+            "Skipped.",
+            "the reply lands under the steer the run actually answered"
         );
     }
 
