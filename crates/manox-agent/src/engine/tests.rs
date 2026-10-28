@@ -5014,3 +5014,282 @@ async fn an_idle_set_model_refused_by_the_durable_path_lands_via_the_queue() {
         "a durable refusal queues only: the switch stays out of the journal"
     );
 }
+
+// ── subagent permission inheritance (the read-only-jail regression) ─────────
+//
+// The incident: a full-access Captain dispatched Sailors whose Bash ran in a
+// deny-default seatbelt with no writable root (a full-disk read-only jail),
+// while the same Sailor's Write tool wrote freely. The pins below are the two
+// halves of the fix: one authority behind both layers, and a fence on the fs
+// side that reads that same authority.
+
+/// Backend that records which of the Captain's two backends served a call.
+struct TaggedBashOps {
+    tag: &'static str,
+    calls: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait::async_trait]
+impl manox_harness::tools::bash::BashOperations for TaggedBashOps {
+    async fn exec(
+        &self,
+        _request: manox_harness::tools::bash::BashExecRequest<'_>,
+    ) -> Result<manox_harness::env::CommandResult, manox_harness::env::ExecutionError> {
+        self.calls.lock().unwrap().push(self.tag);
+        Ok(manox_harness::env::CommandResult {
+            stdout: format!("ran={}", self.tag),
+            stderr: String::new(),
+            exit_code: 0,
+        })
+    }
+}
+
+fn subagent_test_ctx(dir: &Path) -> manox_harness::tool::LocalToolContext {
+    manox_harness::tool::LocalToolContext::new(
+        Arc::new(manox_harness::env::TokioExecutionEnv::new(
+            dir.to_path_buf(),
+        )),
+        dir.to_path_buf(),
+        Arc::new(manox_harness::tool::ToolState::new()),
+    )
+}
+
+fn subagent_test_gate() -> Arc<ApprovalGate> {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    Arc::new(ApprovalGate::new(tx, Arc::new(Mutex::new(None))))
+}
+
+/// The child snapshot's Bash reads the Captain's live mode through the shared
+/// resolver: full access selects the unsandboxed backend, and a mid-turn flip
+/// back to sandbox selects the confined one on the very next call.
+#[tokio::test]
+async fn child_bash_inherits_the_captains_live_mode() {
+    let gate = subagent_test_gate();
+    gate.set_mode(AccessMode::FullAccess);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let sandboxed: Arc<dyn manox_harness::tools::bash::BashOperations> = Arc::new(TaggedBashOps {
+        tag: "sandboxed",
+        calls: Arc::clone(&calls),
+    });
+    let unsandboxed: Arc<dyn manox_harness::tools::bash::BashOperations> =
+        Arc::new(TaggedBashOps {
+            tag: "unsandboxed",
+            calls: Arc::clone(&calls),
+        });
+    let mode_gate = Arc::clone(&gate);
+    let tool = SubagentBashTool {
+        inner: Arc::new(subagent_bash_tool(
+            sandboxed,
+            Arc::new(BackgroundRegistry::new()),
+            true,
+            Arc::new(move || mode_gate.mode()),
+            Arc::new(manox_harness::sandbox::NetworkAccess::default),
+            Some(unsandboxed),
+        )),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = subagent_test_ctx(dir.path());
+
+    tool.execute(
+        "c1",
+        serde_json::json!({"command": "echo hi", "cwd": [""]}),
+        tokio_util::sync::CancellationToken::new(),
+        &ctx,
+    )
+    .await
+    .expect("full-access call runs");
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        ["unsandboxed"],
+        "a full-access Captain's Sailor runs unconfined"
+    );
+
+    // The live flip governs the next call: the shared resolver is the same
+    // authority, not an assembly-time snapshot.
+    gate.set_mode(AccessMode::Sandbox);
+    tool.execute(
+        "c2",
+        serde_json::json!({"command": "echo hi", "cwd": [""]}),
+        tokio_util::sync::CancellationToken::new(),
+        &ctx,
+    )
+    .await
+    .expect("sandboxed call runs");
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        ["unsandboxed", "sandboxed"],
+        "a sandboxed Captain's Sailor is confined identically"
+    );
+}
+
+/// The child Bash refuses the schema-stripped `require_escalated`: the
+/// subagent session has no approver, so the retry could only fail closed.
+#[tokio::test]
+async fn child_bash_refuses_require_escalated() {
+    let tool = SubagentBashTool {
+        inner: Arc::new(MarkerBash),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = subagent_test_ctx(dir.path());
+    let err = tool
+        .execute(
+            "c1",
+            serde_json::json!({
+                "command": "echo hi",
+                "require_escalated": true,
+                "justification": "x",
+            }),
+            tokio_util::sync::CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("no approval channel"),
+        "the refusal names the missing channel: {err}"
+    );
+}
+
+/// Inner tool standing in for a file tool: records that it ran so the fence
+/// can be asserted independently of the real filesystem.
+struct CountingWriteTool {
+    name: &'static str,
+    ran: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl manox_harness::tool::AgentTool for CountingWriteTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        "counting"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(
+        &self,
+        _: &str,
+        _: serde_json::Value,
+        _: tokio_util::sync::CancellationToken,
+        _: &dyn manox_harness::tool::ToolContext,
+    ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
+        self.ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(manox_harness::tool::AgentToolResult::text("ok"))
+    }
+}
+
+type RunCount = Arc<std::sync::atomic::AtomicUsize>;
+
+fn fenced_write_tool(mode: AccessMode, workspace: &Path) -> (SubagentWriteFence, RunCount) {
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fence = SubagentWriteFence {
+        inner: Arc::new(CountingWriteTool {
+            name: "Write",
+            ran: Arc::clone(&ran),
+        }),
+        mode_resolver: Arc::new(move || mode),
+        granted_roots: crate::granted_roots::GrantedRoots::new(workspace),
+    };
+    (fence, ran)
+}
+
+/// The Sailor's Write rides the same fence as the Captain's: inside the
+/// writable roots it runs, outside it is refused with the shared marker and
+/// no escalation hint (there is no channel to answer one).
+#[tokio::test]
+async fn child_write_fence_admits_the_workspace_and_refuses_outside() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fence, ran) = fenced_write_tool(AccessMode::Sandbox, dir.path());
+    let ctx = subagent_test_ctx(dir.path());
+
+    fence
+        .execute(
+            "c1",
+            serde_json::json!({"path": dir.path().join("inside.txt"), "cwd": [""], "content": "x"}),
+            tokio_util::sync::CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .expect("a write inside the workspace passes");
+    assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let err = fence
+        .execute(
+            "c2",
+            serde_json::json!({"path": "/usr/local/manox-sailor-fence-probe/x.txt", "cwd": [""], "content": "x"}),
+            tokio_util::sync::CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("[sandbox: file access denied under sandbox mode]"),
+        "shared denial marker: {err}"
+    );
+    assert!(
+        err.contains("no escalation channel in this session"),
+        "the refusal names the dead end: {err}"
+    );
+    assert!(
+        !err.contains("require_escalated"),
+        "no hint for a channel that does not exist: {err}"
+    );
+    assert_eq!(
+        ran.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the refused call never reached the tool"
+    );
+}
+
+/// A full-access Captain's Sailor writes where the Captain writes: the fence
+/// passes the call straight through.
+#[tokio::test]
+async fn child_write_fence_passes_through_under_full_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fence, ran) = fenced_write_tool(AccessMode::FullAccess, dir.path());
+    let ctx = subagent_test_ctx(dir.path());
+    fence
+        .execute(
+            "c1",
+            serde_json::json!({"path": "/usr/local/manox-sailor-fence-probe/x.txt", "cwd": [""], "content": "x"}),
+            tokio_util::sync::CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .expect("full access is unfenced");
+    assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// The Edit fence classifies every patch target, the same way the Captain's
+/// gate does (one path per file header).
+#[tokio::test]
+async fn child_edit_fence_judges_every_patch_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fence = SubagentWriteFence {
+        inner: Arc::new(CountingWriteTool {
+            name: "Edit",
+            ran: Arc::clone(&ran),
+        }),
+        mode_resolver: Arc::new(|| AccessMode::Sandbox),
+        granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()),
+    };
+    let ctx = subagent_test_ctx(dir.path());
+    let patch = "*** Begin Patch\n[inside.rs#1A2B3C]\nDEL 1\n[/usr/local/manox-sailor-fence-probe/x.rs#1A2B3C]\nDEL 1\n*** End Patch";
+    let err = fence
+        .execute(
+            "c1",
+            serde_json::json!({"patch": patch, "cwd": [""]}),
+            tokio_util::sync::CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("[sandbox: file access denied"), "{err}");
+    assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
