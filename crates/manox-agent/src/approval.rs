@@ -7,9 +7,11 @@
 //!
 //! - `FullAccess` runs every gated call ungated (bash unsandboxed).
 //! - `Sandbox` runs a gated call when its target is provably inside the
-//!   writable roots (`sandbox_verdict` for `Write`/`Edit`; sandbox-confined
+//!   writable roots ([`fs_write_verdict`] for `Write`/`Edit`; sandbox-confined
 //!   `Bash` bypass via the auto-allow resolver); anything the
-//!   policy cannot classify is denied (fail-closed).
+//!   policy cannot classify is denied (fail-closed). The same verdict backs
+//!   the subagent snapshot's fence, so both sessions enforce one containment
+//!   rule.
 //!
 //! Denials return a `ToolError` to the model — the gate never parks a call
 //! on the user. The only round trip left on this channel is
@@ -662,86 +664,105 @@ impl ApprovalGatedTool {
         params: &serde_json::Value,
         ctx: &dyn ToolContext,
     ) -> Result<(), ToolError> {
-        let deny = || Err(fs_denial());
-        // The call's effective cwd — the same `cwd` `[anchor, ...route]`
-        // resolution the tool itself will perform, peeked read-only so the
-        // fence does not advance the sticky cwd. A malformed or unresolvable
-        // `cwd` is an argument error, not a permission problem: surface the
-        // same instructional text the tool itself would return next instead
-        // of dressing it up as a sandbox denial that lures the model into an
-        // escalation it cannot benefit from.
-        let cwd = match manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd"))
-        {
-            Ok(cwd) => cwd,
-            Err(e) => return Err(ToolError::InvalidArguments(e)),
-        };
-        // Containment against the shared writable-root set (workspace + manox
-        // home + /tmp + tmpdir) plus the granted roots derived from the
-        // call's cwd: a linked worktree of the workspace admits itself, an
-        // escalation-approved directory stays for the session — no `.git` or
-        // plans-dir special-casing: the plans dir is admitted transitively
-        // under the manox home.
-        let mut roots = manox_harness::sandbox::writable_roots(AccessMode::Sandbox, &cwd);
-        if let Some(granted) = &self.granted_roots {
-            roots.extend(granted.roots_for(&cwd));
+        fs_write_verdict(
+            self.inner.name(),
+            params,
+            ctx,
+            self.granted_roots.as_ref(),
+            &fs_denial,
+        )
+    }
+}
+
+/// The one fs containment verdict every enforcing surface shares: the host
+/// gate's `Write`/`Edit`/`Py` check and the subagent snapshot's fence. `deny`
+/// is the caller's refusal text — the host gate teaches the escalation retry,
+/// the subagent fence reports a blocker instead (it has no channel).
+///
+/// The call's effective cwd is the same `cwd` `[anchor, ...route]` resolution
+/// the tool itself will perform, peeked read-only so the fence does not
+/// advance the sticky cwd. A malformed or unresolvable `cwd` is an argument
+/// error, not a permission problem: surface the same instructional text the
+/// tool itself would return next instead of dressing it up as a sandbox
+/// denial that lures the model into an escalation it cannot benefit from.
+pub(super) fn fs_write_verdict(
+    tool_name: &str,
+    params: &serde_json::Value,
+    ctx: &dyn ToolContext,
+    granted_roots: Option<&crate::granted_roots::GrantedRoots>,
+    deny: &dyn Fn() -> ToolError,
+) -> Result<(), ToolError> {
+    let refuse = || Err(deny());
+    let cwd = match manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd")) {
+        Ok(cwd) => cwd,
+        Err(e) => return Err(ToolError::InvalidArguments(e)),
+    };
+    // Containment against the shared writable-root set (workspace + manox
+    // home + /tmp + tmpdir) plus the granted roots derived from the call's
+    // cwd: a linked worktree of the workspace admits itself, an
+    // escalation-approved directory stays for the session — no `.git` or
+    // plans-dir special-casing: the plans dir is admitted transitively under
+    // the manox home.
+    let mut roots = manox_harness::sandbox::writable_roots(AccessMode::Sandbox, &cwd);
+    if let Some(granted) = granted_roots {
+        roots.extend(granted.roots_for(&cwd));
+    }
+    let contained = |target: &Path| {
+        let canon = manox_harness::sandbox::canonicalize_best_effort(target);
+        roots.iter().any(|r| canon.starts_with(r))
+    };
+    match tool_name {
+        "Write" => {
+            let Some(path) = params.get("path").and_then(|v| v.as_str()) else {
+                return refuse();
+            };
+            let target = if Path::new(path).is_absolute() {
+                std::path::PathBuf::from(path)
+            } else {
+                cwd.join(path)
+            };
+            if !contained(&target) {
+                return refuse();
+            }
+            Ok(())
         }
-        let contained = |target: &Path| {
-            let canon = manox_harness::sandbox::canonicalize_best_effort(target);
-            roots.iter().any(|r| canon.starts_with(r))
-        };
-        match self.inner.name() {
-            "Write" => {
-                let Some(path) = params.get("path").and_then(|v| v.as_str()) else {
-                    return deny();
-                };
-                let target = if Path::new(path).is_absolute() {
-                    std::path::PathBuf::from(path)
+        "Edit" => {
+            let Some(patch) = params.get("patch").and_then(|v| v.as_str()) else {
+                return refuse();
+            };
+            let file_patches = match manox_harness::hashline::parse_patch(patch) {
+                Ok(p) => p.files,
+                // Unverifiable targets fail closed (the Edit tool rejects
+                // malformed hashline anyway).
+                Err(_) => return refuse(),
+            };
+            for fp in &file_patches {
+                let target = if fp.path.is_absolute() {
+                    fp.path.clone()
                 } else {
-                    cwd.join(path)
+                    cwd.join(&fp.path)
                 };
                 if !contained(&target) {
-                    return deny();
+                    return refuse();
                 }
-                Ok(())
             }
-            "Edit" => {
-                let Some(patch) = params.get("patch").and_then(|v| v.as_str()) else {
-                    return deny();
-                };
-                let file_patches = match manox_harness::hashline::parse_patch(patch) {
-                    Ok(p) => p.files,
-                    // Unverifiable targets fail closed (the Edit tool
-                    // rejects malformed hashline anyway).
-                    Err(_) => return deny(),
-                };
-                for fp in &file_patches {
-                    let target = if fp.path.is_absolute() {
-                        fp.path.clone()
-                    } else {
-                        cwd.join(&fp.path)
-                    };
-                    if !contained(&target) {
-                        return deny();
-                    }
-                }
-                Ok(())
-            }
-            // Py: a script's write targets are decided at runtime, so
-            // containment cannot be proven the way Write/Edit prove a path —
-            // and unlike sandbox-confined Bash there is no OS fence to stand
-            // in (the interpreter runs in-process, with the app's full user
-            // privileges). The call fails closed with the escalation hint;
-            // the assembly line arms this wrapper with the escalation
-            // config, so an approved `require_escalated`+`justification`
-            // grant widens the mode for exactly that call.
-            crate::tools::PY => deny(),
-            // Session/repo-scoped coordination (task tools) was removed in
-            // the tools-optimization cycle — they were retired with the
-            // Steer-based team architecture.
-            // Every other gated call (escalated bash, unknown mutating
-            // tools) has no in-workspace proof.
-            _ => deny(),
+            Ok(())
         }
+        // Py: a script's write targets are decided at runtime, so containment
+        // cannot be proven the way Write/Edit prove a path — and unlike
+        // sandbox-confined Bash there is no OS fence to stand in (the
+        // interpreter runs in-process, with the app's full user privileges).
+        // The call fails closed; under the host gate the assembly line arms
+        // the wrapper with the escalation config, so an approved
+        // `require_escalated`+`justification` grant widens the mode for
+        // exactly that call.
+        crate::tools::PY => refuse(),
+        // Session/repo-scoped coordination (task tools) was removed in the
+        // tools-optimization cycle — they were retired with the
+        // Steer-based team architecture.
+        // Every other gated call (escalated bash, unknown mutating tools) has
+        // no in-workspace proof.
+        _ => refuse(),
     }
 }
 
