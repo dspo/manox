@@ -37,7 +37,9 @@ pub use agent::RunHandle;
 pub use agent_loop::run_loop;
 pub use agent_loop::{EventSink, StreamFn};
 pub use env::ExecutionEnv;
-pub use ext_point_agent::{AgentDef, AgentRegistry};
+pub use ext_point_agent::{
+    AgentDef, AgentPermissions, AgentRegistry, NetworkPermission, PermissionMode,
+};
 pub use ext_point_background::{BackgroundTaskRegistry, PollResult, TaskError, TaskId};
 pub use harness::AgentHarness;
 pub use harness::{NavigateTreeOptions, NavigateTreeResult};

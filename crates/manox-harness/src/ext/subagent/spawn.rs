@@ -69,12 +69,30 @@ pub fn register_defaults(registry: &mut AgentRegistry) {
     registry.register(sailor_agent_def());
 }
 
+/// Builds one child's tool snapshot at dispatch time. The argument is the
+/// request's effective permission declaration (`None` = inherit the
+/// dispatcher's authority live): the enforcing resolvers of the returned
+/// tools must already answer for that declaration. The factory varies
+/// resolver wiring only — the tool NAME set it returns is the static
+/// snapshot's, so filter validation and delegation-name stripping stay
+/// canonical.
+pub type ChildToolFactory = Arc<
+    dyn Fn(Option<&crate::core::ext_point_agent::AgentPermissions>) -> Vec<Arc<dyn AgentTool>>
+        + Send
+        + Sync,
+>;
+
 /// The in-process spawn provider: composes a fresh child session per start
 /// and drives it to settlement.
 pub struct SpawnProvider {
     /// Snapshot of the parent's full tool set; the child's tools are a
     /// stripped/filtered subset resolved per start.
     tools: Vec<Arc<dyn AgentTool>>,
+    /// Per-dispatch snapshot builder. When installed it replaces the static
+    /// snapshot for EVERY dispatch (a `None` declaration builds the same
+    /// live-inheritance shape); the static set stays the canonical name
+    /// source and the no-factory fallback.
+    tool_factory: Option<ChildToolFactory>,
     /// Optional model runtime; without one the session is built from the
     /// default env-backed runtime.
     model_runtime: Option<ModelRuntime>,
@@ -104,6 +122,7 @@ impl SpawnProvider {
     pub fn new(tools: Vec<Arc<dyn AgentTool>>) -> Self {
         SpawnProvider {
             tools,
+            tool_factory: None,
             model_runtime: None,
             model: None,
             model_slot: None,
@@ -112,6 +131,14 @@ impl SpawnProvider {
             observer: None,
             access_mode_resolver: None,
         }
+    }
+
+    /// Build the child's tool snapshot per dispatch instead of sharing the
+    /// assembly-time one: the request's effective permission declaration
+    /// shapes the snapshot's enforcing resolvers. See [`ChildToolFactory`].
+    pub fn with_tool_factory(mut self, factory: ChildToolFactory) -> Self {
+        self.tool_factory = Some(factory);
+        self
     }
 
     /// Inject the model runtime the subagent session runs on (the caller's
@@ -166,13 +193,29 @@ impl SpawnProvider {
         self
     }
 
-    /// Resolve a child's tool set: the parent snapshot minus `Steer`, the
+    /// The snapshot one dispatch runs on: the per-dispatch factory output
+    /// when one is installed (the declaration shapes resolver wiring),
+    /// otherwise the assembly-time static snapshot.
+    fn dispatch_snapshot(
+        &self,
+        permissions: Option<&crate::core::ext_point_agent::AgentPermissions>,
+    ) -> Vec<Arc<dyn AgentTool>> {
+        match &self.tool_factory {
+            Some(factory) => factory(permissions),
+            None => self.tools.clone(),
+        }
+    }
+
+    /// Resolve a child's tool set: the dispatch snapshot minus `Steer`, the
     /// delegation tools, and every [`HUMAN_INTERACTION_TOOLS`] name (D5),
     /// then scoped by the request's allow/deny filter, then wrapped in the
     /// `never` auto-deny gate (D6).
-    fn select_child_tools(&self, filter: Option<&ToolFilter>) -> Vec<Arc<dyn AgentTool>> {
-        let selected: Vec<_> = self
-            .tools
+    fn select_child_tools(
+        &self,
+        tools: &[Arc<dyn AgentTool>],
+        filter: Option<&ToolFilter>,
+    ) -> Vec<Arc<dyn AgentTool>> {
+        let selected: Vec<_> = tools
             .iter()
             .filter(|t| t.name() != "Steer")
             .filter(|t| !self.delegation_names.contains(t.name()))
@@ -199,6 +242,7 @@ impl SubagentProvider for SpawnProvider {
             output_schema: false,
             depth_limit: true,
             tool_filter: true,
+            permissions: true,
             persona: true,
         }
     }
@@ -212,8 +256,9 @@ impl SubagentProvider for SpawnProvider {
         // Loud unknown-name validation against the actual snapshot: a typo
         // in an allow/deny list must reject the dispatch, not silently
         // narrow (or widen) the child's tools.
+        let snapshot = self.dispatch_snapshot(req.permissions.as_ref());
         if let Some(filter) = &req.tool_filter {
-            let names: HashSet<&str> = self.tools.iter().map(|t| t.name()).collect();
+            let names: HashSet<&str> = snapshot.iter().map(|t| t.name()).collect();
             validate_filter_names(filter, &names)
                 .map_err(|e| SubagentError::Provider(self.name().to_string(), e.to_string()))?;
         }
@@ -225,7 +270,7 @@ impl SubagentProvider for SpawnProvider {
                     .to_string(),
             ));
         }
-        let mut selected = self.select_child_tools(req.tool_filter.as_ref());
+        let mut selected = self.select_child_tools(&snapshot, req.tool_filter.as_ref());
         // The child's channel to the parent's user: one clarifying
         // question, delivered once, ending the child's turn — the answer
         // returns as a continuation of the same run.
@@ -389,15 +434,21 @@ impl SubagentProvider for SpawnProvider {
         // The child journal opens each activation with the access authority
         // the run inherits: the standing mode as the live resolver answers
         // NOW — the same authority the child's per-call resolvers will read.
-        // A continuation re-declares on purpose: a flip while the child was
-        // settled had no live journal to propagate into, so this row is the
-        // only durable witness of the mode this activation runs under. The
-        // durable face materializes the fresh journal here (the K5 shape):
-        // a subscriber attaching before the first assistant message
-        // cold-reads the declaration, and every later row lands on disk at
-        // once.
+        // A declarative `mode: sandbox` pin overrides the live answer (the
+        // pin is structural — the run stays confined whatever the dispatching
+        // gate flips to), so the durable face never mirrors a wider mode than
+        // the run is confined to. A continuation re-declares on purpose: a
+        // flip while the child was settled had no live journal to propagate
+        // into, so this row is the only durable witness of the mode this
+        // activation runs under. The durable face materializes the fresh
+        // journal here (the K5 shape): a subscriber attaching before the
+        // first assistant message cold-reads the declaration, and every later
+        // row lands on disk at once.
+        let pinned_mode = (req.permissions.as_ref().map(|p| p.mode)
+            == Some(crate::core::ext_point_agent::PermissionMode::Sandbox))
+        .then_some(crate::sandbox::AccessMode::Sandbox);
         if let Some(resolver) = &self.access_mode_resolver {
-            let mode = resolver();
+            let mode = pinned_mode.unwrap_or_else(|| resolver());
             if let Err(err) = session
                 .journal_appender()
                 .append_access_mode_change_durable(mode.wire())
@@ -410,10 +461,11 @@ impl SubagentProvider for SpawnProvider {
         // propagation lands rows through: both registered for the run's
         // whole life (the drive task holds the guard, so they die on every
         // exit below), so a bridge attaching at any moment during the run
-        // finds the feed and a flip reaches a live child only.
+        // finds the feed and a flip reaches a live child only. The pin rides
+        // the entry: a pinned run's mode cannot change, so flips land no row.
         let feed_guard = ChildFeedGuard(run_id.clone());
         super::feeds::register_child_feed(&run_id, &session.subscribe_journal_sender());
-        super::feeds::register_child_writer(&run_id, session.journal_appender());
+        super::feeds::register_child_writer(&run_id, session.journal_appender(), pinned_mode);
 
         let info = crate::ext::subagent::types::RunInfo {
             run_id: run_id.clone(),
@@ -1040,6 +1092,16 @@ mod tests {
         assert_eq!(def.tools, vec!["Read", "Grep", "Glob", "Ls"]);
         assert!(def.system_prompt.contains("read-only codebase"));
         assert!(def.description.to_lowercase().contains("read-only"));
+        // The declarative permission pin: Explore is read-only by
+        // construction, so its manifest nails the mode down.
+        assert_eq!(
+            def.permissions.mode,
+            crate::core::ext_point_agent::PermissionMode::Sandbox
+        );
+        assert_eq!(
+            def.permissions.network,
+            crate::core::ext_point_agent::NetworkPermission::Inherit
+        );
     }
 
     #[test]
@@ -1073,7 +1135,8 @@ mod tests {
             allow: vec!["Read".into()],
             deny: vec![],
         };
-        let selected = provider.select_child_tools(Some(&filter));
+        let selected =
+            provider.select_child_tools(&provider.dispatch_snapshot(None), Some(&filter));
         assert_eq!(
             selected.iter().map(|t| t.name()).collect::<Vec<_>>(),
             vec!["Read"]
@@ -1083,7 +1146,7 @@ mod tests {
     #[test]
     fn select_child_tools_empty_filter_means_full_snapshot() {
         let provider = provider_with(def_tools_snapshot(), &[]);
-        let selected = provider.select_child_tools(None);
+        let selected = provider.select_child_tools(&provider.dispatch_snapshot(None), None);
         assert_eq!(selected.len(), 2);
     }
 
@@ -1124,11 +1187,83 @@ mod tests {
             Arc::new(NamedTool("Read", true)),
         ];
         let provider = provider_with(tools, &["Sailor"]);
-        let selected = provider.select_child_tools(None);
+        let selected = provider.select_child_tools(&provider.dispatch_snapshot(None), None);
         assert_eq!(
             selected.iter().map(|t| t.name()).collect::<Vec<_>>(),
             vec!["Read"],
             "full-snapshot child keeps only the plain read"
+        );
+    }
+
+    /// A tool whose description echoes the declaration the factory saw —
+    /// the observable of per-dispatch snapshot building.
+    struct DeclarationEcho(&'static str);
+
+    #[async_trait::async_trait]
+    impl AgentTool for DeclarationEcho {
+        fn name(&self) -> &str {
+            "Read"
+        }
+        fn description(&self) -> &str {
+            self.0
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: CancellationToken,
+            _: &dyn crate::core::tool::ToolContext,
+        ) -> Result<AgentToolResult, ToolError> {
+            Ok(AgentToolResult::text("ran"))
+        }
+    }
+
+    /// The per-dispatch factory rides the request's declaration: each start
+    /// shape builds its own snapshot (`None` = the live-inheritance shape),
+    /// while a provider without a factory keeps the static one.
+    #[test]
+    fn dispatch_snapshot_builds_per_declaration_when_a_factory_is_installed() {
+        use crate::core::ext_point_agent::{AgentPermissions, PermissionMode};
+        let factory: ChildToolFactory = Arc::new(|declaration: Option<&AgentPermissions>| {
+            let tag = match declaration.map(|p| p.mode) {
+                Some(PermissionMode::Sandbox) => "pinned",
+                _ => "live",
+            };
+            vec![Arc::new(DeclarationEcho(tag)) as Arc<dyn AgentTool>]
+        });
+        let provider = SpawnProvider::new(vec![
+            Arc::new(DeclarationEcho("static")) as Arc<dyn AgentTool>
+        ])
+        .with_tool_factory(factory);
+        let mut pinned = crate::ext::subagent::types::test_request("l", "p");
+        pinned.permissions = Some(AgentPermissions {
+            mode: PermissionMode::Sandbox,
+            network: Default::default(),
+        });
+        assert_eq!(
+            provider.dispatch_snapshot(pinned.permissions.as_ref())[0].description(),
+            "pinned",
+            "a pinned declaration builds the pinned shape"
+        );
+        assert_eq!(
+            provider.dispatch_snapshot(None)[0].description(),
+            "live",
+            "no declaration builds the live-inheritance shape"
+        );
+        assert_eq!(
+            SpawnProvider::new(vec![
+                Arc::new(DeclarationEcho("static")) as Arc<dyn AgentTool>
+            ])
+            .dispatch_snapshot(None)[0]
+                .description(),
+            "static",
+            "without a factory the static snapshot serves every dispatch"
         );
     }
 

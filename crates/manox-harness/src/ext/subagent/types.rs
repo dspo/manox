@@ -12,6 +12,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::env::ExecutionEnv;
+use crate::core::ext_point_agent::AgentPermissions;
 use crate::core::types::Model;
 
 /// The smallest wall-clock or idle budget a delegation may arm — below it a
@@ -40,6 +41,8 @@ pub struct Capabilities {
     pub depth_limit: bool,
     /// Child tool scoping (allow/deny lists over the parent snapshot).
     pub tool_filter: bool,
+    /// A declared (or dispatch-narrowed) permission ceiling on the child.
+    pub permissions: bool,
     /// A per-request persona prefix shadowing the configured one.
     pub persona: bool,
 }
@@ -157,6 +160,11 @@ pub struct StartRequest {
     pub max_depth: Option<u32>,
     /// Child tool scoping. Requires the `tool_filter` capability.
     pub tool_filter: Option<ToolFilter>,
+    /// The child's permission ceiling, already intersected with any
+    /// dispatch-time narrowing by the caller. `None` = inherit the
+    /// dispatcher's authority live on both axes. Requires the `permissions`
+    /// capability.
+    pub permissions: Option<AgentPermissions>,
     /// Per-request persona prefix shadowing the configured one. Requires the
     /// `persona` capability.
     pub persona: Option<String>,
@@ -349,6 +357,11 @@ pub struct DelegationToolConfig {
     /// Raw dedicated spec from the providers config `subagents:` map —
     /// wins over the frontmatter.
     pub config_model_spec: Option<String>,
+    /// The definition's declared permission ceiling (the `permissions:`
+    /// frontmatter). A dispatch-time `permissions` parameter may narrow it,
+    /// never widen it; `inherit` axes (the default) follow the dispatcher's
+    /// own authority live.
+    pub declared_permissions: AgentPermissions,
     /// Absolute delegation-depth cap for dispatches through this tool.
     pub max_depth: u32,
 }
@@ -400,6 +413,9 @@ pub fn assert_capabilities(
     if request.tool_filter.is_some() {
         need(caps.tool_filter, "tool_filter")?;
     }
+    if request.permissions.is_some() {
+        need(caps.permissions, "permissions")?;
+    }
     if request.persona.is_some() {
         need(caps.persona, "persona")?;
     }
@@ -431,6 +447,7 @@ pub fn test_request(label: &str, prompt: &str) -> StartRequest {
         agent_options: None,
         max_depth: None,
         tool_filter: None,
+        permissions: None,
         persona: None,
         parent_depth: 0,
         parent_session: None,
@@ -515,6 +532,7 @@ mod tests {
             output_schema: false,
             depth_limit: false,
             tool_filter: false,
+            permissions: false,
             persona: false,
         };
         let mut request = test_request("l", "p");
@@ -528,6 +546,11 @@ mod tests {
         request.tool_filter = Some(filter);
         let err = assert_capabilities("p", &caps, &request).unwrap_err();
         assert!(err.to_string().contains("tool_filter"), "{err}");
+
+        request.tool_filter = None;
+        request.permissions = Some(AgentPermissions::default());
+        let err = assert_capabilities("p", &caps, &request).unwrap_err();
+        assert!(err.to_string().contains("permissions"), "{err}");
     }
 
     /// Filter validation: unknown allow/deny names fail loudly so a typo

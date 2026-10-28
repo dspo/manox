@@ -5579,3 +5579,210 @@ async fn child_journal_opens_with_the_inherited_mode_and_follows_a_live_flip() {
         "the restore replays the same mode rows in append order: {replayed:?}"
     );
 }
+
+/// The declared-permission pin: a definition declaring
+/// `permissions: {mode: sandbox}` yields a child whose Bash stays on the
+/// confined backend even while the Captain runs — and mid-turn flips
+/// to — full access. The pin is structural, not a live mirror: the build
+/// mounts a dedicated confined backend, so neither the shared (#965)
+/// backend nor the unsandboxed escape hatch ever serves a pinned call —
+/// the tagged mocks below must stay silent while the real confinement
+/// denies an outside-workspace write the Captain itself could make.
+#[tokio::test]
+async fn a_sandbox_pinned_child_stays_confined_under_a_full_access_captain() {
+    use manox_harness::ext_point_agent::{AgentPermissions, NetworkPermission, PermissionMode};
+
+    let gate = subagent_test_gate();
+    gate.set_mode(AccessMode::FullAccess);
+    // The route stays open so the denial below classifies on the file face:
+    // with the network closed, a bare EPERM reads as the socket face on
+    // Linux (the network-pin test owns that face).
+    gate.set_network_access(manox_harness::sandbox::NetworkAccess::On);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let tagged = |tag: &'static str| {
+        Arc::new(TaggedBashOps {
+            tag,
+            calls: Arc::clone(&calls),
+        }) as Arc<dyn manox_harness::tools::bash::BashOperations>
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let assembly = ChildAssembly {
+        gate: Arc::clone(&gate),
+        standing_resolver: {
+            let gate = Arc::clone(&gate);
+            Arc::new(move || gate.mode())
+        },
+        shared_ops: tagged("shared"),
+        unsandboxed_ops: Some(tagged("unsandboxed")),
+        sandbox_available: true,
+        cwd: dir.path().to_path_buf(),
+        granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()),
+    };
+    let declared = AgentPermissions {
+        mode: PermissionMode::Sandbox,
+        network: NetworkPermission::Inherit,
+    };
+    let tools = assembly.build(Some(&declared));
+    let bash = tools
+        .iter()
+        .find(|t| t.name() == "Bash")
+        .expect("the child snapshot carries Bash")
+        .clone();
+    let ctx = subagent_test_ctx(dir.path());
+    async fn text_of(
+        tool: &Arc<dyn manox_harness::tool::AgentTool>,
+        ctx: &manox_harness::tool::LocalToolContext,
+        command: &str,
+    ) -> String {
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": command, "cwd": [""]}),
+                tokio_util::sync::CancellationToken::new(),
+                ctx,
+            )
+            .await
+            .expect("the pinned call runs (confined)");
+        match &result.content[0] {
+            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text: {other:?}"),
+        }
+    }
+    // Confined under a full-access Captain; the pin does not follow the
+    // Captain's mid-turn flips in either direction.
+    assert_eq!(
+        text_of(&bash, &ctx, "echo hi").await.trim(),
+        "hi",
+        "the pinned child's ordinary commands still run"
+    );
+    gate.set_mode(AccessMode::Sandbox);
+    text_of(&bash, &ctx, "echo still-confined").await;
+    gate.set_mode(AccessMode::FullAccess);
+    // An outside-workspace write is denied by the OS confinement and
+    // classified as a policy refusal — while the Captain's own Bash runs
+    // bare at this very mode.
+    let denied = text_of(&bash, &ctx, "touch /usr/local/manox-pin-bash-probe.txt").await;
+    assert!(
+        denied.contains(&manox_harness::sandbox::sandbox_denial_marker(
+            AccessMode::Sandbox
+        )),
+        "the pinned child's Bash stays confined under a full-access Captain: {denied}"
+    );
+    assert!(
+        !denied.contains("require_escalated"),
+        "no escalation hint without a channel: {denied}"
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "neither the shared backend nor the unsandboxed escape hatch served a pinned call"
+    );
+
+    // The same shape for the write fence: outside-workspace writes are
+    // refused while the Captain itself runs unfenced.
+    let write = tools
+        .iter()
+        .find(|t| t.name() == "Write")
+        .expect("the child snapshot carries Write")
+        .clone();
+    let err = write
+        .execute(
+            "c2",
+            serde_json::json!({"path": "/usr/local/manox-pinned-probe/x.txt", "cwd": [""], "content": "x"}),
+            tokio_util::sync::CancellationToken::new(),
+            &subagent_test_ctx(dir.path()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("[sandbox: file access denied under sandbox mode]"),
+        "the pin fences the write: {err}"
+    );
+}
+
+/// The `network: off` pin closes the pinned child's confined calls even
+/// while the Captain's own switch is on: the denial classifier answers on
+/// the network face (with no escalation hint — the child has no channel),
+/// and without the pin the same output is an ordinary failure.
+#[tokio::test]
+async fn a_network_off_pinned_child_runs_confined_calls_with_the_network_closed() {
+    use manox_harness::ext_point_agent::{AgentPermissions, NetworkPermission, PermissionMode};
+
+    struct CurlFailureOps;
+    #[async_trait::async_trait]
+    impl manox_harness::tools::bash::BashOperations for CurlFailureOps {
+        async fn exec(
+            &self,
+            _request: manox_harness::tools::bash::BashExecRequest<'_>,
+        ) -> Result<manox_harness::env::CommandResult, manox_harness::env::ExecutionError> {
+            Ok(manox_harness::env::CommandResult {
+                stdout: String::new(),
+                stderr: "curl: (7) Connection refused".into(),
+                exit_code: 7,
+            })
+        }
+    }
+
+    let gate = subagent_test_gate();
+    gate.set_mode(AccessMode::Sandbox);
+    gate.set_network_access(manox_harness::sandbox::NetworkAccess::On);
+    let dir = tempfile::tempdir().unwrap();
+    let assembly = ChildAssembly {
+        gate: Arc::clone(&gate),
+        standing_resolver: {
+            let gate = Arc::clone(&gate);
+            Arc::new(move || gate.mode())
+        },
+        shared_ops: Arc::new(CurlFailureOps),
+        unsandboxed_ops: None,
+        sandbox_available: true,
+        cwd: dir.path().to_path_buf(),
+        granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()),
+    };
+    let ctx = subagent_test_ctx(dir.path());
+    let net_off = AgentPermissions {
+        mode: PermissionMode::Inherit,
+        network: NetworkPermission::Off,
+    };
+    let bash_of = |tools: &[Arc<dyn HarnessAgentTool>]| {
+        tools
+            .iter()
+            .find(|t| t.name() == "Bash")
+            .expect("the child snapshot carries Bash")
+            .clone()
+    };
+    async fn output_of(
+        tool: &Arc<dyn manox_harness::tool::AgentTool>,
+        ctx: &manox_harness::tool::LocalToolContext,
+    ) -> String {
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": "curl http://example.test", "cwd": [""]}),
+                tokio_util::sync::CancellationToken::new(),
+                ctx,
+            )
+            .await
+            .expect("the call runs");
+        match &result.content[0] {
+            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text: {other:?}"),
+        }
+    }
+    let pinned = output_of(&bash_of(&assembly.build(Some(&net_off))), &ctx).await;
+    assert!(
+        pinned.contains(&manox_harness::sandbox::network_denial_marker(
+            AccessMode::Sandbox
+        )),
+        "the closed pin classifies the failure as a network denial: {pinned}"
+    );
+    assert!(
+        !pinned.contains("require_escalated"),
+        "no escalation hint without a channel: {pinned}"
+    );
+    let inherited = output_of(&bash_of(&assembly.build(None)), &ctx).await;
+    assert!(
+        !inherited.contains("[sandbox: "),
+        "the open inherited route keeps the failure unclassified: {inherited}"
+    );
+}

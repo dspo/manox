@@ -168,6 +168,15 @@ impl DelegationTool {
         }
     }
 
+    /// The dispatch's effective permission ceiling: the `permissions` param
+    /// (parsed fail-loud) narrowed into the definition's declaration.
+    fn resolve_dispatch_permissions(
+        &self,
+        params: &serde_json::Value,
+    ) -> Result<Option<manox_harness::ext_point_agent::AgentPermissions>, ToolError> {
+        resolve_dispatch_permissions(self.config.declared_permissions, params)
+    }
+
     /// Resolve a declared spec (`config` wins over `frontmatter`) at
     /// dispatch time. `Ok(None)` when nothing is declared; a declared
     /// override that cannot resolve is a loud dispatch error — never a
@@ -226,9 +235,13 @@ pub fn delegation_description(description: &str, capability: &str, name: &str) -
          child's final report; set `run_in_background: true` to run it on a \
          background card instead and receive the report as a message when it \
          settles. `timeout_ms`/`idle_timeout_ms` (min {}ms, max 30 days) arm \
-         kill budgets that deliver a partial report on expiry. A child's \
-         approval-requiring operations are auto-rejected; it cannot delegate \
-         further.",
+         kill budgets that deliver a partial report on expiry. The optional \
+         `permissions` object ({{ mode: inherit|sandbox|full-access, \
+         network: inherit|off|on }}) narrows the child's access for this \
+         dispatch only — it can never exceed the agent's own declared \
+         ceiling or this session's authority; wider requests are refused. \
+         A child's approval-requiring operations are auto-rejected; it \
+         cannot delegate further.",
         manox_harness::subagent::MIN_BUDGET_MS
     )
 }
@@ -292,6 +305,23 @@ impl AgentTool for DelegationTool {
                     "type": "string",
                     "enum": ["worktree"],
                     "description": "Run the child in a throwaway git worktree; a worktree with committed work is kept and reported."
+                },
+                "permissions": {
+                    "type": "object",
+                    "description": "Optional per-dispatch permission override for this child. Narrowing only: each named axis must stay within the agent's declared ceiling on that axis — a wider naming is refused — unnamed axes keep the declared ceiling, and nothing can exceed this session's own authority.",
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["inherit", "sandbox", "full-access"],
+                            "description": "`sandbox` confines the child's Bash regardless of this session's mode; `inherit`/`full-access` both follow this session's live mode."
+                        },
+                        "network": {
+                            "type": "string",
+                            "enum": ["inherit", "off", "on"],
+                            "description": "`off` keeps the child's confined commands off the network regardless of this session's switch; `inherit`/`on` both follow this session's live route."
+                        }
+                    },
+                    "additionalProperties": false
                 }
             },
             "required": ["description", "prompt"]
@@ -338,6 +368,14 @@ impl AgentTool for DelegationTool {
                 deny: Vec::new(),
             });
         }
+        // The permission ceiling: the dispatch override may narrow the
+        // definition's declaration, never widen it — a widened request is
+        // refused with the ceilings named. The intersection (declaration ∩
+        // override) rides to the provider; the dispatcher's own authority is
+        // the structural upper bound (the child's resolvers can never answer
+        // wider than the dispatching gate), so a `full-access`/`on` ask under
+        // a more confined dispatcher settles at the dispatcher's face.
+        let permissions = self.resolve_dispatch_permissions(&params)?;
         // Model precedence: explicit parameter > dedicated config spec >
         // frontmatter override. A parameter naming a model resolves it; an
         // unresolvable name fails the dispatch loudly.
@@ -395,6 +433,7 @@ impl AgentTool for DelegationTool {
             agent_options,
             max_depth: Some(self.config.max_depth),
             tool_filter,
+            permissions,
             persona: Some(self.config.persona.clone()),
             parent_depth: self.parent_depth,
             parent_session: self.parent_session.clone(),
@@ -568,6 +607,117 @@ impl DelegationTool {
 
 fn string_param(params: &serde_json::Value, key: &str) -> Option<String> {
     params.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// The dispatch's effective permission ceiling: the `permissions` param
+/// (parsed fail-loud) narrowed into the definition's declaration.
+/// Narrowing only, per axis: a named axis may restate the declared ceiling
+/// (inherit and the live value name the same face) or narrow it — a wider
+/// naming is refused with both ceilings named, because an unnamed axis
+/// keeps the declaration and a named one replaces it for this dispatch.
+/// `Ok(None)` = all-inherit: the #965 live-inheritance default, ridden as
+/// `None` so providers that declare no `permissions` capability keep
+/// working. The dispatcher's own authority needs no check here: it is the
+/// structural upper bound (the child's resolvers can never answer wider
+/// than the dispatching gate), so a `full-access`/`on` ask under a more
+/// confined dispatcher settles at the dispatcher's face.
+fn resolve_dispatch_permissions(
+    declared: manox_harness::ext_point_agent::AgentPermissions,
+    params: &serde_json::Value,
+) -> Result<Option<manox_harness::ext_point_agent::AgentPermissions>, ToolError> {
+    use manox_harness::ext_point_agent::AgentPermissions;
+    let Some(override_) = parse_permissions_override(params)? else {
+        return Ok(None);
+    };
+    let wider = |axis: &str, named: &str, declared_wire: &str| {
+        ToolError::InvalidArguments(format!(
+            "`permissions` override refused: `{axis}: {named}` would widen this agent's \
+             declared ceiling ({axis}: {declared_wire}). A dispatch may only narrow a \
+             declaration, and no dispatch can exceed this session's own authority."
+        ))
+    };
+    if let Some(mode) = override_.mode
+        && !mode.is_at_most(declared.mode)
+    {
+        return Err(wider("mode", mode.wire(), declared.mode.wire()));
+    }
+    if let Some(network) = override_.network
+        && !network.is_at_most(declared.network)
+    {
+        return Err(wider("network", network.wire(), declared.network.wire()));
+    }
+    // Unnamed axes keep the declaration; named ones intersect with it (the
+    // refusal above guarantees a named axis is never the wider of the two).
+    let effective = AgentPermissions {
+        mode: declared
+            .mode
+            .narrowest(override_.mode.unwrap_or(declared.mode)),
+        network: declared
+            .network
+            .narrowest(override_.network.unwrap_or(declared.network)),
+    };
+    Ok((effective != Default::default()).then_some(effective))
+}
+
+/// One dispatch's `permissions` override: only the axes the call named.
+struct DispatchOverride {
+    mode: Option<manox_harness::ext_point_agent::PermissionMode>,
+    network: Option<manox_harness::ext_point_agent::NetworkPermission>,
+}
+
+/// Parse the dispatch-time `permissions` override (schema shape: an object
+/// with optional `mode`/`network` string axes). Absent or `null` = no
+/// override. Fail-loud: a non-object value, an unknown key, or a value
+/// outside the closed vocabulary is an invalid argument — a silently
+/// ignored typo would run the child under a different ceiling than asked.
+fn parse_permissions_override(
+    params: &serde_json::Value,
+) -> Result<Option<DispatchOverride>, ToolError> {
+    use manox_harness::ext_point_agent::{NetworkPermission, PermissionMode};
+    let Some(value) = params.get("permissions").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let obj = value.as_object().ok_or_else(|| {
+        ToolError::InvalidArguments(
+            "`permissions` must be an object with optional `mode` and `network` strings.".into(),
+        )
+    })?;
+    let axis = |key: &str| -> Result<Option<String>, ToolError> {
+        match obj.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => v.as_str().map(str::to_string).map(Some).ok_or_else(|| {
+                ToolError::InvalidArguments(format!("`permissions.{key}` must be a string."))
+            }),
+        }
+    };
+    let mode = match axis("mode")? {
+        None => None,
+        Some(mode) => Some(PermissionMode::from_wire(&mode).ok_or_else(|| {
+            ToolError::InvalidArguments(format!(
+                "`permissions.mode` `{mode}` is not a known value; expected one of \
+                 inherit | sandbox | full-access."
+            ))
+        })?),
+    };
+    let network = match axis("network")? {
+        None => None,
+        Some(network) => Some(NetworkPermission::from_wire(&network).ok_or_else(|| {
+            ToolError::InvalidArguments(format!(
+                "`permissions.network` `{network}` is not a known value; expected one of \
+                 inherit | off | on."
+            ))
+        })?),
+    };
+    let unknown: Vec<&String> = obj
+        .keys()
+        .filter(|k| k.as_str() != "mode" && k.as_str() != "network")
+        .collect();
+    if !unknown.is_empty() {
+        return Err(ToolError::InvalidArguments(format!(
+            "`permissions` has unknown field(s) {unknown:?}; only `mode` and `network` exist."
+        )));
+    }
+    Ok(Some(DispatchOverride { mode, network }))
 }
 
 fn tool_error_of(error: manox_harness::subagent::SubagentError) -> ToolError {
@@ -1369,6 +1519,7 @@ mod tests {
             description: "d".into(),
             tools: vec!["Read".into(), "AskUserQuestion".into(), "Ghost".into()],
             model: None,
+            permissions: Default::default(),
             system_prompt: "p".into(),
         };
         let assembly = crate::subagent::resolve_delegation_tool(&def, &HashSet::new(), &snapshot)
@@ -1391,6 +1542,138 @@ mod tests {
         let assembly = crate::subagent::resolve_delegation_tool(&def, &taken, &snapshot)
             .expect("a distinct def still resolves");
         assert_eq!(assembly.tool_name, "remora_task");
+    }
+
+    /// The dispatch `permissions` override narrows a declaration, never
+    /// widens: an in-ceiling request intersects, a widening request is
+    /// refused with both ceilings named (the refusal is the tool result the
+    /// model reads), and an all-inherit resolution rides as `None` — the
+    /// #965 default providers without the `permissions` capability speak.
+    #[test]
+    fn dispatch_permissions_narrow_only() {
+        use manox_harness::ext_point_agent::{AgentPermissions, NetworkPermission, PermissionMode};
+        let pinned = AgentPermissions {
+            mode: PermissionMode::Sandbox,
+            network: NetworkPermission::Off,
+        };
+        let declared_of = |mode, network| Some(AgentPermissions { mode, network });
+        let params_with = |permissions: serde_json::Value| serde_json::json!({"description": "d", "prompt": "p", "permissions": permissions});
+
+        // No override on an all-inherit declaration stays `None`.
+        assert_eq!(
+            resolve_dispatch_permissions(AgentPermissions::default(), &serde_json::json!({}))
+                .unwrap(),
+            None,
+        );
+        // Restating the live ceiling (inherit/full-access/on) is not a
+        // widening: both names point at the dispatcher's own authority.
+        assert_eq!(
+            resolve_dispatch_permissions(
+                AgentPermissions::default(),
+                &params_with(serde_json::json!({"mode": "full-access", "network": "on"}))
+            )
+            .unwrap(),
+            None,
+            "the live ceiling restated resolves to the same all-inherit ride"
+        );
+        // A narrowing override intersects the declaration.
+        assert_eq!(
+            resolve_dispatch_permissions(
+                AgentPermissions::default(),
+                &params_with(serde_json::json!({"mode": "sandbox", "network": "off"}))
+            )
+            .unwrap(),
+            declared_of(PermissionMode::Sandbox, NetworkPermission::Off),
+        );
+        assert_eq!(
+            resolve_dispatch_permissions(
+                pinned,
+                &params_with(serde_json::json!({"mode": "sandbox", "network": "off"}))
+            )
+            .unwrap(),
+            declared_of(PermissionMode::Sandbox, NetworkPermission::Off),
+        );
+        // A widening ask on one axis is refused with that axis's faces
+        // named — the refusal is the tool result the model reads.
+        for (requested, axis, declared_wire) in [
+            (
+                serde_json::json!({"mode": "full-access"}),
+                "mode",
+                "sandbox",
+            ),
+            (serde_json::json!({"mode": "inherit"}), "mode", "sandbox"),
+            (serde_json::json!({"network": "on"}), "network", "off"),
+            (serde_json::json!({"network": "inherit"}), "network", "off"),
+            (
+                serde_json::json!({"mode": "full-access", "network": "off"}),
+                "mode",
+                "sandbox",
+            ),
+        ] {
+            let err = resolve_dispatch_permissions(pinned, &params_with(requested.clone()))
+                .expect_err("a widening override is refused")
+                .to_string();
+            assert!(
+                err.contains("would widen this agent's declared ceiling"),
+                "{requested}: {err}"
+            );
+            assert!(err.contains(&format!("`{axis}:")), "{requested}: {err}");
+            assert!(
+                err.contains(&format!("({axis}: {declared_wire})")),
+                "{requested}: {err}"
+            );
+        }
+        // A narrowed-but-not-fully-pinned override on a pinned declaration
+        // keeps the pin: the intersection never relaxes an axis.
+        assert_eq!(
+            resolve_dispatch_permissions(
+                pinned,
+                &params_with(serde_json::json!({"network": "off"}))
+            )
+            .unwrap(),
+            declared_of(PermissionMode::Sandbox, NetworkPermission::Off),
+        );
+    }
+
+    /// The `permissions` override parses fail-loud: a value outside the
+    /// closed vocabulary, an unknown field, or a non-object payload is an
+    /// invalid argument — a silently ignored typo would run the child under
+    /// a different ceiling than asked.
+    #[test]
+    fn dispatch_permissions_override_parses_fail_loud() {
+        use manox_harness::ext_point_agent::{AgentPermissions, NetworkPermission, PermissionMode};
+        let params_with = |permissions: serde_json::Value| serde_json::json!({"description": "d", "prompt": "p", "permissions": permissions});
+        let parsed = |v: serde_json::Value| {
+            resolve_dispatch_permissions(AgentPermissions::default(), &params_with(v)).unwrap()
+        };
+        assert_eq!(
+            parsed(serde_json::Value::Null),
+            None,
+            "an explicit null override is no override"
+        );
+        assert_eq!(
+            parsed(serde_json::json!({"mode": "sandbox"})),
+            Some(AgentPermissions {
+                mode: PermissionMode::Sandbox,
+                network: NetworkPermission::Inherit,
+            }),
+            "an omitted axis keeps its inherit default"
+        );
+        for bad in [
+            serde_json::json!("sandbox"),
+            serde_json::json!({"mode": "readonly"}),
+            serde_json::json!({"network": "partial"}),
+            serde_json::json!({"mode": true}),
+            serde_json::json!({"filesystem": "none"}),
+        ] {
+            let err = resolve_dispatch_permissions(
+                AgentPermissions::default(),
+                &params_with(bad.clone()),
+            )
+            .expect_err("a malformed override fails loudly")
+            .to_string();
+            assert!(err.contains("permissions"), "{bad}: {err}");
+        }
     }
 
     /// Plugin namespacing (`remora:remora-task`) must never reach the wire:
@@ -1644,6 +1927,7 @@ mod tests {
                 output_schema: false,
                 depth_limit: false,
                 tool_filter: false,
+                permissions: false,
                 persona: false,
             }
         }

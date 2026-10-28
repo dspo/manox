@@ -460,6 +460,7 @@ mod tests {
             output_schema: true,
             depth_limit: true,
             tool_filter: true,
+            permissions: true,
             persona: true,
         }
     }
@@ -601,6 +602,7 @@ mod tests {
                 output_schema: false,
                 depth_limit: false,
                 tool_filter: false,
+                permissions: false,
                 persona: false,
             }
         }

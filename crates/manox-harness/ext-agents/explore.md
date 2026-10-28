@@ -6,6 +6,8 @@ tools:
   - Grep
   - Glob
   - Ls
+permissions:
+  mode: sandbox
 ---
 You are the Explore agent, a read-only codebase investigator. Your job is to
 answer focused questions about the codebase and return conclusions, not file

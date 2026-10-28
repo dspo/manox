@@ -38,15 +38,16 @@ pub(super) struct SubagentBashTool {
     pub(super) inner: Arc<dyn manox_harness::tool::AgentTool>,
 }
 
-pub(super) const SUBAGENT_BASH_DESCRIPTION: &str = "Execute a shell command. Each call runs in a fresh \
-    one-shot shell at the current cwd (no persistent cwd/vars across calls). Access follows the \
-    dispatching session's mode live: under full-access the command runs unsandboxed; under \
-    sandbox it runs in the same OS confinement (same writable roots, same network switch) as \
-    the dispatching session's own Bash. `run_in_background` and `require_escalated` are not \
-    available inside a subagent — the subagent itself is the async primitive and it has no \
-    approval channel, so run long commands in the foreground and report blockers instead. Use \
-    `head_lines`/`tail_lines` to keep a selection of output instead of piping through \
-    `head`/`tail`.";
+pub(super) const SUBAGENT_BASH_DESCRIPTION: &str = "Execute a shell command. Each call runs in a \
+    fresh one-shot shell at the current cwd (no persistent cwd/vars across calls). Access follows \
+    the dispatching session's mode, narrowed by this subagent's declared permission ceiling: \
+    under full-access (and with no narrowing declared) the command runs unsandboxed; under \
+    sandbox — the dispatching session's or the definition's own — it runs in the same OS \
+    confinement (same writable roots, same network switch) as the dispatching session's own \
+    Bash. `run_in_background` and `require_escalated` are not available inside a subagent — the \
+    subagent itself is the async primitive and it has no approval channel, so run long commands \
+    in the foreground and report blockers instead. Use `head_lines`/`tail_lines` to keep a \
+    selection of output instead of piping through `head`/`tail`.";
 
 #[async_trait::async_trait]
 impl manox_harness::tool::AgentTool for SubagentBashTool {
@@ -227,6 +228,111 @@ impl SubagentWriteFence {
             Some(&self.granted_roots),
             &subagent_fence_denial,
         )
+    }
+}
+
+/// The shared assembly pieces every child snapshot derives from: the
+/// dispatcher's live authority (gate + standing resolver) and the shared
+/// backends. The per-dispatch declaration is the only variable — [`build`]
+/// turns it into the child's tool set.
+///
+/// [`build`]: ChildAssembly::build
+#[derive(Clone)]
+pub(super) struct ChildAssembly {
+    pub(super) gate: Arc<ApprovalGate>,
+    pub(super) standing_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
+    pub(super) shared_ops: Arc<dyn manox_harness::tools::bash::BashOperations>,
+    pub(super) unsandboxed_ops: Option<Arc<dyn manox_harness::tools::bash::BashOperations>>,
+    pub(super) sandbox_available: bool,
+    pub(super) cwd: std::path::PathBuf,
+    pub(super) granted_roots: crate::granted_roots::GrantedRoots,
+}
+
+impl ChildAssembly {
+    /// The child snapshot's tool set for one effective permission
+    /// declaration — the per-dispatch shape [`ChildToolFactory`] builds.
+    /// The declaration is the intersection of the definition's
+    /// `permissions:` frontmatter and any dispatch-time override, already
+    /// narrowed by the caller; `None` is the all-inherit default. The
+    /// invariant on every axis: **the child's effective permissions are a
+    /// subset of the dispatcher's live authority** —
+    ///
+    /// - `mode: sandbox` pins the mode constant (a read-only agent stays
+    ///   read-only even under a `full-access` Captain); `inherit`/
+    ///   `full-access` ride the dispatcher's gate live (#965 semantics,
+    ///   mid-turn flips included).
+    /// - `network: off` pins the confined calls' route closed;
+    ///   `inherit`/`on` follow the dispatcher's switch live.
+    ///
+    /// A pinned axis cannot ride the shared (#965) backend, whose resolvers
+    /// read the dispatcher's gate — a sandbox pin would un-pin the moment
+    /// the Captain flipped to full-access (the ops layer would
+    /// short-circuit to a bare run). Pinned shapes therefore get a
+    /// dedicated backend whose resolvers already answer for the child,
+    /// standing-mode only (a child has no escalation channel, so the shared
+    /// grant cell is not consulted — an escalation stamp belongs to the
+    /// call that requested it).
+    pub(super) fn build(
+        &self,
+        effective: Option<&manox_harness::ext_point_agent::AgentPermissions>,
+    ) -> Vec<Arc<dyn HarnessAgentTool>> {
+        use manox_harness::ext_point_agent::{NetworkPermission, PermissionMode};
+        let declared = effective.copied().unwrap_or_default();
+        let mode_pinned = declared.mode == PermissionMode::Sandbox;
+        let network_pinned_off = declared.network == NetworkPermission::Off;
+        // Tool-level resolvers: a pinned axis is constant; an inherited axis
+        // reads the dispatcher's live gate.
+        let mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync> = if mode_pinned {
+            Arc::new(|| AccessMode::Sandbox)
+        } else {
+            Arc::clone(&self.standing_resolver)
+        };
+        let network_resolver: Arc<dyn Fn() -> manox_harness::sandbox::NetworkAccess + Send + Sync> =
+            if network_pinned_off {
+                Arc::new(|| manox_harness::sandbox::NetworkAccess::Off)
+            } else {
+                let gate = Arc::clone(&self.gate);
+                Arc::new(move || gate.network_route().access())
+            };
+        let ops: Arc<dyn manox_harness::tools::bash::BashOperations> =
+            if self.sandbox_available && (mode_pinned || network_pinned_off) {
+                let ops_mode: Arc<dyn Fn() -> AccessMode + Send + Sync> = if mode_pinned {
+                    Arc::new(|| AccessMode::Sandbox)
+                } else {
+                    Arc::clone(&self.standing_resolver)
+                };
+                let ops_network: Arc<dyn Fn() -> crate::sandbox::NetworkRoute + Send + Sync> =
+                    if network_pinned_off {
+                        Arc::new(|| crate::sandbox::NetworkRoute::Disabled)
+                    } else {
+                        let gate = Arc::clone(&self.gate);
+                        Arc::new(move || gate.network_route())
+                    };
+                Arc::new(crate::sandbox::SandboxedBashOperations::new(
+                    &self.cwd,
+                    self.granted_roots.clone(),
+                    ops_mode,
+                    ops_network,
+                ))
+            } else {
+                // No pin (or no OS backend to pin with — the confined face
+                // there is the persistent shell either way): the shared
+                // #965 backend.
+                Arc::clone(&self.shared_ops)
+            };
+        let bash = subagent_bash_tool(
+            ops,
+            Arc::new(BackgroundRegistry::new()),
+            self.sandbox_available,
+            Arc::clone(&mode_resolver),
+            network_resolver,
+            // A pinned child never selects the unsandboxed backend — it is
+            // not installed, so the escape hatch it serves does not exist.
+            (!mode_pinned)
+                .then(|| self.unsandboxed_ops.clone())
+                .flatten(),
+        );
+        child_snapshot(bash, &mode_resolver, &self.granted_roots)
     }
 }
 
@@ -599,7 +705,6 @@ pub(super) fn build_tools(
     // to a background Sailor would widen a call no human approved.
     let subagent_bash_ops: Arc<dyn manox_harness::tools::bash::BashOperations> =
         Arc::clone(&bash_ops);
-    let subagent_background = Arc::new(BackgroundRegistry::new());
     let manager = BackgroundManager::new(Arc::clone(&background));
     // Unsandboxed backend (no confinement): selected per call when the
     // effective mode is `full-access` (the standing session mode, or
@@ -629,19 +734,6 @@ pub(super) fn build_tools(
         .with_network_resolver(Arc::new(move || classifier_gate.network_route().access()))
         .with_grant_cell(grant_cell)
         .with_escalation_approver(Arc::clone(&escalation_approver));
-    // The subagent half of the same shape: the shared backends and the same
-    // live resolvers, no manager (background is refused) and no grant cell.
-    let subagent_bash = subagent_bash_tool(
-        Arc::clone(&subagent_bash_ops),
-        subagent_background,
-        sandbox_available,
-        Arc::clone(&standing_resolver),
-        {
-            let gate = Arc::clone(gate);
-            Arc::new(move || gate.network_route().access())
-        },
-        unsandboxed_ops.clone(),
-    );
     if let Some(ops) = &unsandboxed_ops {
         bash = bash.with_unsandboxed_operations(Arc::clone(ops));
     }
@@ -915,7 +1007,24 @@ pub(super) fn build_tools(
         SubagentRunObserver::new(bus.owner_thread_id().to_string(), notice_tx.clone());
     let provider_registry = crate::provider_glue::global();
     let model_slot = gate.model_slot();
-    let child_tools = child_snapshot(subagent_bash, &standing_resolver, granted_roots);
+    // The inherit-shaped snapshot (the #965 live-inheritance wiring) doubles
+    // as the provider's no-factory fallback and the canonical child tool-name
+    // set; per-dispatch declarations build through the factory below, which
+    // varies resolver wiring only — never the name set.
+    let child_assembly = ChildAssembly {
+        gate: Arc::clone(gate),
+        standing_resolver: Arc::clone(&standing_resolver),
+        shared_ops: Arc::clone(&subagent_bash_ops),
+        unsandboxed_ops: unsandboxed_ops.clone(),
+        sandbox_available,
+        cwd: cwd.to_path_buf(),
+        granted_roots: granted_roots.clone(),
+    };
+    let child_tools = child_assembly.build(None);
+    let child_tool_factory: manox_harness::subagent::ChildToolFactory = {
+        let child_assembly = child_assembly.clone();
+        Arc::new(move |effective: Option<&_>| child_assembly.build(effective))
+    };
     let child_snapshot_names: HashSet<String> =
         child_tools.iter().map(|t| t.name().to_string()).collect();
     // Delegation tool names: sanitized into the provider wire charset
@@ -956,8 +1065,12 @@ pub(super) fn build_tools(
         .with_delegation_names(subagent_runtime.delegation_tool_names())
         // The child journal declares the mode it inherits and takes the
         // parent's mid-turn flips: the same standing resolver the child's
-        // enforcing tools read per call.
+        // enforcing tools read per call. A `sandbox` pin overrides this at
+        // dispatch (the spawn start resolves the pin to a constant before
+        // the row lands), so the durable face never mirrors a wider mode
+        // than the run is confined to.
         .with_access_mode_resolver(Arc::clone(&standing_resolver))
+        .with_tool_factory(child_tool_factory)
         // Subagent transcripts persist under the host session root (a
         // subdirectory the sidebar's non-recursive listing never surfaces)
         // so their usage stays accountable.
@@ -987,6 +1100,7 @@ pub(super) fn build_tools(
             default_tools: allow.clone(),
             frontmatter_model_spec: def.model.clone(),
             config_model_spec: overrides.get(&def.name).cloned(),
+            declared_permissions: def.permissions,
             max_depth: 1,
         };
         tools.push(Arc::new(crate::subagent::DelegationTool::new(
