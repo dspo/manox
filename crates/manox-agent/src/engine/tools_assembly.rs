@@ -48,11 +48,6 @@ pub(super) const SUBAGENT_BASH_DESCRIPTION: &str = "Execute a shell command. Eac
     `head_lines`/`tail_lines` to keep a selection of output instead of piping through \
     `head`/`tail`.";
 
-/// The refusal text both unavailable fields share: the field exists on the
-/// host schema, so a non-conforming model can still emit it.
-const SUBAGENT_REFUSED_PARAM: &str = "is not available inside a subagent session — the subagent \
-     itself is the async primitive";
-
 #[async_trait::async_trait]
 impl manox_harness::tool::AgentTool for SubagentBashTool {
     fn name(&self) -> &str {
@@ -120,9 +115,11 @@ fn refuse_unavailable_params(
     params: &serde_json::Value,
 ) -> Result<(), manox_harness::tool::ToolError> {
     if params["run_in_background"].as_bool().unwrap_or(false) {
-        return Err(manox_harness::tool::ToolError::ExecutionFailed(format!(
-            "`run_in_background` {SUBAGENT_REFUSED_PARAM}. Run the command in the foreground instead."
-        )));
+        return Err(manox_harness::tool::ToolError::ExecutionFailed(
+            "`run_in_background` is not available inside a subagent session — the subagent \
+             itself is the async primitive. Run the command in the foreground instead."
+                .into(),
+        ));
     }
     if params
         .get("require_escalated")
