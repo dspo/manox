@@ -5,8 +5,10 @@
 //!
 //! The seatbelt renders a per-call profile from the effective `AccessMode`:
 //! `sandbox` confines writes to the shared `writable_roots`; `full-access`
-//! skips the seatbelt entirely (the unsandboxed backend, selected before any
-//! profile is rendered).
+//! runs bare — both backends short-circuit it here, below backend selection,
+//! so a resolver mismatch between the tool layer and the ops layer can never
+//! render a denial-only profile (an empty writable-root set is a full-disk
+//! read-only jail, not an unconfined run).
 //!
 //! The base is deny-default and the profile curates its allows: full-disk
 //! reads, per-root writes injected as `sandbox-exec -D` definitions (paths
@@ -320,8 +322,8 @@ impl SandboxPolicy {
     }
 
     /// Add roots the `sandbox` profile admits on top of the workspace
-    /// (validated, canonicalized, deduplicated). Full access never renders a
-    /// profile — backend selection skips the seatbelt for it.
+    /// (validated, canonicalized, deduplicated). Full access renders nothing:
+    /// the ops layer short-circuits it before a profile is built.
     pub fn with_extra_roots(mut self, roots: Vec<PathBuf>) -> Result<Self, String> {
         for root in roots {
             let canon = validated_writable_root(&root)?;
@@ -336,9 +338,8 @@ impl SandboxPolicy {
     /// and network `route`. Deny-default base with the explicit allow set
     /// described in the module docs; `sandbox` admits the shared
     /// `writable_roots()` plus the extra granted roots. `full-access` is
-    /// never rendered — backend selection skips the seatbelt for it — and
-    /// rendering it anyway shows the profile alone cannot be trusted to
-    /// unconfine.
+    /// never rendered — the ops layer short-circuits it — and rendering it
+    /// anyway shows the profile alone cannot be trusted to unconfine.
     pub fn render_seatbelt(&self, mode: AccessMode, route: NetworkRoute) -> String {
         self.render_seatbelt_with_params(mode, route).0
     }
@@ -663,6 +664,13 @@ fn login_shell_path() -> String {
 /// session mode, or an approved `require_escalated` grant for one call) —
 /// the kernel `BashOperations` trait stays untouched, so the mode travels
 /// through a closure, not a kernel field.
+///
+/// `full-access` short-circuits to the unsandboxed invocation on both paths
+/// ([`Self::exec`] and [`Self::wrap_background`]): the writable-root set is
+/// empty for it by derivation, and rendering a deny-default profile around an
+/// empty set is a full-disk read-only jail. The short-circuit is the
+/// structural guarantee that a resolver mismatch upstream can only ever run a
+/// call at its declared mode, never stricter than declared.
 // On platforms without a backend the compiled stub's fields stay unread
 // (`is_available()` is always false there, so the backend is never built).
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
@@ -707,15 +715,17 @@ impl SandboxedBashOperations {
     /// Build the confined command for a background task — the same per-call
     /// mode and env as a foreground call (seatbelt on macOS, bwrap + seccomp
     /// on Linux), so a non-escalated background task is confined identically.
-    /// The registry adds process-group/pipes after this. Unreachable stub on
-    /// platforms without a backend: the wrap closure is only installed where
-    /// `is_available()`.
+    /// `full-access` returns the bare backend command: the mode short-circuit
+    /// holds on the wrap path too, never only on `exec`. The registry adds
+    /// process-group/pipes after this. Unreachable stub on platforms without
+    /// a backend: the wrap closure is only installed where `is_available()`.
     pub fn wrap_background(&self, command: &str, cwd: &Path) -> tokio::process::Command {
         /// Fail-closed refusal for an unbuildable confinement: the task
         /// runs, prints a fixed refusal line, and exits nonzero — it never
         /// falls back to an unsandboxed run. No escalation hint rides here
         /// on purpose: a wider mode grants paths, it cannot fix a symlinked
         /// root (nor a vanished bwrap).
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         fn refused(cwd: &Path) -> tokio::process::Command {
             let mut cmd = tokio::process::Command::new("bash");
             cmd.arg("-c")
@@ -725,6 +735,12 @@ impl SandboxedBashOperations {
                 )
                 .current_dir(cwd);
             cmd
+        }
+        // Full access is not a confinement shape: run the command as the
+        // unsandboxed backend would, so an empty writable-root set can never
+        // become a denial-only jail.
+        if (self.mode_resolver)() == AccessMode::FullAccess {
+            return UnsandboxedBashOperations::command(command, cwd);
         }
         #[cfg(target_os = "macos")]
         {
@@ -784,10 +800,17 @@ impl BashOperations for SandboxedBashOperations {
                 .unwrap_or_else(|| self.workspace.clone());
             let mode = (self.mode_resolver)();
             let route = (self.network_resolver)();
-            // A policy that cannot be built (a symlinked writable root)
-            // fails the call closed — the command never runs unsandboxed.
-            let policy = self.policy_for(&cwd).map_err(ExecutionError::Other)?;
-            let mut cmd = policy.wrap_command(request.command, &cwd, mode, route);
+            // Full access never renders a profile: an empty writable-root set
+            // under the deny-default base is a read-only jail, so the
+            // short-circuit lives here, structurally below backend selection.
+            let mut cmd = if mode == AccessMode::FullAccess {
+                UnsandboxedBashOperations::command(request.command, &cwd)
+            } else {
+                // A policy that cannot be built (a symlinked writable root)
+                // fails the call closed — the command never runs unsandboxed.
+                let policy = self.policy_for(&cwd).map_err(ExecutionError::Other)?;
+                policy.wrap_command(request.command, &cwd, mode, route)
+            };
             cmd.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true);
@@ -795,21 +818,8 @@ impl BashOperations for SandboxedBashOperations {
                 .spawn()
                 .map_err(|e| ExecutionError::Spawn(e.to_string()))?;
             let timeout = request.timeout.unwrap_or(DEFAULT_TIMEOUT);
-            let mut result =
+            let result =
                 run_to_completion(child, request.on_data, timeout, &request.signal).await?;
-            // Classify a seatbelt denial — file-write EPERM, or a network
-            // refusal when the route is closed — and surface the matching
-            // marker + escalation hint so the model recognizes a policy
-            // refusal (not a command bug) and can retry with
-            // `require_escalated`.
-            if let Some(note) = manox_harness::sandbox::seatbelt_denial_note(
-                &result.stderr,
-                result.exit_code,
-                mode,
-                route.access(),
-            ) {
-                result.stderr.push_str(&note);
-            }
             Ok(result)
         }
         #[cfg(target_os = "linux")]
@@ -820,6 +830,19 @@ impl BashOperations for SandboxedBashOperations {
                 .unwrap_or_else(|| self.workspace.clone());
             let mode = (self.mode_resolver)();
             let route = (self.network_resolver)();
+            // Same full-access short-circuit as macOS: no bwrap, no netns
+            // bridge, no seccomp face.
+            if mode == AccessMode::FullAccess {
+                let mut cmd = UnsandboxedBashOperations::command(request.command, &cwd);
+                cmd.stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true);
+                let child = cmd
+                    .spawn()
+                    .map_err(|e| ExecutionError::Spawn(e.to_string()))?;
+                let timeout = request.timeout.unwrap_or(DEFAULT_TIMEOUT);
+                return run_to_completion(child, request.on_data, timeout, &request.signal).await;
+            }
             // Same fail-closed policy build as macOS (a symlinked writable
             // root never runs unsandboxed).
             let roots = self
@@ -859,20 +882,8 @@ impl BashOperations for SandboxedBashOperations {
                 }
             }
             let timeout = request.timeout.unwrap_or(DEFAULT_TIMEOUT);
-            let mut result =
+            let result =
                 run_to_completion(child, request.on_data, timeout, &request.signal).await?;
-            // Classify a bwrap denial — the read-only base surfaces EROFS
-            // ("Read-only file system"), the socket-restricted seccomp face
-            // EPERM — onto the same marker + escalation hint vocabulary,
-            // re-worded for the network face when the route is closed.
-            if let Some(note) = manox_harness::sandbox::seatbelt_denial_note(
-                &result.stderr,
-                result.exit_code,
-                mode,
-                route.access(),
-            ) {
-                result.stderr.push_str(&note);
-            }
             Ok(result)
         }
     }
@@ -1324,6 +1335,65 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn full_access_short_circuits_the_background_wrap() {
+        // The incident shape: a full-access resolver reaching the sandboxed
+        // backend must run bare, never render the deny-default base around an
+        // empty writable-root set (a full-disk read-only jail).
+        let root = project_root();
+        std::fs::create_dir_all(&root).ok();
+        let ops = SandboxedBashOperations::new(
+            &root,
+            crate::granted_roots::GrantedRoots::new(&root),
+            resolver(AccessMode::FullAccess),
+            route_resolver(NetworkRoute::Direct),
+        );
+        let std_cmd = ops.wrap_background("touch probe", &root).into_std();
+        assert_eq!(
+            std_cmd.get_program(),
+            "bash",
+            "no sandbox-exec wrapper under full access"
+        );
+        assert_eq!(std_cmd.get_args().next().unwrap(), "-c");
+        // The exact command travels intact and no `-p` profile rides along.
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["-c", "touch probe"], "{args:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn full_access_short_circuits_exec() {
+        // Same short-circuit on the exec path: the command runs (and its file
+        // effect lands) instead of being jailed by an empty root set.
+        let root = project_root();
+        std::fs::create_dir_all(&root).ok();
+        let ops = SandboxedBashOperations::new(
+            &root,
+            crate::granted_roots::GrantedRoots::new(&root),
+            resolver(AccessMode::FullAccess),
+            route_resolver(NetworkRoute::Direct),
+        );
+        let probe = root.join("full-access-shortcut.txt");
+        let _ = std::fs::remove_file(&probe);
+        let res = ops
+            .exec(BashExecRequest {
+                command: &format!("printf hi > {}", probe.display()),
+                cwd: Some(&root),
+                timeout: Some(Duration::from_secs(30)),
+                signal: tokio_util::sync::CancellationToken::new(),
+                on_data: None,
+            })
+            .await
+            .expect("exec runs");
+        assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
+        assert!(probe.exists(), "the write landed unconfined");
+        let _ = std::fs::remove_file(&probe);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn wrap_argv_shapes_the_invocation() {
         let root = project_root();
         std::fs::create_dir_all(&root).ok();
@@ -1472,12 +1542,11 @@ mod tests {
             return;
         }
         assert_ne!(res.exit_code, 0, "sandbox denies the write");
-        // The seatbelt denial carries the denial marker + escalation hint
-        // so the model recognizes a policy refusal (not a command bug).
+        // Denial classification is the bash tool's job, not the ops layer's:
+        // the raw backend output carries the OS refusal and no marker.
         assert!(
-            res.stderr
-                .contains("[sandbox: file access denied under sandbox mode]"),
-            "denial marker in stderr: {}",
+            !res.stderr.contains("[sandbox: "),
+            "ops attach no marker: {}",
             res.stderr
         );
         assert!(!denied.exists());
@@ -1555,15 +1624,12 @@ mod tests {
             "the connect failure is visible in stderr: {}",
             res.stderr
         );
+        // The ops layer reports the OS refusal raw; the denial marker is the
+        // bash tool's classification (and it alone knows whether an
+        // escalation channel exists).
         assert!(
-            res.stderr
-                .contains("network access denied under sandbox mode"),
-            "network marker in stderr: {}",
-            res.stderr
-        );
-        assert!(
-            res.stderr.contains("require_escalated"),
-            "escalation hint rides the denial: {}",
+            !res.stderr.contains("[sandbox: "),
+            "ops attach no marker: {}",
             res.stderr
         );
     }

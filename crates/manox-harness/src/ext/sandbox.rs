@@ -154,16 +154,17 @@ pub fn sandbox_denial_marker(mode: AccessMode) -> String {
 /// Substrings a sandboxed file-write denial leaves in the process output
 /// stream, per backend: the macOS seatbelt's EPERM surfaces as "operation
 /// not permitted", the Linux bwrap read-only base as EROFS ("read-only
-/// file system"). Shared by the sandboxed exec backends (stderr of a
-/// finished child) and the registry-executed foreground path (combined
-/// output after the exit is recorded).
+/// file system"). Read by the bash tool's post-exit classification, which
+/// sees the output of both the backend path and the registry's foreground
+/// path.
 pub const SANDBOX_DENIAL_SIGNATURES: &[&str] =
     &["operation not permitted", "read-only file system"];
 
 /// The model-facing denial marker for the network face — the wording a
 /// network-closed sandbox reports so the model distinguishes "the network is
-/// off" (fixable by flipping `networkAccess`, or by escalation) from a file
-/// denial. Only meaningful under the sandbox mode; full access never denies.
+/// off" (fixable by flipping `networkAccess`, or by an escalation when one is
+/// available) from a file denial. Only meaningful under the sandbox mode;
+/// full access never denies.
 pub fn network_denial_marker(mode: AccessMode) -> String {
     format!(
         "[sandbox: network access denied under {} mode — networkAccess is off]",
@@ -190,47 +191,52 @@ pub const NETWORK_DENIAL_SIGNATURES: &[&str] = &[
 ];
 
 /// Post-exit denial classification: when a nonzero-exit command's output
-/// carries a sandbox denial signature, the marker + same-turn escalation
-/// hint is returned so the model recognizes a policy refusal (not a command
-/// bug) and can retry with `require_escalated`. The network face is judged
-/// first while the network is closed — its signatures name connection
-/// failures the file faces never produce — so a closed-network run classifies
-/// a `curl` refusal as a network denial instead of a file denial. On Linux
-/// the two deny faces have distinct errnos (the read-only base surfaces
-/// EROFS, seccomp EPERM), so a bare "operation not permitted" under a closed
-/// network reads as the socket filter; on macOS the seatbelt's file denials
-/// are also EPERM, so there the generic signature keeps its file meaning.
+/// carries a sandbox denial signature, the marker (plus, when the calling
+/// tool has an escalation channel, the same-turn hint) is returned so the
+/// model recognizes a policy refusal (not a command bug) and can retry with
+/// `require_escalated`. The network face is judged first while the network is
+/// closed — its signatures name connection failures the file faces never
+/// produce — so a closed-network run classifies a `curl` refusal as a network
+/// denial instead of a file denial. On Linux the two deny faces have distinct
+/// errnos (the read-only base surfaces EROFS, seccomp EPERM), so a bare
+/// "operation not permitted" under a closed network reads as the socket
+/// filter; on macOS the seatbelt's file denials are also EPERM, so there the
+/// generic signature keeps its file meaning.
+///
+/// `escalation_available` is the calling tool's fact, not this classifier's:
+/// a session with no approval channel (a subagent) gets the marker alone —
+/// teaching a retry it cannot make would point the model at a dead end.
 pub fn seatbelt_denial_note(
     output: &str,
     exit_code: i32,
     mode: AccessMode,
     network: NetworkAccess,
+    escalation_available: bool,
 ) -> Option<String> {
     if exit_code == 0 {
         return None;
     }
     let lower = output.to_ascii_lowercase();
+    let note = |marker: String| {
+        if escalation_available {
+            format!("\n{marker}\n{}", escalation_hint_marker("command"))
+        } else {
+            format!("\n{marker}")
+        }
+    };
     let network_denial = network == NetworkAccess::Off
         && (NETWORK_DENIAL_SIGNATURES
             .iter()
             .any(|sig| lower.contains(sig))
             || (cfg!(target_os = "linux") && lower.contains("operation not permitted")));
     if network_denial {
-        return Some(format!(
-            "\n{}\n{}",
-            network_denial_marker(mode),
-            escalation_hint_marker("command")
-        ));
+        return Some(note(network_denial_marker(mode)));
     }
     if SANDBOX_DENIAL_SIGNATURES
         .iter()
         .any(|sig| lower.contains(sig))
     {
-        Some(format!(
-            "\n{}\n{}",
-            sandbox_denial_marker(mode),
-            escalation_hint_marker("command")
-        ))
+        Some(note(sandbox_denial_marker(mode)))
     } else {
         None
     }
@@ -320,10 +326,13 @@ pub fn manox_home() -> Option<PathBuf> {
 /// root, the manox state home ([`manox_home`] — plan files and other session
 /// state write without escalation), the host `/tmp`, and the per-user
 /// platform temp dir (`std::env::temp_dir()` — the real temp area; omitting
-/// it would deny what the mode promises). `full-access` is never fenced, so
-/// it has no root list (enforcement skips this function entirely for it).
-/// Shared by the bash seatbelt and the fs fence so the "the write tool
-/// cannot write `/tmp` but bash can" asymmetry cannot arise.
+/// it would deny what the mode promises). `full-access` is never fenced and
+/// never rendered (both backends short-circuit it before a profile or a
+/// verdict is built), so its empty list is unreachable as an enforcement
+/// input — an empty root set under the deny-default base would be a
+/// read-only jail, not an unconfined run. Shared by the bash seatbelt and the
+/// fs fence so the "the write tool cannot write `/tmp` but bash can"
+/// asymmetry cannot arise.
 pub fn writable_roots(mode: AccessMode, workspace_root: &Path) -> Vec<PathBuf> {
     if mode != AccessMode::Sandbox {
         return Vec::new();
@@ -574,7 +583,7 @@ mod tests {
     #[test]
     fn closed_network_classifies_connection_failures_as_network_denials() {
         let note = |out: &str, code: i32| {
-            seatbelt_denial_note(out, code, AccessMode::Sandbox, NetworkAccess::Off)
+            seatbelt_denial_note(out, code, AccessMode::Sandbox, NetworkAccess::Off, true)
         };
         // The macOS shape: seatbelt denies the DNS mach lookups, curl reports
         // name resolution.
@@ -602,9 +611,30 @@ mod tests {
             .copied()
             .collect();
         for stderr in stderrs {
-            let note = seatbelt_denial_note(stderr, 7, AccessMode::Sandbox, NetworkAccess::Off)
-                .unwrap_or_else(|| panic!("no classification for: {stderr}"));
+            let note =
+                seatbelt_denial_note(stderr, 7, AccessMode::Sandbox, NetworkAccess::Off, true)
+                    .unwrap_or_else(|| panic!("no classification for: {stderr}"));
             assert!(note.contains("network access denied"), "{note}");
+        }
+    }
+
+    #[test]
+    fn a_session_without_an_escalation_channel_gets_the_marker_alone() {
+        // A subagent has no approver: teaching a `require_escalated` retry
+        // would point the model at a channel it does not have.
+        for output in [
+            "curl: (6) Could not resolve host: crates.io",
+            "touch: /usr/local/x: Operation not permitted",
+            "touch: Read-only file system",
+        ] {
+            let note =
+                seatbelt_denial_note(output, 1, AccessMode::Sandbox, NetworkAccess::Off, false)
+                    .unwrap_or_else(|| panic!("no classification for: {output}"));
+            assert!(note.contains("[sandbox: "), "marker stays: {note}");
+            assert!(
+                !note.contains("require_escalated"),
+                "no dead-end hint: {note}"
+            );
         }
     }
 
@@ -618,7 +648,8 @@ mod tests {
             "curl: (7) Connection refused",
         ] {
             assert!(
-                seatbelt_denial_note(stderr, 7, AccessMode::Sandbox, NetworkAccess::On).is_none(),
+                seatbelt_denial_note(stderr, 7, AccessMode::Sandbox, NetworkAccess::On, true)
+                    .is_none(),
                 "open network misclassified: {stderr}"
             );
         }
@@ -635,6 +666,7 @@ mod tests {
             1,
             AccessMode::Sandbox,
             NetworkAccess::Off,
+            true,
         );
         if cfg!(target_os = "linux") {
             assert!(note.unwrap().contains("network access denied"));
@@ -651,6 +683,7 @@ mod tests {
             1,
             AccessMode::Sandbox,
             NetworkAccess::Off,
+            true,
         )
         .unwrap();
         assert!(note.contains("file access denied"), "{note}");

@@ -508,7 +508,7 @@ impl BashTool {
         } else {
             &*self.operations
         };
-        let result = backend
+        let mut result = backend
             .exec(BashExecRequest {
                 command: &command,
                 cwd: Some(&run_cwd),
@@ -518,6 +518,20 @@ impl BashTool {
             })
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
+        // The tool owns the escalation fact: only a session with an approval
+        // channel may be taught the retry, so a subagent (no approver) gets
+        // the denial marker alone.
+        if self.confines(effective)
+            && let Some(note) = crate::sandbox::seatbelt_denial_note(
+                &result.stderr,
+                result.exit_code,
+                effective,
+                self.network_access(),
+                self.escalation_approver.is_some(),
+            )
+        {
+            result.stderr.push_str(&note);
+        }
 
         let mut output = assemble_output(result, head_lines, tail_lines);
 
@@ -626,12 +640,13 @@ impl BashTool {
         let signaled = exit == Some(None);
         let code = exit.flatten().unwrap_or(0);
         let mut result = output.into_result(code);
-        if sandboxed
+        if self.confines(effective)
             && let Some(note) = crate::sandbox::seatbelt_denial_note(
                 &result.stderr,
                 code,
                 effective,
                 self.network_access(),
+                self.escalation_approver.is_some(),
             )
         {
             result.stderr.push_str(&note);
@@ -651,6 +666,13 @@ impl BashTool {
     /// persistent shell's state cannot move into a fresh process).
     fn promotes_on_timeout(&self) -> bool {
         self.manager.is_some() && self.sandbox_available
+    }
+
+    /// Whether a call at `mode` runs under an OS confinement — the only
+    /// shape that can leave a policy denial in its output. `full-access`
+    /// runs bare, and a platform with no sandbox backend ran bare all along.
+    fn confines(&self, mode: AccessMode) -> bool {
+        self.sandbox_available && mode != AccessMode::FullAccess
     }
 
     /// The standing session mode (absent any per-call grant).
@@ -1815,6 +1837,113 @@ mod tests {
             "{}",
             err
         );
+    }
+
+    /// Backend that answers with a seatbelt-style EPERM so the tool's denial
+    /// classification runs against a realistic stderr.
+    struct DeniedOps;
+    #[async_trait::async_trait]
+    impl BashOperations for DeniedOps {
+        async fn exec(
+            &self,
+            _request: BashExecRequest<'_>,
+        ) -> Result<CommandResult, crate::core::env::ExecutionError> {
+            Ok(CommandResult {
+                stdout: String::new(),
+                stderr: "touch: /usr/local/x: Operation not permitted".into(),
+                exit_code: 1,
+            })
+        }
+    }
+
+    fn denial_tool(approver: Option<Arc<CannedApprover>>) -> BashTool {
+        let tool = BashTool::new(Arc::new(DeniedOps), Arc::new(NoopRegistry))
+            .with_sandbox_available(true)
+            .with_mode_resolver(Arc::new(|| AccessMode::Sandbox))
+            // Network open: the classifier's Linux rule reads a bare
+            // "operation not permitted" under a CLOSED network as the socket
+            // filter, which would flip these pins to the network face. These
+            // tests pin the file face and the escalation-channel dimension.
+            .with_network_resolver(Arc::new(|| crate::sandbox::NetworkAccess::On));
+        match approver {
+            Some(approver) => tool.with_escalation_approver(approver),
+            None => tool,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_without_an_approver_gets_the_marker_without_the_hint() {
+        // The subagent shape: the seatbelt may refuse, but there is no
+        // approval channel to retry through — teaching the retry would point
+        // the model at a dead end.
+        let tool = denial_tool(None);
+        let (ctx, _dir) = ctx();
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": "touch /usr/local/x", "cwd": [""]}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = output_text(&result);
+        assert!(
+            text.contains("[sandbox: file access denied under sandbox mode]"),
+            "denial marker: {text}"
+        );
+        assert!(
+            !text.contains("require_escalated"),
+            "no escalation hint without a channel: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_with_an_approver_gets_the_marker_and_the_hint() {
+        let approver = Arc::new(CannedApprover {
+            outcome: crate::sandbox::EscalationOutcome::AllowedOnce,
+            asked: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let tool = denial_tool(Some(approver));
+        let (ctx, _dir) = ctx();
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": "touch /usr/local/x", "cwd": [""]}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = output_text(&result);
+        assert!(
+            text.contains("[sandbox: file access denied under sandbox mode]"),
+            "denial marker: {text}"
+        );
+        assert!(
+            text.contains("require_escalated"),
+            "the sanctioned retry rides a real channel: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_access_run_never_classifies_a_denial() {
+        // Full access is unconfined: an EPERM there is an ordinary failure,
+        // never a policy marker.
+        let tool = BashTool::new(Arc::new(DeniedOps), Arc::new(NoopRegistry))
+            .with_sandbox_available(true)
+            .with_mode_resolver(Arc::new(|| AccessMode::FullAccess));
+        let (ctx, _dir) = ctx();
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": "touch /usr/local/x", "cwd": [""]}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!output_text(&result).contains("[sandbox: "));
     }
 
     #[test]
