@@ -546,6 +546,31 @@ impl<S: SessionStorage> Session<S> {
         Ok(id)
     }
 
+    /// Append an `access_mode_change` entry on the K5 durable face: a
+    /// deferred session materializes here (header plus every buffered row
+    /// plus this entry) instead of waiting for the first assistant message.
+    /// The child journal's opening declaration lands at dispatch, so a
+    /// subscriber attaching at any point cold-reads it and a run that dies
+    /// before its first assistant message still leaves the durable witness
+    /// of the authority it ran under.
+    pub async fn append_access_mode_change_durable(
+        &self,
+        mode: &str,
+    ) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+
+        let entry = SessionTreeEntry::AccessModeChange {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            mode: mode.to_string(),
+        };
+        self.storage.append_entry_durable(&entry).await?;
+        Ok(id)
+    }
+
     /// Append a compaction entry and return the entry ID and timestamp.
     ///
     /// The leaf cursor moves to the entry, so later messages parent onto it.

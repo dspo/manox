@@ -385,6 +385,12 @@ struct EngineState {
     /// before the actor drains — is what the `SetAccessMode` arm diffs
     /// against, so a restate lands no duplicate row.
     journaled_access_mode: Mutex<AccessMode>,
+    /// This assembly's subagent run observer, published per session
+    /// build/swap like the acceptance-time writer. The `SetAccessMode` arm
+    /// reads it to propagate a real mid-turn flip to the live children (the
+    /// observer owns the live roster; the children's journals take the
+    /// matching row).
+    subagent_observer: Mutex<Option<Arc<SubagentRunObserver>>>,
     /// The thinking level the journal's `thinking_level_change` rows last
     /// carried (raw wire string; `None` = the journal carries no level).
     /// Same contract as the access-mode baseline: the durable diff source
@@ -547,6 +553,7 @@ pub fn spawn_engine(
         current_resources: Mutex::new(None),
         journaled_access_mode: Mutex::new(AccessMode::default()),
         journaled_thinking_level: Mutex::new(None),
+        subagent_observer: Mutex::new(None),
         gate,
         question_gate,
         held_settle: Mutex::new(None),
@@ -1097,7 +1104,7 @@ async fn run_actor(
         // projects the session's own model only when the builder carries
         // none, and the actor adopts
         // it right after the open below.
-        let (builder, background) = session_builder(
+        let (builder, background, subagent_observer) = session_builder(
             &tool_cwd,
             &sessions_dir,
             None,
@@ -1112,6 +1119,9 @@ async fn run_actor(
             None,
             &bus,
         );
+        // Published per assembly like the acceptance-time writer (the actor
+        // propagates a mid-turn mode flip through it).
+        *state.subagent_observer.lock().unwrap() = Some(subagent_observer);
         match builder.open(session_path).await {
             Ok(mut s) => {
                 attach_orchestrators(&mut s, &background);
@@ -1131,7 +1141,7 @@ async fn run_actor(
     let mut session = match session {
         Some(s) => s,
         None => {
-            let (builder, background) = session_builder(
+            let (builder, background, subagent_observer) = session_builder(
                 &cwd,
                 &sessions_dir,
                 session_file.as_deref(),
@@ -1146,6 +1156,9 @@ async fn run_actor(
                 parent_session.as_deref(),
                 &bus,
             );
+            // Published per assembly like the acceptance-time writer (the actor
+            // propagates a mid-turn mode flip through it).
+            *state.subagent_observer.lock().unwrap() = Some(subagent_observer);
             // The fresh session carries the facade thread's id so the
             // sidebar row (keyed by session id) and the in-memory thread
             // share one identity.
@@ -2948,6 +2961,16 @@ async fn apply_access_mode(
             );
         }
         *state.journaled_access_mode.lock().unwrap() = mode;
+        // Propagate the flip to this assembly's live children: each live
+        // child journal gains the same `access_mode_change` row. Under the
+        // live-inheritance semantics the children's enforcing tools read
+        // this gate per call, so the propagated value IS their effective
+        // mode the moment the row lands. A restate (the `if` above) spreads
+        // nothing — no duplicate rows anywhere.
+        let observer = state.subagent_observer.lock().unwrap().clone();
+        if let Some(observer) = observer {
+            observer.propagate_access_mode(mode).await;
+        }
     }
     send_notice(
         notice_tx,

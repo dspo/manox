@@ -1102,6 +1102,7 @@ fn test_engine_state() -> Arc<EngineState> {
         last_cwd_note: Mutex::new(None),
         journaled_access_mode: Mutex::new(AccessMode::default()),
         journaled_thinking_level: Mutex::new(None),
+        subagent_observer: Mutex::new(None),
     })
 }
 
@@ -5292,4 +5293,289 @@ async fn child_edit_fence_judges_every_patch_target() {
         .to_string();
     assert!(err.contains("[sandbox: file access denied"), "{err}");
     assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+// ── subagent effective access mode observability (#968) ─────────────────────
+//
+// #965 made the inheritance real; #968 makes it legible: the child journal
+// declares the mode it inherits, and a parent mid-turn flip appends the
+// matching row to every live child. The journal is the durable authority —
+// the AHP session channel folds these rows into `configChanged{accessMode}`
+// (projection's `AccessModeChange` arm), so a subscriber answers "what mode
+// does this Sailor run under" without a probe sequence.
+
+/// A stream that parks the child's turn until released, so a dispatch is
+/// observably live while the propagation lands.
+struct HeldStream(Arc<tokio::sync::Notify>);
+
+#[async_trait::async_trait]
+impl manox_harness::agent_loop::StreamFn for HeldStream {
+    async fn stream(
+        &self,
+        context: &manox_harness::types::AgentContext,
+        signal: tokio_util::sync::CancellationToken,
+        _event_tx: tokio::sync::mpsc::Sender<manox_harness::types::AgentEvent>,
+    ) -> Result<manox_harness::types::AgentMessage, anyhow::Error> {
+        tokio::select! {
+            _ = self.0.notified() => Ok(AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "ok".into(),
+                    signature: None,
+                }],
+                model: context.model.id.clone(),
+                provider: context.model.provider.clone(),
+                api: context.model.api.clone(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: Some(manox_harness::types::StopReason::Stop),
+                usage: Box::new(manox_harness::types::Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            }),
+            _ = signal.cancelled() => Err(anyhow::anyhow!("aborted")),
+        }
+    }
+}
+
+/// Every `access_mode_change` row of a journal file, in append order —
+/// parsed off the wire lines, the same bytes a fold or a restore reads.
+async fn access_mode_rows(path: &Path) -> Vec<serde_json::Value> {
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .expect("journal file reads");
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| row["type"] == "access_mode_change")
+        .collect()
+}
+
+/// The wire row types of a journal file, in order — the shape a fold walks.
+async fn journal_row_types(path: &Path) -> Vec<String> {
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .expect("journal file reads");
+    content
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()?
+                .get("type")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// The parent session's carried mode rows via the read face (a fresh chain
+/// is deferred — its rows are in the in-memory chain before any file
+/// exists).
+async fn parent_mode_rows(session: &manox_harness::coding_agent::AgentSession) -> Vec<String> {
+    session
+        .context_entries()
+        .await
+        .expect("context entries read")
+        .into_iter()
+        .filter_map(|entry| match entry {
+            manox_harness::session::SessionTreeEntry::AccessModeChange { mode, .. } => Some(mode),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Poll until the child's registry entries clear (the drive task drops its
+/// guard after the result resolves — settle and teardown are two steps).
+async fn wait_for_feed_clearance(run_id: &str) {
+    for _ in 0..500 {
+        if !manox_harness::subagent::feeds::child_journal_feed(run_id).is_some() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the child registry entries never cleared after settle");
+}
+
+/// A dispatch declares the mode it inherits, a real mid-turn flip appends to
+/// the live child's journal, a restate spreads nothing, and a settled child
+/// takes no rows. This is the #968 contract end to end: the gate flip rides
+/// the actor's own `apply_access_mode` (the path the `SetAccessMode` command
+/// drives), against the state's real gate and a provider wired to the real
+/// observer.
+#[tokio::test]
+async fn child_journal_opens_with_the_inherited_mode_and_follows_a_live_flip() {
+    use manox_harness::subagent::{SpawnProvider, SubagentRuntime};
+
+    // The run task's settle path reads the process-global runtime handle;
+    // hermetic HOME keeps the journal roots out of the developer's own.
+    crate::runtime::init_hermetic_for_test();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("proj");
+    tokio::fs::create_dir_all(&cwd).await.unwrap();
+    let subagents = dir.path().join("subagents");
+
+    let state = test_engine_state();
+    let gate = Arc::clone(&state.gate);
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
+    let observer = crate::subagent::SubagentRunObserver::new(
+        "thread-observers".to_string(),
+        notice_tx.clone(),
+    );
+    *state.subagent_observer.lock().unwrap() = Some(Arc::clone(&observer));
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let held = Arc::new(HeldStream(Arc::clone(&release)));
+    let stream_for_resolver = Arc::clone(&held);
+    let resolver: manox_harness::agent_loop::StreamResolver =
+        Arc::new(move |_m: &HarnessModel| Ok(stream_for_resolver.clone()));
+    let runtime = ModelRuntime::new(resolver);
+
+    let resolver_gate = Arc::clone(&gate);
+    let provider =
+        SpawnProvider::new(vec![Arc::new(manox_harness::tools::read::ReadTool)
+            as Arc<dyn manox_harness::tool::AgentTool>])
+        .with_model_runtime(runtime.clone())
+        .with_model(test_model())
+        .with_session_dir(subagents.clone())
+        .with_access_mode_resolver(Arc::new(move || resolver_gate.mode()))
+        .with_observer(Arc::clone(&observer) as Arc<dyn manox_harness::subagent::RunObserver>);
+    let subagent_runtime = SubagentRuntime::new();
+    subagent_runtime.register_provider_permanent(Arc::new(provider));
+
+    let mut request = manox_harness::subagent::test_request("probe the mode", "work");
+    request.cwd = cwd.clone();
+    request.env = Arc::new(manox_harness::env::TokioExecutionEnv::new(cwd.clone()));
+    let run = subagent_runtime
+        .start("spawn", request)
+        .await
+        .expect("dispatch starts");
+    let run_id = run.id.clone();
+    let journal = subagents.join(manox_harness::session::repository::session_file_name(
+        &run_id,
+    ));
+
+    // The registry entries (feed + writer) are live the moment the dispatch
+    // returns — the guard rides the run task, not the dispatch return. The
+    // opening declaration materializes the child journal at dispatch (the
+    // K5 shape): the durable file already carries it while the run is live.
+    assert!(
+        manox_harness::subagent::feeds::child_journal_writer(&run_id),
+        "the child writer is registered for the run's whole life"
+    );
+    assert_eq!(
+        journal_row_types(&journal).await,
+        ["session", "access_mode_change"],
+        "the journal's first batch is the header then the inherited mode"
+    );
+    assert_eq!(
+        access_mode_rows(&journal).await[0]["mode"],
+        "sandbox",
+        "the declared mode is the gate's standing mode at dispatch"
+    );
+
+    // Real flip through the actor's apply: the state's gate is the live
+    // authority the child's resolvers read, the parent journal takes its own
+    // row, and the live child's chain takes the propagated one.
+    let parent = create_agent_session()
+        .with_cwd(&cwd)
+        .with_session_dir(dir.path().join("parent"))
+        .with_model_runtime(runtime.clone())
+        .with_model(test_model())
+        .build()
+        .await
+        .unwrap();
+    apply_access_mode(&parent, &state, AccessMode::FullAccess, &notice_tx).await;
+    assert_eq!(
+        parent_mode_rows(&parent).await,
+        ["full-access"],
+        "the parent journal carries the flip once"
+    );
+
+    // A restate (the facade re-stamping the same mode) spreads nothing.
+    apply_access_mode(&parent, &state, AccessMode::FullAccess, &notice_tx).await;
+    assert_eq!(
+        parent_mode_rows(&parent).await,
+        ["full-access"],
+        "a restate lands no duplicate parent row"
+    );
+
+    // Settle the run; its first assistant message materializes the child
+    // journal with every buffered row in append order, and the registry
+    // entries clear with it.
+    release.notify_one();
+    let result = run.result().await;
+    assert_eq!(
+        result.stop_reason,
+        manox_harness::subagent::StopReason::Completed,
+        "the released child completes: {result:?}"
+    );
+    wait_for_feed_clearance(&run_id).await;
+
+    // The child journal opens with the mode it inherited (before the run's
+    // own turn_start — first batch), and the mid-turn flip's row follows.
+    let row_types = journal_row_types(&journal).await;
+    assert_eq!(
+        row_types.first().map(String::as_str),
+        Some("session"),
+        "the header leads: {row_types:?}"
+    );
+    assert_eq!(
+        row_types.get(1).map(String::as_str),
+        Some("access_mode_change"),
+        "the inherited mode is the journal's first fact: {row_types:?}"
+    );
+    assert_eq!(
+        access_mode_rows(&journal)
+            .await
+            .iter()
+            .map(|r| r["mode"].clone())
+            .collect::<Vec<_>>(),
+        ["sandbox", "full-access"],
+        "the live child gained the propagated row"
+    );
+    let start_row = &access_mode_rows(&journal).await[0];
+    assert!(
+        start_row["id"].is_string() && start_row["timestamp"].is_string(),
+        "the row carries the same envelope fields the parent's rows do"
+    );
+
+    // A later flip reaches no settled child — the parent still journals.
+    apply_access_mode(&parent, &state, AccessMode::Sandbox, &notice_tx).await;
+    assert_eq!(
+        access_mode_rows(&journal).await.len(),
+        2,
+        "a settled child takes no propagation rows"
+    );
+    assert_eq!(
+        parent_mode_rows(&parent).await,
+        ["full-access", "sandbox"],
+        "the parent's own durable row lands regardless"
+    );
+
+    // Replay consistency: a restore (the continuation's `builder.open`, the
+    // AHP cold read) reopens the settled file through the storage face and
+    // reads the same rows the wire lines showed — the mode history survives
+    // the process, in order.
+    let replayed = manox_harness::session::jsonl::JsonlSessionStorage::open(&journal)
+        .await
+        .expect("settled child journal reopens")
+        .journal_range(0, u64::MAX)
+        .await
+        .expect("entries read");
+    let replayed_modes: Vec<&str> = replayed
+        .iter()
+        .filter_map(|record| match &record.entry {
+            manox_harness::session::SessionTreeEntry::AccessModeChange { mode, .. } => {
+                Some(mode.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replayed_modes,
+        ["sandbox", "full-access"],
+        "the restore replays the same mode rows in append order: {replayed:?}"
+    );
 }
