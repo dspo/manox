@@ -1082,6 +1082,35 @@ impl SubagentRunObserver {
             .unwrap_or_else(|e| e.into_inner())
             .remove(run_id);
     }
+
+    /// Propagate the parent's access-mode decision to every live child run:
+    /// each live child's journal gains one `access_mode_change` row carrying
+    /// the mode now in force. Under the live-inheritance semantics the
+    /// child's enforcing tools already read the parent's gate per call — the
+    /// row is the durable witness the fold reads back, not the authority.
+    /// Runs that settled between the roster read and the append are skipped
+    /// (their writer is gone); append failures are logged, never fatal — an
+    /// observability row must not fail the user's switch. Propagated value =
+    /// the dispatcher's new standing mode: with inheritance live by pointer,
+    /// that IS the child's effective mode the moment the row lands. (If a
+    /// declarative per-child pin ever overrides inheritance, both this value
+    /// and the resolvers must move to the same resolution.)
+    pub async fn propagate_access_mode(&self, mode: manox_harness::sandbox::AccessMode) {
+        let run_ids: Vec<String> = {
+            let runs = self.locked();
+            if runs.is_empty() {
+                return;
+            }
+            runs.keys().cloned().collect()
+        };
+        for run_id in run_ids {
+            if let Err(err) =
+                manox_harness::subagent::feeds::journal_access_mode(&run_id, mode).await
+            {
+                tracing::warn!(%err, run_id, "child access_mode_change propagation failed");
+            }
+        }
+    }
 }
 
 impl RunObserver for SubagentRunObserver {

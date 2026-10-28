@@ -326,8 +326,9 @@ pub(super) fn session_builder(
 ) -> (
     manox_harness::coding_agent::AgentSessionBuilder,
     Arc<BackgroundManager>,
+    Arc<crate::subagent::SubagentRunObserver>,
 ) {
-    let (tools, background) = build_tools(
+    let (tools, background, subagent_observer) = build_tools(
         cwd,
         runtime,
         model,
@@ -405,7 +406,7 @@ pub(super) fn session_builder(
     if let Some(model) = model {
         builder = builder.with_model(model.clone());
     }
-    (builder, background)
+    (builder, background, subagent_observer)
 }
 /// Adopt the session's own model after a restore: the reopened session's
 /// harness already carries the model its `model_change` rows project (the
@@ -519,7 +520,7 @@ pub(super) async fn rebuild_session(
     // Like the startup restore, a session swap passes no model override so
     // the opened session's own persisted model wins; the actor adopts it
     // right after the open.
-    let (builder, background) = session_builder(
+    let (builder, background, subagent_observer) = session_builder(
         &cwd,
         sessions_dir,
         None,
@@ -534,6 +535,10 @@ pub(super) async fn rebuild_session(
         None,
         bus,
     );
+    // Published per assembly like the acceptance-time writer: the actor's
+    // access-mode apply propagates a mid-turn flip through this observer to
+    // the live children.
+    *state.subagent_observer.lock().unwrap() = Some(subagent_observer);
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
             attach_orchestrators(&mut s, &background);

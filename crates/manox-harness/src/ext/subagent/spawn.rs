@@ -93,6 +93,11 @@ pub struct SpawnProvider {
     session_dir: Option<PathBuf>,
     /// Host bridge for transcript/health surfaces.
     observer: Option<Arc<dyn RunObserver>>,
+    /// The dispatching session's standing access mode, answered live at
+    /// dispatch. The child's enforcing tools read the same authority per
+    /// call (live inheritance); this resolver is what the child journal's
+    /// `access_mode_change` rows declare.
+    access_mode_resolver: Option<Arc<dyn Fn() -> crate::sandbox::AccessMode + Send + Sync>>,
 }
 
 impl SpawnProvider {
@@ -105,6 +110,7 @@ impl SpawnProvider {
             delegation_names: HashSet::new(),
             session_dir: None,
             observer: None,
+            access_mode_resolver: None,
         }
     }
 
@@ -144,6 +150,19 @@ impl SpawnProvider {
     /// Host bridge for transcript/health surfaces.
     pub fn with_observer(mut self, observer: Arc<dyn RunObserver>) -> Self {
         self.observer = Some(observer);
+        self
+    }
+
+    /// The dispatching session's standing access mode, answered live. When
+    /// set, every child journal opens with the mode the run inherits (an
+    /// `access_mode_change` row, one per activation) and the writer
+    /// registry lets the parent's mid-turn flips append to the live
+    /// child's journal.
+    pub fn with_access_mode_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> crate::sandbox::AccessMode + Send + Sync>,
+    ) -> Self {
+        self.access_mode_resolver = Some(resolver);
         self
     }
 
@@ -367,11 +386,34 @@ impl SubagentProvider for SpawnProvider {
         };
         let handle = session.handle();
         let model = session.model().clone();
-        // The live feed for the child's own chat: registered for the run's
-        // whole life (the drive loop removes it on every exit below), so a
-        // bridge attaching at any moment during the run finds it.
-        let _feed_guard = ChildFeedGuard(run_id.clone());
+        // The child journal opens each activation with the access authority
+        // the run inherits: the standing mode as the live resolver answers
+        // NOW — the same authority the child's per-call resolvers will read.
+        // A continuation re-declares on purpose: a flip while the child was
+        // settled had no live journal to propagate into, so this row is the
+        // only durable witness of the mode this activation runs under. The
+        // durable face materializes the fresh journal here (the K5 shape):
+        // a subscriber attaching before the first assistant message
+        // cold-reads the declaration, and every later row lands on disk at
+        // once.
+        if let Some(resolver) = &self.access_mode_resolver {
+            let mode = resolver();
+            if let Err(err) = session
+                .journal_appender()
+                .append_access_mode_change_durable(mode.wire())
+                .await
+            {
+                tracing::warn!(%err, "child journal access_mode_change append failed");
+            }
+        }
+        // The live feed for the child's own chat plus the writer the mode
+        // propagation lands rows through: both registered for the run's
+        // whole life (the drive task holds the guard, so they die on every
+        // exit below), so a bridge attaching at any moment during the run
+        // finds the feed and a flip reaches a live child only.
+        let feed_guard = ChildFeedGuard(run_id.clone());
         super::feeds::register_child_feed(&run_id, &session.subscribe_journal_sender());
+        super::feeds::register_child_writer(&run_id, session.journal_appender());
 
         let info = crate::ext::subagent::types::RunInfo {
             run_id: run_id.clone(),
@@ -399,6 +441,10 @@ impl SubagentProvider for SpawnProvider {
         let task_label = label.clone();
         tokio::spawn(async move {
             let _temp_guard = temp_guard; // hold the throwaway transcript dir alive
+            // Both registry halves (feed + writer) die with the run, on
+            // every ending — the guard moved into the task lives to the
+            // drive loop's exit, not just the dispatch return.
+            let _feed_guard = feed_guard;
             // Panic-tolerant settle: a run-loop panic must still settle the
             // result and the observer's surfaces (otherwise the rail row
             // stays Running forever), not take the task down silently.
@@ -485,13 +531,16 @@ enum Ending {
     Stalled,
 }
 
-/// Removes the run's child feed entry when the drive loop exits, on every
-/// ending — the guard lives to the function's return, not just its tail.
+/// Removes the run's registry entries (the child feed and the mode-writer,
+/// both halves) when the drive task exits, on every ending — the guard is
+/// moved into the run task, so it lives to the loop's return, not the
+/// dispatch return.
 struct ChildFeedGuard(String);
 
 impl Drop for ChildFeedGuard {
     fn drop(&mut self) {
         super::feeds::remove_child_feed(&self.0);
+        super::feeds::remove_child_writer(&self.0);
     }
 }
 

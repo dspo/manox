@@ -509,9 +509,11 @@ impl BrowserSuite {
 /// no gate — permission policy is a harness concern); `AskUserQuestion` joins
 /// ungated because asking the user is itself the interaction.
 ///
-/// Returns the tools plus the session-scoped background manager that must
+/// Returns the tools, the session-scoped background manager that must
 /// attach once the session exists (its steerer and lifecycle hook need a
-/// live session handle).
+/// live session handle), and the subagent run observer (published into the
+/// engine state so the actor's access-mode apply can propagate a mid-turn
+/// flip to the live children).
 #[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
 pub(super) fn build_tools(
     cwd: &Path,
@@ -524,7 +526,11 @@ pub(super) fn build_tools(
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     granted_roots: &crate::granted_roots::GrantedRoots,
     bus: &Arc<crate::steer_bus::AgentBus>,
-) -> (Vec<Arc<dyn HarnessAgentTool>>, Arc<BackgroundManager>) {
+) -> (
+    Vec<Arc<dyn HarnessAgentTool>>,
+    Arc<BackgroundManager>,
+    Arc<SubagentRunObserver>,
+) {
     // Bash execution backend: OS-confined one-shot commands when the platform
     // backend is available (seatbelt on macOS, bubblewrap + seccomp on Linux;
     // the per-call file-effect profile follows the effective `AccessMode`;
@@ -948,6 +954,10 @@ pub(super) fn build_tools(
         .with_model_runtime(runtime.clone())
         .with_model_slot(Arc::clone(&model_slot))
         .with_delegation_names(subagent_runtime.delegation_tool_names())
+        // The child journal declares the mode it inherits and takes the
+        // parent's mid-turn flips: the same standing resolver the child's
+        // enforcing tools read per call.
+        .with_access_mode_resolver(Arc::clone(&standing_resolver))
         // Subagent transcripts persist under the host session root (a
         // subdirectory the sidebar's non-recursive listing never surfaces)
         // so their usage stays accountable.
@@ -997,7 +1007,7 @@ pub(super) fn build_tools(
     tools.push(Arc::new(crate::subagent::InterruptAgentTool::new(
         Arc::clone(&subagent_runtime),
     )));
-    (tools, manager)
+    (tools, manager, subagent_observer)
 }
 
 /// Re-mount the embedder's registered tools (the `RegisterSessionTools`
