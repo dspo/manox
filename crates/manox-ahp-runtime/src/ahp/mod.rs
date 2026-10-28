@@ -269,7 +269,7 @@ pub(crate) async fn session_state_with_live(
             })
             .unwrap_or_default();
     }
-    state.status = row_status_bits(Some(&state), &row, running, pending_auth);
+    state.status = row_status_bits(Some(state.status), &row, running, pending_auth);
     Some(state)
 }
 
@@ -940,18 +940,22 @@ fn project_info(project: &str) -> ProjectInfo {
     }
 }
 
-/// The session status bitset after the fold.
+/// The session status bitset.
 ///
-/// The fold may already carry `isArchived` (a journalled `pinnedArchived`
-/// row); the live flags come from the store, which owns them (running,
-/// pending-auth, the derived read bit, errored, archived). Pin has no AHP
-/// bit at all — the translator publishes it as an `x-manox` extension
-/// action, which this standard-state fold does not consume. `None` fold =
-/// a parked row (this host never folded it): the store carries everything
-/// the bit table can express, which is exactly why the parked answer and
-/// the live answer must come from ONE table — two tables drift.
+/// The FOLD may carry `isArchived` (a journalled `pinnedArchived` row), but
+/// it contributes its status BITS only — never a wholesale status. Every
+/// per-session flag (read, error, archived, running, pending-auth) derives
+/// from the STORE's current row/facts: a fold is a snapshot taken at
+/// subscribe time, and a seeded summary that echoed its stale bits would
+/// serve last week's read state and suppress every catalogue delta (the
+/// summary would equal the published one while the world moved). Pin has
+/// no AHP bit at all — the translator publishes it as an `x-manox`
+/// extension action. `None` bits = a parked row (this host never folded
+/// it): the store carries everything the bit table can express, which is
+/// exactly why the parked answer and the live answer must come from ONE
+/// table — two tables drift.
 pub(crate) fn row_status_bits(
-    folded: Option<&SessionState>,
+    folded_status: Option<u32>,
     row: &manox_agent::db::ThreadSummary,
     running: bool,
     pending_auth: bool,
@@ -970,7 +974,7 @@ pub(crate) fn row_status_bits(
         bits |= SessionStatus::IsRead.bits();
     }
     if row.archived
-        || folded.is_some_and(|folded| folded.status & SessionStatus::IsArchived.bits() != 0)
+        || folded_status.is_some_and(|bits| bits & SessionStatus::IsArchived.bits() != 0)
     {
         bits |= SessionStatus::IsArchived.bits();
     }
@@ -1702,12 +1706,11 @@ mod row_status_bits_tests {
 
     #[test]
     fn a_live_fold_and_a_parked_row_share_the_table() {
-        let folded = manox_ahp::channels::session::initial("manox", None, None);
-        let mut folded_archived = folded.clone();
-        folded_archived.status = SessionStatus::IsArchived.bits();
+        let folded = manox_ahp::channels::session::initial("manox", None, None).status;
+        let folded_archived = folded | SessionStatus::IsArchived.bits();
         let base = row(false, false, false);
         assert_eq!(
-            row_status_bits(Some(&folded), &base, true, true),
+            row_status_bits(Some(folded), &base, true, true),
             SessionStatus::Idle.bits()
                 | SessionStatus::InProgress.bits()
                 | SessionStatus::InputNeeded.bits()
@@ -1715,7 +1718,7 @@ mod row_status_bits_tests {
             "the live facts ride the same table"
         );
         assert_eq!(
-            row_status_bits(Some(&folded_archived), &base, false, false),
+            row_status_bits(Some(folded_archived), &base, false, false),
             SessionStatus::Idle.bits()
                 | SessionStatus::IsRead.bits()
                 | SessionStatus::IsArchived.bits(),

@@ -16,6 +16,7 @@
 //! an in-process subscriber and a WebSocket subscriber with the same
 //! `serverSeq` — that parity is asserted in `tests/ahp_transport_parity.rs`.
 
+use ahp_types::state::SessionStatus;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -124,6 +125,7 @@ impl AhpRuntime {
         };
         let rows: Vec<String> =
             store.read(|state| state.summaries().iter().map(|row| row.id.clone()).collect());
+        let active: std::collections::HashSet<String> = rows.iter().cloned().collect();
         let mut published = self.published.lock();
         for session_id in &rows {
             let Some(summary) = self.host.backend().session_summary(session_id) else {
@@ -132,6 +134,28 @@ impl AhpRuntime {
             match published.get(session_id.as_str()) {
                 None => host.session_added(summary.clone()),
                 Some(prev) if prev != &summary => {
+                    // The derived read bit's flip must ALSO reach the
+                    // session channel: attached clients read their fold
+                    // FIRST (the summary row is the parked fallback), and a
+                    // fold that never sees `isReadChanged` keeps whatever
+                    // bit it subscribed with — the badge never lights for
+                    // exactly the sessions the user has open. Host
+                    // publishes bypass `Backend::dispatch`, so this cannot
+                    // loop back through the mark-viewed leg.
+                    if prev.status & SessionStatus::IsRead.bits()
+                        != summary.status & SessionStatus::IsRead.bits()
+                        && host.has_session(session_id)
+                    {
+                        host.publish(
+                            &manox_ahp::channels::session::uri(session_id.as_str()),
+                            ahp_types::actions::StateAction::SessionIsReadChanged(
+                                ahp_types::actions::SessionIsReadChangedAction {
+                                    is_read: summary.status & SessionStatus::IsRead.bits() != 0,
+                                },
+                            ),
+                            None,
+                        );
+                    }
                     host.summary_changed(session_id, super::backend::summary_delta(&summary));
                 }
                 Some(_) => continue,
@@ -140,7 +164,7 @@ impl AhpRuntime {
         }
         let departed: Vec<String> = published
             .keys()
-            .filter(|id| !rows.contains(id))
+            .filter(|id| !active.contains(id.as_str()))
             .cloned()
             .collect();
         for session_id in departed {
@@ -154,6 +178,11 @@ impl AhpRuntime {
     /// never materialized leaves no journal — its disappearance is a fact
     /// the client must see, not infer from a restart.
     pub fn catalogue_removed(&self, session_id: &str) {
+        // Forget the published entry: a dispose followed by a rebuild of
+        // the same id must announce as the lifecycle event again, and the
+        // diff's own departure sweep would otherwise remove it a second
+        // time.
+        self.published.lock().remove(session_id);
         self.host().session_removed(session_id);
     }
 

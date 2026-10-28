@@ -391,11 +391,16 @@ impl StoreHandle {
             }
             // Broadcast only on a real change: a quiet pass (a sweep tick
             // over an idle store, a fingerprint-identical rescan) must not
-            // re-rank sidebars or re-announce the catalogue. The first pass
-            // announces unconditionally — the subscribers start empty.
+            // re-rank sidebars or re-announce the catalogue. The comparison
+            // is order-INSENSITIVE on the row partitions — the fresh rows
+            // walk a HashMap while the held rows came out of the last
+            // pass's rerank, and reading different orders of one set as
+            // "changed" would turn every sweep tick into a re-announce.
+            // The first pass announces unconditionally — the subscribers
+            // start empty.
             let changed = s.scanned_once
-                && (s.summaries != summaries
-                    || s.archived_summaries != archived
+                && (!rows_match_ignoring_order(&s.summaries, &summaries)
+                    || !rows_match_ignoring_order(&s.archived_summaries, &archived)
                     || s.session_paths != session_paths);
             s.session_paths = session_paths;
             s.flush_materialized_working_dirs();
@@ -909,6 +914,35 @@ impl ThreadStore {
         });
     }
 
+    /// The explicit "mark unread" leg (`isReadChanged(false)`): lower the
+    /// view stamp to the sentinel so every recorded settle reads as
+    /// un-viewed. The PERSIST is the point — the reducer already folded the
+    /// action for every subscriber, and a fold the disk will not confirm is
+    /// exactly the never-happened state the fail-closed rule forbids. A
+    /// session with no settled turn reads clear afterwards (nothing to
+    /// mark): the derivation says so, not a second stored bit.
+    pub fn mark_unread(&mut self, id: &str) -> bool {
+        let flipped = match self.summary_mut(id) {
+            Some(summary) => {
+                summary.last_viewed_at = Some(0);
+                let was = summary.has_unread;
+                summary.has_unread =
+                    crate::db::derive_unread(summary.last_settled_at, summary.last_viewed_at);
+                let flipped = summary.has_unread != was;
+                if self.session_paths.contains_key(id) {
+                    self.write_meta(id, |meta| meta.last_viewed_at = Some(0));
+                }
+                flipped
+            }
+            None => false,
+        };
+        self.pending_viewed.insert(id.to_string(), 0);
+        if flipped {
+            self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
+        }
+        flipped
+    }
+
     /// Rename a session: the user's title, durable in the journal and the
     /// sidecar.
     ///
@@ -1056,6 +1090,9 @@ impl ThreadStore {
         self.session_paths.remove(id);
         self.live_threads.remove(id);
         self.pending_working_dirs.remove(id);
+        // A parked view for a dropped row would resurrect the stamp (and
+        // its sidecar write) against whatever reuses the id next.
+        self.pending_viewed.remove(id);
         self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
     }
 
@@ -2067,6 +2104,16 @@ fn group_by_thread(
         }
     }
     (session_paths, active, archived)
+}
+
+/// Set equality on row id: same rows, any order. The scan rebuilds rows
+/// from a HashMap walk and the store holds them reranked; comparing the
+/// slices directly would flag every quiet pass as changed.
+fn rows_match_ignoring_order(
+    held: &[crate::db::ThreadSummary],
+    fresh: &[crate::db::ThreadSummary],
+) -> bool {
+    held.len() == fresh.len() && held.iter().all(|row| fresh.contains(row))
 }
 
 /// The team leader's session id from a session header's `team.parent`, when
@@ -3718,6 +3765,39 @@ mod tests {
             count_summaries_updated(&rx),
             1,
             "the derived bit's flip is announced"
+        );
+    }
+
+    /// The quiet gate on a MULTI-row store: the fresh rows walk a HashMap
+    /// (group_by_thread) while the held rows are reranked, so a direct
+    /// slice compare would flag every pass as changed and turn each sweep
+    /// tick into a re-announce. Five unchanged passes over three rows
+    /// announce once — the first.
+    #[tokio::test]
+    async fn a_quiet_pass_is_quiet_on_a_multi_row_store() {
+        let _db_path = temp_db();
+        let store = standalone_for_test();
+        crate::runtime::init_hermetic_for_test();
+        let dir = store.read(|s| s.sessions_dir.clone());
+        write_session_fixture(&dir, "t-quiet-a", "a");
+        write_session_fixture(&dir, "t-quiet-b", "b");
+        write_session_fixture(&dir, "t-quiet-c", "c");
+        let rx = store.subscribe();
+
+        store.refresh_now().await;
+        assert!(
+            count_summaries_updated(&rx) >= 1,
+            "the first pass announces unconditionally"
+        );
+
+        for _ in 0..5 {
+            store.refresh_now().await;
+        }
+        assert_eq!(
+            count_summaries_updated(&rx),
+            0,
+            "five unchanged passes over three rows: the HashMap walk order \
+             must not read as change"
         );
     }
 

@@ -1657,15 +1657,30 @@ fn summary_from_row(
     seeded: Option<SeededFacts>,
 ) -> SessionSummary {
     let facts_title = seeded.as_ref().map(|facts| facts.title.clone());
+    // The status comes from ONE table on both legs, fed by the store's
+    // CURRENT row: a seeded summary that echoed the fold's subscription-time
+    // bits would serve last week's read state and — being equal to what was
+    // already published — suppress the very delta that should announce the
+    // change. Only the fold's IsArchived (a journalled decision) joins the
+    // row's facts; activity/directories stay the fold's own live facts.
     let (status, activity, directories) = match seeded {
-        Some(facts) => (facts.status, facts.activity, facts.directories),
-        // A session the store knows and this host has not folded: the
-        // shared bit table answers from the row alone — the derived read
-        // bit included, so a never-folded session does not read as unread
-        // (the 99+ class). One table for the parked and the live answer:
-        // two tables drift.
+        Some(facts) => (
+            super::row_status_bits(
+                Some(facts.status),
+                row,
+                store.is_running(&row.id),
+                store.pending_auth_contains(&row.id),
+            ),
+            facts.activity,
+            facts.directories,
+        ),
         None => (
-            super::row_status_bits(None, row, store.is_running(&row.id), false),
+            super::row_status_bits(
+                None,
+                row,
+                store.is_running(&row.id),
+                store.pending_auth_contains(&row.id),
+            ),
             None,
             None,
         ),
@@ -2668,29 +2683,25 @@ impl Backend for RuntimeBackend {
                         .to_string(),
                 )
             }
-            // The view observation is the read rule's second input: a
-            // client declaring `isReadChanged(true)` stamps the sidecar's
-            // view time (monotone max), so a settled-after-viewed session
-            // reads back as read everywhere. The false leg — an explicit
-            // mark-unread — has no derived semantics: the rule has nothing
-            // to clear for a session with no settled turn, and
-            // materializing the intent would build a second read truth
-            // beside the two stamps. It stays a reducer-only echo until a
-            // caller needs it.
+            // The read rule's client legs: `isReadChanged(true)` stamps
+            // the view time (monotone max) so a settled-after-viewed
+            // session reads back as read everywhere; `isReadChanged(false)`
+            // lowers the view stamp to the sentinel so every recorded
+            // settle reads un-viewed. BOTH persist — the reducer folded
+            // the action for every subscriber, and a fold the disk will
+            // not confirm is the never-happened state the fail-closed
+            // rule forbids.
             StateAction::SessionIsReadChanged(changed) => {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
-                if !changed.is_read {
-                    tracing::debug!(
-                        session_id,
-                        "explicit mark-unread: derived read has no clear leg yet"
-                    );
-                    return DispatchOutcome::Ignored;
-                }
                 if let Some(store) = manox_agent::thread_store::try_global() {
                     store.with_mut(|s| {
-                        s.mark_viewed(session_id, chrono::Utc::now().timestamp());
+                        if changed.is_read {
+                            s.mark_viewed(session_id, chrono::Utc::now().timestamp());
+                        } else {
+                            s.mark_unread(session_id);
+                        }
                     });
                 }
                 DispatchOutcome::Accepted
@@ -3814,12 +3825,13 @@ mod mcp_dispatch_tests {
         });
     }
 
-    /// The view declaration is the read rule's second input: a focus
-    /// stamps the view time (monotone max), so a settled session reads
-    /// back as read everywhere. The explicit mark-unread leg stays a
-    /// reducer-only echo — the derived rule has no clear leg, and
-    /// materializing the intent would build a second read truth beside
-    /// the two stamps.
+    /// The read rule's client legs: a focus stamps the view time
+    /// (monotone max) so a settled session reads back as read everywhere;
+    /// the explicit mark-unread lowers the view stamp to the sentinel so
+    /// every recorded settle reads un-viewed. Both PERSIST — the reducer
+    /// folded the action for every subscriber, and a fold the disk will
+    /// not confirm is the never-happened state the fail-closed rule
+    /// forbids.
     #[test]
     fn a_viewed_declaration_stamps_the_derived_read() {
         // The store override is process-global and the suite runs in
@@ -3863,10 +3875,19 @@ mod mcp_dispatch_tests {
         });
         assert!(unread(&store), "a settle after the view re-lights it");
 
-        assert_eq!(declare(&backend, false), DispatchOutcome::Ignored);
+        assert_eq!(declare(&backend, false), DispatchOutcome::Accepted);
         assert!(
             unread(&store),
-            "the mark-unread echo has no derived semantics to change"
+            "the mark-unread sentinel keeps the recorded settle un-viewed"
+        );
+        assert_eq!(
+            store.read(|st| {
+                st.summary_by_id("s-derived")
+                    .expect("seeded")
+                    .last_viewed_at
+            }),
+            Some(0),
+            "the sentinel view stamp is the persisted leg"
         );
         manox_agent::thread_store::drop_for_test();
     }
