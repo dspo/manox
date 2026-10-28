@@ -3131,8 +3131,8 @@ fn delegation_tool_description_carries_definition_and_contract() {
         "description declares the background mode: {rendered}"
     );
     assert!(
-        rendered.contains("auto-rejected"),
-        "description declares the never-approval boundary: {rendered}"
+        rendered.contains("may escalate a denied command"),
+        "description declares the bounded escalation channel: {rendered}"
     );
 }
 
@@ -3223,6 +3223,7 @@ async fn subagent_bash_refuses_background_but_allows_foreground() {
     use std::path::PathBuf;
     let tool = SubagentBashTool {
         inner: Arc::new(MarkerBash),
+        escalation: None,
     };
     let ctx = manox_harness::tool::LocalToolContext::new(
         Arc::new(manox_harness::env::TokioExecutionEnv::new(PathBuf::from(
@@ -3273,6 +3274,7 @@ async fn subagent_bash_refuses_background_but_allows_foreground() {
 fn subagent_bash_schema_strips_background_and_escalation_fields() {
     let tool = SubagentBashTool {
         inner: Arc::new(MarkerBash),
+        escalation: None,
     };
     let schema = tool.parameters_schema();
     let props = schema["properties"]
@@ -5087,6 +5089,7 @@ async fn child_bash_inherits_the_captains_live_mode() {
             Arc::new(manox_harness::sandbox::NetworkAccess::default),
             Some(unsandboxed),
         )),
+        escalation: None,
     };
     let dir = tempfile::tempdir().unwrap();
     let ctx = subagent_test_ctx(dir.path());
@@ -5129,6 +5132,7 @@ async fn child_bash_inherits_the_captains_live_mode() {
 async fn child_bash_refuses_require_escalated() {
     let tool = SubagentBashTool {
         inner: Arc::new(MarkerBash),
+        escalation: None,
     };
     let dir = tempfile::tempdir().unwrap();
     let ctx = subagent_test_ctx(dir.path());
@@ -5193,6 +5197,7 @@ fn fenced_write_tool(mode: AccessMode, workspace: &Path) -> (SubagentWriteFence,
         }),
         mode_resolver: Arc::new(move || mode),
         granted_roots: crate::granted_roots::GrantedRoots::new(workspace),
+        escalation: None,
     };
     (fence, ran)
 }
@@ -5278,6 +5283,7 @@ async fn child_edit_fence_judges_every_patch_target() {
         }),
         mode_resolver: Arc::new(|| AccessMode::Sandbox),
         granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()),
+        escalation: None,
     };
     let ctx = subagent_test_ctx(dir.path());
     let patch = "*** Begin Patch\n[inside.rs#1A2B3C]\nDEL 1\n[/usr/local/manox-sailor-fence-probe/x.rs#1A2B3C]\nDEL 1\n*** End Patch";
@@ -5784,5 +5790,489 @@ async fn a_network_off_pinned_child_runs_confined_calls_with_the_network_closed(
     assert!(
         !inherited.contains("[sandbox: "),
         "the open inherited route keeps the failure unclassified: {inherited}"
+    );
+}
+
+/// An armed gate whose notice channel stays readable, so a test can observe
+/// the escalation card a child parks on the parent session and answer it.
+fn subagent_gate_with_notices() -> (
+    Arc<ApprovalGate>,
+    tokio::sync::mpsc::UnboundedReceiver<crate::thread_engine::BackendNotice>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (
+        Arc::new(ApprovalGate::new(tx, Arc::new(Mutex::new(None)))),
+        rx,
+    )
+}
+
+/// Pull the next escalation card off the parent's notice channel.
+async fn next_escalation_card(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::thread_engine::BackendNotice>,
+) -> (String, String, String, serde_json::Value) {
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a card parks on the parent channel")
+        .expect("the channel stays open");
+    let crate::thread_engine::BackendNotice::Event(event) = notice else {
+        panic!("expected an event notice");
+    };
+    match *event {
+        crate::thread::ThreadEvent::ToolCallAuthorization {
+            id,
+            tool_name,
+            summary,
+            input,
+        } => (id, tool_name, summary, input),
+        other => panic!("expected a tool-call authorization, got {other:?}"),
+    }
+}
+
+/// An armed fence refuses a plain out-of-roots call with the shared marker
+/// plus the sanctioned escalation retry — the one widening road this run
+/// has — and never reaches the inner tool.
+#[tokio::test]
+async fn armed_child_fence_refuses_outside_with_the_escalation_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (gate, _rx) = subagent_gate_with_notices();
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fence = SubagentWriteFence {
+        inner: Arc::new(CountingWriteTool {
+            name: "Write",
+            ran: Arc::clone(&ran),
+        }),
+        mode_resolver: Arc::new(|| AccessMode::Sandbox),
+        granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()),
+        escalation: Some(ChildEscalation::new(
+            gate,
+            "run-1".into(),
+            "Sailor".into(),
+            "fix tests".into(),
+        )),
+    };
+    let ctx = subagent_test_ctx(dir.path());
+    let err = fence
+        .execute(
+            "c1",
+            serde_json::json!({"path": "/usr/local/manox-sailor-fence-probe/x.txt", "cwd": [""], "content": "x"}),
+            tokio_util::sync::CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("[sandbox: file access denied under sandbox mode]"),
+        "shared denial marker: {err}"
+    );
+    assert!(
+        err.contains("require_escalated"),
+        "the armed refusal teaches the retry: {err}"
+    );
+    assert_eq!(
+        ran.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the refused call never reached the tool"
+    );
+}
+
+/// The escalation round trip on the armed fence: an out-of-roots write
+/// re-issued with `require_escalated` parks a card attributed to the run on
+/// the PARENT session; an approval admits the call and records the covered
+/// root into THIS run's overlay (a plain write under it never re-asks); a
+/// sibling run armed from the same parent roots stays closed at that root
+/// and escalates — and is named — on its own card.
+#[tokio::test]
+async fn armed_child_fence_escalates_outside_through_the_parent_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (gate, mut rx) = subagent_gate_with_notices();
+    let parent_roots = crate::granted_roots::GrantedRoots::new(dir.path());
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fence = Arc::new(SubagentWriteFence {
+        inner: Arc::new(CountingWriteTool {
+            name: "Write",
+            ran: Arc::clone(&ran),
+        }),
+        mode_resolver: Arc::new(|| AccessMode::Sandbox),
+        granted_roots: parent_roots.child_overlay(),
+        escalation: Some(ChildEscalation::new(
+            Arc::clone(&gate),
+            "run-7".into(),
+            "Sailor".into(),
+            "export the report".into(),
+        )),
+    });
+    let sibling = Arc::new(SubagentWriteFence {
+        inner: Arc::new(CountingWriteTool {
+            name: "Write",
+            ran: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }),
+        mode_resolver: Arc::new(|| AccessMode::Sandbox),
+        granted_roots: parent_roots.child_overlay(),
+        escalation: Some(ChildEscalation::new(
+            Arc::clone(&gate),
+            "run-8".into(),
+            "Sailor".into(),
+            "other errand".into(),
+        )),
+    });
+    let ctx = Arc::new(subagent_test_ctx(dir.path()));
+    // A temp path cannot stand in for "outside" — platform temp is a
+    // writable scratch root under sandbox. The probe lives under /usr/local;
+    // the escalation covers its nearest existing ancestor (/usr/local).
+    let target = PathBuf::from("/usr/local/manox-sailor-escalation-probe/report.txt");
+    let root_display = "/usr/local".to_string();
+
+    // The escalated ask parks its card on the parent session, named for the
+    // run that raised it and the root it would widen.
+    let ask = {
+        let (fence, ctx, target) = (Arc::clone(&fence), Arc::clone(&ctx), target.clone());
+        tokio::spawn(async move {
+            fence.execute(
+                "c1",
+                serde_json::json!({"path": target, "cwd": [""], "content": "x", "require_escalated": true, "justification": "the report must land next to the dataset"}),
+                tokio_util::sync::CancellationToken::new(),
+                ctx.as_ref(),
+            )
+            .await
+        })
+    };
+    let (id, tool_name, summary, input) = next_escalation_card(&mut rx).await;
+    assert_eq!(tool_name, "Write", "the card names the real tool");
+    assert!(
+        summary.contains("Sailor")
+            && summary.contains("export the report")
+            && summary.contains("run-7"),
+        "the card names the run: {summary}"
+    );
+    assert!(
+        summary.contains(&root_display),
+        "the card names the covered root: {summary}"
+    );
+    assert_eq!(
+        input["subagent"]["runId"],
+        serde_json::json!("run-7"),
+        "the input carries the structured attribution"
+    );
+    gate.respond(
+        &id,
+        crate::permission::ToolAuthorizationResponse::Decision(
+            crate::permission::PermissionDecision::AllowOnce,
+        ),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), ask)
+        .await
+        .expect("resolves once answered")
+        .expect("join")
+        .expect("an approved escalation admits the call");
+    assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // The covered root joined THIS run's overlay: a plain write under it
+    // passes without a card (approve once for this run, never re-ask).
+    fence.execute(
+        "c2",
+        serde_json::json!({"path": "/usr/local/manox-sailor-escalation-probe/more.txt", "cwd": [""], "content": "x"}),
+        tokio_util::sync::CancellationToken::new(),
+        ctx.as_ref(),
+    )
+    .await
+    .expect("the approved root admits plain writes for this run");
+    assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(
+        rx.try_recv().is_err(),
+        "no card is raised for an already-approved root"
+    );
+
+    // The sibling's overlay never saw the approval: the same target is still
+    // fenced for it, and its own escalation raises ITS OWN card.
+    let err = sibling
+        .execute(
+            "c3",
+            serde_json::json!({"path": target, "cwd": [""], "content": "x"}),
+            tokio_util::sync::CancellationToken::new(),
+            ctx.as_ref(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("[sandbox: file access denied under sandbox mode]"),
+        "one run's approval never widens a sibling: {err}"
+    );
+    let sibling_ask = {
+        let (sibling, ctx, target) = (Arc::clone(&sibling), Arc::clone(&ctx), target.clone());
+        tokio::spawn(async move {
+            sibling.execute(
+                "c4",
+                serde_json::json!({"path": target, "cwd": [""], "content": "x", "require_escalated": true, "justification": "same report, other run"}),
+                tokio_util::sync::CancellationToken::new(),
+                ctx.as_ref(),
+            )
+            .await
+        })
+    };
+    let (id, _, summary, _) = next_escalation_card(&mut rx).await;
+    assert!(
+        summary.contains("run-8") && summary.contains("other errand"),
+        "the sibling's card names the sibling: {summary}"
+    );
+    gate.respond(
+        &id,
+        crate::permission::ToolAuthorizationResponse::Decision(
+            crate::permission::PermissionDecision::AllowOnce,
+        ),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), sibling_ask)
+        .await
+        .expect("resolves once answered")
+        .expect("join")
+        .expect("the sibling's own approval admits its call");
+}
+
+/// A rejected escalation denies the call, never reaches the inner tool, and
+/// leaves the root closed — the next plain attempt still teaches the retry.
+#[tokio::test]
+async fn armed_child_fence_denied_escalation_keeps_the_root_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (gate, mut rx) = subagent_gate_with_notices();
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fence = Arc::new(SubagentWriteFence {
+        inner: Arc::new(CountingWriteTool {
+            name: "Write",
+            ran: Arc::clone(&ran),
+        }),
+        mode_resolver: Arc::new(|| AccessMode::Sandbox),
+        granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()).child_overlay(),
+        escalation: Some(ChildEscalation::new(
+            Arc::clone(&gate),
+            "run-2".into(),
+            "Sailor".into(),
+            "export the report".into(),
+        )),
+    });
+    let ctx = Arc::new(subagent_test_ctx(dir.path()));
+    // Temp scratch is writable under sandbox; the probe is genuinely outside.
+    let target = PathBuf::from("/usr/local/manox-sailor-escalation-probe/report.txt");
+    let ask = {
+        let (fence, ctx, target) = (Arc::clone(&fence), Arc::clone(&ctx), target.clone());
+        tokio::spawn(async move {
+            fence.execute(
+                "c1",
+                serde_json::json!({"path": target, "cwd": [""], "content": "x", "require_escalated": true, "justification": "need it"}),
+                tokio_util::sync::CancellationToken::new(),
+                ctx.as_ref(),
+            )
+            .await
+        })
+    };
+    let (id, _, _, _) = next_escalation_card(&mut rx).await;
+    gate.respond(
+        &id,
+        crate::permission::ToolAuthorizationResponse::Decision(
+            crate::permission::PermissionDecision::Deny,
+        ),
+    );
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), ask)
+        .await
+        .expect("resolves once answered")
+        .expect("join")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("rejected"),
+        "the denial says the user rejected it: {err}"
+    );
+    assert_eq!(
+        ran.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the denied call never reached the tool"
+    );
+    // The root stayed closed: a plain attempt is refused again, with the
+    // retry hint — the road stays open, the verdict stays the user's.
+    let err = fence
+        .execute(
+            "c2",
+            serde_json::json!({"path": target, "cwd": [""], "content": "x"}),
+            tokio_util::sync::CancellationToken::new(),
+            ctx.as_ref(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("require_escalated"), "{err}");
+}
+
+/// The armed Bash routes its `require_escalated` retry through the parent
+/// gate: the card parks attributed, an approval runs exactly that call on
+/// the unsandboxed backend, and the stamp is this call's alone.
+#[tokio::test]
+async fn armed_child_bash_escalates_one_call_through_the_parent_gate() {
+    use manox_harness::subagent::ChildAuthority as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (gate, mut rx) = subagent_gate_with_notices();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let unsandboxed: Arc<dyn manox_harness::tools::bash::BashOperations> =
+        Arc::new(TaggedBashOps {
+            tag: "unsandboxed",
+            calls: Arc::clone(&calls),
+        });
+    let authority = SubagentChildAuthority::new(
+        Arc::clone(&gate),
+        dir.path().to_path_buf(),
+        crate::granted_roots::GrantedRoots::new(dir.path()),
+        true,
+        Some(unsandboxed),
+    );
+    // arm() replaces the placeholder by name; what comes back is the armed
+    // SubagentBashTool carrying this run's approver and grant cell.
+    let armed = authority.arm(
+        "run-9",
+        "Sailor",
+        "publish the branch",
+        vec![Arc::new(CountingWriteTool {
+            name: "Bash",
+            ran: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }) as Arc<dyn manox_harness::tool::AgentTool>],
+    );
+    let bash = armed
+        .iter()
+        .find(|t| t.name() == "Bash")
+        .expect("the armed set still carries Bash")
+        .clone();
+    assert!(
+        bash.parameters_schema()["properties"]["require_escalated"].is_object(),
+        "the armed bash advertises the escalation fields"
+    );
+    let ctx = Arc::new(subagent_test_ctx(dir.path()));
+    let ask = {
+        let (bash, ctx) = (Arc::clone(&bash), Arc::clone(&ctx));
+        tokio::spawn(async move {
+            bash.execute(
+                "c1",
+                serde_json::json!({"command": "git push", "cwd": [""], "require_escalated": true, "justification": "publish the branch"}),
+                tokio_util::sync::CancellationToken::new(),
+                ctx.as_ref(),
+            )
+            .await
+        })
+    };
+    let (id, tool_name, summary, _) = next_escalation_card(&mut rx).await;
+    assert_eq!(tool_name, "Bash");
+    assert!(
+        summary.contains("Sailor")
+            && summary.contains("publish the branch")
+            && summary.contains("run-9"),
+        "the card names the run: {summary}"
+    );
+    gate.respond(
+        &id,
+        crate::permission::ToolAuthorizationResponse::Decision(
+            crate::permission::PermissionDecision::AllowOnce,
+        ),
+    );
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), ask)
+        .await
+        .expect("resolves once answered")
+        .expect("join")
+        .expect("an approved escalation runs the command");
+    let text = result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            manox_harness::types::ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("ran=unsandboxed"),
+        "the approved call ran unconfined: {text}"
+    );
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        ["unsandboxed"],
+        "exactly the approved call selected the unsandboxed backend"
+    );
+}
+
+/// The escalation budget bounds the cards one child run raises: every ask
+/// within budget parks a card and an approval runs the call; past the
+/// budget the tool refuses informatively and parks nothing.
+#[tokio::test]
+async fn armed_child_bash_budget_spent_refuses_without_a_card() {
+    use manox_harness::subagent::ChildAuthority as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (gate, mut rx) = subagent_gate_with_notices();
+    let unsandboxed: Arc<dyn manox_harness::tools::bash::BashOperations> =
+        Arc::new(TaggedBashOps {
+            tag: "unsandboxed",
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+    let authority = SubagentChildAuthority::new(
+        Arc::clone(&gate),
+        dir.path().to_path_buf(),
+        crate::granted_roots::GrantedRoots::new(dir.path()),
+        true,
+        Some(unsandboxed),
+    );
+    let armed = authority.arm(
+        "run-10",
+        "Sailor",
+        "l",
+        vec![Arc::new(CountingWriteTool {
+            name: "Bash",
+            ran: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }) as Arc<dyn manox_harness::tool::AgentTool>],
+    );
+    let bash = armed
+        .iter()
+        .find(|t| t.name() == "Bash")
+        .expect("the armed set still carries Bash")
+        .clone();
+    let ctx = Arc::new(subagent_test_ctx(dir.path()));
+    for _ in 0..MAX_ESCALATIONS_PER_RUN {
+        let ask = {
+            let (bash, ctx) = (Arc::clone(&bash), Arc::clone(&ctx));
+            tokio::spawn(async move {
+                bash.execute(
+                    "c",
+                    serde_json::json!({"command": "git push", "cwd": [""], "require_escalated": true, "justification": "j"}),
+                    tokio_util::sync::CancellationToken::new(),
+                    ctx.as_ref(),
+                )
+                .await
+            })
+        };
+        let (id, _, _, _) = next_escalation_card(&mut rx).await;
+        gate.respond(
+            &id,
+            crate::permission::ToolAuthorizationResponse::Decision(
+                crate::permission::PermissionDecision::AllowOnce,
+            ),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), ask)
+            .await
+            .expect("resolves once answered")
+            .expect("join")
+            .expect("within budget the approved call runs");
+    }
+    // Past the budget the refusal is informative and parks nothing.
+    let err = bash
+        .execute(
+            "c-final",
+            serde_json::json!({"command": "git push", "cwd": [""], "require_escalated": true, "justification": "j"}),
+            tokio_util::sync::CancellationToken::new(),
+            ctx.as_ref(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("budget is spent"),
+        "the refusal names the spent budget: {err}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a spent budget never parks another card"
     );
 }

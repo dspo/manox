@@ -21,6 +21,7 @@ use crate::core::tool::{AgentTool, ToolError};
 use crate::core::types::{AgentEvent, AgentMessage};
 use crate::ext::prompt::base_prompt_builder;
 use crate::ext::subagent::SubagentRun;
+use crate::ext::subagent::escalation::ChildAuthority;
 use crate::ext::subagent::provider::{RunObserver, SubagentProvider};
 use crate::ext::subagent::types::{
     Capabilities, HUMAN_INTERACTION_TOOLS, ResolvedStartRequest, RunResult,
@@ -116,6 +117,10 @@ pub struct SpawnProvider {
     /// call (live inheritance); this resolver is what the child journal's
     /// `access_mode_change` rows declare.
     access_mode_resolver: Option<Arc<dyn Fn() -> crate::sandbox::AccessMode + Send + Sync>>,
+    /// Host hook that re-arms the enforcing tools per child run with that
+    /// run's own escalation state. Absent, the snapshot runs as-is and
+    /// every escalation request fails closed at the boundary gate.
+    child_authority: Option<Arc<dyn ChildAuthority>>,
 }
 
 impl SpawnProvider {
@@ -130,6 +135,7 @@ impl SpawnProvider {
             session_dir: None,
             observer: None,
             access_mode_resolver: None,
+            child_authority: None,
         }
     }
 
@@ -193,6 +199,15 @@ impl SpawnProvider {
         self
     }
 
+    /// Install the per-run child authority (the host's parent-approval
+    /// channel). Applied at the start boundary so each run gets its own
+    /// grant cell, approver, and approved-roots overlay — never a slice of
+    /// the shared snapshot.
+    pub fn with_child_authority(mut self, authority: Arc<dyn ChildAuthority>) -> Self {
+        self.child_authority = Some(authority);
+        self
+    }
+
     /// The snapshot one dispatch runs on: the per-dispatch factory output
     /// when one is installed (the declaration shapes resolver wiring),
     /// otherwise the assembly-time static snapshot.
@@ -208,8 +223,7 @@ impl SpawnProvider {
 
     /// Resolve a child's tool set: the dispatch snapshot minus `Steer`, the
     /// delegation tools, and every [`HUMAN_INTERACTION_TOOLS`] name (D5),
-    /// then scoped by the request's allow/deny filter, then wrapped in the
-    /// `never` auto-deny gate (D6).
+    /// then scoped by the request's allow/deny filter.
     fn select_child_tools(
         &self,
         tools: &[Arc<dyn AgentTool>],
@@ -223,9 +237,26 @@ impl SpawnProvider {
             .filter(|t| filter.is_none_or(|f| f.admits(t.name())))
             .cloned()
             .collect();
-        // Definition-supplied filters are pre-sanitized at assembly (warn +
-        // skip there); request-supplied filters are loud-validated at the
-        // runtime before this runs — nothing to warn about here.
+        selected
+    }
+
+    /// The full per-run pipeline: raw selection from the dispatch snapshot,
+    /// the host's per-run arming (the escalation state a shared snapshot
+    /// cannot carry), then the `never` boundary gate. Arming runs BEFORE the
+    /// gate so an armed tool can resolve its own escalation round trip
+    /// instead of being rejected by it.
+    fn resolve_run_tools(
+        &self,
+        snapshot: &[Arc<dyn AgentTool>],
+        run_id: &str,
+        kind: &str,
+        label: &str,
+        filter: Option<&ToolFilter>,
+    ) -> Vec<Arc<dyn AgentTool>> {
+        let mut selected = self.select_child_tools(snapshot, filter);
+        if let Some(authority) = &self.child_authority {
+            selected = authority.arm(run_id, kind, label, selected);
+        }
         auto_deny_gated(selected)
     }
 }
@@ -270,7 +301,19 @@ impl SubagentProvider for SpawnProvider {
                     .to_string(),
             ));
         }
-        let mut selected = self.select_child_tools(&snapshot, req.tool_filter.as_ref());
+        // The child's enforcing tools, armed for THIS run before the
+        // boundary gate — the definition-supplied filters are pre-sanitized
+        // at assembly (warn + skip there); request-supplied filters are
+        // loud-validated at the runtime before this runs. The dispatch
+        // snapshot shapes the enforcing resolvers (#966); the arming slices
+        // this run's escalation state onto it (#967).
+        let mut selected = self.resolve_run_tools(
+            &snapshot,
+            &run_id,
+            &req.kind,
+            &req.label,
+            req.tool_filter.as_ref(),
+        );
         // The child's channel to the parent's user: one clarifying
         // question, delivered once, ending the child's turn — the answer
         // returns as a continuation of the same run.
@@ -1128,6 +1171,59 @@ mod tests {
             .with_delegation_names(delegation.iter().map(|s| s.to_string()).collect())
     }
 
+    /// A minimal named tool: no approval, classification by flag.
+    struct NamedTool(&'static str, bool);
+
+    #[async_trait::async_trait]
+    impl AgentTool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "mock"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn is_read_only(&self) -> bool {
+            self.1
+        }
+        async fn execute(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: CancellationToken,
+            _: &dyn crate::core::tool::ToolContext,
+        ) -> Result<AgentToolResult, ToolError> {
+            Ok(AgentToolResult::text(format!("RAN:{}", self.0)))
+        }
+    }
+
+    /// A stub authority: records the run identity it was handed and swaps
+    /// every tool for one named marker, so the pipeline's order is
+    /// observable from the outside.
+    struct RecordingAuthority {
+        calls: Arc<Mutex<Vec<(String, String, String)>>>,
+    }
+
+    impl ChildAuthority for RecordingAuthority {
+        fn arm(
+            &self,
+            run_id: &str,
+            kind: &str,
+            label: &str,
+            tools: Vec<Arc<dyn AgentTool>>,
+        ) -> Vec<Arc<dyn AgentTool>> {
+            self.calls.lock().unwrap().push((
+                run_id.to_string(),
+                kind.to_string(),
+                label.to_string(),
+            ));
+            let _ = tools;
+            vec![Arc::new(NamedTool("ArmedMarker", true))]
+        }
+    }
+
     #[test]
     fn select_child_tools_filters_by_allow_list() {
         let provider = provider_with(def_tools_snapshot(), &[]);
@@ -1155,31 +1251,6 @@ mod tests {
     /// by a filter naming it explicitly.
     #[test]
     fn select_child_tools_strips_privileged_and_human_interaction_tools() {
-        struct NamedTool(&'static str, bool);
-        #[async_trait::async_trait]
-        impl AgentTool for NamedTool {
-            fn name(&self) -> &str {
-                self.0
-            }
-            fn description(&self) -> &str {
-                "mock"
-            }
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
-            }
-            fn is_read_only(&self) -> bool {
-                self.1
-            }
-            async fn execute(
-                &self,
-                _: &str,
-                _: serde_json::Value,
-                _: CancellationToken,
-                _: &dyn crate::core::tool::ToolContext,
-            ) -> Result<AgentToolResult, ToolError> {
-                Ok(AgentToolResult::text("ran"))
-            }
-        }
         let tools: Vec<Arc<dyn AgentTool>> = vec![
             Arc::new(NamedTool("Steer", false)),
             Arc::new(NamedTool("AskUserQuestion", true)),
@@ -1264,6 +1335,60 @@ mod tests {
                 .description(),
             "static",
             "without a factory the static snapshot serves every dispatch"
+        );
+    }
+
+    /// The per-run pipeline without a host authority: the raw selection
+    /// comes back boundary-gated, nothing else changes.
+    #[test]
+    fn resolve_run_tools_without_authority_gates_the_selection() {
+        let snapshot = vec![
+            Arc::new(NamedTool("Bash", false)) as Arc<dyn AgentTool>,
+            Arc::new(NamedTool("Read", true)),
+        ];
+        let provider = provider_with(snapshot.clone(), &[]);
+        let tools = provider.resolve_run_tools(&snapshot, "run-1", "Sailor", "label", None);
+        assert_eq!(
+            tools.iter().map(|t| t.name()).collect::<Vec<_>>(),
+            vec!["Bash", "Read"]
+        );
+    }
+
+    /// The authority sees the RAW selection (pre-gate) and its replacement
+    /// is what the run receives; each run is armed independently.
+    #[test]
+    fn resolve_run_tools_arms_each_run_before_the_boundary_gate() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let snapshot = vec![
+            Arc::new(NamedTool("Bash", false)) as Arc<dyn AgentTool>,
+            Arc::new(NamedTool("Read", true)),
+        ];
+        let provider = SpawnProvider::new(snapshot.clone()).with_child_authority(Arc::new(
+            RecordingAuthority {
+                calls: Arc::clone(&calls),
+            },
+        ));
+        let tools = provider.resolve_run_tools(&snapshot, "run-7", "Sailor", "fix tests", None);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [(
+                "run-7".to_string(),
+                "Sailor".to_string(),
+                "fix tests".to_string()
+            )],
+            "the authority sees the run identity"
+        );
+        assert_eq!(
+            tools.iter().map(|t| t.name()).collect::<Vec<_>>(),
+            vec!["ArmedMarker"],
+            "the armed replacement is what the run gets"
+        );
+        // A second run is armed independently — no shared armed state.
+        let tools = provider.resolve_run_tools(&snapshot, "run-8", "Sailor", "other", None);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(
+            tools.iter().map(|t| t.name()).collect::<Vec<_>>(),
+            vec!["ArmedMarker"]
         );
     }
 

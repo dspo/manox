@@ -43,12 +43,14 @@ mod journal;
 pub(crate) use journal::{notes_cell, refresh_notes_cell};
 mod lifecycle;
 mod run;
+mod subagent_authority;
 #[cfg(test)]
 mod tests;
 mod tools_assembly;
 use journal::*;
 use lifecycle::*;
 use run::*;
+use subagent_authority::*;
 use tools_assembly::*;
 // Public aliases: `BrowserSuite` and the two journal entry points are
 // addressed as `crate::engine::…` from other modules.

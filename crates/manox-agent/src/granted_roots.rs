@@ -39,6 +39,11 @@ struct Inner {
     /// Same-repo worktree roots keyed by canonical cwd — one `git
     /// rev-parse` per distinct directory.
     same_repo_cache: Mutex<HashMap<PathBuf, Vec<PathBuf>>>,
+    /// The parent session's store a child overlay reads through: the
+    /// parent's roots are visible read-only (they were approved by the same
+    /// human), while `approve` records only into the child's own list — one
+    /// child's approved escalation never widens the parent or a sibling.
+    parent: Option<GrantedRoots>,
 }
 
 impl GrantedRoots {
@@ -47,6 +52,21 @@ impl GrantedRoots {
             workspace: canonicalize_best_effort(&workspace.into()),
             approved: Mutex::new(Vec::new()),
             same_repo_cache: Mutex::new(HashMap::new()),
+            parent: None,
+        }))
+    }
+
+    /// A child-scoped overlay over this store: the parent's roots read
+    /// through live and read-only; an escalation approval records only into
+    /// the overlay's own list. Every enforcing surface of one child run
+    /// holds the same overlay, so the run's approvals land everywhere in
+    /// that run and nowhere else.
+    pub fn child_overlay(&self) -> Self {
+        GrantedRoots(Arc::new(Inner {
+            workspace: self.0.workspace.clone(),
+            approved: Mutex::new(Vec::new()),
+            same_repo_cache: Mutex::new(HashMap::new()),
+            parent: Some(self.clone()),
         }))
     }
 
@@ -76,8 +96,9 @@ impl GrantedRoots {
     }
 
     /// Every extra root in force for a call running in `cwd`: the
-    /// escalation-approved roots (session-wide) plus the same-repo worktree
-    /// roots for `cwd` (directory-relative).
+    /// escalation-approved roots (store-wide, plus — on a child overlay —
+    /// the parent's, read through live), plus the same-repo worktree roots
+    /// for `cwd` (directory-relative).
     pub fn roots_for(&self, cwd: &Path) -> Vec<PathBuf> {
         let mut roots = self
             .0
@@ -85,9 +106,20 @@ impl GrantedRoots {
             .lock()
             .expect("granted roots poisoned")
             .clone();
-        for root in self.same_repo_roots(cwd) {
-            if !roots.contains(&root) {
-                roots.push(root);
+        match &self.0.parent {
+            Some(parent) => {
+                for root in parent.roots_for(cwd) {
+                    if !roots.contains(&root) {
+                        roots.push(root);
+                    }
+                }
+            }
+            None => {
+                for root in self.same_repo_roots(cwd) {
+                    if !roots.contains(&root) {
+                        roots.push(root);
+                    }
+                }
             }
         }
         roots
@@ -224,6 +256,43 @@ mod tests {
         let granted = GrantedRoots::new(dir.path());
         granted.approve("/");
         assert!(granted.roots_for(dir.path()).is_empty());
+    }
+
+    /// A child overlay reads the parent's roots live and read-only; its own
+    /// approvals land only in the overlay — never in the parent's store, so
+    /// a sibling overlay cannot see them.
+    #[test]
+    fn a_child_overlay_is_read_through_but_write_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = GrantedRoots::new(dir.path());
+        let sibling = parent.child_overlay();
+        let child = parent.child_overlay();
+
+        // The overlay starts empty.
+        assert!(child.roots_for(dir.path()).is_empty());
+        // Parent approvals land later and still read through (live, not a
+        // snapshot).
+        let root_a = tempfile::tempdir().unwrap();
+        parent.approve(root_a.path());
+        assert!(
+            child
+                .roots_for(dir.path())
+                .contains(&canonicalize_best_effort(root_a.path())),
+            "the parent's approval reads through"
+        );
+        // The child's own approval is visible to the child alone.
+        let root_b = tempfile::tempdir().unwrap();
+        child.approve(root_b.path());
+        let canon_b = canonicalize_best_effort(root_b.path());
+        assert!(child.roots_for(dir.path()).contains(&canon_b));
+        assert!(
+            !parent.roots_for(dir.path()).contains(&canon_b),
+            "a child approval never widens the parent"
+        );
+        assert!(
+            !sibling.roots_for(dir.path()).contains(&canon_b),
+            "a child approval never widens a sibling"
+        );
     }
 
     fn run_git(dir: &Path, args: &[&str]) {

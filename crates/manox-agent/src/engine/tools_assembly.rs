@@ -29,13 +29,16 @@ pub(super) fn subagent_capability(def: &manox_harness::ext_point_agent::AgentDef
 /// registry has no manager/seatbelt-wrap, so `run_in_background` would
 /// spawn a bare process that bypasses the seatbelt, eludes
 /// `TaskStop`/`BashOutput`/UI, and outlives the session (no `Drop` reap).
-/// Reject `run_in_background` outright; refuse `require_escalated` for the
-/// same structural reason — the subagent session carries no approver, so a
-/// retry there could only fail closed. The description is also corrected for
-/// the subagent context (one-shot, no state persistence) since the kernel
-/// BashTool's static text assumes the host session.
+/// Reject `run_in_background` outright. The escalation fields follow the
+/// armed state: with the per-run parent channel attached (the authority's
+/// per-run grant cell + approver ride the inner BashTool) a
+/// `require_escalated` retry resolves through the parent's approval card;
+/// without it the session has no channel and the retry fails closed.
 pub(super) struct SubagentBashTool {
     pub(super) inner: Arc<dyn manox_harness::tool::AgentTool>,
+    /// The run's escalation channel; `None` on the shared snapshot (the
+    /// per-run state is attached by the child authority at spawn).
+    pub(super) escalation: Option<Arc<ChildEscalation>>,
 }
 
 pub(super) const SUBAGENT_BASH_DESCRIPTION: &str = "Execute a shell command. Each call runs in a \
@@ -44,10 +47,32 @@ pub(super) const SUBAGENT_BASH_DESCRIPTION: &str = "Execute a shell command. Eac
     under full-access (and with no narrowing declared) the command runs unsandboxed; under \
     sandbox — the dispatching session's or the definition's own — it runs in the same OS \
     confinement (same writable roots, same network switch) as the dispatching session's own \
-    Bash. `run_in_background` and `require_escalated` are not available inside a subagent — the \
-    subagent itself is the async primitive and it has no approval channel, so run long commands \
-    in the foreground and report blockers instead. Use `head_lines`/`tail_lines` to keep a \
-    selection of output instead of piping through `head`/`tail`.";
+    Bash. If the sandbox denies a command, retry that exact command once with \
+    `require_escalated: true` + `justification` — the request surfaces as an approval card on \
+    the parent conversation, attributed to this subagent; an approval widens exactly that one \
+    call, and a denial or a spent escalation budget is final. `run_in_background` is not \
+    available inside a subagent — the subagent itself is the async primitive; run long commands \
+    in the foreground. Use `head_lines`/`tail_lines` to keep a selection of output instead of \
+    piping through `head`/`tail`.";
+
+pub(super) const SUBAGENT_BASH_DESCRIPTION_NO_CHANNEL: &str = "Execute a shell command. Each call runs in a \
+    fresh one-shot shell at the current cwd (no persistent cwd/vars across calls). Access follows \
+    the dispatching session's mode, narrowed by this subagent's declared permission ceiling: \
+    under full-access (and with no narrowing declared) the command runs unsandboxed; under \
+    sandbox — the dispatching session's or the definition's own — it runs in the same OS \
+    confinement (same writable roots, same network switch) as the dispatching session's own \
+    Bash. `run_in_background` and `require_escalated` are not available inside a subagent — \
+    the subagent itself is the async primitive and it has no approval channel. Use \
+    `head_lines`/`tail_lines` to keep a selection of output instead of piping through \
+    `head`/`tail`.";
+
+/// Whether the call carries an escalation request.
+fn is_escalation_request(params: &serde_json::Value) -> bool {
+    params
+        .get("require_escalated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
 
 #[async_trait::async_trait]
 impl manox_harness::tool::AgentTool for SubagentBashTool {
@@ -55,12 +80,24 @@ impl manox_harness::tool::AgentTool for SubagentBashTool {
         "Bash"
     }
     fn description(&self) -> &str {
-        SUBAGENT_BASH_DESCRIPTION
+        if self.escalation.is_some() {
+            SUBAGENT_BASH_DESCRIPTION
+        } else {
+            SUBAGENT_BASH_DESCRIPTION_NO_CHANNEL
+        }
     }
     fn is_read_only(&self) -> bool {
         false
     }
     fn requires_approval(&self, params: &serde_json::Value) -> bool {
+        // An escalated call on an armed tool parks no boundary gate — the
+        // tool runs the approval round trip itself against the parent
+        // channel (mirrors the host gate's `auto_allow` for confined bash).
+        // Without the channel the call stays approval-bearing and the
+        // boundary gate rejects it.
+        if self.escalation.is_some() && is_escalation_request(params) {
+            return false;
+        }
         self.inner.requires_approval(params)
     }
     fn execution_mode(&self) -> manox_harness::tool::ExecutionMode {
@@ -70,15 +107,16 @@ impl manox_harness::tool::AgentTool for SubagentBashTool {
         self.inner.execution_mode()
     }
     fn parameters_schema(&self) -> serde_json::Value {
-        // Strip `run_in_background` (refused by this wrapper — N1) and the
-        // `require_escalated`/`justification` escalation fields (no
-        // escalation path in the ungated subagent session) so the model
-        // never proposes them.
+        // Strip `run_in_background` (refused by this wrapper) always; strip
+        // the escalation fields only when no channel is armed, so the model
+        // never proposes a retry it cannot make.
         let mut schema = self.inner.parameters_schema();
         if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
             props.remove("run_in_background");
-            props.remove("require_escalated");
-            props.remove("justification");
+            if self.escalation.is_none() {
+                props.remove("require_escalated");
+                props.remove("justification");
+            }
         }
         schema
     }
@@ -90,7 +128,15 @@ impl manox_harness::tool::AgentTool for SubagentBashTool {
         signal: tokio_util::sync::CancellationToken,
         ctx: &dyn manox_harness::tool::ToolContext,
     ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
-        refuse_unavailable_params(&params)?;
+        self.refuse_unavailable(&params)?;
+        if let Some(esc) = &self.escalation
+            && is_escalation_request(&params)
+        {
+            // Refuse before the round trip so a spent budget produces the
+            // informative text instead of a surprise denial at the channel.
+            esc.check_budget()
+                .map_err(manox_harness::tool::ToolError::Other)?;
+        }
         self.inner.execute(tool_call_id, params, signal, ctx).await
     }
 
@@ -102,63 +148,87 @@ impl manox_harness::tool::AgentTool for SubagentBashTool {
         ctx: &dyn manox_harness::tool::ToolContext,
         progress: &dyn manox_harness::tool::ToolProgress,
     ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
-        refuse_unavailable_params(&params)?;
+        self.refuse_unavailable(&params)?;
+        if let Some(esc) = &self.escalation
+            && is_escalation_request(&params)
+        {
+            esc.check_budget()
+                .map_err(manox_harness::tool::ToolError::Other)?;
+        }
         self.inner
             .execute_with_progress(tool_call_id, params, signal, ctx, progress)
             .await
     }
 }
 
-/// Refuse the schema-stripped fields a non-conforming model can still emit:
-/// `run_in_background` would spawn a bare process outside every lifecycle
-/// handle, and `require_escalated` has no approver to resolve against.
-fn refuse_unavailable_params(
-    params: &serde_json::Value,
-) -> Result<(), manox_harness::tool::ToolError> {
-    if params["run_in_background"].as_bool().unwrap_or(false) {
-        return Err(manox_harness::tool::ToolError::ExecutionFailed(
-            "`run_in_background` is not available inside a subagent session — the subagent \
-             itself is the async primitive. Run the command in the foreground instead."
-                .into(),
-        ));
+impl SubagentBashTool {
+    /// Refuse the calls this wrapper can never run: a background spawn
+    /// (always), and an escalation request on an unarmed tool (the schema
+    /// already strips the fields — this is the non-conforming-model
+    /// backstop, and it names the missing channel).
+    fn refuse_unavailable(
+        &self,
+        params: &serde_json::Value,
+    ) -> Result<(), manox_harness::tool::ToolError> {
+        if params["run_in_background"].as_bool().unwrap_or(false) {
+            return Err(manox_harness::tool::ToolError::ExecutionFailed(
+                "`run_in_background` is not available inside a subagent session — the subagent \
+                 itself is the async primitive. Run the command in the foreground instead."
+                    .into(),
+            ));
+        }
+        if self.escalation.is_none() && is_escalation_request(params) {
+            return Err(manox_harness::tool::ToolError::ExecutionFailed(
+                "`require_escalated` is not available inside a subagent session — this session \
+                 has no approval channel, and its access mode already follows the dispatching \
+                 session."
+                    .into(),
+            ));
+        }
+        Ok(())
     }
-    if params
-        .get("require_escalated")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return Err(manox_harness::tool::ToolError::ExecutionFailed(
-            "`require_escalated` is not available inside a subagent session — this session has no \
-             approval channel, and its access mode already follows the dispatching session. Report \
-             the blocker in your summary instead."
-                .into(),
-        ));
-    }
-    Ok(())
 }
 
 /// Write/Edit fence for the subagent snapshot: the same containment verdict
 /// the Captain's `ApprovalGatedTool` applies, read from the dispatching
-/// session's live gate, minus the escalation channel a subagent does not
-/// have. `full-access` passes through (the Captain runs unfenced);
-/// `sandbox` admits only targets inside the shared `writable_roots` plus the
-/// granted roots, so a Sailor cannot write where its Bash could not. Wraps
-/// the file-locked tool (`fence(FileLocked(tool))`): the fence judges before
-/// the lock is taken, so a refusal never holds a path.
+/// session's live gate. `full-access` passes through; `sandbox` admits only
+/// targets inside the shared `writable_roots` plus the run's granted roots,
+/// so a Sailor cannot write where its Bash could not. Wraps the file-locked
+/// tool (`fence(FileLocked(tool))`): the fence judges before the lock is
+/// taken, so a refusal never holds a path.
+///
+/// The escalation channel follows the armed state. Armed (the authority's
+/// per-run approver + overlay are attached): an out-of-roots target is
+/// refused with the sanctioned retry — the model re-issues the call with
+/// `require_escalated` + `justification`, the ask parks an approval card on
+/// the parent conversation, and an approval records the covered root into
+/// the run's overlay (approve once for this run, never re-ask). Unarmed:
+/// the marker and the honest fact of a session with no channel.
 pub(super) struct SubagentWriteFence {
     pub(super) inner: Arc<dyn HarnessAgentTool>,
     pub(super) mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
     pub(super) granted_roots: crate::granted_roots::GrantedRoots,
+    /// The run's escalation channel; `None` on the shared snapshot.
+    pub(super) escalation: Option<Arc<ChildEscalation>>,
 }
 
-/// The subagent fence's refusal: the shared sandbox marker (the one
-/// vocabulary both enforcing families speak) and an honest dead end — no
-/// `require_escalated` hint, because this session has no approver to answer
-/// it.
+/// The unarmed fence's refusal: the shared sandbox marker (the one
+/// vocabulary both enforcing families speak) and the honest fact of a
+/// session with no escalation channel.
 fn subagent_fence_denial() -> manox_harness::tool::ToolError {
     manox_harness::tool::ToolError::Other(format!(
-        "{}\n[sandbox: no escalation channel in this session; report the blocker in your summary]",
+        "{}\n[sandbox: no escalation channel in this session]",
         manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox)
+    ))
+}
+
+/// The armed fence's refusal for a plain out-of-roots call: the marker plus
+/// the sanctioned retry — the one widening road this session has.
+fn armed_fence_plain_denial() -> manox_harness::tool::ToolError {
+    manox_harness::tool::ToolError::Other(format!(
+        "{}\n{}",
+        manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox),
+        manox_harness::sandbox::escalation_hint_marker("operation")
     ))
 }
 
@@ -171,7 +241,29 @@ impl manox_harness::tool::AgentTool for SubagentWriteFence {
         self.inner.description()
     }
     fn parameters_schema(&self) -> serde_json::Value {
-        self.inner.parameters_schema()
+        let mut schema = self.inner.parameters_schema();
+        // Advertise the escalation fields on the armed fence, so the model
+        // knows a refused call can be retried with `require_escalated` +
+        // `justification` and the ask reaches the parent's user.
+        if self.escalation.is_some()
+            && let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut())
+        {
+            props.insert(
+                "require_escalated".into(),
+                serde_json::json!({
+                    "type": "boolean",
+                    "description": "Set true to retry this exact operation with full access (no sandbox). Only valid as a one-shot retry of an operation the fence just refused; requires justification and user approval on the parent conversation."
+                }),
+            );
+            props.insert(
+                "justification".into(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Required with require_escalated: one sentence for the user explaining why this exact file operation needs full access."
+                }),
+            );
+        }
+        schema
     }
     fn requires_approval(&self, params: &serde_json::Value) -> bool {
         self.inner.requires_approval(params)
@@ -193,7 +285,7 @@ impl manox_harness::tool::AgentTool for SubagentWriteFence {
         signal: tokio_util::sync::CancellationToken,
         ctx: &dyn manox_harness::tool::ToolContext,
     ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
-        self.verdict(&params, ctx)?;
+        self.verdict(tool_call_id, &params, &signal, ctx).await?;
         self.inner.execute(tool_call_id, params, signal, ctx).await
     }
 
@@ -205,7 +297,7 @@ impl manox_harness::tool::AgentTool for SubagentWriteFence {
         ctx: &dyn manox_harness::tool::ToolContext,
         progress: &dyn manox_harness::tool::ToolProgress,
     ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
-        self.verdict(&params, ctx)?;
+        self.verdict(tool_call_id, &params, &signal, ctx).await?;
         self.inner
             .execute_with_progress(tool_call_id, params, signal, ctx, progress)
             .await
@@ -213,21 +305,65 @@ impl manox_harness::tool::AgentTool for SubagentWriteFence {
 }
 
 impl SubagentWriteFence {
-    fn verdict(
+    /// The containment verdict, escalating through the parent channel when
+    /// armed and the call asks for it.
+    async fn verdict(
         &self,
+        tool_call_id: &str,
         params: &serde_json::Value,
+        signal: &tokio_util::sync::CancellationToken,
         ctx: &dyn manox_harness::tool::ToolContext,
     ) -> Result<(), manox_harness::tool::ToolError> {
         if (self.mode_resolver)() == AccessMode::FullAccess {
             return Ok(());
         }
-        crate::approval::fs_write_verdict(
+        match crate::approval::fs_write_verdict(
             self.inner.name(),
             params,
             ctx,
             Some(&self.granted_roots),
             &subagent_fence_denial,
-        )
+        ) {
+            Ok(()) => return Ok(()),
+            // A malformed cwd is an argument error, not a policy denial —
+            // surface the tool's own instructional text, never an
+            // escalation for a call that cannot name its target.
+            Err(err @ manox_harness::tool::ToolError::InvalidArguments(_)) => return Err(err),
+            Err(_) => {}
+        }
+        let Some(escalation) = &self.escalation else {
+            return Err(subagent_fence_denial());
+        };
+        if !is_escalation_request(params) {
+            return Err(armed_fence_plain_denial());
+        }
+        let justification = params
+            .get("justification")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        manox_harness::sandbox::validate_escalation_args(true, Some(justification))
+            .map_err(manox_harness::tool::ToolError::InvalidArguments)?;
+        let ask = super::subagent_authority::FsEscalationAsk {
+            tool_name: self.inner.name(),
+            params,
+            justification,
+            effective_mode: (self.mode_resolver)(),
+        };
+        match escalation
+            .resolve_fs_escalation(ask, tool_call_id, signal, ctx)
+            .await
+        {
+            // Approved: the covered root joins the run's overlay, so later
+            // calls under the same root never re-ask; this call proceeds.
+            Ok(root) => {
+                self.granted_roots.approve(root);
+                Ok(())
+            }
+            Err(msg) => Err(manox_harness::tool::ToolError::Other(format!(
+                "{}\n{msg}",
+                manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox)
+            ))),
+        }
     }
 }
 
@@ -360,9 +496,9 @@ pub(super) fn subagent_bash_tool(
 }
 
 /// The child snapshot's tool set. A subagent inherits the dispatching
-/// session's access authority live (B4: no ungated bypass, and no escalation
-/// either), so every enforcing surface here reads the same authority as the
-/// Captain's own tools:
+/// session's access authority live (B4: no ungated bypass), so every
+/// enforcing surface here reads the same authority as the Captain's own
+/// tools:
 ///
 /// - Bash rides the shared sandboxed backend with the same mode and network
 ///   resolvers plus the same unsandboxed backend: confined exactly like the
@@ -371,11 +507,14 @@ pub(super) fn subagent_bash_tool(
 ///   stamp belongs to the call that requested it.
 /// - Write/Edit carry the process write lock (`fence(FileLocked(tool))`, so
 ///   the fence judges before the lock is taken) and the same fs containment
-///   verdict, minus the escalation hint: a subagent has no approver.
+///   verdict.
 /// - Py is deliberately absent: the interpreter runs in-process with no OS
-///   sandbox, so its only fence is the host-side escalation round trip —
-///   which a subagent cannot make. A Py the child could see but only ever
-///   lose a turn on is worse than no Py at all.
+///   sandbox, so its only fence would be the host-side escalation round
+///   trip, which the child snapshot does not carry.
+///
+/// This is the shared fallback shape (no escalation channel); the child
+/// authority arms each run at spawn with per-run replacements carrying the
+/// parent-channel escalation state.
 pub(super) fn child_snapshot(
     bash: BashTool,
     mode_resolver: &Arc<dyn Fn() -> AccessMode + Send + Sync>,
@@ -388,6 +527,7 @@ pub(super) fn child_snapshot(
         Arc::new(manox_harness::tools::ls::LsTool),
         Arc::new(SubagentBashTool {
             inner: Arc::new(bash),
+            escalation: None,
         }),
         Arc::new(SubagentWriteFence {
             inner: Arc::new(crate::file_lock::FileLockedTool::new(
@@ -396,6 +536,7 @@ pub(super) fn child_snapshot(
             )),
             mode_resolver: Arc::clone(mode_resolver),
             granted_roots: granted_roots.clone(),
+            escalation: None,
         }),
         Arc::new(SubagentWriteFence {
             inner: Arc::new(crate::file_lock::FileLockedTool::new(
@@ -407,6 +548,7 @@ pub(super) fn child_snapshot(
             )),
             mode_resolver: Arc::clone(mode_resolver),
             granted_roots: granted_roots.clone(),
+            escalation: None,
         }),
     ]
 }
@@ -1076,7 +1218,18 @@ pub(super) fn build_tools(
         // so their usage stays accountable.
         .with_observer(
             Arc::clone(&subagent_observer) as Arc<dyn manox_harness::subagent::RunObserver>
-        );
+        )
+        // The per-run escalation authority: each child run gets its own
+        // grant cell, parent-channel approver, and granted-roots overlay —
+        // one Sailor's approved escalation widens that run alone, never a
+        // sibling's call or the Captain's.
+        .with_child_authority(Arc::new(SubagentChildAuthority::new(
+            Arc::clone(gate),
+            cwd.to_path_buf(),
+            granted_roots.clone(),
+            sandbox_available,
+            unsandboxed_ops.clone(),
+        )));
     let spawn_provider = match model {
         Some(model) => spawn_provider.with_model(model.clone()),
         None => spawn_provider,
