@@ -1859,7 +1859,12 @@ mod tests {
     fn denial_tool(approver: Option<Arc<CannedApprover>>) -> BashTool {
         let tool = BashTool::new(Arc::new(DeniedOps), Arc::new(NoopRegistry))
             .with_sandbox_available(true)
-            .with_mode_resolver(Arc::new(|| AccessMode::Sandbox));
+            .with_mode_resolver(Arc::new(|| AccessMode::Sandbox))
+            // Network open: the classifier's Linux rule reads a bare
+            // "operation not permitted" under a CLOSED network as the socket
+            // filter, which would flip these pins to the network face. These
+            // tests pin the file face and the escalation-channel dimension.
+            .with_network_resolver(Arc::new(|| crate::sandbox::NetworkAccess::On));
         match approver {
             Some(approver) => tool.with_escalation_approver(approver),
             None => tool,
