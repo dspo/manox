@@ -898,8 +898,10 @@ mod tests {
         assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
         assert!(inside.exists(), "file written inside the workspace");
 
-        // A write outside every root hits the read-only base: the EROFS
-        // stderr carries the denial marker + escalation hint.
+        // A write outside every root hits the read-only base. The ops layer
+        // returns raw output — denial classification lives at the bash tool —
+        // so the raw EROFS signature is asserted here and the classifier is
+        // applied explicitly on the realistic stderr.
         let res = ops
             .exec(request(
                 "touch /usr/local/manox-live-deny-target",
@@ -915,16 +917,21 @@ mod tests {
             "EROFS signature in stderr: {}",
             res.stderr
         );
+        let note = manox_harness::sandbox::seatbelt_denial_note(
+            &res.stderr,
+            res.exit_code,
+            manox_harness::sandbox::AccessMode::Sandbox,
+            manox_harness::sandbox::NetworkAccess::Off,
+            true,
+        )
+        .expect("the EROFS denial classifies");
         assert!(
-            res.stderr
-                .contains("[sandbox: file access denied under sandbox mode]"),
-            "denial marker appended: {}",
-            res.stderr
+            note.contains("[sandbox: file access denied under sandbox mode]"),
+            "denial marker: {note}"
         );
         assert!(
-            res.stderr.contains("require_escalated"),
-            "escalation hint appended: {}",
-            res.stderr
+            note.contains("require_escalated"),
+            "escalation hint: {note}"
         );
         assert!(!Path::new("/usr/local/manox-live-deny-target").exists());
     }
@@ -992,8 +999,9 @@ mod tests {
     }
 
     /// The closed route: no net namespace interface reaches the network, so
-    /// curl fails and the stderr carries a network-classified signature —
-    /// the marker + escalation hint ride the denial.
+    /// curl fails. The ops layer returns raw output — denial classification
+    /// lives at the bash tool — so the raw failure is asserted here and the
+    /// classifier is applied explicitly on the realistic stderr.
     #[tokio::test]
     async fn live_closed_network_denies_curl_and_classifies() {
         if !live_ready() {
@@ -1006,16 +1014,21 @@ mod tests {
             .await
             .expect("exec runs");
         assert_ne!(res.exit_code, 0, "closed network denies curl");
+        let note = manox_harness::sandbox::seatbelt_denial_note(
+            &res.stderr,
+            res.exit_code,
+            manox_harness::sandbox::AccessMode::Sandbox,
+            manox_harness::sandbox::NetworkAccess::Off,
+            true,
+        )
+        .expect("the closed-network refusal classifies");
         assert!(
-            res.stderr
-                .contains("network access denied under sandbox mode"),
-            "network marker in stderr: {}",
-            res.stderr
+            note.contains("network access denied under sandbox mode"),
+            "network marker: {note}"
         );
         assert!(
-            res.stderr.contains("require_escalated"),
-            "escalation hint rides the denial: {}",
-            res.stderr
+            note.contains("require_escalated"),
+            "escalation hint: {note}"
         );
     }
 

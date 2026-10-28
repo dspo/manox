@@ -29,19 +29,24 @@ pub(super) fn subagent_capability(def: &manox_harness::ext_point_agent::AgentDef
 /// registry has no manager/seatbelt-wrap, so `run_in_background` would
 /// spawn a bare process that bypasses the seatbelt, eludes
 /// `TaskStop`/`BashOutput`/UI, and outlives the session (no `Drop` reap).
-/// Reject `run_in_background` outright; the description is also corrected
-/// for the subagent context (one-shot, no state persistence, no gating
-/// claim) since the kernel BashTool's static text assumes the host session.
+/// Reject `run_in_background` outright; refuse `require_escalated` for the
+/// same structural reason — the subagent session carries no approver, so a
+/// retry there could only fail closed. The description is also corrected for
+/// the subagent context (one-shot, no state persistence) since the kernel
+/// BashTool's static text assumes the host session.
 pub(super) struct SubagentBashTool {
     pub(super) inner: Arc<dyn manox_harness::tool::AgentTool>,
 }
 
 pub(super) const SUBAGENT_BASH_DESCRIPTION: &str = "Execute a shell command. Each call runs in a fresh \
-    one-shot shell at the current cwd (no persistent cwd/vars across calls), under the same \
-    backend as the Captain (seatbelt-confined where the host has one). `run_in_background` is \
-    not available inside a subagent — the subagent itself is the async primitive, so run long \
-    commands in the foreground. Use `head_lines`/`tail_lines` to keep a selection of output \
-    instead of piping through `head`/`tail`.";
+    one-shot shell at the current cwd (no persistent cwd/vars across calls). Access follows the \
+    dispatching session's mode live: under full-access the command runs unsandboxed; under \
+    sandbox it runs in the same OS confinement (same writable roots, same network switch) as \
+    the dispatching session's own Bash. `run_in_background` and `require_escalated` are not \
+    available inside a subagent — the subagent itself is the async primitive and it has no \
+    approval channel, so run long commands in the foreground and report blockers instead. Use \
+    `head_lines`/`tail_lines` to keep a selection of output instead of piping through \
+    `head`/`tail`.";
 
 #[async_trait::async_trait]
 impl manox_harness::tool::AgentTool for SubagentBashTool {
@@ -84,13 +89,7 @@ impl manox_harness::tool::AgentTool for SubagentBashTool {
         signal: tokio_util::sync::CancellationToken,
         ctx: &dyn manox_harness::tool::ToolContext,
     ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
-        if params["run_in_background"].as_bool().unwrap_or(false) {
-            return Err(manox_harness::tool::ToolError::ExecutionFailed(
-                "`run_in_background` is not available inside a subagent session — the subagent \
-                 itself is the async primitive. Run the command in the foreground instead."
-                    .into(),
-            ));
-        }
+        refuse_unavailable_params(&params)?;
         self.inner.execute(tool_call_id, params, signal, ctx).await
     }
 
@@ -102,17 +101,205 @@ impl manox_harness::tool::AgentTool for SubagentBashTool {
         ctx: &dyn manox_harness::tool::ToolContext,
         progress: &dyn manox_harness::tool::ToolProgress,
     ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
-        if params["run_in_background"].as_bool().unwrap_or(false) {
-            return Err(manox_harness::tool::ToolError::ExecutionFailed(
-                "`run_in_background` is not available inside a subagent session — the subagent \
-                 itself is the async primitive. Run the command in the foreground instead."
-                    .into(),
-            ));
-        }
+        refuse_unavailable_params(&params)?;
         self.inner
             .execute_with_progress(tool_call_id, params, signal, ctx, progress)
             .await
     }
+}
+
+/// Refuse the schema-stripped fields a non-conforming model can still emit:
+/// `run_in_background` would spawn a bare process outside every lifecycle
+/// handle, and `require_escalated` has no approver to resolve against.
+fn refuse_unavailable_params(
+    params: &serde_json::Value,
+) -> Result<(), manox_harness::tool::ToolError> {
+    if params["run_in_background"].as_bool().unwrap_or(false) {
+        return Err(manox_harness::tool::ToolError::ExecutionFailed(
+            "`run_in_background` is not available inside a subagent session — the subagent \
+             itself is the async primitive. Run the command in the foreground instead."
+                .into(),
+        ));
+    }
+    if params
+        .get("require_escalated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(manox_harness::tool::ToolError::ExecutionFailed(
+            "`require_escalated` is not available inside a subagent session — this session has no \
+             approval channel, and its access mode already follows the dispatching session. Report \
+             the blocker in your summary instead."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Write/Edit fence for the subagent snapshot: the same containment verdict
+/// the Captain's `ApprovalGatedTool` applies, read from the dispatching
+/// session's live gate, minus the escalation channel a subagent does not
+/// have. `full-access` passes through (the Captain runs unfenced);
+/// `sandbox` admits only targets inside the shared `writable_roots` plus the
+/// granted roots, so a Sailor cannot write where its Bash could not. Wraps
+/// the file-locked tool (`fence(FileLocked(tool))`): the fence judges before
+/// the lock is taken, so a refusal never holds a path.
+pub(super) struct SubagentWriteFence {
+    pub(super) inner: Arc<dyn HarnessAgentTool>,
+    pub(super) mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
+    pub(super) granted_roots: crate::granted_roots::GrantedRoots,
+}
+
+/// The subagent fence's refusal: the shared sandbox marker (the one
+/// vocabulary both enforcing families speak) and an honest dead end — no
+/// `require_escalated` hint, because this session has no approver to answer
+/// it.
+fn subagent_fence_denial() -> manox_harness::tool::ToolError {
+    manox_harness::tool::ToolError::Other(format!(
+        "{}\n[sandbox: no escalation channel in this session; report the blocker in your summary]",
+        manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox)
+    ))
+}
+
+#[async_trait::async_trait]
+impl manox_harness::tool::AgentTool for SubagentWriteFence {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+    fn requires_approval(&self, params: &serde_json::Value) -> bool {
+        self.inner.requires_approval(params)
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+    fn execution_mode(&self) -> manox_harness::tool::ExecutionMode {
+        self.inner.execution_mode()
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn manox_harness::tool::ToolContext,
+    ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
+        self.verdict(&params, ctx)?;
+        self.inner.execute(tool_call_id, params, signal, ctx).await
+    }
+
+    async fn execute_with_progress(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn manox_harness::tool::ToolContext,
+        progress: &dyn manox_harness::tool::ToolProgress,
+    ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
+        self.verdict(&params, ctx)?;
+        self.inner
+            .execute_with_progress(tool_call_id, params, signal, ctx, progress)
+            .await
+    }
+}
+
+impl SubagentWriteFence {
+    fn verdict(
+        &self,
+        params: &serde_json::Value,
+        ctx: &dyn manox_harness::tool::ToolContext,
+    ) -> Result<(), manox_harness::tool::ToolError> {
+        if (self.mode_resolver)() == AccessMode::FullAccess {
+            return Ok(());
+        }
+        crate::approval::fs_write_verdict(
+            self.inner.name(),
+            params,
+            ctx,
+            Some(&self.granted_roots),
+            &subagent_fence_denial,
+        )
+    }
+}
+
+/// The subagent's `BashTool`: the Captain's backends and resolvers without
+/// the manager (background is refused upstream) and without the per-call
+/// grant cell. Inheritance is live and by pointer — the same `Arc`s — so a
+/// mid-turn mode or network switch governs the Sailor's next call exactly as
+/// it governs the Captain's.
+pub(super) fn subagent_bash_tool(
+    operations: Arc<dyn manox_harness::tools::bash::BashOperations>,
+    registry: Arc<BackgroundRegistry>,
+    sandbox_available: bool,
+    mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
+    network_resolver: Arc<dyn Fn() -> manox_harness::sandbox::NetworkAccess + Send + Sync>,
+    unsandboxed_operations: Option<Arc<dyn manox_harness::tools::bash::BashOperations>>,
+) -> BashTool {
+    let tool = BashTool::new(operations, registry)
+        .with_sandbox_available(sandbox_available)
+        .with_mode_resolver(mode_resolver)
+        .with_network_resolver(network_resolver);
+    match unsandboxed_operations {
+        Some(ops) => tool.with_unsandboxed_operations(ops),
+        None => tool,
+    }
+}
+
+/// The child snapshot's tool set. A subagent inherits the dispatching
+/// session's access authority live (B4: no ungated bypass, and no escalation
+/// either), so every enforcing surface here reads the same authority as the
+/// Captain's own tools:
+///
+/// - Bash rides the shared sandboxed backend with the same mode and network
+///   resolvers plus the same unsandboxed backend: confined exactly like the
+///   Captain under `sandbox`, bare exactly when the Captain runs
+///   `full-access`. The per-call grant cell is NOT shared — an escalation
+///   stamp belongs to the call that requested it.
+/// - Write/Edit carry the process write lock (`fence(FileLocked(tool))`, so
+///   the fence judges before the lock is taken) and the same fs containment
+///   verdict, minus the escalation hint: a subagent has no approver.
+/// - Py is deliberately absent: the interpreter runs in-process with no OS
+///   sandbox, so its only fence is the host-side escalation round trip —
+///   which a subagent cannot make. A Py the child could see but only ever
+///   lose a turn on is worse than no Py at all.
+pub(super) fn child_snapshot(
+    bash: BashTool,
+    mode_resolver: &Arc<dyn Fn() -> AccessMode + Send + Sync>,
+    granted_roots: &crate::granted_roots::GrantedRoots,
+) -> Vec<Arc<dyn HarnessAgentTool>> {
+    vec![
+        Arc::new(manox_harness::read::SelectorReadTool::new()),
+        Arc::new(manox_harness::tools::grep::GrepTool),
+        Arc::new(manox_harness::tools::glob::GlobTool),
+        Arc::new(manox_harness::tools::ls::LsTool),
+        Arc::new(SubagentBashTool {
+            inner: Arc::new(bash),
+        }),
+        Arc::new(SubagentWriteFence {
+            inner: Arc::new(crate::file_lock::FileLockedTool::new(
+                Arc::new(manox_harness::tools::write::WriteTool),
+                "sailor",
+            )),
+            mode_resolver: Arc::clone(mode_resolver),
+            granted_roots: granted_roots.clone(),
+        }),
+        Arc::new(SubagentWriteFence {
+            inner: Arc::new(crate::file_lock::FileLockedTool::new(
+                Arc::new(
+                    manox_harness::tools::edit::EditTool::default()
+                        .with_enforce_seen_lines(crate::settings::edit().enforce_seen_lines),
+                ),
+                "sailor",
+            )),
+            mode_resolver: Arc::clone(mode_resolver),
+            granted_roots: granted_roots.clone(),
+        }),
+    ]
 }
 
 /// The host `TaskStop`: one registry covers every task kind (Sailors
@@ -386,8 +573,13 @@ pub(super) fn build_tools(
     } else {
         Arc::new(PersistentShellOperations::new(cwd))
     };
-    // Subagent snapshot inherits the same seatbelt backend so a Sailor's
-    // Bash is confined exactly like the Captain's (B4: no ungated bypass).
+    // Subagent snapshot inherits the Captain's access authority: the same
+    // seatbelt backend AND the same live resolvers (mode + network), so a
+    // Sailor's Bash is confined exactly like the Captain's (B4: no ungated
+    // bypass) — and runs bare when the Captain itself runs at full access.
+    // The per-call grant cell is deliberately NOT shared: an escalation stamp
+    // belongs to the call that requested it, and lending the Captain's grant
+    // to a background Sailor would widen a call no human approved.
     let subagent_bash_ops: Arc<dyn manox_harness::tools::bash::BashOperations> =
         Arc::clone(&bash_ops);
     let subagent_background = Arc::new(BackgroundRegistry::new());
@@ -420,8 +612,21 @@ pub(super) fn build_tools(
         .with_network_resolver(Arc::new(move || classifier_gate.network_route().access()))
         .with_grant_cell(grant_cell)
         .with_escalation_approver(Arc::clone(&escalation_approver));
-    if let Some(ops) = unsandboxed_ops {
-        bash = bash.with_unsandboxed_operations(ops);
+    // The subagent half of the same shape: the shared backends and the same
+    // live resolvers, no manager (background is refused) and no grant cell.
+    let subagent_bash = subagent_bash_tool(
+        Arc::clone(&subagent_bash_ops),
+        subagent_background,
+        sandbox_available,
+        Arc::clone(&standing_resolver),
+        {
+            let gate = Arc::clone(gate);
+            Arc::new(move || gate.network_route().access())
+        },
+        unsandboxed_ops.clone(),
+    );
+    if let Some(ops) = &unsandboxed_ops {
+        bash = bash.with_unsandboxed_operations(Arc::clone(ops));
     }
     let tools: Vec<Arc<dyn HarnessAgentTool>> = vec![
         // Read with path selectors (`path:N-M` / `:raw` / multi-range);
@@ -693,42 +898,7 @@ pub(super) fn build_tools(
         SubagentRunObserver::new(bus.owner_thread_id().to_string(), notice_tx.clone());
     let provider_registry = crate::provider_glue::global();
     let model_slot = gate.model_slot();
-    // Child snapshot: the same seatbelt backend as the Captain (B4: no
-    // ungated bypass); Write/Edit carry the process write lock so parallel
-    // workers clobbering the same path surface a named-holder conflict
-    // instead of silently racing.
-    let child_tools: Vec<Arc<dyn HarnessAgentTool>> = vec![
-        Arc::new(manox_harness::read::SelectorReadTool::new()),
-        Arc::new(manox_harness::tools::grep::GrepTool),
-        Arc::new(manox_harness::tools::glob::GlobTool),
-        Arc::new(manox_harness::tools::ls::LsTool),
-        // Py is deliberately absent from the child snapshot: the interpreter
-        // runs in-process with no OS sandbox, so the only fence is the
-        // host-side escalation round trip — which a subagent cannot make
-        // (its `never` gate auto-denies approval-bearing calls, and its
-        // tools carry no escalation fields). A Py the child could see but
-        // only ever lose a turn on is worse than no Py at all.
-        Arc::new(SubagentBashTool {
-            inner: Arc::new(
-                manox_harness::bash::BashTool::new(
-                    Arc::clone(&subagent_bash_ops),
-                    subagent_background.clone(),
-                )
-                .with_sandbox_available(sandbox_available),
-            ),
-        }),
-        Arc::new(crate::file_lock::FileLockedTool::new(
-            Arc::new(manox_harness::tools::write::WriteTool),
-            "sailor",
-        )),
-        Arc::new(crate::file_lock::FileLockedTool::new(
-            Arc::new(
-                manox_harness::tools::edit::EditTool::default()
-                    .with_enforce_seen_lines(crate::settings::edit().enforce_seen_lines),
-            ),
-            "sailor",
-        )),
-    ];
+    let child_tools = child_snapshot(subagent_bash, &standing_resolver, granted_roots);
     let child_snapshot_names: HashSet<String> =
         child_tools.iter().map(|t| t.name().to_string()).collect();
     // Delegation tool names: sanitized into the provider wire charset
