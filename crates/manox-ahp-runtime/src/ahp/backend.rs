@@ -3931,7 +3931,7 @@ mod mcp_dispatch_tests {
         });
     }
 
-    /// The parked list answer carries the row's derived read state: an    /// The parked list answer carries the row's derived read state: an
+    /// The parked list answer carries the row's derived read state: an
     /// unread row keeps `IsRead` down (it counts as attention), a read row
     /// carries `IsRead` — a session this host never subscribed must not
     /// read as unread just because it never subscribed.

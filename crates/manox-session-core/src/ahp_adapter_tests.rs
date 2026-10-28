@@ -5529,7 +5529,12 @@ mod create_intent {
         store.with_mut(|st| st.insert_summary_for_test("s-fold", None));
         // The host holds folded state for the session (the subscribe-time
         // seed), status carrying IsRead — the fold's standing assumption.
-        let seeded = manox_ahp::channels::session::initial("manox", None, None);
+        // The seed MUST carry it: a bare `Idle` seed would make the
+        // "folded IsRead came down" assertion below vacuous (it was
+        // already down), and a regression that skipped the flip publish
+        // would still pass.
+        let mut seeded = manox_ahp::channels::session::initial("manox", None, None);
+        seeded.status |= ahp_types::state::SessionStatus::IsRead.bits();
         runtime.host().seed_session("s-fold", seeded);
         assert!(runtime.host().has_session("s-fold"));
 
