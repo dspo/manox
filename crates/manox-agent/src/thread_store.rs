@@ -939,7 +939,13 @@ impl ThreadStore {
             }
             None => false,
         };
-        self.pending_viewed.insert(id.to_string(), 0);
+        // No park for the lowering: the park's merge is a monotone max and
+        // retires as soon as `last_viewed_at >= parked`, so it cannot hold a
+        // stamp BELOW the scanned one. A pass that read the sidecar before
+        // this queued write lands may republish the old view for one pass;
+        // the write's next scan flips it back. The durable write is the
+        // authority either way — a second in-memory overlay would be a
+        // second read truth for a leg with no caller today.
         if flipped {
             self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
         }
@@ -2111,12 +2117,24 @@ fn group_by_thread(
 
 /// Set equality on row id: same rows, any order. The scan rebuilds rows
 /// from a HashMap walk and the store holds them reranked; comparing the
-/// slices directly would flag every quiet pass as changed.
+/// slices directly would flag every quiet pass as changed. Rows are unique
+/// by id (the store's key), so an id-keyed map is exact and linear — the
+/// previous `fresh.contains` scan was quadratic in the row count and
+/// compared every field of every candidate pair.
 fn rows_match_ignoring_order(
     held: &[crate::db::ThreadSummary],
     fresh: &[crate::db::ThreadSummary],
 ) -> bool {
-    held.len() == fresh.len() && held.iter().all(|row| fresh.contains(row))
+    if held.len() != fresh.len() {
+        return false;
+    }
+    let fresh_by_id: HashMap<&str, &crate::db::ThreadSummary> =
+        fresh.iter().map(|row| (row.id.as_str(), row)).collect();
+    held.iter().all(|row| {
+        fresh_by_id
+            .get(row.id.as_str())
+            .is_some_and(|fresh_row| *fresh_row == row)
+    })
 }
 
 /// The team leader's session id from a session header's `team.parent`, when
@@ -3849,9 +3867,26 @@ mod tests {
             "B derives unread from A's stamped sidecar"
         );
 
-        // B's viewer declares the view; the queued sidecar write drains at
-        // B's next pass head, and A's re-scan reads the shared truth.
+        // B's viewer declares the view. The write is QUEUED for the store's
+        // pass runner (a direct `refresh_now` does not drain the queue), so
+        // wait for it to land on the shared disk before A re-scans — racing
+        // the spawned runner is the flake this test used to carry.
         b.with_mut(|s| assert!(s.mark_viewed("s-cross", 100)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let viewed = manox_harness::session_meta::load(&dir, &path)
+                .await
+                .ok()
+                .and_then(|meta| meta.last_viewed_at);
+            if viewed == Some(100) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "B's view write never landed on the shared root"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         b.refresh_now().await;
         a.refresh_now().await;
         assert!(
