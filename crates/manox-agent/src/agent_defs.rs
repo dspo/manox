@@ -17,11 +17,14 @@
 //!   matching Claude Code's plugin-scoped lookup.
 //!
 //! A missing directory is normal (no definitions); a malformed file logs a
-//! warning and is skipped rather than aborting the whole registry.
+//! warning and is skipped rather than aborting the whole registry. A file
+//! with unmodeled frontmatter still registers — captured keys are logged
+//! (`DECLARED_NOOP_FRONTMATTER_FIELDS` at debug as contract, anything else at
+//! warn as drift) without dropping the definition.
 
 use std::path::{Path, PathBuf};
 
-use manox_harness::ext_point_agent::{AgentDef, AgentRegistry};
+use manox_harness::ext_point_agent::{AgentDef, AgentRegistry, DECLARED_NOOP_FRONTMATTER_FIELDS};
 
 /// `~/.claude/agents` — user-authored subagent definitions.
 pub fn user_agents_dir() -> Result<PathBuf, anyhow::Error> {
@@ -49,13 +52,40 @@ fn load_dir(dir: &Path) -> Vec<(String, AgentDef)> {
             }
         };
         match AgentDef::parse_md(&content) {
-            Ok(def) => out.push((label, def)),
+            Ok(def) => {
+                report_unmodeled_frontmatter(&label, &def);
+                out.push((label, def));
+            }
             Err(err) => {
                 tracing::warn!("agent definition {label} malformed, skipped: {err}");
             }
         }
     }
     out
+}
+
+/// One line per definition carrying unmodeled frontmatter: declared no-ops
+/// (the Claude vocabulary this runtime knowingly does not act on) log at
+/// debug, anything else logs at warn — an unrecognized key is upstream drift
+/// this build does not understand yet, and the reader should see it.
+fn report_unmodeled_frontmatter(label: &str, def: &AgentDef) {
+    if def.unknown_frontmatter.is_empty() {
+        return;
+    }
+    let (noop, unrecognized): (Vec<_>, Vec<_>) = def
+        .unknown_frontmatter
+        .keys()
+        .map(String::as_str)
+        .partition(|key| DECLARED_NOOP_FRONTMATTER_FIELDS.contains(key));
+    if !noop.is_empty() {
+        tracing::debug!("agent definition {label} declares no-op frontmatter fields {noop:?}");
+    }
+    if !unrecognized.is_empty() {
+        tracing::warn!(
+            "agent definition {label} carries unrecognized frontmatter fields \
+             {unrecognized:?}; they are ignored and the definition still registers"
+        );
+    }
 }
 
 /// Register user-authored definitions (same-name overrides built-ins), then
@@ -179,6 +209,43 @@ mod tests {
             }],
         );
         assert_eq!(registry.names(), vec!["gitwork@test:Reviewer"]);
+    }
+
+    /// An official-plugin manifest carrying unmodeled frontmatter (`color:`
+    /// on the claude-plugins-official vocabulary) must still register — the
+    /// field is captured and logged, never fatal to the definition.
+    #[test]
+    fn manifests_with_unmodeled_fields_still_register() {
+        let plugin_root = tempfile::tempdir().unwrap();
+        let agents = plugin_root.path().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        write(
+            &agents,
+            "reviewer.md",
+            "---\nname: Reviewer\ndescription: Reviews diffs.\nmodel: inherit\ncolor: pink\n---\nYou review diffs.\n",
+        );
+        let mut registry = AgentRegistry::new();
+        register_from_dirs(
+            &mut registry,
+            None,
+            None,
+            &[crate::plugin::InstalledPlugin {
+                name: "pr-review-toolkit".to_string(),
+                root: plugin_root.path().to_path_buf(),
+                marketplace: "claude-plugins-official".to_string(),
+                key: "pr-review-toolkit@claude-plugins-official".to_string(),
+            }],
+        );
+        let def = registry
+            .get("pr-review-toolkit@claude-plugins-official:Reviewer")
+            .expect("the unmodeled field must not drop the definition");
+        assert_eq!(def.model.as_deref(), Some("inherit"));
+        assert_eq!(
+            def.unknown_frontmatter
+                .get("color")
+                .and_then(|v| v.as_str()),
+            Some("pink")
+        );
     }
 
     /// Same plugin name, two marketplaces: the registry-key namespace keeps
