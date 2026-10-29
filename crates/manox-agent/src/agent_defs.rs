@@ -211,9 +211,10 @@ mod tests {
         assert_eq!(registry.names(), vec!["gitwork@test:Reviewer"]);
     }
 
-    /// An official-plugin manifest carrying unmodeled frontmatter (`color:`
-    /// on the claude-plugins-official vocabulary) must still register — the
-    /// field is captured and logged, never fatal to the definition.
+    /// An official-plugin manifest must register whole: the Claude
+    /// vocabulary this runtime handles (`color:`, `model: inherit`) lands in
+    /// its typed slots, and a genuinely unmodeled field is captured and
+    /// logged — never fatal to the definition.
     #[test]
     fn manifests_with_unmodeled_fields_still_register() {
         let plugin_root = tempfile::tempdir().unwrap();
@@ -222,7 +223,7 @@ mod tests {
         write(
             &agents,
             "reviewer.md",
-            "---\nname: Reviewer\ndescription: Reviews diffs.\nmodel: inherit\ncolor: pink\n---\nYou review diffs.\n",
+            "---\nname: Reviewer\ndescription: Reviews diffs.\nmodel: inherit\ncolor: pink\nfutureField: 1\n---\nYou review diffs.\n",
         );
         let mut registry = AgentRegistry::new();
         register_from_dirs(
@@ -240,12 +241,8 @@ mod tests {
             .get("pr-review-toolkit@claude-plugins-official:Reviewer")
             .expect("the unmodeled field must not drop the definition");
         assert_eq!(def.model.as_deref(), Some("inherit"));
-        assert_eq!(
-            def.unknown_frontmatter
-                .get("color")
-                .and_then(|v| v.as_str()),
-            Some("pink")
-        );
+        assert_eq!(def.color.as_deref(), Some("pink"));
+        assert!(def.unknown_frontmatter.contains_key("futureField"));
     }
 
     /// Same plugin name, two marketplaces: the registry-key namespace keeps

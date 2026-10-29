@@ -275,6 +275,7 @@ impl SubagentProvider for SpawnProvider {
             tool_filter: true,
             permissions: true,
             persona: true,
+            max_turns: true,
         }
     }
 
@@ -374,7 +375,10 @@ impl SubagentProvider for SpawnProvider {
             .with_metadata(serde_json::json!({ "subagent": descriptor.metadata(
                     req.parent_session.as_deref(),
                     req.tool_call_id.as_deref(),
-                ) }));
+                ) }))
+            // The definition's turn cap: the loop ends the run with its
+            // accumulated output at the limit (partial, resumable).
+            .with_max_turns(req.max_turns);
         if let Some(runtime) = &self.model_runtime {
             builder = builder.with_model_runtime(runtime.clone());
         }

@@ -1183,6 +1183,7 @@ pub(super) fn build_tools(
         String,
         &manox_harness::ext_point_agent::AgentDef,
         Vec<String>,
+        Vec<String>,
     )> = registry
         .all()
         .into_iter()
@@ -1193,10 +1194,15 @@ pub(super) fn build_tools(
                 &child_snapshot_names,
             )?;
             taken_tool_names.insert(assembly.tool_name.clone());
-            Some((assembly.tool_name, def, assembly.default_tools))
+            Some((
+                assembly.tool_name,
+                def,
+                assembly.default_tools,
+                assembly.default_denied,
+            ))
         })
         .collect();
-    for (tool_name, _, _) in &delegation_defs {
+    for (tool_name, _, _, _) in &delegation_defs {
         subagent_runtime.register_delegation_tool(tool_name);
     }
     subagent_runtime.register_delegation_tool(crate::subagent::ListAgentsTool::NAME);
@@ -1238,21 +1244,56 @@ pub(super) fn build_tools(
     let subagent_env: Arc<dyn manox_harness::env::ExecutionEnv> = Arc::new(
         manox_harness::env::TokioExecutionEnv::new(cwd.to_path_buf()),
     );
-    for (tool_name, def, allow) in &delegation_defs {
+    for (tool_name, def, allow, denied) in &delegation_defs {
         let capability = subagent_capability(def);
+        // The declaration defaults change the dispatch contract the model
+        // sees, so the rendered description names them — a tool whose schema
+        // says "foreground by default" while the definition says otherwise
+        // would teach the model the wrong call shape.
+        let mut rendered_description =
+            crate::subagent::delegation_description(&def.description, capability, tool_name);
+        if def.background {
+            rendered_description.push_str(
+                " This agent dispatches onto a background card by default; the \
+                           report arrives as a message when the run settles.",
+            );
+        }
+        if def.isolation.as_deref() == Some("worktree") {
+            rendered_description.push_str(
+                " This agent dispatches into a throwaway git worktree by default; \
+                 its report names where kept work landed.",
+            );
+        }
+        if let Some(max_turns) = def.max_turns {
+            rendered_description.push_str(&format!(
+                " This agent's runs are capped at {max_turns} turns."
+            ));
+        }
         let config = DelegationToolConfig {
             provider: "spawn".into(),
             name: tool_name.clone(),
             capability: capability.to_string(),
-            rendered_description: crate::subagent::delegation_description(
-                &def.description,
-                capability,
-                tool_name,
-            ),
+            rendered_description,
             persona: def.system_prompt.clone(),
             default_tools: allow.clone(),
+            default_denied_tools: denied.clone(),
             frontmatter_model_spec: def.model.clone(),
             config_model_spec: overrides.get(&def.name).cloned(),
+            // The manifest vocabularies map onto this runtime's at assembly:
+            // an out-of-vocabulary declaration warns (once per session build)
+            // and degrades to the unset default.
+            frontmatter_effort: def
+                .effort
+                .as_deref()
+                .and_then(crate::subagent::declared_effort)
+                .map(str::to_string),
+            frontmatter_isolation: def
+                .isolation
+                .as_deref()
+                .and_then(crate::subagent::declared_isolation),
+            frontmatter_background: def.background,
+            frontmatter_max_turns: def.max_turns,
+            color: def.color.clone(),
             declared_permissions: def.permissions,
             max_depth: 1,
         };

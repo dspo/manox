@@ -18,6 +18,13 @@
 // | `tools`             | handled — allow list (sequence or comma scalar)        |
 // | `model`             | handled — override; `inherit` = dispatcher's model     |
 // | `permissions`       | handled (this runtime's extension) — access ceiling    |
+// | `disallowedTools`   | handled — deny list removed from the surviving pool    |
+// | `effort`            | handled — default reasoning effort (frontmatter tier)  |
+// | `isolation`         | handled — `worktree` dispatches into a throwaway       |
+// |                     | worktree by default                                    |
+// | `background`        | handled — dispatches onto a background card by default |
+// | `maxTurns`          | handled — turn cap; the child ends partial, resumable  |
+// | `color`             | handled — display data; rides the run rows to hosts    |
 // | `permissionMode`    | declared no-op — Claude approval modes have no         |
 // |                     | counterpart on the access-axis `permissions` block;    |
 // |                     | Claude Code itself ignores it for plugin agents        |
@@ -32,8 +39,6 @@
 // |                     | delegation dispatch                                    |
 // | `experimental`      | declared no-op — Claude Code's own CLI ignores it      |
 // | `omitClaudeMd`      | declared no-op — children never load CLAUDE.md anyway  |
-// | `color` / `disallowedTools` / `effort` / `isolation` / `background` /   |
-// | `maxTurns`          | not yet modeled — captured and reported until wired    |
 //
 // The `permissions:` block stays a closed vocabulary (`deny_unknown_fields`):
 // it is this runtime's security-bearing surface, where an unknown axis must
@@ -61,13 +66,13 @@ pub const DECLARED_NOOP_FRONTMATTER_FIELDS: &[&str] = &[
 
 /// Static agent definition parsed from a manifest.
 ///
-/// `name`/`description`/`tools`/`model`/`permissions` come from the YAML
-/// frontmatter; the markdown body becomes the agent's system prompt.
-/// Frontmatter keys outside the handled vocabulary are captured in
-/// `unknown_frontmatter` — never silently dropped with the file, never read
-/// for behavior — so the independently-evolving Claude vocabulary cannot
-/// brick a working definition.
+/// The frontmatter is Claude Code's subagent vocabulary; the markdown body
+/// becomes the agent's system prompt. Fields outside the handled vocabulary
+/// are captured in `unknown_frontmatter` — never silently dropped with the
+/// file, never read for behavior — so the independently-evolving Claude
+/// vocabulary cannot brick a working definition.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentDef {
     /// Registry key, also the `subagent_type` the main agent passes.
     pub name: String,
@@ -79,9 +84,40 @@ pub struct AgentDef {
     pub tools: Vec<String>,
     /// Optional model override. Resolution is the caller's job (the core is
     /// registry-free); the field is declared here so manifests stay
-    /// self-describing.
+    /// self-describing. The literal `inherit` is the no-override case.
     #[serde(default)]
     pub model: Option<String>,
+    /// Tool names removed from whatever survives the `tools:` allow pass
+    /// (Claude's denylist semantics: with no allow list, the full snapshot
+    /// minus these).
+    #[serde(default, deserialize_with = "deserialize_tool_list")]
+    pub disallowed_tools: Vec<String>,
+    /// Default reasoning effort for dispatches through this definition
+    /// (`off|low|medium|high|xhigh|max`; `xhigh` maps onto this runtime's
+    /// `max`). The lowest tier of the effort precedence — a dispatch
+    /// parameter or the providers-config spec wins over it.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Default dispatch isolation. Only `worktree` is modeled: the child
+    /// runs in a throwaway git worktree forked from the session cwd. Any
+    /// other value is reported by the assembly and ignored.
+    #[serde(default)]
+    pub isolation: Option<String>,
+    /// Dispatch onto a background card by default: the call returns
+    /// immediately and the report arrives as a message when the run
+    /// settles. A per-call `run_in_background` stays available.
+    #[serde(default)]
+    pub background: bool,
+    /// Turn cap for dispatches through this definition: the child ends
+    /// with whatever it accumulated (partial output, resumable via
+    /// `continue_run_id`).
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    /// Display color from the Claude vocabulary (`red|blue|green|yellow|
+    /// purple|orange|pink|cyan`). No behavior; hosts tint their subagent
+    /// surfaces with it and fall back on anything else.
+    #[serde(default)]
+    pub color: Option<String>,
     /// Declared access permissions for the children this definition
     /// dispatches. Defaults to inheriting everything from the dispatcher.
     #[serde(default)]
@@ -527,11 +563,36 @@ mod tests {
         assert_eq!(def.model.as_deref(), Some("inherit"));
         assert_eq!(def.tools, vec!["Read", "Grep"]);
         assert_eq!(
-            def.unknown_frontmatter
-                .get("color")
-                .and_then(|v| v.as_str()),
+            def.color.as_deref(),
             Some("pink"),
-            "not yet a modeled field — captured, not fatal"
+            "display data — carried, never a parse error"
+        );
+        assert!(def.unknown_frontmatter.is_empty());
+    }
+
+    /// The camelCase Tier A vocabulary parses: denylist (comma scalar or
+    /// sequence), effort, isolation, background, turn cap, color.
+    #[test]
+    fn parse_md_reads_the_behavioral_claude_fields() {
+        let manifest = "---\nname: X\ndescription: d\ntools: Read, Grep\n\
+                        disallowedTools: Bash, Write\neffort: high\nisolation: worktree\n\
+                        background: true\nmaxTurns: 12\ncolor: cyan\n---\nbody";
+        let def = AgentDef::parse_md(manifest).unwrap();
+        assert_eq!(def.disallowed_tools, vec!["Bash", "Write"]);
+        assert_eq!(def.effort.as_deref(), Some("high"));
+        assert_eq!(def.isolation.as_deref(), Some("worktree"));
+        assert!(def.background);
+        assert_eq!(def.max_turns, Some(12));
+        assert_eq!(def.color.as_deref(), Some("cyan"));
+
+        let bare = "---\nname: X\ndescription: d\n---\nbody";
+        let def = AgentDef::parse_md(bare).unwrap();
+        assert!(def.disallowed_tools.is_empty() && !def.background);
+        assert!(
+            def.effort.is_none()
+                && def.isolation.is_none()
+                && def.max_turns.is_none()
+                && def.color.is_none()
         );
     }
 
@@ -580,6 +641,12 @@ mod tests {
             description: "one".into(),
             tools: vec![],
             model: None,
+            disallowed_tools: vec![],
+            effort: None,
+            isolation: None,
+            background: false,
+            max_turns: None,
+            color: None,
             permissions: AgentPermissions::default(),
             system_prompt: "p".into(),
             unknown_frontmatter: BTreeMap::new(),
@@ -590,6 +657,12 @@ mod tests {
             description: "two".into(),
             tools: vec!["Read".into()],
             model: None,
+            disallowed_tools: vec![],
+            effort: None,
+            isolation: None,
+            background: false,
+            max_turns: None,
+            color: None,
             permissions: AgentPermissions::default(),
             system_prompt: "p2".into(),
             unknown_frontmatter: BTreeMap::new(),
