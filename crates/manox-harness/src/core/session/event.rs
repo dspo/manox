@@ -484,6 +484,10 @@ pub enum Event {
         tool_call_id: String,
         budgets: Budgets,
         depth: u32,
+        /// The definition's display color, for host surfaces. Written only
+        /// by definitions that declare one; absent on every older row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
     },
     /// A swarm run settled — exactly one `run/settled` per `run/started`,
     /// whatever the ending. `verdict` is host-authored judgment, always
@@ -523,6 +527,10 @@ pub enum Event {
         timestamp: DateTime<Utc>,
         run_id: String,
         follow_up: String,
+        /// The definition's display color, mirroring `run/started` so a
+        /// reopened run's surface keeps its identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
     },
 }
 
@@ -616,6 +624,7 @@ mod tests {
                 idle_timeout_ms: None,
             },
             depth: 1,
+            color: None,
         };
         let settled = Event::RunSettled {
             id: "e-1".into(),

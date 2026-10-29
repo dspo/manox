@@ -296,6 +296,10 @@ pub struct Agent {
     /// Observation hooks forwarded into each turn's loop config. The harness
     /// fills these so its registered `HookPoint`s fire inside the loop.
     loop_hooks: LoopHooks,
+    /// Turn cap applied to every drive of this agent (`None` = unbounded).
+    /// Set at assembly (a subagent definition's `maxTurns`); the loop ends
+    /// the run with its accumulated output when the cap is reached.
+    max_turns: Option<usize>,
 }
 
 impl Agent {
@@ -325,6 +329,7 @@ impl Agent {
             cache_retention: CacheRetention::default(),
             stream_options: crate::types::StreamOptions::default(),
             loop_hooks: LoopHooks::default(),
+            max_turns: None,
         }
     }
 
@@ -375,6 +380,12 @@ impl Agent {
     /// Set the per-run observation hooks forwarded into the loop config.
     pub fn set_loop_hooks(&mut self, hooks: LoopHooks) {
         self.loop_hooks = hooks;
+    }
+
+    /// Cap the agent's drive at `max_turns` turns per run; the loop ends
+    /// with the accumulated output when the cap is reached.
+    pub fn set_max_turns(&mut self, max_turns: Option<u32>) {
+        self.max_turns = max_turns.map(|v| v as usize);
     }
 
     /// Replace the session-scoped tool execution context (env + cwd + tool
@@ -736,7 +747,7 @@ impl Agent {
             before_turn_end,
             max_turn_end_bounces: None,
             sequential_tool_execution: false,
-            max_turns: None,
+            max_turns: self.max_turns,
         }
     }
 

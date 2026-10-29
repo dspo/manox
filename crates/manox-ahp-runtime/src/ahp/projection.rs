@@ -1082,16 +1082,24 @@ impl Translator {
                 kind,
                 label,
                 tool_call_id,
+                color,
                 ..
             } => {
                 // The durable lifecycle rows are the whole background-work
                 // truth: one open at start, one close at settle — and the
                 // child's own state lives in its chat (`ahp-chat:/<run_id>`;
                 // the run id names the child session). No progress rides
-                // this pointer.
+                // this pointer. The `_meta` carries the flat keys host
+                // surfaces read off this row type: the definition identity
+                // and its display color.
                 let listed = self.subagents.contains_key(run_id);
                 if !listed {
                     self.subagents.insert(run_id.clone(), ());
+                    let mut meta = JsonObject::new();
+                    meta.insert("agentType".to_string(), Value::String(kind.clone()));
+                    if let Some(color) = &color {
+                        meta.insert("agentColor".to_string(), Value::String(color.clone()));
+                    }
                     out.push(Emitted::new(
                         &chat,
                         StateAction::ChatBackgroundWorkSet(
@@ -1101,7 +1109,7 @@ impl Translator {
                                         id: run_id.clone(),
                                         label: label.clone(),
                                         started_at: row.timestamp.clone(),
-                                        meta: None,
+                                        meta: Some(meta),
                                         chat: format!("ahp-chat:/{run_id}"),
                                     },
                                 ),
@@ -1179,13 +1187,22 @@ impl Translator {
                 );
             }
             SessionTreeEntry::RunContinued {
-                run_id, follow_up, ..
+                run_id,
+                follow_up,
+                color,
+                ..
             } => {
                 // A continuation re-opens the run's roster entry: the same
-                // child chat, a fresh start line, every pointer intact.
+                // child chat, a fresh start line, every pointer intact — the
+                // definition identity and display color ride along so the
+                // reopened surface keeps them.
                 let listed = self.subagents.contains_key(run_id);
                 if !listed {
                     self.subagents.insert(run_id.clone(), ());
+                    let mut meta = JsonObject::new();
+                    if let Some(color) = &color {
+                        meta.insert("agentColor".to_string(), Value::String(color.clone()));
+                    }
                     out.push(Emitted::new(
                         &chat,
                         StateAction::ChatBackgroundWorkSet(
@@ -1197,7 +1214,7 @@ impl Translator {
                                         // of the reopened run.
                                         label: follow_up.clone(),
                                         started_at: row.timestamp.clone(),
-                                        meta: None,
+                                        meta: (!meta.is_empty()).then_some(meta),
                                         chat: format!("ahp-chat:/{run_id}"),
                                     },
                                 ),
@@ -3312,6 +3329,75 @@ mod tests {
         assert_eq!(encoded["backgroundTasks"]["bg_7"], snapshot);
         let decoded: ext::XManoxState = serde_json::from_value(encoded).expect("state round-trips");
         assert_eq!(decoded.background_tasks, state.background_tasks);
+    }
+
+    /// A `run/started` row's definition identity and display color land in
+    /// the background-work `_meta` under the flat keys host surfaces read
+    /// (`agentType`, `agentColor`); an undeclared color simply omits the key.
+    #[test]
+    fn a_run_started_row_stamps_the_definition_identity_and_color_into_the_work_meta() {
+        let mut translator = Translator::new();
+        let emitted = translator.on_entry(
+            "c-1",
+            "s-1",
+            0,
+            &kernel(json!({
+                "type": "run/started",
+                "runId": "sub-1",
+                "kind": "pr-review-toolkit@claude-plugins-official:type-design-analyzer",
+                "label": "review types",
+                "childSession": "sub-1",
+                "toolCallId": "tu_1",
+                "budgets": {"timeoutMs": null, "idleTimeoutMs": null},
+                "depth": 1,
+                "color": "pink"
+            })),
+        );
+        let work: Vec<_> = emitted
+            .iter()
+            .filter(|e| e.channel == "ahp-chat:/c-1")
+            .collect();
+        let action = work
+            .iter()
+            .find_map(|e| {
+                let action = serde_json::to_value(&e.action).ok()?;
+                (action["type"] == "chat/backgroundWorkSet").then_some(action)
+            })
+            .expect("the run opens a background-work entry");
+        let meta = &action["work"]["_meta"];
+        assert_eq!(
+            meta["agentType"],
+            "pr-review-toolkit@claude-plugins-official:type-design-analyzer"
+        );
+        assert_eq!(meta["agentColor"], "pink");
+
+        // No declared color: the identity rides alone, the color key is
+        // absent rather than null.
+        let emitted = translator.on_entry(
+            "c-1",
+            "s-1",
+            1,
+            &kernel(json!({
+                "type": "run/started",
+                "runId": "sub-2",
+                "kind": "Explore",
+                "label": "explore",
+                "childSession": "sub-2",
+                "toolCallId": "tu_2",
+                "budgets": {"timeoutMs": null, "idleTimeoutMs": null},
+                "depth": 1
+            })),
+        );
+        let action = emitted
+            .iter()
+            .filter(|e| e.channel == "ahp-chat:/c-1")
+            .find_map(|e| {
+                let action = serde_json::to_value(&e.action).ok()?;
+                (action["type"] == "chat/backgroundWorkSet").then_some(action)
+            })
+            .expect("the second run opens its entry");
+        assert_eq!(action["work"]["_meta"]["agentType"], "Explore");
+        assert!(action["work"]["_meta"].get("agentColor").is_none());
     }
 
     /// The full background-task projection chain, anchored at the real

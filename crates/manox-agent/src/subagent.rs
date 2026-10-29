@@ -61,11 +61,12 @@ pub fn sanitized_tool_name(def_name: &str, taken: &HashSet<String>) -> Option<St
 }
 
 /// One definition's assembly result: the sanitized wire tool name and the
-/// definition `tools:` allow list resolved (warn-and-skip) against the
-/// child snapshot.
+/// definition `tools:`/`disallowedTools:` lists resolved (warn-and-skip)
+/// against the child snapshot.
 pub struct DelegationAssembly {
     pub tool_name: String,
     pub default_tools: Vec<String>,
+    pub default_denied: Vec<String>,
 }
 
 /// Resolve one agent definition into its delegation tool identity.
@@ -74,7 +75,9 @@ pub struct DelegationAssembly {
 /// `tools:` data is definition data, not a call parameter: unknown names
 /// and privileged names (human-interaction tools, `Steer`) warn and skip
 /// instead of failing every dispatch — the request-param filter path stays
-/// fail-loud.
+/// fail-loud. `disallowedTools:` names resolve the same way; a deny name the
+/// child never had is dropped with the same warn (it would be a silent
+/// no-op).
 pub fn resolve_delegation_tool(
     def: &manox_harness::ext_point_agent::AgentDef,
     taken: &HashSet<String>,
@@ -88,37 +91,78 @@ pub fn resolve_delegation_tool(
             "agent definition name sanitized into the provider wire charset"
         );
     }
-    let default_tools: Vec<String> = def
-        .tools
-        .iter()
-        .filter(|name| {
-            if snapshot_names.contains(*name) {
-                true
-            } else if manox_harness::subagent::HUMAN_INTERACTION_TOOLS.contains(&name.as_str())
-                || name.as_str() == "Steer"
-            {
-                tracing::warn!(
-                    agent = %def.name,
-                    tool = %name,
-                    "agent definition names a tool children never receive; subagents never \
-                     get it (DELEGATED_CALLER guard)"
-                );
-                false
-            } else {
-                tracing::warn!(
-                    agent = %def.name,
-                    tool = %name,
-                    "agent definition names a tool not in the child snapshot; skipping it"
-                );
-                false
-            }
-        })
-        .cloned()
-        .collect();
+    let resolve_list = |names: &[String]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|name| {
+                if snapshot_names.contains(*name) {
+                    true
+                } else if manox_harness::subagent::HUMAN_INTERACTION_TOOLS.contains(&name.as_str())
+                    || name.as_str() == "Steer"
+                {
+                    tracing::warn!(
+                        agent = %def.name,
+                        tool = %name,
+                        "agent definition names a tool children never receive; subagents never \
+                         get it (DELEGATED_CALLER guard)"
+                    );
+                    false
+                } else {
+                    tracing::warn!(
+                        agent = %def.name,
+                        tool = %name,
+                        "agent definition names a tool not in the child snapshot; skipping it"
+                    );
+                    false
+                }
+            })
+            .cloned()
+            .collect()
+    };
+    let default_tools = resolve_list(&def.tools);
+    let default_denied = resolve_list(&def.disallowed_tools);
     Some(DelegationAssembly {
         tool_name,
         default_tools,
+        default_denied,
     })
+}
+
+/// The manifest `effort:` vocabulary mapped onto this runtime's reasoning
+/// tiers: Claude's `xhigh` IS this runtime's `max`; anything outside both
+/// vocabularies is a warn-and-ignore (a display-adjacent declaration must
+/// not brick the definition).
+pub fn declared_effort(raw: &str) -> Option<&'static str> {
+    match raw {
+        "off" => Some("off"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "max" => Some("max"),
+        "xhigh" => Some("max"),
+        other => {
+            tracing::warn!(
+                effort = %other,
+                "agent definition names an effort outside the vocabulary; ignoring it"
+            );
+            None
+        }
+    }
+}
+
+/// The manifest `isolation:` vocabulary: only `worktree` is modeled. Any
+/// other value warns and dispatches in place.
+pub fn declared_isolation(raw: &str) -> Option<String> {
+    match raw {
+        "worktree" => Some(raw.to_string()),
+        other => {
+            tracing::warn!(
+                isolation = %other,
+                "agent definition names an isolation outside the vocabulary; dispatching in place"
+            );
+            None
+        }
+    }
 }
 
 /// Claude's `model: inherit` means "run on the dispatcher's model" — in this
@@ -358,7 +402,8 @@ impl AgentTool for DelegationTool {
         let run_in_background = params
             .get("run_in_background")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || self.config.frontmatter_background;
         // Continue a settled run: the child session the id names reopens and
         // `prompt` is the follow-up. The dispatch otherwise behaves exactly
         // like a first run — same budgets, promotion, settlement, delivery.
@@ -370,7 +415,11 @@ impl AgentTool for DelegationTool {
         budgets
             .validate()
             .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        let isolation = params.get("isolation").and_then(|v| v.as_str());
+        let isolation = params
+            .get("isolation")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| self.config.frontmatter_isolation.clone());
         if self.parent_depth + 1 > self.config.max_depth {
             return Err(ToolError::InvalidArguments(format!(
                 "delegation depth budget exhausted: this agent may not delegate (cap {})",
@@ -378,10 +427,10 @@ impl AgentTool for DelegationTool {
             )));
         }
         let mut tool_filter: Option<ToolFilter> = None;
-        if !self.config.default_tools.is_empty() {
+        if !self.config.default_tools.is_empty() || !self.config.default_denied_tools.is_empty() {
             tool_filter = Some(ToolFilter {
                 allow: self.config.default_tools.clone(),
-                deny: Vec::new(),
+                deny: self.config.default_denied_tools.clone(),
             });
         }
         // The permission ceiling: the dispatch override may narrow the
@@ -416,7 +465,9 @@ impl AgentTool for DelegationTool {
         };
         let effort = match string_param(&params, "reasoning_effort") {
             Some(requested) => Some(requested),
-            None => declared_effort,
+            // Precedence: parameter > config spec (carried in declared_effort)
+            // > the definition's own `effort:` frontmatter.
+            None => declared_effort.or_else(|| self.config.frontmatter_effort.clone()),
         };
         let replay_thinking = params
             .get("replay_thinking")
@@ -448,6 +499,7 @@ impl AgentTool for DelegationTool {
             prompt: prompt.clone(),
             agent_options,
             max_depth: Some(self.config.max_depth),
+            max_turns: self.config.frontmatter_max_turns,
             tool_filter,
             permissions,
             persona: Some(self.config.persona.clone()),
@@ -463,7 +515,7 @@ impl AgentTool for DelegationTool {
                     idle_timeout_ms: budgets.idle_timeout_ms,
                 }
             },
-            isolation: isolation.map(String::from),
+            isolation,
             env: Arc::clone(&self.env),
             cwd: self.cwd.clone(),
             // A background run's cancellation is its own: the dispatching
@@ -492,17 +544,27 @@ impl AgentTool for DelegationTool {
         let run_id_for_result = run_id.clone();
         // The run.s lifecycle row is the durable record — two rows per run,
         // written once each; progress never rides the parent journal.
+        // The rows carry the definition's `color:` so host surfaces tint the
+        // run's identity; the key is absent when undeclared, and both
+        // lifecycle rows agree so a reopened run keeps its color. The key is
+        // the event's own wire name — the row IS the durable `Event`.
+        let with_color = |mut row: serde_json::Value| {
+            if let Some(color) = &self.config.color {
+                row["color"] = serde_json::json!(color);
+            }
+            row
+        };
         match &continue_run_id {
             Some(_) => self.observer.journal_swarm_row(
                 "run/continued",
-                serde_json::json!({
+                with_color(serde_json::json!({
                     "runId": run_id.clone(),
                     "followUp": prompt,
-                }),
+                })),
             ),
             None => self.observer.journal_swarm_row(
                 "run/started",
-                serde_json::json!({
+                with_color(serde_json::json!({
                     "runId": run_id.clone(),
                     "kind": self.config.name,
                     "label": card_title.clone(), // the delivery keeps the label
@@ -513,7 +575,7 @@ impl AgentTool for DelegationTool {
                         "idleTimeoutMs": budgets.idle_timeout_ms,
                     },
                     "depth": self.parent_depth + 1,
-                }),
+                })),
             ),
         }
         if !run_in_background {
@@ -1535,6 +1597,12 @@ mod tests {
             description: "d".into(),
             tools: vec!["Read".into(), "AskUserQuestion".into(), "Ghost".into()],
             model: None,
+            disallowed_tools: vec![],
+            effort: None,
+            isolation: None,
+            background: false,
+            max_turns: None,
+            color: None,
             permissions: Default::default(),
             system_prompt: "p".into(),
             unknown_frontmatter: Default::default(),
@@ -1569,6 +1637,56 @@ mod tests {
         assert!(crate::subagent::is_inherit_model("Inherit"));
         assert!(!crate::subagent::is_inherit_model("sonnet"));
         assert!(!crate::subagent::is_inherit_model("inherit-prefix"));
+    }
+
+    /// `disallowedTools:` resolves warn-and-skip like the allow list: names
+    /// the child never had are dropped, known names survive into the deny
+    /// filter.
+    #[test]
+    fn resolve_delegation_tool_resolves_the_deny_list() {
+        let snapshot: HashSet<String> = ["Read", "Grep", "Bash"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let def = manox_harness::ext_point_agent::AgentDef {
+            name: "scout".into(),
+            description: "d".into(),
+            tools: vec!["Read".into(), "Grep".into()],
+            model: None,
+            disallowed_tools: vec!["Bash".into(), "Ghost".into()],
+            effort: None,
+            isolation: None,
+            background: false,
+            max_turns: None,
+            color: None,
+            permissions: Default::default(),
+            system_prompt: "p".into(),
+            unknown_frontmatter: Default::default(),
+        };
+        let assembly = crate::subagent::resolve_delegation_tool(&def, &HashSet::new(), &snapshot)
+            .expect("a plain def resolves");
+        assert_eq!(assembly.default_tools, vec!["Read", "Grep"]);
+        assert_eq!(
+            assembly.default_denied,
+            vec!["Bash"],
+            "the unknown deny name (Ghost) warn-and-skips"
+        );
+    }
+
+    /// The manifest `effort:`/`isolation:` vocabularies map onto this
+    /// runtime's at assembly: `xhigh` is `max`, unknown values degrade to
+    /// unset (warned), `worktree` is the only modeled isolation.
+    #[test]
+    fn declared_effort_and_isolation_map_the_claude_vocabulary() {
+        assert_eq!(crate::subagent::declared_effort("xhigh"), Some("max"));
+        assert_eq!(crate::subagent::declared_effort("max"), Some("max"));
+        assert_eq!(crate::subagent::declared_effort("low"), Some("low"));
+        assert_eq!(crate::subagent::declared_effort("turbo"), None);
+        assert_eq!(
+            crate::subagent::declared_isolation("worktree").as_deref(),
+            Some("worktree")
+        );
+        assert_eq!(crate::subagent::declared_isolation("container"), None);
     }
 
     /// The dispatch `permissions` override narrows a declaration, never
@@ -1956,6 +2074,7 @@ mod tests {
                 tool_filter: false,
                 permissions: false,
                 persona: false,
+                max_turns: false,
             }
         }
 

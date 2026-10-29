@@ -45,6 +45,8 @@ pub struct Capabilities {
     pub permissions: bool,
     /// A per-request persona prefix shadowing the configured one.
     pub persona: bool,
+    /// A turn cap on the child's drive loop (`max_turns`).
+    pub max_turns: bool,
 }
 
 /// Why a start request was rejected before any provider work began.
@@ -158,6 +160,10 @@ pub struct StartRequest {
     /// Absolute delegation-depth cap for the child: its computed depth must
     /// be ≤ this. Requires the `depth_limit` capability.
     pub max_depth: Option<u32>,
+    /// Turn cap for the child's drive loop: the child ends with whatever it
+    /// accumulated once the cap is reached (partial output, resumable).
+    /// `None` = unbounded.
+    pub max_turns: Option<u32>,
     /// Child tool scoping. Requires the `tool_filter` capability.
     pub tool_filter: Option<ToolFilter>,
     /// The child's permission ceiling, already intersected with any
@@ -351,12 +357,33 @@ pub struct DelegationToolConfig {
     pub persona: String,
     /// The definition's `tools:` allow list; empty = the full snapshot.
     pub default_tools: Vec<String>,
+    /// The definition's `disallowedTools:` deny list, removed from whatever
+    /// survives the allow pass. Pre-sanitized at assembly (unknown names
+    /// warn-and-dropped there).
+    pub default_denied_tools: Vec<String>,
     /// Raw `model:` frontmatter spec, resolved by the tool against the
     /// provider registry at construction.
     pub frontmatter_model_spec: Option<String>,
     /// Raw dedicated spec from the providers config `subagents:` map —
     /// wins over the frontmatter.
     pub config_model_spec: Option<String>,
+    /// The definition's `effort:` mapped onto this runtime's vocabulary
+    /// (`xhigh` → `max`) at assembly; `None` when undeclared or out of
+    /// vocabulary. The lowest effort tier — a dispatch parameter or the
+    /// config spec wins over it.
+    pub frontmatter_effort: Option<String>,
+    /// The definition's `isolation:` default, validated at assembly (only
+    /// `worktree` survives); `None` = dispatch in place. A per-call
+    /// `isolation` parameter wins over it.
+    pub frontmatter_isolation: Option<String>,
+    /// The definition's `background: true` default: dispatch onto a
+    /// background card without the model asking.
+    pub frontmatter_background: bool,
+    /// The definition's `maxTurns:` cap on the child's drive loop.
+    pub frontmatter_max_turns: Option<u32>,
+    /// The definition's `color:` display data; rides the run rows to host
+    /// surfaces. No behavior.
+    pub color: Option<String>,
     /// The definition's declared permission ceiling (the `permissions:`
     /// frontmatter). A dispatch-time `permissions` parameter may narrow it,
     /// never widen it; `inherit` axes (the default) follow the dispatcher's
@@ -419,6 +446,9 @@ pub fn assert_capabilities(
     if request.persona.is_some() {
         need(caps.persona, "persona")?;
     }
+    if request.max_turns.is_some() {
+        need(caps.max_turns, "max_turns")?;
+    }
     Ok(())
 }
 
@@ -446,6 +476,7 @@ pub fn test_request(label: &str, prompt: &str) -> StartRequest {
         prompt: prompt.to_string(),
         agent_options: None,
         max_depth: None,
+        max_turns: None,
         tool_filter: None,
         permissions: None,
         persona: None,
@@ -534,6 +565,7 @@ mod tests {
             tool_filter: false,
             permissions: false,
             persona: false,
+            max_turns: false,
         };
         let mut request = test_request("l", "p");
         request.persona = Some("p".into());
@@ -551,6 +583,11 @@ mod tests {
         request.permissions = Some(AgentPermissions::default());
         let err = assert_capabilities("p", &caps, &request).unwrap_err();
         assert!(err.to_string().contains("permissions"), "{err}");
+
+        request.permissions = None;
+        request.max_turns = Some(10);
+        let err = assert_capabilities("p", &caps, &request).unwrap_err();
+        assert!(err.to_string().contains("max_turns"), "{err}");
     }
 
     /// Filter validation: unknown allow/deny names fail loudly so a typo

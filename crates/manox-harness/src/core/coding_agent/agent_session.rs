@@ -898,11 +898,20 @@ pub struct AgentSessionBuilder {
     /// Directory persisting hashline snapshots so a rebuilt store rehydrates
     /// tags across restarts/forks. `None` keeps snapshots memory-only.
     snapshot_dir: Option<PathBuf>,
+    /// Turn cap applied to the session's drive (`None` = unbounded; a
+    /// subagent definition's `maxTurns` rides this).
+    max_turns: Option<u32>,
 }
 
 impl AgentSessionBuilder {
     pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Cap the session's drive at `max_turns` turns per run.
+    pub fn with_max_turns(mut self, max_turns: Option<u32>) -> Self {
+        self.max_turns = max_turns;
         self
     }
 
@@ -1230,6 +1239,10 @@ impl AgentSessionBuilder {
         };
         let levels = runtime.thinking_levels(&clamp_model);
         harness.set_initial_thinking_level(clamp_thinking(&clamp_model, &levels, desired));
+        // The assembly-time turn cap (a subagent definition's `maxTurns`)
+        // lands on the agent, so every drive — fresh build or reopen —
+        // enforces the same bound.
+        harness.agent_mut().set_max_turns(self.max_turns);
 
         Ok(AgentSession {
             harness,

@@ -462,6 +462,7 @@ mod tests {
             tool_filter: true,
             permissions: true,
             persona: true,
+            max_turns: true,
         }
     }
 
@@ -604,6 +605,7 @@ mod tests {
                 tool_filter: false,
                 permissions: false,
                 persona: false,
+                max_turns: false,
             }
         }
         async fn start(&self, request: ResolvedStartRequest) -> Result<SubagentRun, SubagentError> {
