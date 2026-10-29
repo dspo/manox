@@ -121,6 +121,14 @@ pub fn resolve_delegation_tool(
     })
 }
 
+/// Claude's `model: inherit` means "run on the dispatcher's model" — in this
+/// runtime that is exactly the absence of an override. Treating the literal
+/// as a resolvable reference would fail every such dispatch loudly (official
+/// plugin manifests carry it routinely).
+fn is_inherit_model(spec: &str) -> bool {
+    spec.eq_ignore_ascii_case("inherit")
+}
+
 // ── DelegationTool ───────────────────────────────────────────────────────
 
 /// One model-facing delegation tool, configured from a single agent
@@ -202,6 +210,13 @@ impl DelegationTool {
             return Ok(Some((resolved.model, resolved.effort)));
         }
         if let Some(reference) = self.config.frontmatter_model_spec.as_deref() {
+            if is_inherit_model(reference) {
+                tracing::debug!(
+                    agent = %self.config.name,
+                    "frontmatter model `inherit` dispatches on the caller's model"
+                );
+                return Ok(None);
+            }
             let registry = self.provider_registry.as_ref().ok_or_else(|| {
                 ToolError::ExecutionFailed(format!(
                     "agent `{}` declares model override `{reference}` but no provider registry \
@@ -1522,6 +1537,7 @@ mod tests {
             model: None,
             permissions: Default::default(),
             system_prompt: "p".into(),
+            unknown_frontmatter: Default::default(),
         };
         let assembly = crate::subagent::resolve_delegation_tool(&def, &HashSet::new(), &snapshot)
             .expect("a namespaced def resolves");
@@ -1543,6 +1559,16 @@ mod tests {
         let assembly = crate::subagent::resolve_delegation_tool(&def, &taken, &snapshot)
             .expect("a distinct def still resolves");
         assert_eq!(assembly.tool_name, "remora_task");
+    }
+
+    /// The Claude `model: inherit` literal — case-insensitively — is the
+    /// absence of an override, not a reference to resolve.
+    #[test]
+    fn inherit_model_literal_is_the_no_override_case() {
+        assert!(crate::subagent::is_inherit_model("inherit"));
+        assert!(crate::subagent::is_inherit_model("Inherit"));
+        assert!(!crate::subagent::is_inherit_model("sonnet"));
+        assert!(!crate::subagent::is_inherit_model("inherit-prefix"));
     }
 
     /// The dispatch `permissions` override narrows a declaration, never

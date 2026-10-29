@@ -3,19 +3,71 @@
 // An `AgentDef` is pure data: defining an agent is writing a manifest (YAML
 // frontmatter + markdown body), not code. A def becomes a subagent only at
 // runtime, when the main agent invokes it through the `agent` tool.
+//
+// The manifest format is Claude Code's `.claude/agents/*.md` vocabulary, and
+// the compatibility contract with that ecosystem is Claude Code's own parse
+// behavior: an unrecognized or unmodeled field never drops the definition —
+// it is captured (`unknown_frontmatter`) and reported by the loader, while
+// structural errors (bad YAML, missing `name`, empty body) still do. The
+// disposition of every Claude frontmatter field:
+//
+// | field               | disposition                                            |
+// |---------------------|--------------------------------------------------------|
+// | `name`              | handled — registry key / `subagent_type`               |
+// | `description`       | handled — model-facing description                     |
+// | `tools`             | handled — allow list (sequence or comma scalar)        |
+// | `model`             | handled — override; `inherit` = dispatcher's model     |
+// | `permissions`       | handled (this runtime's extension) — access ceiling    |
+// | `permissionMode`    | declared no-op — Claude approval modes have no         |
+// |                     | counterpart on the access-axis `permissions` block;    |
+// |                     | Claude Code itself ignores it for plugin agents        |
+// | `mcpServers`        | declared no-op — the child tool universe is fixed;     |
+// |                     | Claude Code ignores it for plugin agents too           |
+// | `hooks`             | declared no-op — no per-def hook wiring; Claude Code   |
+// |                     | ignores it for plugin agents too                       |
+// | `memory`            | declared no-op — no per-agent memory store yet         |
+// | `skills`            | declared no-op — no child resource mount yet           |
+// | `autoCompactWindow` | declared no-op — compaction settings not wired to defs |
+// | `initialPrompt`     | declared no-op — main-session-agent semantics, not     |
+// |                     | delegation dispatch                                    |
+// | `experimental`      | declared no-op — Claude Code's own CLI ignores it      |
+// | `omitClaudeMd`      | declared no-op — children never load CLAUDE.md anyway  |
+// | `color` / `disallowedTools` / `effort` / `isolation` / `background` /   |
+// | `maxTurns`          | not yet modeled — captured and reported until wired    |
+//
+// The `permissions:` block stays a closed vocabulary (`deny_unknown_fields`):
+// it is this runtime's security-bearing surface, where an unknown axis must
+// fail the parse instead of silently widening a child.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde::Deserialize;
 
+/// Claude Code frontmatter fields this schema deliberately does not act on.
+/// The loader reports these as declared no-ops rather than unknown fields, so
+/// an ecosystem manifest logs intent instead of drift.
+pub const DECLARED_NOOP_FRONTMATTER_FIELDS: &[&str] = &[
+    "permissionMode",
+    "mcpServers",
+    "hooks",
+    "memory",
+    "skills",
+    "autoCompactWindow",
+    "initialPrompt",
+    "experimental",
+    "omitClaudeMd",
+];
+
 /// Static agent definition parsed from a manifest.
 ///
 /// `name`/`description`/`tools`/`model`/`permissions` come from the YAML
-/// frontmatter; the markdown body becomes the agent's system prompt. Unknown
-/// frontmatter fields are rejected rather than silently ignored.
+/// frontmatter; the markdown body becomes the agent's system prompt.
+/// Frontmatter keys outside the handled vocabulary are captured in
+/// `unknown_frontmatter` — never silently dropped with the file, never read
+/// for behavior — so the independently-evolving Claude vocabulary cannot
+/// brick a working definition.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentDef {
     /// Registry key, also the `subagent_type` the main agent passes.
     pub name: String,
@@ -23,7 +75,7 @@ pub struct AgentDef {
     pub description: String,
     /// Tool names this agent may use, resolved against the caller's tool
     /// snapshot at dispatch time. Empty means "all tools".
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tool_list")]
     pub tools: Vec<String>,
     /// Optional model override. Resolution is the caller's job (the core is
     /// registry-free); the field is declared here so manifests stay
@@ -37,6 +89,47 @@ pub struct AgentDef {
     /// The agent's system prompt (manifest body).
     #[serde(skip)]
     pub system_prompt: String,
+    /// Unmodeled frontmatter keys, captured verbatim. The loader logs them;
+    /// nothing reads them for behavior.
+    #[serde(flatten)]
+    pub unknown_frontmatter: BTreeMap<String, serde_yaml::Value>,
+}
+
+/// The `tools:` allow list. Claude manifests write it either as a YAML
+/// sequence or as a comma-separated scalar (`tools: Read, Grep`); a bare
+/// `tools:` (null) means the omitted case — inherit all tools.
+fn deserialize_tool_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ToolList;
+    impl<'de> serde::de::Visitor<'de> for ToolList {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a tool list or a comma-separated string")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect())
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                out.push(item);
+            }
+            Ok(out)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+    }
+    deserializer.deserialize_any(ToolList)
 }
 
 /// The `permissions:` frontmatter block: how far a dispatched child may reach.
@@ -412,10 +505,52 @@ mod tests {
         );
     }
 
+    /// Unmodeled fields never drop the definition — they are captured so the
+    /// loader can report them while the agent still registers (the Claude
+    /// Code compatibility contract).
     #[test]
-    fn parse_md_rejects_unknown_frontmatter_fields() {
+    fn parse_md_captures_unknown_frontmatter_fields() {
         let manifest = "---\nname: X\ndescription: d\ntypo_field: 1\n---\nbody";
-        assert!(AgentDef::parse_md(manifest).is_err());
+        let def = AgentDef::parse_md(manifest).unwrap();
+        assert_eq!(def.unknown_frontmatter.len(), 1);
+        assert!(def.unknown_frontmatter.contains_key("typo_field"));
+    }
+
+    /// Official plugin manifests (claude-plugins-official) carry `color:` and
+    /// `model: inherit` and may write `tools:` as a comma scalar — the full
+    /// shape must parse and register, not die on the first unmodeled field.
+    #[test]
+    fn parse_md_accepts_the_claude_plugin_vocabulary() {
+        let manifest = "---\nname: t\ndescription: d\nmodel: inherit\ncolor: pink\n\
+                        tools: Read, Grep\n---\nbody";
+        let def = AgentDef::parse_md(manifest).unwrap();
+        assert_eq!(def.model.as_deref(), Some("inherit"));
+        assert_eq!(def.tools, vec!["Read", "Grep"]);
+        assert_eq!(
+            def.unknown_frontmatter
+                .get("color")
+                .and_then(|v| v.as_str()),
+            Some("pink"),
+            "not yet a modeled field — captured, not fatal"
+        );
+    }
+
+    /// `tools:` accepts the sequence form, the comma scalar, and a bare null
+    /// (all meaning the omitted case where empty = inherit all).
+    #[test]
+    fn parse_md_accepts_sequence_scalar_and_null_tools() {
+        let sequence = "---\nname: X\ndescription: d\ntools:\n  - Read\n  - Grep\n---\nbody";
+        assert_eq!(
+            AgentDef::parse_md(sequence).unwrap().tools,
+            vec!["Read", "Grep"]
+        );
+        let scalar = "---\nname: X\ndescription: d\ntools: Read, Grep\n---\nbody";
+        assert_eq!(
+            AgentDef::parse_md(scalar).unwrap().tools,
+            vec!["Read", "Grep"]
+        );
+        let null = "---\nname: X\ndescription: d\ntools:\n---\nbody";
+        assert!(AgentDef::parse_md(null).unwrap().tools.is_empty());
     }
 
     #[test]
@@ -447,6 +582,7 @@ mod tests {
             model: None,
             permissions: AgentPermissions::default(),
             system_prompt: "p".into(),
+            unknown_frontmatter: BTreeMap::new(),
         };
         registry.register(a.clone());
         registry.register(AgentDef {
@@ -456,6 +592,7 @@ mod tests {
             model: None,
             permissions: AgentPermissions::default(),
             system_prompt: "p2".into(),
+            unknown_frontmatter: BTreeMap::new(),
         });
         assert_eq!(registry.names(), vec!["A"]);
         assert_eq!(registry.get("A").unwrap().description, "two");
