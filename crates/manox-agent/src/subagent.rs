@@ -1340,6 +1340,7 @@ mod tests {
             description: "d".into(),
             tools: vec!["Read".into(), "AskUserQuestion".into(), "Ghost".into()],
             model: None,
+            color: None,
             system_prompt: "p".into(),
         };
         let assembly = crate::subagent::resolve_delegation_tool(&def, &HashSet::new(), &snapshot)

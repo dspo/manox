@@ -11,9 +11,9 @@ use serde::Deserialize;
 
 /// Static agent definition parsed from a manifest.
 ///
-/// `name`/`description`/`tools`/`model` come from the YAML frontmatter; the
-/// markdown body becomes the agent's system prompt. Unknown frontmatter
-/// fields are rejected rather than silently ignored.
+/// `name`/`description`/`tools`/`model`/`color` come from the YAML
+/// frontmatter; the markdown body becomes the agent's system prompt. Unknown
+/// frontmatter fields are rejected rather than silently ignored.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDef {
@@ -30,6 +30,12 @@ pub struct AgentDef {
     /// self-describing.
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional display color from the Claude plugin vocabulary (`color:
+    /// blue`). Declared — not silently ignored — so official plugin
+    /// manifests carrying it parse instead of being dropped as malformed.
+    /// Display-only: the core never reads it.
+    #[serde(default)]
+    pub color: Option<String>,
     /// The agent's system prompt (manifest body).
     #[serde(skip)]
     pub system_prompt: String,
@@ -170,6 +176,17 @@ mod tests {
         assert!(def.tools.is_empty());
     }
 
+    /// Official Claude plugin manifests carry `color:`; the field must parse
+    /// (and stay optional) or the whole agent is dropped as malformed.
+    #[test]
+    fn parse_md_accepts_the_plugin_color_field() {
+        let manifest = "---\nname: X\ndescription: d\ncolor: blue\n---\nbody";
+        let def = AgentDef::parse_md(manifest).unwrap();
+        assert_eq!(def.color.as_deref(), Some("blue"));
+        let bare = "---\nname: X\ndescription: d\n---\nbody";
+        assert!(AgentDef::parse_md(bare).unwrap().color.is_none());
+    }
+
     #[test]
     fn parse_md_rejects_unknown_frontmatter_fields() {
         let manifest = "---\nname: X\ndescription: d\ntypo_field: 1\n---\nbody";
@@ -203,6 +220,7 @@ mod tests {
             description: "one".into(),
             tools: vec![],
             model: None,
+            color: None,
             system_prompt: "p".into(),
         };
         registry.register(a.clone());
@@ -211,6 +229,7 @@ mod tests {
             description: "two".into(),
             tools: vec!["Read".into()],
             model: None,
+            color: None,
             system_prompt: "p2".into(),
         });
         assert_eq!(registry.names(), vec!["A"]);
