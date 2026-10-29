@@ -44,8 +44,15 @@ crates/                    # Rust workspace 成员（全部 gpui-free）
 ### 仓库边界（manox / manox-app 拆分）
 
 - 本仓库**不得引入 gpui 或任何 UI 依赖**；apps、cx 启动器、ext-agents、terminal-ui（GPUI 渲染层）已迁至 `dspo/manox-app`。终端仿真核心 `manox-terminal` 与 `hyperlinks` 已回流本仓，由 manox-app 经 git 依赖消费。
-- manox-app 经 git 依赖（branch=main + Cargo.lock 锁 rev）消费本仓库；本仓库 main 的每次 push 都可能被下游锁定引用——破坏性 API 变更须在 commit message 标注。下游约定：manox-app 合并前会把对本仓的依赖 bump 到最新兼容 commit，故 main 上任何提交都可能很快进入下游合并，保持 main 常绿。
+- manox-app 经 git 依赖（tag pin `tag = "vX.Y.Z"` + Cargo.lock 锁 rev）消费本仓库；本仓库 main 的每次 push 都可能很快成为下一个发布 tag 的内容——破坏性 API 变更须在 commit message 标注（`!`）。下游约定：manox-app 合并前会把对本仓的依赖 bump 到最新发布 tag，故 main 上任何提交都可能很快进入下游合并，保持 main 常绿。
 - 本仓库运行时状态根 `~/.manox/` 与 manox-app 共享（见下）；协议/磁盘格式（journal、db、sessions）的变更即两仓联合变更。
+
+### 发版（release）
+
+- **版本单源**：全部成员继承根 `[workspace.package].version`（`version.workspace = true`；成员自带 `version` 会被 `script/check_release_version.sh` 拒绝）。版本号是发布序号，不是 semver 契约（下游 pin 死 tag 等价 `=X.Y.Z`）；破坏性变更在 commit subject 标 `!`。
+- **发布动作**：内容合入 main 后，开 `chore(release): vX.Y.Z` PR 只改一行版本号；**合并后立刻在该 main commit 上打 `vX.Y.Z` tag 并 push**。tag 一律打在 main 的 commit 上，无 release 分支（v0.6.9 及更早打在 `release/0.6` 分支上的 tag 属历史遗留——勿模仿、勿移动，v0.6.10 起生效）。
+- **CI 守卫**：`.github/workflows/release-version.yml` 在 `v*` tag push 时校验 tag 名 == 该 commit 的 manifest 版本，不符即红；build 工作流同步跑单源检查。
+- **下游**：manox-app 一次 bump 其全部 manox 依赖的 `tag = "vX.Y.Z"`（`chore(deps): consume manox vX.Y.Z`）。
 
 ## 构建与开发命令
 
@@ -142,7 +149,7 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`；�
 
 ### 工作流约定
 
-- 独立 git worktree（`/private/tmp/manox--<branch>`）+ 常规分支命名（`feat/*` `fix/*` `hotfix/*` `release/*`，或个人前缀如 `dspo/*`）+ 正交 PR；发射点重叠时叠加 PR 并在 PR 中注明 base 关系与合入后 rebase 路径。
+- 独立 git worktree（`/private/tmp/manox--<branch>`）+ 常规分支命名（`feat/*` `fix/*` `chore/*` `hotfix/*`，或个人前缀如 `dspo/*`；**`release/*` 专用**——只用于承载实际发布分支（如 `release/0.6`），日常改动勿用）+ 正交 PR；发射点重叠时叠加 PR 并在 PR 中注明 base 关系与合入后 rebase 路径。
 - 每 PR 门禁：以 `script/gates.sh` 的输出为唯一权威（含 `--quick` 之外的完整四腿），不做手挑 `cargo test` 的假绿声明。
 - 已知沙箱环境性测试失败（harness 的 bind 类 provider 测试、IPC socket 测试）记录在案、不计回归；整机并发 timing flake 同样不计回归。**再记一条**（2026-09-28，CI ubuntu-latest 实测）：`manox_harness::core::session::jsonl::tests::test_message_entry_writes_camel_case_parent_id` 在 CI 全量跑中偶发 `Option::unwrap() on a None value`（`jsonl.rs` 的 `.find(...)` 找不到刚写的 `child` 行）。**实测样本**：同一 commit 三次 CI —— 一次绿、两次红，故是**非确定性**失败，不是稳定回归；同一 job 在本仓历史上也出现过别的并发类 flake（`concurrent_open_session_yields_one_entry_one_pump`、`concurrent_cold_appends_land_a_linear_chain`）。**本地无法复现**（macOS 上单独跑与全量跑各多次均恒过），故未定位到根因。已排查并排除的方向：该测试用独立 `tempfile::tempdir`，不共享状态；读路径持 shared `flock`、写路径持 exclusive `flock`，锁序正确；`#818` 对 `manox-harness` 的唯一改动是给 `PlanReview` 变体加两个 `#[serde(default)]` 字段（纯增量），而 `jsonl.rs` 根本不引用 `PlanReview`，**无因果通路**。判定：环境性/未定位，不计回归。**升级条件**：若它开始稳定失败（而非偶发），按真缺陷排查——优先怀疑「写完立刻从另一路径读回」的可见性窗口（`write_all` 后未 flush 即释放 fence 的 fd）。**再记一条**（2026-09-29，本机全量跑偶发、单跑与复跑恒过）：`manox_agent::engine::tests::journal_replay_is_consistent_across_disk_reload`——断言跨盘回读的 display 投影一致，时间戳为秒级精度，写入跨秒边界时两侧相差 1s 导致断言失败；与本 diff 无关，属测试自身的时钟边界脆性。**改一条**（2026-09-30，2026-10-15 随 Monitor 退役再改名）：旧条目 `manox_agent::monitor_bridge::monitor_spawn_bridges_snapshots`（整机并发 timing flake）未随 monitor_bridge 退场消失——该测试随宿主 TaskCenter 落地改名，Monitor 退役后又改现为 **`manox_agent::background_task::tests::host_observer_bridges_background_bash_snapshots`**（测试体同形：真起 echo 后台 bash 任务 + deadline 轮询通知），flake 记录对新名继续有效，观察勿从零重诊。**再记一条**（2026-09-30，本机全量 `cargo test --workspace --all-targets` 偶发、随后 16 轮 manox-agent lib 单跑 + 5 轮全量复跑恒过）：manox-agent lib 套件一次非确定性失败，测试名未能捕获（门禁日志经 tail 管道只留摘要）；发生在 PR codex/task-surface-pr3（HostTaskObserver 接线）门禁期间，同代码复跑不复现，暂记环境性/未定位，**升级条件**同上——若稳定失败按真缺陷排查，优先怀疑 observer 异步结算与同步 stop 终态推的 first-wins 竞争窗口。**流程补救**：门禁日志落盘（`> file`）而非管道 `| tail`，避免失败记录连测试名都留不下。**再记一条**（2026-10-08，gates 全量并发跑中一次非确定性失败、单跑与整包复跑恒过）：`manox_session_core::ahp_adapter_tests::dispatch::pending_message_set_parks_the_steer_under_its_id`——断言「steer 打进运行中的 turn 时回报 injected:true」实际拿到 `injected:false`（steer 到达早于 turn 真正开跑，测试自身的同步竞态），与 de-provenance diff 无因果通路（该 diff 未触碰 session-core 投递逻辑）；判定：满载 timing flake，不计回归，升级条件同上。
 - PR 写清 Test Plan 与 Assumptions；注释必须准确描述代码（注释错位即回归，单独修复）。

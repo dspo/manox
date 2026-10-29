@@ -19,6 +19,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Same check as gates leg "version": the manifest version is
+      # single-sourced at [workspace.package].version.
+      - name: Release version single-source
+        run: ./script/check_release_version.sh
+
       - name: Install system dependencies
         run: |
           sudo apt-get update -y
