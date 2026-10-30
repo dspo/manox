@@ -63,7 +63,7 @@ struct ClipboardReadInput {}
 #[async_trait::async_trait]
 impl AgentTool for ClipboardReadTool {
     fn name(&self) -> &str {
-        "ClipboardRead"
+        crate::tools::CLIPBOARD_READ
     }
     fn description(&self) -> &str {
         "Read the host's system clipboard as plain text. Returns empty output \
@@ -110,7 +110,7 @@ struct OpenExternalInput {
 #[async_trait::async_trait]
 impl AgentTool for OpenExternalTool {
     fn name(&self) -> &str {
-        "Open"
+        crate::tools::OPEN
     }
     fn description(&self) -> &str {
         "Open a URL or file path in the host's default handler (browser / \
