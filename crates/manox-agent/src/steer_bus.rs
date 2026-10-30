@@ -498,7 +498,7 @@ const STEER_DESCRIPTION: &str = "Steer your subagents and TeamMembers — the si
 #[async_trait::async_trait]
 impl AgentTool for SteerTool {
     fn name(&self) -> &str {
-        "Steer"
+        crate::tools::STEER
     }
 
     fn description(&self) -> &str {

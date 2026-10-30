@@ -31,6 +31,12 @@ pub const UPDATE_PLAN: &str = "UpdatePlan";
 pub const UPDATE_GOAL: &str = "UpdateGoal";
 pub const WEB_FETCH: &str = "WebFetch";
 pub const TASK_STOP: &str = "TaskStop";
+pub const TASK_LIST: &str = "TaskList";
+pub const CLIPBOARD_READ: &str = "ClipboardRead";
+pub const OPEN: &str = "Open";
+pub const STEER: &str = "Steer";
+
+pub const LS: &str = "Ls";
 
 pub const WRITE: &str = "Write";
 
