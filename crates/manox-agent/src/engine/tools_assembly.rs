@@ -579,7 +579,7 @@ pub(super) const TASKLIST_DESCRIPTION: &str = "List this session's background ta
 #[async_trait::async_trait]
 impl manox_harness::tool::AgentTool for HostTaskList {
     fn name(&self) -> &str {
-        "TaskList"
+        crate::tools::TASK_LIST
     }
     fn description(&self) -> &str {
         TASKLIST_DESCRIPTION

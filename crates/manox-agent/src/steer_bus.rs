@@ -195,7 +195,7 @@ impl SteerTool {
 #[async_trait::async_trait]
 impl AgentTool for SteerTool {
     fn name(&self) -> &str {
-        "Steer"
+        crate::tools::STEER
     }
 
     fn description(&self) -> &str {
