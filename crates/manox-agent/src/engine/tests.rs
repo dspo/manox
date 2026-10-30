@@ -3113,6 +3113,7 @@ fn delegation_tool_description_carries_definition_and_contract() {
         "Read-only codebase exploration",
         "read-only",
         "Explore",
+        false,
     );
     assert!(
         rendered.contains("[capability: read-only]"),
@@ -3133,6 +3134,31 @@ fn delegation_tool_description_carries_definition_and_contract() {
     assert!(
         rendered.contains("may escalate a denied command"),
         "description declares the bounded escalation channel: {rendered}"
+    );
+}
+
+/// The waiting contract tracks the definition's `background` declaration:
+/// a background-default tool must not be taught the foreground default,
+/// and it must state that the flag cannot foreground it.
+#[test]
+fn delegation_tool_description_flips_the_waiting_contract_on_a_background_default() {
+    let rendered = crate::subagent::delegation_description(
+        "Long-running sweep",
+        "write+bash",
+        "Sweeper",
+        true,
+    );
+    assert!(
+        rendered.contains("returns immediately"),
+        "background default declares the non-blocking call: {rendered}"
+    );
+    assert!(
+        rendered.contains("cannot foreground it"),
+        "background default states the flag is not an override: {rendered}"
+    );
+    assert!(
+        !rendered.contains("By default the call waits"),
+        "the foreground waiting sentence must not contradict the declaration: {rendered}"
     );
 }
 
@@ -5703,6 +5729,63 @@ async fn a_sandbox_pinned_child_stays_confined_under_a_full_access_captain() {
     assert!(
         err.contains("[sandbox: file access denied under sandbox mode]"),
         "the pin fences the write: {err}"
+    );
+}
+
+/// The two-path tool resolution — `resolve_delegation_tool` filters
+/// definitions against `build(None)` at assembly, `validate_filter_names`
+/// checks the request against `build(Some(decl))` at dispatch — is only
+/// safe while the child snapshot's NAME set is invariant across the
+/// permission declaration. A declaration-dependent name set would turn a
+/// definition's resolved allow/deny name into a per-dispatch failure naming
+/// a tool the author spelled correctly. Pin the invariant.
+#[test]
+fn child_snapshot_name_set_is_invariant_across_permission_declarations() {
+    use manox_harness::ext_point_agent::{AgentPermissions, NetworkPermission, PermissionMode};
+
+    let gate = subagent_test_gate();
+    let dir = tempfile::tempdir().unwrap();
+    let ops = Arc::new(TaggedBashOps {
+        tag: "shared",
+        calls: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn manox_harness::tools::bash::BashOperations>;
+    let assembly = ChildAssembly {
+        gate: Arc::clone(&gate),
+        standing_resolver: {
+            let gate = Arc::clone(&gate);
+            Arc::new(move || gate.mode())
+        },
+        shared_ops: Arc::clone(&ops),
+        unsandboxed_ops: Some(Arc::clone(&ops)),
+        sandbox_available: true,
+        cwd: dir.path().to_path_buf(),
+        granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()),
+    };
+    let names = |declaration: Option<AgentPermissions>| {
+        let mut set: Vec<String> = assembly
+            .build(declaration.as_ref())
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        set.sort();
+        set
+    };
+    assert!(
+        !names(None).is_empty(),
+        "the undeclared snapshot carries the fixed child universe"
+    );
+    assert_eq!(
+        names(None),
+        names(Some(AgentPermissions::default())),
+        "an inherit declaration names the same tools as no declaration"
+    );
+    assert_eq!(
+        names(None),
+        names(Some(AgentPermissions {
+            mode: PermissionMode::Sandbox,
+            network: NetworkPermission::Off,
+        })),
+        "the tightest pin narrows resolver wiring only — never the name set"
     );
 }
 
