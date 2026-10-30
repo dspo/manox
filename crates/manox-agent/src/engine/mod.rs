@@ -3250,6 +3250,7 @@ fn session_info_to_summary(
         depth: 0,
         parent_id: crate::thread_store::team_parent_id(info)
             .or_else(|| info.parent_session_path.clone()),
+        subagent: false,
         archived: false,
         pinned: false,
         // The actor's mirror never reads the sidecar; tags stay sidebar-only.

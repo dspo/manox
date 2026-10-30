@@ -123,8 +123,17 @@ impl AhpRuntime {
         let Some(store) = manox_agent::thread_store::try_global() else {
             return;
         };
-        let rows: Vec<String> =
-            store.read(|state| state.summaries().iter().map(|row| row.id.clone()).collect());
+        // The child partition joins the diff: a run dispatched mid-session
+        // must announce its catalogue row (annotated with parent/kind) the
+        // same way a fresh captain does.
+        let rows: Vec<String> = store.read(|state| {
+            state
+                .summaries()
+                .iter()
+                .chain(state.child_summaries().iter().filter(|row| !row.archived))
+                .map(|row| row.id.clone())
+                .collect()
+        });
         let active: std::collections::HashSet<String> = rows.iter().cloned().collect();
         let mut published = self.published.lock();
         for session_id in &rows {
