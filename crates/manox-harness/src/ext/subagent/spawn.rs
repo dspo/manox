@@ -504,15 +504,18 @@ impl SubagentProvider for SpawnProvider {
                 tracing::warn!(%err, "child journal access_mode_change append failed");
             }
         }
-        // The live feed for the child's own chat plus the writer the mode
-        // propagation lands rows through: both registered for the run's
+        // The live feed for the child's own chat, the writer the mode
+        // propagation lands rows through, and the steer face the
+        // dispatcher's mid-run guidance rides: all registered for the run's
         // whole life (the drive task holds the guard, so they die on every
         // exit below), so a bridge attaching at any moment during the run
-        // finds the feed and a flip reaches a live child only. The pin rides
-        // the entry: a pinned run's mode cannot change, so flips land no row.
+        // finds the feed, a flip reaches a live child only, and a guidance
+        // message reaches a live turn only. The pin rides the writer entry:
+        // a pinned run's mode cannot change, so flips land no row.
         let feed_guard = ChildFeedGuard(run_id.clone());
         super::feeds::register_child_feed(&run_id, &session.subscribe_journal_sender());
         super::feeds::register_child_writer(&run_id, session.journal_appender(), pinned_mode);
+        super::feeds::register_child_steer(&run_id, &handle);
 
         let info = crate::ext::subagent::types::RunInfo {
             run_id: run_id.clone(),
@@ -540,7 +543,7 @@ impl SubagentProvider for SpawnProvider {
         let task_label = label.clone();
         tokio::spawn(async move {
             let _temp_guard = temp_guard; // hold the throwaway transcript dir alive
-            // Both registry halves (feed + writer) die with the run, on
+            // Every registry half (feed + writer + steer) dies with the run, on
             // every ending — the guard moved into the task lives to the
             // drive loop's exit, not just the dispatch return.
             let _feed_guard = feed_guard;
@@ -630,8 +633,8 @@ enum Ending {
     Stalled,
 }
 
-/// Removes the run's registry entries (the child feed and the mode-writer,
-/// both halves) when the drive task exits, on every ending — the guard is
+/// Removes the run's registry entries (the child feed, the mode-writer,
+/// and the steer face) when the drive task exits, on every ending — the guard is
 /// moved into the run task, so it lives to the loop's return, not the
 /// dispatch return.
 struct ChildFeedGuard(String);
@@ -640,6 +643,7 @@ impl Drop for ChildFeedGuard {
     fn drop(&mut self) {
         super::feeds::remove_child_feed(&self.0);
         super::feeds::remove_child_writer(&self.0);
+        super::feeds::remove_child_steer(&self.0);
     }
 }
 

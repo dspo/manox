@@ -338,31 +338,33 @@ pub struct RunInfo {
     pub tool_call_id: Option<String>,
 }
 
-/// The static per-definition configuration one model-facing delegation tool
-/// is built from (sourced from manox agent manifests + the providers
-/// config).
+/// The static per-definition dispatch configuration, sourced from manox
+/// agent manifests + the providers config. Definition resolution is
+/// engine-internal: the unified `Steer` tool dispatches against this
+/// config by registry name; no per-definition model-facing tool exists.
 #[derive(Debug, Clone)]
-pub struct DelegationToolConfig {
-    /// The provider registry name the tool dispatches on (e.g. `spawn`).
+pub struct SubagentDefConfig {
+    /// The provider registry name dispatches run on (e.g. `spawn`).
     pub provider: String,
-    /// Tool name — the definition's registry name.
+    /// The definition's registry name — the `Steer` `to.spawn` value and
+    /// the run's `kind` identity.
     pub name: String,
     /// Capability tag (`read-only` / `write+bash` / …) surfaced in the
-    /// description.
+    /// `ListAgents` catalog.
     pub capability: String,
-    /// The full rendered tool description (host-assembled from the fields
-    /// above plus the dispatch contract).
-    pub rendered_description: String,
+    /// The definition's own description (what it is for), as the catalog
+    /// lists it.
+    pub description: String,
     /// The definition body — the child's persona/system prompt.
     pub persona: String,
     /// The definition's `tools:` allow list; empty = the full snapshot.
     pub default_tools: Vec<String>,
     /// The definition's `disallowedTools:` deny list, removed from whatever
-    /// survives the allow pass. Pre-sanitized at assembly (unknown names
+    /// survives the allow pass. Pre-resolved at assembly (unknown names
     /// warn-and-dropped there).
     pub default_denied_tools: Vec<String>,
-    /// Raw `model:` frontmatter spec, resolved by the tool against the
-    /// provider registry at construction.
+    /// Raw `model:` frontmatter spec, resolved against the provider
+    /// registry at dispatch.
     pub frontmatter_model_spec: Option<String>,
     /// Raw dedicated spec from the providers config `subagents:` map —
     /// wins over the frontmatter.
@@ -389,7 +391,7 @@ pub struct DelegationToolConfig {
     /// never widen it; `inherit` axes (the default) follow the dispatcher's
     /// own authority live.
     pub declared_permissions: AgentPermissions,
-    /// Absolute delegation-depth cap for dispatches through this tool.
+    /// Absolute delegation-depth cap for dispatches through this config.
     pub max_depth: u32,
 }
 

@@ -1,14 +1,21 @@
-//! Host-side subagent delegation surface:
+//! Host-side subagent scheduling surface:
 //!
-//! - [`DelegationTool`]: one model-facing tool per agent definition (name =
-//!   definition name), bound to the `spawn` provider. Foreground by default
-//!   (the tool result IS the child's final output); `run_in_background`
-//!   parks the run on a background card and delivers the settled result as
-//!   a peer report. A definition declaring `background: true` flips its
-//!   own default the other way — its dispatches always go to the
-//!   background card, and the flag cannot foreground them.
-//! - [`ListAgentsTool`] / [`InterruptAgentTool`]: the control pair over the
-//!   runtime's live-run table.
+//! - [`SubagentDispatcher`]: the one dispatch path the Captain's `Steer`
+//!   tool routes through — parameter parsing (fail-loud), permission
+//!   narrowing, model resolution, budget validation, the
+//!   foreground/background promotion split, and the settlement delivery.
+//!   Foreground by default (the tool result IS the child's final output);
+//!   `run_in_background` parks the run on a background card and delivers
+//!   the settled result as a peer report. A definition declaring
+//!   `background: true` flips its own default the other way — its
+//!   dispatches always go to the background card, and the flag cannot
+//!   foreground them.
+//! - [`SubagentCatalog`]: the definition catalog (`SubagentDefConfig` per
+//!   agent definition) dispatches resolve against. Definition resolution is
+//!   engine-internal config — no per-definition model-facing tool exists.
+//! - [`ListAgentsTool`]: the live-run table snapshot with the watchdog's
+//!   health verdict per row, plus the definition catalog the `Steer`
+//!   `to.spawn` values are picked from.
 //! - [`SubagentRunObserver`]: the [`RunObserver`] bridge folding ext-level
 //!   run events into this host's transcript rail, health watchdog, and
 //!   background cards.
@@ -17,13 +24,13 @@
 //! that touches host-owned surfaces (ThreadEvent notices, the watchdog,
 //! background cards, peer delivery) flows through here.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use manox_harness::subagent::{
-    Budgets, DelegationToolConfig, RunEndInfo, RunInfo, RunObserver, RunResult, StopReason,
+    Budgets, RunEndInfo, RunInfo, RunObserver, RunResult, StopReason, SubagentDefConfig,
     SubagentRuntime, ToolFilter,
 };
 use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
@@ -35,64 +42,17 @@ use crate::subagent_watchdog::SubagentWatchdog;
 use crate::thread::ThreadEvent;
 use crate::thread_engine::{BackendNotice, send_notice};
 
-/// Sanitize a definition's registry name into a model-facing tool name.
-/// Provider wire APIs constrain tool names to `[A-Za-z0-9_-]{1,64}` (a name
-/// like the plugin namespacing's `remora:remora-task` would make every
-/// provider request of the session fail with a 400 — tool definitions ride
-/// each request's cached prefix). Out-of-charset characters map to `_`.
-/// `None` = unusable (empty after cleaning, or a collision with an
-/// already-registered tool name) and the assembly skips the definition's
-/// delegation tool loudly.
-pub fn sanitized_tool_name(def_name: &str, taken: &HashSet<String>) -> Option<String> {
-    let cleaned: String = def_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(64)
-        .collect();
-    if cleaned.is_empty() || taken.contains(&cleaned) {
-        None
-    } else {
-        Some(cleaned)
-    }
-}
-
-/// One definition's assembly result: the sanitized wire tool name and the
-/// definition `tools:`/`disallowedTools:` lists resolved (warn-and-skip)
-/// against the child snapshot.
-pub struct DelegationAssembly {
-    pub tool_name: String,
-    pub default_tools: Vec<String>,
-    pub default_denied: Vec<String>,
-}
-
-/// Resolve one agent definition into its delegation tool identity.
-/// `None` = the definition is skipped loudly (no usable wire name after
-/// sanitizing, or a collision with an already-taken tool name). Definition
-/// `tools:` data is definition data, not a call parameter: unknown names
-/// and privileged names (human-interaction tools, `Steer`) warn and skip
-/// instead of failing every dispatch — the request-param filter path stays
-/// fail-loud. `disallowedTools:` names resolve the same way; a deny name the
-/// child never had is dropped with the same warn (it would be a silent
-/// no-op).
-pub fn resolve_delegation_tool(
+/// Resolve one agent definition's `tools:`/`disallowedTools:` lists
+/// (warn-and-skip) against the child snapshot. Definition `tools:` data is
+/// definition data, not a call parameter: unknown names and privileged
+/// names (human-interaction tools, `Steer`) warn and skip instead of
+/// failing every dispatch — the request-param filter path stays fail-loud.
+/// `disallowedTools:` names resolve the same way; a deny name the child
+/// never had is dropped with the same warn (it would be a silent no-op).
+pub fn resolve_definition_filters(
     def: &manox_harness::ext_point_agent::AgentDef,
-    taken: &HashSet<String>,
     snapshot_names: &HashSet<String>,
-) -> Option<DelegationAssembly> {
-    let tool_name = sanitized_tool_name(&def.name, taken)?;
-    if tool_name != def.name {
-        tracing::info!(
-            def = %def.name,
-            tool = %tool_name,
-            "agent definition name sanitized into the provider wire charset"
-        );
-    }
+) -> (Vec<String>, Vec<String>) {
     let resolve_list = |names: &[String]| -> Vec<String> {
         names
             .iter()
@@ -129,13 +89,10 @@ pub fn resolve_delegation_tool(
             .cloned()
             .collect()
     };
-    let default_tools = resolve_list(&def.tools);
-    let default_denied = resolve_list(&def.disallowed_tools);
-    Some(DelegationAssembly {
-        tool_name,
-        default_tools,
-        default_denied,
-    })
+    (
+        resolve_list(&def.tools),
+        resolve_list(&def.disallowed_tools),
+    )
 }
 
 /// The manifest `effort:` vocabulary mapped onto this runtime's reasoning
@@ -183,90 +140,130 @@ fn is_inherit_model(spec: &str) -> bool {
     spec.eq_ignore_ascii_case("inherit")
 }
 
-// ── DelegationTool ───────────────────────────────────────────────────────
+// ── Definition catalog + dispatcher ──────────────────────────────────────
 
-/// One model-facing delegation tool, configured from a single agent
-/// definition. The definition's body is the child's persona, its `tools`
-/// frontmatter the default allow filter, and its `model` frontmatter the
-/// default route (explicit per-call `model`/`reasoning_effort` parameters
-/// win over the configured spec, which wins over the frontmatter).
-pub struct DelegationTool {
-    runtime: Arc<SubagentRuntime>,
-    observer: Arc<SubagentRunObserver>,
-    config: DelegationToolConfig,
-    /// Registry for resolving model specs (`provider::model::effort`).
-    /// Resolution happens at dispatch — the provider catalog may still be
-    /// filling in when a resume-at-launch session assembles, and an
-    /// unresolvable declared route fails that dispatch loudly rather than
-    /// silently inheriting the caller's model.
-    provider_registry: Option<Arc<manox_harness::core::ProviderRegistry>>,
-    parent_depth: u32,
-    parent_session: Option<String>,
-    env: Arc<dyn manox_harness::core::env::ExecutionEnv>,
-    cwd: PathBuf,
+/// The definition catalog the Steer surface dispatches against: one entry
+/// per registered agent definition, in registry order. `ListAgents` lists
+/// it; a dispatch resolves its `to.spawn` value here.
+pub(crate) struct SubagentCatalog {
+    defs: Vec<SubagentDefConfig>,
 }
 
-impl DelegationTool {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        runtime: Arc<SubagentRuntime>,
-        observer: Arc<SubagentRunObserver>,
-        config: DelegationToolConfig,
-        provider_registry: Option<Arc<manox_harness::core::ProviderRegistry>>,
-        parent_depth: u32,
-        parent_session: Option<String>,
-        env: Arc<dyn manox_harness::core::env::ExecutionEnv>,
-        cwd: PathBuf,
-    ) -> Self {
-        DelegationTool {
-            runtime,
-            observer,
-            config,
-            provider_registry,
-            parent_depth,
-            parent_session,
-            env,
-            cwd,
-        }
+impl SubagentCatalog {
+    pub(crate) fn new(defs: Vec<SubagentDefConfig>) -> Self {
+        SubagentCatalog { defs }
     }
 
-    /// The dispatch's effective permission ceiling: the `permissions` param
-    /// (parsed fail-loud) narrowed into the definition's declaration.
-    fn resolve_dispatch_permissions(
-        &self,
-        params: &serde_json::Value,
-    ) -> Result<Option<manox_harness::ext_point_agent::AgentPermissions>, ToolError> {
-        resolve_dispatch_permissions(self.config.declared_permissions, params)
+    pub(crate) fn get(&self, name: &str) -> Option<&SubagentDefConfig> {
+        self.defs.iter().find(|def| def.name == name)
     }
 
+    pub(crate) fn defs(&self) -> &[SubagentDefConfig] {
+        &self.defs
+    }
+}
+
+/// The per-assembly handles every subagent dispatch needs: the host
+/// observer, the provider registry (model-spec resolution happens at
+/// dispatch — the catalog may still be filling in when a resume-at-launch
+/// session assembles), the execution environment, and the dispatching
+/// lineage. The runtime run table is passed per call — the Steer arms hold
+/// the same `Arc` the live-address checks read.
+pub(crate) struct SubagentDispatcher {
+    pub(crate) observer: Arc<SubagentRunObserver>,
+    pub(crate) provider_registry: Option<Arc<manox_harness::core::ProviderRegistry>>,
+    pub(crate) env: Arc<dyn manox_harness::core::env::ExecutionEnv>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) parent_depth: u32,
+    pub(crate) parent_session: Option<String>,
+}
+
+/// One Dispatch's parsed-and-validated parameters, ready for
+/// [`SubagentDispatcher::dispatch`]. The `promote_after` split is the
+/// foreground/background contract: foreground waiting is a choice with an
+/// exit — the wall-clock budget promotes the wait instead of killing the
+/// run, so a foreground run starts WITHOUT the wall-clock budget (the idle
+/// watchdog stays armed) and the caller enforces promotion itself.
+#[derive(Debug)]
+pub(crate) struct ResolvedDispatch {
+    pub(crate) label: String,
+    pub(crate) prompt: String,
+    pub(crate) run_in_background: bool,
+    pub(crate) budgets: Budgets,
+    pub(crate) isolation: Option<String>,
+    pub(crate) permissions: Option<manox_harness::ext_point_agent::AgentPermissions>,
+    pub(crate) agent_options: Option<manox_harness::subagent::AgentOptions>,
+    pub(crate) tool_filter: Option<ToolFilter>,
+    pub(crate) promote_after: Option<u64>,
+    /// `Some(run_id)` = a continuation: the settled child session the id
+    /// names reopens and `prompt` is the follow-up. The dispatch otherwise
+    /// behaves exactly like a first run.
+    pub(crate) continuation: Option<String>,
+}
+
+/// The request parameter's optional-scalar reads: absent and explicit-null
+/// are the same "not given"; a present value of the wrong JSON type is a
+/// loud invalid argument — a silently ignored typo would run the child
+/// under a different contract than asked.
+fn optional_str(params: &serde_json::Value, key: &str) -> Result<Option<String>, ToolError> {
+    match params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(str::to_string)
+            .map(Some)
+            .ok_or_else(|| wrong_type(key)),
+    }
+}
+
+fn optional_u64(params: &serde_json::Value, key: &str) -> Result<Option<u64>, ToolError> {
+    match params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| wrong_type(key)),
+    }
+}
+
+fn optional_bool(params: &serde_json::Value, key: &str) -> Result<Option<bool>, ToolError> {
+    match params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value.as_bool().map(Some).ok_or_else(|| wrong_type(key)),
+    }
+}
+
+fn wrong_type(key: &str) -> ToolError {
+    ToolError::InvalidArguments(format!("`{key}` has the wrong JSON type."))
+}
+
+impl SubagentDispatcher {
     /// Resolve a declared spec (`config` wins over `frontmatter`) at
     /// dispatch time. `Ok(None)` when nothing is declared; a declared
     /// override that cannot resolve is a loud dispatch error — never a
     /// silent fallback to the caller's model.
     fn resolve_declared_model(
         &self,
+        config: &SubagentDefConfig,
     ) -> Result<Option<(manox_harness::types::Model, Option<String>)>, ToolError> {
-        if let Some(spec) = self.config.config_model_spec.as_deref() {
+        if let Some(spec) = config.config_model_spec.as_deref() {
             let registry = self.provider_registry.as_ref().ok_or_else(|| {
                 ToolError::ExecutionFailed(format!(
                     "agent `{}` has a dedicated model config `{spec}` but no provider registry \
                      is available to resolve it",
-                    self.config.name
+                    config.name
                 ))
             })?;
             let resolved =
                 manox_harness::model_ref::resolve_model_spec(registry, spec).map_err(|e| {
                     ToolError::ExecutionFailed(format!(
                         "agent `{}` dedicated model config `{spec}` did not resolve: {e}",
-                        self.config.name
+                        config.name
                     ))
                 })?;
             return Ok(Some((resolved.model, resolved.effort)));
         }
-        if let Some(reference) = self.config.frontmatter_model_spec.as_deref() {
+        if let Some(reference) = config.frontmatter_model_spec.as_deref() {
             if is_inherit_model(reference) {
                 tracing::debug!(
-                    agent = %self.config.name,
+                    agent = %config.name,
                     "frontmatter model `inherit` dispatches on the caller's model"
                 );
                 return Ok(None);
@@ -275,199 +272,68 @@ impl DelegationTool {
                 ToolError::ExecutionFailed(format!(
                     "agent `{}` declares model override `{reference}` but no provider registry \
                      is available to resolve it",
-                    self.config.name
+                    config.name
                 ))
             })?;
             let model = manox_harness::model_ref::resolve_model_ref(registry, reference)
                 .ok_or_else(|| {
                     ToolError::ExecutionFailed(format!(
                         "agent `{}` model override `{reference}` did not resolve",
-                        self.config.name
+                        config.name
                     ))
                 })?;
             return Ok(Some((model, None)));
         }
         Ok(None)
     }
-}
 
-/// Build the model-facing description: the definition's own description and
-/// capability tag plus the dispatch contract (fresh context, the waiting
-/// contract the definition declares, budgets). `background_default` flips
-/// the waiting sentence — the contract the model is taught must match what
-/// the dispatch actually does, per definition, never a generic claim a
-/// `background: true` definition silently contradicts. Model-facing
-/// English — never localized.
-pub fn delegation_description(
-    description: &str,
-    capability: &str,
-    name: &str,
-    background_default: bool,
-) -> String {
-    let waiting = if background_default {
-        "The call returns immediately: the definition declares `background: true`, \
-         so the run goes to a background card and the report arrives as a message \
-         when it settles (`run_in_background: false` cannot foreground it)."
-    } else {
-        "By default the call waits and returns the child's final report; set \
-         `run_in_background: true` to run it on a background card instead and \
-         receive the report as a message when it settles."
-    };
-    format!(
-        "{description} [capability: {capability}] Dispatch a `{name}` subagent — a \
-         fresh-context worker that cannot see this conversation. Required: \
-         `description` (short task label) and `prompt` (the full task; the child \
-         only knows what you write). {waiting} `timeout_ms`/`idle_timeout_ms` \
-         (min {}ms, max 30 days) arm \
-         kill budgets that deliver a partial report on expiry. The optional \
-         `permissions` object ({{ mode: inherit|sandbox|full-access, \
-         network: inherit|off|on }}) narrows the child's access for this \
-         dispatch only — it can never exceed the agent's own declared \
-         ceiling or this session's authority; wider requests are refused. \
-         Under a sandboxed dispatch the child may escalate a denied command \
-         or write through an approval card on this conversation (bounded \
-         per run). It cannot delegate further.",
-        manox_harness::subagent::MIN_BUDGET_MS
-    )
-}
-
-#[async_trait::async_trait]
-impl AgentTool for DelegationTool {
-    fn name(&self) -> &str {
-        &self.config.name
-    }
-
-    fn description(&self) -> &str {
-        &self.config.rendered_description
-    }
-
-    fn is_read_only(&self) -> bool {
-        self.config.capability == "read-only"
-    }
-
-    fn requires_approval(&self, _params: &serde_json::Value) -> bool {
-        false
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        // A background-default definition keeps the flag in the schema (the
-        // request still parses) but says what it actually does there, so
-        // the model is never taught an override that does nothing.
-        let run_in_background_hint = if self.config.frontmatter_background {
-            "Run on a background card and deliver the report as a message on \
-             settlement instead of blocking this call until the final report. \
-             This definition always dispatches to the background; the flag \
-             cannot foreground it."
-        } else {
-            "Run on a background card and deliver the report as a message on \
-             settlement instead of blocking this call until the final report."
-        };
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "description": {
-                    "type": "string",
-                    "description": "Short task label (shown on the run card and used as the child's creation label)."
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "The full task for the child. It runs with a fresh context: include every fact, path, and done-criterion it needs, and ask for a concise final report."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Optional model override (provider::model, or provider::model::effort)."
-                },
-                "reasoning_effort": {
-                    "type": "string",
-                    "enum": ["off", "low", "medium", "high", "max"],
-                    "description": "Optional reasoning effort for the child's model."
-                },
-                "replay_thinking": {
-                    "type": "boolean",
-                    "description": "Replay the child's thinking blocks from earlier turns on later requests. Off by default: historical reasoning is dropped to save tokens, while the current turn's thinking is always kept."
-                },
-                "run_in_background": {
-                    "type": "boolean",
-                    "description": run_in_background_hint,
-                },
-                "timeout_ms": {
-                    "type": "integer",
-                    "description": "Optional wall-clock budget in milliseconds (min 1000, max 30 days). On expiry the child is terminated and a report with its partial output is delivered."
-                },
-                "idle_timeout_ms": {
-                    "type": "integer",
-                    "description": "Optional idle budget in milliseconds (min 1000, max 30 days): the longest stretch with no activity and no tool running before the child is terminated as stalled. Enforcement granularity is ~5s."
-                },
-                "isolation": {
-                    "type": "string",
-                    "enum": ["worktree"],
-                    "description": "Run the child in a throwaway git worktree; a worktree with committed work is kept and reported."
-                },
-                "permissions": {
-                    "type": "object",
-                    "description": "Optional per-dispatch permission override for this child. Narrowing only: each named axis must stay within the agent's declared ceiling on that axis — a wider naming is refused — unnamed axes keep the declared ceiling, and nothing can exceed this session's own authority.",
-                    "properties": {
-                        "mode": {
-                            "type": "string",
-                            "enum": ["inherit", "sandbox", "full-access"],
-                            "description": "`sandbox` confines the child's Bash regardless of this session's mode; `inherit`/`full-access` both follow this session's live mode."
-                        },
-                        "network": {
-                            "type": "string",
-                            "enum": ["inherit", "off", "on"],
-                            "description": "`off` keeps the child's confined commands off the network regardless of this session's switch; `inherit`/`on` both follow this session's live route."
-                        }
-                    },
-                    "additionalProperties": false
-                }
-            },
-            "required": ["description", "prompt"]
-        })
-    }
-
-    async fn execute(
+    /// Parse and validate one Dispatch's parameters against a definition's
+    /// config: fail-loud scalar parsing, budget validation, permission
+    /// narrowing into the declared ceiling, model resolution (explicit
+    /// parameter > dedicated config spec > frontmatter), and the
+    /// foreground/background promotion split. The model-facing contract is
+    /// the `Steer` tool's schema; this is its enforcement.
+    pub(crate) fn resolve_dispatch(
         &self,
-        _tool_call_id: &str,
-        params: serde_json::Value,
-        signal: CancellationToken,
-        _ctx: &dyn ToolContext,
-    ) -> Result<AgentToolResult, ToolError> {
-        let description = string_param(&params, "description")
+        config: &SubagentDefConfig,
+        params: &serde_json::Value,
+    ) -> Result<ResolvedDispatch, ToolError> {
+        let label = string_param(params, "description")
             .ok_or_else(|| ToolError::InvalidArguments("'description' is required".into()))?;
-        let prompt = string_param(&params, "prompt")
+        let prompt = string_param(params, "prompt")
             .ok_or_else(|| ToolError::InvalidArguments("'prompt' is required".into()))?;
-        let run_in_background = params
-            .get("run_in_background")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            || self.config.frontmatter_background;
-        // Continue a settled run: the child session the id names reopens and
-        // `prompt` is the follow-up. The dispatch otherwise behaves exactly
-        // like a first run — same budgets, promotion, settlement, delivery.
-        let continue_run_id = string_param(&params, "continue_run_id");
+        let background_default = config.frontmatter_background;
+        let run_in_background =
+            optional_bool(params, "run_in_background")?.unwrap_or(false) || background_default;
         let budgets = Budgets {
-            timeout_ms: params.get("timeout_ms").and_then(|v| v.as_u64()),
-            idle_timeout_ms: params.get("idle_timeout_ms").and_then(|v| v.as_u64()),
+            timeout_ms: optional_u64(params, "timeout_ms")?,
+            idle_timeout_ms: optional_u64(params, "idle_timeout_ms")?,
         };
         budgets
             .validate()
             .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        let isolation = params
-            .get("isolation")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| self.config.frontmatter_isolation.clone());
-        if self.parent_depth + 1 > self.config.max_depth {
+        let isolation = match optional_str(params, "isolation")? {
+            Some(isolation) => {
+                if isolation != "worktree" {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "`isolation` `{isolation}` is not a known value; expected \"worktree\"."
+                    )));
+                }
+                Some(isolation.to_string())
+            }
+            None => config.frontmatter_isolation.clone(),
+        };
+        if self.parent_depth + 1 > config.max_depth {
             return Err(ToolError::InvalidArguments(format!(
                 "delegation depth budget exhausted: this agent may not delegate (cap {})",
-                self.config.max_depth
+                config.max_depth
             )));
         }
         let mut tool_filter: Option<ToolFilter> = None;
-        if !self.config.default_tools.is_empty() || !self.config.default_denied_tools.is_empty() {
+        if !config.default_tools.is_empty() || !config.default_denied_tools.is_empty() {
             tool_filter = Some(ToolFilter {
-                allow: self.config.default_tools.clone(),
-                deny: self.config.default_denied_tools.clone(),
+                allow: config.default_tools.clone(),
+                deny: config.default_denied_tools.clone(),
             });
         }
         // The permission ceiling: the dispatch override may narrow the
@@ -477,12 +343,12 @@ impl AgentTool for DelegationTool {
         // the structural upper bound (the child's resolvers can never answer
         // wider than the dispatching gate), so a `full-access`/`on` ask under
         // a more confined dispatcher settles at the dispatcher's face.
-        let permissions = self.resolve_dispatch_permissions(&params)?;
+        let permissions = resolve_dispatch_permissions(config.declared_permissions, params)?;
         // Model precedence: explicit parameter > dedicated config spec >
         // frontmatter override. A parameter naming a model resolves it; an
         // unresolvable name fails the dispatch loudly.
-        let declared = self.resolve_declared_model()?;
-        let (model, declared_effort) = match string_param(&params, "model") {
+        let declared = self.resolve_declared_model(config)?;
+        let (model, declared_effort) = match string_param(params, "model") {
             Some(spec) => {
                 let registry = self.provider_registry.as_ref().ok_or_else(|| {
                     ToolError::InvalidArguments(
@@ -500,16 +366,24 @@ impl AgentTool for DelegationTool {
                 None => (None, None),
             },
         };
-        let effort = match string_param(&params, "reasoning_effort") {
-            Some(requested) => Some(requested),
+        let effort = match optional_str(params, "reasoning_effort")? {
+            Some(requested) => {
+                if !matches!(
+                    requested.as_str(),
+                    "off" | "low" | "medium" | "high" | "max"
+                ) {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "`reasoning_effort` `{requested}` is not a known value; expected one of \
+                         off | low | medium | high | max."
+                    )));
+                }
+                Some(requested.to_string())
+            }
             // Precedence: parameter > config spec (carried in declared_effort)
             // > the definition's own `effort:` frontmatter.
-            None => declared_effort.or_else(|| self.config.frontmatter_effort.clone()),
+            None => declared_effort.or_else(|| config.frontmatter_effort.clone()),
         };
-        let replay_thinking = params
-            .get("replay_thinking")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
+        let replay_thinking = optional_bool(params, "replay_thinking")?.unwrap_or(false);
         let agent_options = if model.is_some() || effort.is_some() || replay_thinking {
             Some(manox_harness::subagent::AgentOptions {
                 model,
@@ -519,30 +393,63 @@ impl AgentTool for DelegationTool {
         } else {
             None
         };
-        let card_title = description.clone();
-        // Foreground waiting is a choice with an exit: the wall-clock budget
-        // promotes the wait instead of killing the run. A foreground run is
-        // therefore started WITHOUT the wall-clock budget (the idle watchdog
-        // stays armed) and the caller enforces promotion itself — the run
-        // never races a kill it could have survived.
         let promote_after = if run_in_background {
             None
         } else {
             budgets.timeout_ms
         };
-        let request = manox_harness::subagent::StartRequest {
+        Ok(ResolvedDispatch {
+            label,
+            prompt,
+            run_in_background,
+            budgets,
+            isolation,
+            permissions,
+            agent_options,
+            tool_filter,
+            promote_after,
+            continuation: None,
+        })
+    }
+
+    /// The one dispatch: StartRequest assembly, the `run/*` lifecycle rows,
+    /// then either the foreground wait (with budget promotion to a
+    /// background card) or the background card + settlement delivery.
+    /// `dispatch.continuation` routes through `runtime.continue_run` — same
+    /// run id, reopened child session — instead of `start`.
+    pub(crate) async fn dispatch(
+        &self,
+        runtime: &Arc<SubagentRuntime>,
+        config: &SubagentDefConfig,
+        dispatch: ResolvedDispatch,
+        tool_call_id: &str,
+        signal: &CancellationToken,
+    ) -> Result<AgentToolResult, ToolError> {
+        let ResolvedDispatch {
             label: description,
-            kind: self.config.name.clone(),
+            prompt,
+            run_in_background,
+            budgets,
+            isolation,
+            permissions,
+            agent_options,
+            tool_filter,
+            promote_after,
+            continuation: continue_run_id,
+        } = dispatch;
+        let request = manox_harness::subagent::StartRequest {
+            label: description.clone(),
+            kind: config.name.clone(),
             prompt: prompt.clone(),
             agent_options,
-            max_depth: Some(self.config.max_depth),
-            max_turns: self.config.frontmatter_max_turns,
+            max_depth: Some(config.max_depth),
+            max_turns: config.frontmatter_max_turns,
             tool_filter,
             permissions,
-            persona: Some(self.config.persona.clone()),
+            persona: Some(config.persona.clone()),
             parent_depth: self.parent_depth,
             parent_session: self.parent_session.clone(),
-            tool_call_id: Some(_tool_call_id.to_string()),
+            tool_call_id: Some(tool_call_id.to_string()),
             continuation_of: continue_run_id.clone(),
             budgets: if run_in_background {
                 budgets
@@ -557,7 +464,7 @@ impl AgentTool for DelegationTool {
             cwd: self.cwd.clone(),
             // A background run's cancellation is its own: the dispatching
             // turn's abort must not reach it (it survives to deliver its
-            // report), and cancellation belongs to InterruptAgent / the
+            // report), and cancellation belongs to Steer Abort / the
             // card's TaskStop — both drive the runtime's dispose token.
             cancel: if run_in_background {
                 CancellationToken::new()
@@ -566,27 +473,25 @@ impl AgentTool for DelegationTool {
             },
         };
         let run = match &continue_run_id {
-            Some(run_id) => self
-                .runtime
-                .continue_run(&self.config.provider, run_id, request)
+            Some(run_id) => runtime
+                .continue_run(&config.provider, run_id, request)
                 .await
                 .map_err(tool_error_of)?,
-            None => self
-                .runtime
-                .start(&self.config.provider, request)
+            None => runtime
+                .start(&config.provider, request)
                 .await
                 .map_err(tool_error_of)?,
         };
         let run_id = run.id.clone();
         let run_id_for_result = run_id.clone();
-        // The run.s lifecycle row is the durable record — two rows per run,
+        // The run's lifecycle row is the durable record — two rows per run,
         // written once each; progress never rides the parent journal.
         // The rows carry the definition's `color:` so host surfaces tint the
         // run's identity; the key is absent when undeclared, and both
         // lifecycle rows agree so a reopened run keeps its color. The key is
         // the event's own wire name — the row IS the durable `Event`.
         let with_color = |mut row: serde_json::Value| {
-            if let Some(color) = &self.config.color {
+            if let Some(color) = &config.color {
                 row["color"] = serde_json::json!(color);
             }
             row
@@ -596,7 +501,7 @@ impl AgentTool for DelegationTool {
                 "run/continued",
                 with_color(serde_json::json!({
                     "runId": run_id.clone(),
-                    "kind": self.config.name,
+                    "kind": config.name,
                     "followUp": prompt,
                 })),
             ),
@@ -604,10 +509,10 @@ impl AgentTool for DelegationTool {
                 "run/started",
                 with_color(serde_json::json!({
                     "runId": run_id.clone(),
-                    "kind": self.config.name,
-                    "label": card_title.clone(), // the delivery keeps the label
+                    "kind": config.name,
+                    "label": description.clone(), // the delivery keeps the label
                     "childSession": run_id.clone(), // the invariant: the run id names the child session
-                    "toolCallId": _tool_call_id,
+                    "toolCallId": tool_call_id,
                     "budgets": {
                         "timeoutMs": budgets.timeout_ms,
                         "idleTimeoutMs": budgets.idle_timeout_ms,
@@ -627,21 +532,24 @@ impl AgentTool for DelegationTool {
                         // arrives through the same settlement delivery as a
                         // dispatched background run.
                         let cancel = run.dispose_token().clone();
-                        let (task_id, task) =
-                            background_task::register(self.owner_thread_id(), card_title.clone(), cancel);
+                        let (task_id, task) = background_task::register(
+                            self.observer.owner_thread_id.clone(),
+                            description.clone(),
+                            cancel,
+                        );
                         send_notice(
-                            &self.notice_tx(),
+                            &self.observer.notice_tx,
                             BackendNotice::Event(Box::new(ThreadEvent::BackgroundTaskUpdated {
                                 snapshot: task.snapshot(&task_id),
                             })),
                             "promoted subagent task card",
                         );
                         spawn_settlement_delivery(
-                            Arc::clone(&self.runtime),
+                            Arc::clone(runtime),
                             Arc::clone(&self.observer),
                             run,
                             run_id_for_result.clone(),
-                            card_title,
+                            description.clone(),
                             task,
                             task_id,
                             // The promoted run was started WITHOUT a
@@ -675,21 +583,24 @@ impl AgentTool for DelegationTool {
         // The card title is the dispatch's `description` (the run label),
         // not a watchdog activity line.
         let cancel = run.dispose_token().clone();
-        let (task_id, task) =
-            background_task::register(self.owner_thread_id(), card_title.clone(), cancel);
+        let (task_id, task) = background_task::register(
+            self.observer.owner_thread_id.clone(),
+            description.clone(),
+            cancel,
+        );
         send_notice(
-            &self.notice_tx(),
+            &self.observer.notice_tx,
             BackendNotice::Event(Box::new(ThreadEvent::BackgroundTaskUpdated {
                 snapshot: task.snapshot(&task_id),
             })),
             "subagent task card snapshot",
         );
         spawn_settlement_delivery(
-            Arc::clone(&self.runtime),
+            Arc::clone(runtime),
             Arc::clone(&self.observer),
             run,
             run_id.clone(),
-            card_title,
+            description,
             task,
             task_id,
             // Net past budget + grace: the drive loop's own deadline settles
@@ -711,16 +622,6 @@ impl AgentTool for DelegationTool {
         ))
     }
 }
-
-impl DelegationTool {
-    fn owner_thread_id(&self) -> String {
-        self.observer.owner_thread_id.clone()
-    }
-    fn notice_tx(&self) -> mpsc::UnboundedSender<BackendNotice> {
-        self.observer.notice_tx.clone()
-    }
-}
-
 fn string_param(params: &serde_json::Value, key: &str) -> Option<String> {
     params.get(key).and_then(|v| v.as_str()).map(str::to_string)
 }
@@ -955,8 +856,7 @@ async fn settle_with_net(
 /// task either). The net lands the durable settlement through this same
 /// funnel.
 // The eight inputs are the settlement's own data set (runtime table, host
-// observer, run handle + id, label, card pair, net) — coherent as a unit,
-// same shape as `DelegationTool::new` above.
+// observer, run handle + id, label, card pair, net) — coherent as a unit.
 #[allow(clippy::too_many_arguments)]
 fn spawn_settlement_delivery(
     runtime: Arc<manox_harness::subagent::SubagentRuntime>,
@@ -1066,18 +966,28 @@ fn background_delivery(label: &str, result: &RunResult, stats: Option<(u64, u64)
 // ── Control tools ────────────────────────────────────────────────────────
 
 /// The `ListAgents` control tool: the live-run table snapshot with the
-/// watchdog's health verdict per row (children
-/// scope; one-shot runs are always direct children).
+/// watchdog's health verdict per row, plus the definition catalog the
+/// `Steer` `to.spawn` values are picked from (children scope; one-shot runs
+/// are always direct children).
 pub struct ListAgentsTool {
     runtime: Arc<SubagentRuntime>,
     observer: Arc<SubagentRunObserver>,
+    catalog: Arc<SubagentCatalog>,
 }
 
 impl ListAgentsTool {
     pub const NAME: &str = "ListAgents";
 
-    pub fn new(runtime: Arc<SubagentRuntime>, observer: Arc<SubagentRunObserver>) -> Self {
-        ListAgentsTool { runtime, observer }
+    pub(crate) fn new(
+        runtime: Arc<SubagentRuntime>,
+        observer: Arc<SubagentRunObserver>,
+        catalog: Arc<SubagentCatalog>,
+    ) -> Self {
+        ListAgentsTool {
+            runtime,
+            observer,
+            catalog,
+        }
     }
 }
 
@@ -1088,10 +998,11 @@ impl AgentTool for ListAgentsTool {
     }
 
     fn description(&self) -> &str {
-        "List this thread's live subagent runs: id, task label, provider, \
-         health, and running time. Check it when a background run seems slow \
-         or silent before deciding to InterruptAgent or re-dispatch — do not \
-         guess."
+        "List this thread's live subagent runs (id, task label, provider, health, running \
+         time) and every subagent definition available for `Steer` dispatches (name, \
+         description, capability, model). Check it when a background run seems slow or \
+         silent before deciding to Steer-Abort or steer it — and take `to.spawn` values \
+         from the definitions list; do not guess."
     }
 
     fn is_read_only(&self) -> bool {
@@ -1116,7 +1027,7 @@ impl AgentTool for ListAgentsTool {
         _signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
-        let mut rows: Vec<serde_json::Value> = self
+        let mut runs: Vec<serde_json::Value> = self
             .runtime
             .list_runs()
             .into_iter()
@@ -1139,85 +1050,34 @@ impl AgentTool for ListAgentsTool {
                 row
             })
             .collect();
-        rows.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-        if rows.is_empty() {
-            return Ok(AgentToolResult::text("no live agents".to_string()));
-        }
+        runs.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        let definitions: Vec<serde_json::Value> = self
+            .catalog
+            .defs()
+            .iter()
+            .map(|def| {
+                let model = def
+                    .config_model_spec
+                    .as_deref()
+                    .or(def.frontmatter_model_spec.as_deref())
+                    .unwrap_or("inherit (this thread's model)");
+                serde_json::json!({
+                    "name": def.name,
+                    "description": def.description,
+                    "capability": def.capability,
+                    "model": model,
+                    "color": def.color,
+                    "background_default": def.frontmatter_background,
+                })
+            })
+            .collect();
         Ok(AgentToolResult::text(
-            serde_json::to_string_pretty(&rows)
-                .unwrap_or_else(|_| "agent list unavailable".to_string()),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "runs": runs,
+                "definitions": definitions,
+            }))
+            .unwrap_or_else(|_| "agent list unavailable".to_string()),
         ))
-    }
-}
-
-/// The `InterruptAgent` control tool: cancel one live run
-/// (`interrupt_agent`, parent-adjacency enforced structurally — this runtime
-/// only tracks this thread's children).
-pub struct InterruptAgentTool {
-    runtime: Arc<SubagentRuntime>,
-}
-
-impl InterruptAgentTool {
-    pub const NAME: &str = "InterruptAgent";
-
-    pub fn new(runtime: Arc<SubagentRuntime>) -> Self {
-        InterruptAgentTool { runtime }
-    }
-}
-
-#[async_trait::async_trait]
-impl AgentTool for InterruptAgentTool {
-    fn name(&self) -> &str {
-        "InterruptAgent"
-    }
-
-    fn description(&self) -> &str {
-        "Cancel one of this thread's live subagent runs by id (as reported \
-         by ListAgents or the dispatch result). The run settles silently — \
-         no report is delivered for an interruption you requested."
-    }
-
-    fn is_read_only(&self) -> bool {
-        false
-    }
-
-    fn requires_approval(&self, _params: &serde_json::Value) -> bool {
-        false
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "agent_id": {
-                    "type": "string",
-                    "description": "The run id (e.g. \"sub-0\")."
-                }
-            },
-            "required": ["agent_id"]
-        })
-    }
-
-    async fn execute(
-        &self,
-        _tool_call_id: &str,
-        params: serde_json::Value,
-        _signal: CancellationToken,
-        _ctx: &dyn ToolContext,
-    ) -> Result<AgentToolResult, ToolError> {
-        let agent_id = params
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArguments("'agent_id' is required".into()))?;
-        if self.runtime.interrupt(agent_id) {
-            Ok(AgentToolResult::text(
-                serde_json::json!({"interrupted": true, "agent_id": agent_id}).to_string(),
-            ))
-        } else {
-            Err(ToolError::InvalidArguments(format!(
-                "no live agent {agent_id}"
-            )))
-        }
     }
 }
 
@@ -1248,6 +1108,12 @@ pub struct SubagentRunObserver {
     pub(crate) notice_tx: mpsc::UnboundedSender<BackendNotice>,
     runs: Mutex<BTreeMap<String, RunWatch>>,
     settled: Mutex<BTreeMap<String, SettledStats>>,
+    /// run id → definition kind, remembered from every activation (never
+    /// cleared; bounded by the run count of one assembly, like
+    /// `settled_once`). The Steer continuation arm resolves the run's
+    /// definition config here — the run id is the address, and a settled
+    /// run is not in the live table to answer.
+    kinds: Mutex<HashMap<String, String>>,
     /// Run ids whose settlement was already landed, exactly once per
     /// activation: the net's synthetic settlement and a recovered drive's
     /// later (richer) one must not both write a `run/settled` row, and
@@ -1272,6 +1138,7 @@ impl SubagentRunObserver {
             notice_tx,
             runs: Mutex::new(BTreeMap::new()),
             settled: Mutex::new(BTreeMap::new()),
+            kinds: Mutex::new(HashMap::new()),
             settled_once: Mutex::new(HashSet::new()),
         })
     }
@@ -1309,12 +1176,47 @@ impl SubagentRunObserver {
             .map(|s| (s.turns, s.tool_calls))
     }
 
+    /// External guidance landed on a live run (the Steer surface's Inject):
+    /// the run's idle watchdog treats it as activity, so a guidance message
+    /// cannot be followed immediately by an idle-budget kill.
+    pub fn note_guidance(&self, run_id: &str) {
+        if let Some(watch) = self.locked().get(run_id) {
+            watch
+                .watchdog
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .note_external_activity(std::time::Instant::now());
+        }
+    }
+
+    /// The definition kind a run id dispatched through (this assembly's
+    /// activations). The Steer continuation arm resolves the run's config
+    /// from it.
+    pub fn kind_of(&self, run_id: &str) -> Option<String> {
+        self.kinds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(run_id)
+            .cloned()
+    }
+
+    /// Whether the id names a run that already settled (in this assembly):
+    /// the Steer Inject arm's coaching split — a settled run takes no
+    /// mid-run input, it is reopened by dispatching to its id.
+    pub fn has_settled(&self, run_id: &str) -> bool {
+        self.settled_once
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(run_id)
+    }
+
     /// Land one swarm lifecycle row in the owning thread's journal (the
     /// store's typed route; the engine synthesizes the envelope fields).
     /// Two rows per run — `run/started` at dispatch, `run/settled` at the
     /// end — are the whole durable record: progress never rides the
-    /// parent journal.
-    fn journal_swarm_row(&self, kind: &str, payload: serde_json::Value) {
+    /// parent journal. `run/guided` (the Steer surface's mid-run guidance)
+    /// rides the same route.
+    pub(crate) fn journal_swarm_row(&self, kind: &str, payload: serde_json::Value) {
         // The path is resolved against the disk, not only the store's scan
         // map: the two rows per run are the durable record, and a session
         // whose journal materialized since the last scan (the common case for
@@ -1405,6 +1307,10 @@ impl RunObserver for SubagentRunObserver {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&info.run_id);
         let subagent_type = info.kind.clone();
+        self.kinds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(info.run_id.clone(), subagent_type.clone());
         self.locked().insert(
             info.run_id.clone(),
             RunWatch {
@@ -1523,6 +1429,40 @@ impl RunObserver for SubagentRunObserver {
 mod tests {
     use super::*;
 
+    fn test_dispatcher() -> SubagentDispatcher {
+        SubagentDispatcher {
+            observer: SubagentRunObserver::new("thread-1".to_string(), mpsc::unbounded_channel().0),
+            provider_registry: None,
+            env: Arc::new(manox_harness::env::TokioExecutionEnv::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
+            cwd: std::path::PathBuf::from("/tmp"),
+            parent_depth: 0,
+            parent_session: Some("thread-1".into()),
+        }
+    }
+
+    fn def_config(name: &str) -> SubagentDefConfig {
+        SubagentDefConfig {
+            provider: "spawn".into(),
+            name: name.into(),
+            capability: "read-only".into(),
+            description: "d".into(),
+            persona: "p".into(),
+            default_tools: vec![],
+            default_denied_tools: vec![],
+            frontmatter_model_spec: None,
+            config_model_spec: None,
+            frontmatter_effort: None,
+            frontmatter_isolation: None,
+            frontmatter_background: false,
+            frontmatter_max_turns: None,
+            color: None,
+            declared_permissions: Default::default(),
+            max_depth: 1,
+        }
+    }
+
     fn text_of(tool_result: &AgentToolResult) -> String {
         match &tool_result.content[0] {
             manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
@@ -1623,14 +1563,14 @@ mod tests {
         assert!(aborted.contains("partial before the stop"), "{aborted}");
     }
 
-    /// Assembly-level resolution: a plugin-namespaced def sanitizes into a
-    /// safe wire name, a collision skips the def, and definition `tools:`
-    /// data resolves warn-and-skip against the child snapshot (unknown and
-    /// privileged names dropped, known names kept).
+    /// Definition `tools:` data resolves warn-and-skip against the child
+    /// snapshot: unknown and privileged names dropped, known names kept.
+    /// With the per-definition tools retired the def's registry name needs
+    /// no wire sanitizing — it is the `Steer` `to.spawn` value verbatim.
     #[test]
-    fn resolve_delegation_tool_sanitizes_skips_and_warns() {
+    fn resolve_definition_filters_warns_and_skips() {
         let snapshot: HashSet<String> = ["Read", "Grep"].iter().map(|s| s.to_string()).collect();
-        let mut def = manox_harness::ext_point_agent::AgentDef {
+        let def = manox_harness::ext_point_agent::AgentDef {
             name: "remora:remora-task".into(),
             description: "d".into(),
             tools: vec!["Read".into(), "AskUserQuestion".into(), "Ghost".into()],
@@ -1645,26 +1585,13 @@ mod tests {
             system_prompt: "p".into(),
             unknown_frontmatter: Default::default(),
         };
-        let assembly = crate::subagent::resolve_delegation_tool(&def, &HashSet::new(), &snapshot)
-            .expect("a namespaced def resolves");
-        assert_eq!(assembly.tool_name, "remora_remora-task");
+        let (allow, denied) = crate::subagent::resolve_definition_filters(&def, &snapshot);
         assert_eq!(
-            assembly.default_tools,
+            allow,
             vec!["Read".to_string()],
             "privileged (AskUserQuestion) and unknown (Ghost) names warn-and-skip"
         );
-
-        // A collision with an already-taken wire name skips the def.
-        let taken: HashSet<String> = ["remora_remora-task".to_string()].into_iter().collect();
-        assert!(crate::subagent::resolve_delegation_tool(&def, &taken, &snapshot).is_none());
-
-        // A collision between two defs resolves the second only after the
-        // first's name is taken into account — the engine inserts as it
-        // goes, so distinct defs never collapse onto one tool.
-        def.name = "remora.task".into();
-        let assembly = crate::subagent::resolve_delegation_tool(&def, &taken, &snapshot)
-            .expect("a distinct def still resolves");
-        assert_eq!(assembly.tool_name, "remora_task");
+        assert!(denied.is_empty());
     }
 
     /// The Claude `model: inherit` literal — case-insensitively — is the
@@ -1681,7 +1608,7 @@ mod tests {
     /// the child never had are dropped, known names survive into the deny
     /// filter.
     #[test]
-    fn resolve_delegation_tool_resolves_the_deny_list() {
+    fn resolve_definition_filters_resolves_the_deny_list() {
         let snapshot: HashSet<String> = ["Read", "Grep", "Bash"]
             .iter()
             .map(|s| s.to_string())
@@ -1701,12 +1628,11 @@ mod tests {
             system_prompt: "p".into(),
             unknown_frontmatter: Default::default(),
         };
-        let assembly = crate::subagent::resolve_delegation_tool(&def, &HashSet::new(), &snapshot)
-            .expect("a plain def resolves");
-        assert_eq!(assembly.default_tools, vec!["Read", "Grep"]);
+        let (allow, denied) = crate::subagent::resolve_definition_filters(&def, &snapshot);
+        assert_eq!(allow, vec!["Read".to_string(), "Grep".to_string()]);
         assert_eq!(
-            assembly.default_denied,
-            vec!["Bash"],
+            denied,
+            vec!["Bash".to_string()],
             "the unknown deny name (Ghost) warn-and-skips"
         );
     }
@@ -1725,6 +1651,89 @@ mod tests {
             Some("worktree")
         );
         assert_eq!(crate::subagent::declared_isolation("container"), None);
+    }
+
+    /// The extracted dispatch resolver enforces the Steer Dispatch schema:
+    /// wrong-typed scalars, out-of-vocabulary values, and a background
+    /// default the flag cannot override.
+    #[test]
+    fn resolve_dispatch_enforces_the_schema_fail_loud() {
+        let dispatcher = test_dispatcher();
+        let config = def_config("Scout");
+        // A background-default definition forces the card: the flag cannot
+        // foreground it, and the budget promotion split follows the card.
+        let mut bg = config.clone();
+        bg.frontmatter_background = true;
+        let resolved = dispatcher
+            .resolve_dispatch(
+                &bg,
+                &serde_json::json!({
+                    "description": "d", "prompt": "p", "run_in_background": false,
+                }),
+            )
+            .expect("the dispatch resolves");
+        assert!(
+            resolved.run_in_background,
+            "a background default is not overridable"
+        );
+        assert!(resolved.promote_after.is_none());
+
+        // The foreground default arms the promotion timer off the budget.
+        let resolved = dispatcher
+            .resolve_dispatch(
+                &config,
+                &serde_json::json!({
+                    "description": "d", "prompt": "p", "timeout_ms": 5_000,
+                }),
+            )
+            .expect("the dispatch resolves");
+        assert!(!resolved.run_in_background);
+        assert_eq!(resolved.promote_after, Some(5_000));
+
+        // Wrong-typed and out-of-vocabulary values are invalid arguments,
+        // never silently ignored.
+        for (bad, needle) in [
+            (
+                serde_json::json!({"description": "d", "prompt": "p", "timeout_ms": "soon"}),
+                "timeout_ms",
+            ),
+            (
+                serde_json::json!({"description": "d", "prompt": "p", "run_in_background": "yes"}),
+                "run_in_background",
+            ),
+            (
+                serde_json::json!({"description": "d", "prompt": "p", "isolation": "container"}),
+                "isolation",
+            ),
+            (
+                serde_json::json!({"description": "d", "prompt": "p", "reasoning_effort": "turbo"}),
+                "reasoning_effort",
+            ),
+            (
+                serde_json::json!({"description": "d", "prompt": "p", "replay_thinking": 1}),
+                "replay_thinking",
+            ),
+        ] {
+            let err = dispatcher
+                .resolve_dispatch(&config, &bad)
+                .expect_err("a malformed param fails loudly")
+                .to_string();
+            assert!(err.contains(needle), "{bad}: {err}");
+        }
+
+        // In-vocabulary scalars land in the agent options.
+        let resolved = dispatcher
+            .resolve_dispatch(
+                &config,
+                &serde_json::json!({
+                    "description": "d", "prompt": "p",
+                    "reasoning_effort": "high", "replay_thinking": true,
+                }),
+            )
+            .expect("the dispatch resolves");
+        let options = resolved.agent_options.expect("options carry the scalars");
+        assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
+        assert!(options.replay_thinking);
     }
 
     /// The dispatch `permissions` override narrows a declaration, never
@@ -1857,38 +1866,6 @@ mod tests {
             .to_string();
             assert!(err.contains("permissions"), "{bad}: {err}");
         }
-    }
-
-    /// Plugin namespacing (`remora:remora-task`) must never reach the wire:
-    /// `:` sanitizes to `_`; a collision or empty result skips the def.
-    #[test]
-    fn sanitized_tool_name_maps_wire_charset_and_rejects_collisions() {
-        let taken: HashSet<String> = ["Sailor", "remora_remora-task"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(
-            crate::subagent::sanitized_tool_name("remora:remora-task", &taken),
-            None,
-            "collision with an existing tool name is skipped"
-        );
-        assert_eq!(
-            crate::subagent::sanitized_tool_name("remora:remora-task", &HashSet::new()),
-            Some("remora_remora-task".to_string())
-        );
-        assert_eq!(
-            crate::subagent::sanitized_tool_name("Explore", &HashSet::new()),
-            Some("Explore".to_string()),
-            "charset-clean names pass through"
-        );
-        let long = "x".repeat(70);
-        assert_eq!(
-            crate::subagent::sanitized_tool_name(&long, &HashSet::new())
-                .unwrap()
-                .chars()
-                .count(),
-            64
-        );
     }
 
     /// The net lets a landing result through untouched: even a result that

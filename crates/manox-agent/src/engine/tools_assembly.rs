@@ -7,8 +7,8 @@ use super::*;
 /// Infer a capability tag for an agent definition from its declared tool
 /// allowlist. The host snapshot carries Read/Grep/Glob/Ls (read),
 /// Write/Edit (write), and Bash (exec); `tools: []` means the full
-/// snapshot. The tag rides the delegation tool's description so the model
-/// knows what each subagent can do before dispatching.
+/// snapshot. The tag rides the `ListAgents` catalog so the model knows
+/// what each subagent can do before dispatching.
 pub(super) fn subagent_capability(def: &manox_harness::ext_point_agent::AgentDef) -> &'static str {
     if def.tools.is_empty() {
         return "write+bash";
@@ -1085,9 +1085,7 @@ pub(super) fn build_tools(
                 || embedder_mounted.contains(&name)
                 || matches!(
                     name.as_str(),
-                    "Steer"
-                        | crate::subagent::ListAgentsTool::NAME
-                        | crate::subagent::InterruptAgentTool::NAME
+                    "Steer" | crate::subagent::ListAgentsTool::NAME
                 );
             if taken {
                 tracing::warn!(
@@ -1111,11 +1109,13 @@ pub(super) fn build_tools(
         Arc::clone(bus),
         manox_harness::steer_bus::AgentId::Captain,
     )));
-    // The delegation surface: one runtime + spawn provider
-    // per session assembly; one delegation tool per registered definition
-    // (Explore, Sailor, user/plugin manifests); the control pair. Child
-    // snapshots strip every registered delegation-surface name (nesting is
-    // structurally disabled this iteration).
+    // The subagent scheduling surface: one runtime + spawn provider per
+    // session assembly; the whole model-facing surface is the Captain's
+    // `Steer` tool (dispatch/continue/guide/abort) plus the `ListAgents`
+    // catalog. Definitions resolve internally (persona / tool filter /
+    // model / permission ceiling / color) — no per-definition model-facing
+    // tool is mounted anymore, and child snapshots strip the surface names
+    // (nesting is structurally disabled this iteration).
     let subagent_runtime = SubagentRuntime::new();
     let mut registry = AgentRegistry::new();
     register_defaults(&mut registry);
@@ -1169,44 +1169,64 @@ pub(super) fn build_tools(
     };
     let child_snapshot_names: HashSet<String> =
         child_tools.iter().map(|t| t.name().to_string()).collect();
-    // Delegation tool names: sanitized into the provider wire charset
-    // (`[A-Za-z0-9_-]{1,64}` — plugin namespacing's `:` would 400 every
-    // request of the session), collision-checked against every model-facing
-    // name in this assembly, and registered into the runtime so child
-    // snapshots strip them (nesting is structurally disabled this
-    // iteration).
-    let mut taken_tool_names: HashSet<String> =
-        tools.iter().map(|t| t.name().to_string()).collect();
-    taken_tool_names.insert(crate::subagent::ListAgentsTool::NAME.to_string());
-    taken_tool_names.insert(crate::subagent::InterruptAgentTool::NAME.to_string());
-    let delegation_defs: Vec<(
-        String,
-        &manox_harness::ext_point_agent::AgentDef,
-        Vec<String>,
-        Vec<String>,
-    )> = registry
-        .all()
-        .into_iter()
-        .filter_map(|def| {
-            let assembly = crate::subagent::resolve_delegation_tool(
-                def,
-                &taken_tool_names,
-                &child_snapshot_names,
-            )?;
-            taken_tool_names.insert(assembly.tool_name.clone());
-            Some((
-                assembly.tool_name,
-                def,
-                assembly.default_tools,
-                assembly.default_denied,
-            ))
-        })
-        .collect();
-    for (tool_name, _, _, _) in &delegation_defs {
-        subagent_runtime.register_delegation_tool(tool_name);
-    }
+    // The definition catalog: one internal dispatch config per registered
+    // definition, its `tools:`/`disallowedTools:` resolved (warn-and-skip)
+    // against the child snapshot. The registry name is the `Steer`
+    // `to.spawn` value verbatim.
+    let catalog = Arc::new(crate::subagent::SubagentCatalog::new(
+        registry
+            .all()
+            .into_iter()
+            .map(|def| {
+                let (allow, denied) =
+                    crate::subagent::resolve_definition_filters(def, &child_snapshot_names);
+                // A run always spends at least one turn, so `maxTurns: 0` is
+                // an authoring error, not a cap of zero — warn and leave the
+                // child unbounded rather than honoring a number that means
+                // the opposite of what its author wrote.
+                let frontmatter_max_turns = match def.max_turns {
+                    Some(0) => {
+                        tracing::warn!(
+                            agent = %def.name,
+                            "agent definition declares maxTurns: 0; a run always spends at least \
+                             one turn — treating it as unset"
+                        );
+                        None
+                    }
+                    other => other,
+                };
+                SubagentDefConfig {
+                    provider: "spawn".into(),
+                    name: def.name.clone(),
+                    capability: subagent_capability(def).to_string(),
+                    description: def.description.clone(),
+                    persona: def.system_prompt.clone(),
+                    default_tools: allow,
+                    default_denied_tools: denied,
+                    frontmatter_model_spec: def.model.clone(),
+                    config_model_spec: overrides.get(&def.name).cloned(),
+                    // The manifest vocabularies map onto this runtime's at
+                    // assembly: an out-of-vocabulary declaration warns (once
+                    // per session build) and degrades to the unset default.
+                    frontmatter_effort: def
+                        .effort
+                        .as_deref()
+                        .and_then(crate::subagent::declared_effort)
+                        .map(str::to_string),
+                    frontmatter_isolation: def
+                        .isolation
+                        .as_deref()
+                        .and_then(crate::subagent::declared_isolation),
+                    frontmatter_background: def.background,
+                    frontmatter_max_turns,
+                    color: def.color.clone(),
+                    declared_permissions: def.permissions,
+                    max_depth: 1,
+                }
+            })
+            .collect(),
+    ));
     subagent_runtime.register_delegation_tool(crate::subagent::ListAgentsTool::NAME);
-    subagent_runtime.register_delegation_tool(crate::subagent::InterruptAgentTool::NAME);
     let spawn_provider = SpawnProvider::new(child_tools)
         .with_model_runtime(runtime.clone())
         .with_model_slot(Arc::clone(&model_slot))
@@ -1244,95 +1264,26 @@ pub(super) fn build_tools(
     let subagent_env: Arc<dyn manox_harness::env::ExecutionEnv> = Arc::new(
         manox_harness::env::TokioExecutionEnv::new(cwd.to_path_buf()),
     );
-    for (tool_name, def, allow, denied) in &delegation_defs {
-        let capability = subagent_capability(def);
-        // A run always spends at least one turn, so `maxTurns: 0` is an
-        // authoring error, not a cap of zero — warn and leave the child
-        // unbounded rather than honoring a number that means the opposite
-        // of what its author wrote. Sanitized BEFORE the description: a
-        // definition rendered as "capped at 0 turns" while dispatching
-        // unbounded is exactly the contradiction this adapter must not
-        // teach the model.
-        let frontmatter_max_turns = match def.max_turns {
-            Some(0) => {
-                tracing::warn!(
-                    agent = %def.name,
-                    "agent definition declares maxTurns: 0; a run always spends at least \
-                     one turn — treating it as unset"
-                );
-                None
-            }
-            other => other,
-        };
-        // The declaration defaults change the dispatch contract the model
-        // sees, so the rendered description names them — a tool whose
-        // contract text says one thing while the dispatch does another
-        // teaches the model the wrong call shape. The waiting contract is
-        // the description's own sentence (parameterized, no contradiction);
-        // isolation and the sanitized turn cap append.
-        let mut rendered_description = crate::subagent::delegation_description(
-            &def.description,
-            capability,
-            tool_name,
-            def.background,
-        );
-        if def.isolation.as_deref() == Some("worktree") {
-            rendered_description.push_str(
-                " This agent dispatches into a throwaway git worktree by default; \
-                 its report names where kept work landed.",
-            );
-        }
-        if let Some(max_turns) = frontmatter_max_turns {
-            rendered_description.push_str(&format!(
-                " This agent's runs are capped at {max_turns} turns per drive; \
-                 a continuation starts a fresh count."
-            ));
-        }
-        let config = DelegationToolConfig {
-            provider: "spawn".into(),
-            name: tool_name.clone(),
-            capability: capability.to_string(),
-            rendered_description,
-            persona: def.system_prompt.clone(),
-            default_tools: allow.clone(),
-            default_denied_tools: denied.clone(),
-            frontmatter_model_spec: def.model.clone(),
-            config_model_spec: overrides.get(&def.name).cloned(),
-            // The manifest vocabularies map onto this runtime's at assembly:
-            // an out-of-vocabulary declaration warns (once per session build)
-            // and degrades to the unset default.
-            frontmatter_effort: def
-                .effort
-                .as_deref()
-                .and_then(crate::subagent::declared_effort)
-                .map(str::to_string),
-            frontmatter_isolation: def
-                .isolation
-                .as_deref()
-                .and_then(crate::subagent::declared_isolation),
-            frontmatter_background: def.background,
-            frontmatter_max_turns,
-            color: def.color.clone(),
-            declared_permissions: def.permissions,
-            max_depth: 1,
-        };
-        tools.push(Arc::new(crate::subagent::DelegationTool::new(
-            Arc::clone(&subagent_runtime),
-            Arc::clone(&subagent_observer),
-            config,
-            Some(Arc::clone(&provider_registry)),
-            0,
-            Some(bus.owner_thread_id().to_string()),
-            Arc::clone(&subagent_env),
-            cwd.to_path_buf(),
-        )));
-    }
+    // The Steer surface's dispatch arm: the runtime + observer handles and
+    // the definition catalog, installed on the engine-scoped bus (it
+    // survives session swaps; each assembly replaces the surface).
+    bus.install_delegation(crate::steer_bus::SubagentDelegation {
+        runtime: Arc::clone(&subagent_runtime),
+        observer: Arc::clone(&subagent_observer),
+        dispatcher: Arc::new(crate::subagent::SubagentDispatcher {
+            observer: Arc::clone(&subagent_observer),
+            provider_registry: Some(Arc::clone(&provider_registry)),
+            env: Arc::clone(&subagent_env),
+            cwd: cwd.to_path_buf(),
+            parent_depth: 0,
+            parent_session: Some(bus.owner_thread_id().to_string()),
+        }),
+        catalog: Arc::clone(&catalog),
+    });
     tools.push(Arc::new(crate::subagent::ListAgentsTool::new(
         Arc::clone(&subagent_runtime),
         Arc::clone(&subagent_observer),
-    )));
-    tools.push(Arc::new(crate::subagent::InterruptAgentTool::new(
-        Arc::clone(&subagent_runtime),
+        Arc::clone(&catalog),
     )));
     (tools, manager, subagent_observer)
 }

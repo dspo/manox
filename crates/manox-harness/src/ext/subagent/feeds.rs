@@ -3,23 +3,28 @@
 // A running sub-agent's child session journals to its own file, but the
 // session object lives inside the spawn provider's drive loop — the AHP
 // backend has no thread handle for it the way it does for user sessions.
-// The registry bridges the two worlds in both directions: the READ half
+// The registry bridges the two worlds in three directions: the READ half
 // hands the child's journal broadcast to a bridge attaching to the child
-// chat, and the WRITE half lets the host land a row in the live child's
-// journal (the parent's mid-turn access-mode flip). Both halves register
-// at dispatch and die with the run (the drive loop removes them at settle;
-// the storage's sender drop closes any bridge still parked on the
-// channel), so a settled child serves from its durable journal alone.
+// chat, the WRITE half lets the host land a row in the live child's
+// journal (the parent's mid-turn access-mode flip), and the STEER half
+// reaches the child's `HarnessHandle` so the dispatcher can inject a
+// mid-run guidance message through the kernel's intra-session steer
+// primitive. Every half registers at dispatch and dies with the run (the
+// drive loop removes them at settle; the storage's sender drop closes any
+// bridge still parked on the channel), so a settled child serves from its
+// durable journal alone.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use tokio::sync::broadcast;
 
+use crate::core::harness::HarnessHandle;
 use crate::core::session::jsonl::JournalEvent;
 use crate::sandbox::AccessMode;
 use crate::session::Session;
 use crate::session::jsonl::JsonlSessionStorage;
+use crate::types::AgentMessage;
 
 type Feeds = RwLock<HashMap<String, broadcast::Sender<JournalEvent>>>;
 
@@ -38,6 +43,9 @@ struct ChildWriterEntry {
 
 type Writers = RwLock<HashMap<String, ChildWriterEntry>>;
 
+/// One run's steer entry: the child's decoupled handle, cloned at dispatch.
+type Steers = RwLock<HashMap<String, HarnessHandle>>;
+
 fn feeds() -> &'static Feeds {
     static FEEDS: OnceLock<Feeds> = OnceLock::new();
     FEEDS.get_or_init(|| RwLock::new(HashMap::new()))
@@ -46,6 +54,11 @@ fn feeds() -> &'static Feeds {
 fn writers() -> &'static Writers {
     static WRITERS: OnceLock<Writers> = OnceLock::new();
     WRITERS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn steers() -> &'static Steers {
+    static STEERS: OnceLock<Steers> = OnceLock::new();
+    STEERS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Register a run's child journal feed. The spawn calls this at dispatch,
@@ -86,6 +99,41 @@ pub fn remove_child_writer(run_id: &str) {
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(run_id);
+}
+
+/// Register a run's steer face: the child's `HarnessHandle`, cloned at
+/// dispatch. Same lifecycle as the feed and writer halves — the drive task
+/// holds the guard, so the entry dies on every ending.
+pub fn register_child_steer(run_id: &str, handle: &HarnessHandle) {
+    steers()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(run_id.to_string(), handle.clone());
+}
+
+/// Drop a run's steer entry: a settled child has no live turn to receive a
+/// guidance message.
+pub fn remove_child_steer(run_id: &str) {
+    steers()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(run_id);
+}
+
+/// Inject one guidance message into a live run's current (or next) turn
+/// through the kernel's steer primitive. `false` when the id names no
+/// running child — the run settled between the caller's roster read and
+/// this call, and a settled run takes no mid-run input.
+pub fn steer_child(run_id: &str, message: AgentMessage) -> bool {
+    steers()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(run_id)
+        .map(|handle| {
+            handle.steer(message);
+            true
+        })
+        .unwrap_or(false)
 }
 
 /// A receiver for a live run's child journal. `None` when the id names no

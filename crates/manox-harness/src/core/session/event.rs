@@ -537,6 +537,18 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         color: Option<String>,
     },
+    /// The dispatcher guided a live run mid-flight (the unified `Steer`
+    /// surface's Inject): the text rode the kernel's steer primitive into
+    /// the child's current turn. Attributed to the dispatcher, never to
+    /// the child.
+    #[serde(rename = "run/guided", rename_all = "camelCase")]
+    RunGuided {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        run_id: String,
+        text: String,
+    },
 }
 
 impl Event {
