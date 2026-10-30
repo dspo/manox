@@ -302,6 +302,25 @@ pub trait SessionRuntime: Send + Sync + 'static {
         max_rounds: Option<u64>,
     ) -> Result<(), RuntimeError>;
 
+    /// The container-level teardown, the `x-manox/teardown` seam: stop every
+    /// live derivative of `session_id` (`mode` `"stop-all"` — the active
+    /// turn, every live subagent run, every background task; cancellation is
+    /// issued, never awaited), or stop them and archive the whole container
+    /// tree (`mode` `"archive"` — children resolved along the catalogue's
+    /// parent edges, then the session itself). Returns a receipt naming what
+    /// was issued. The default is a refusal: a runtime without the container
+    /// face must not accept a teardown it can never honour.
+    fn teardown_container(
+        &self,
+        _owner: &str,
+        _session_id: &str,
+        _mode: &str,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::new(
+            "container teardown is not supported by this runtime",
+        ))
+    }
+
     /// Settle a tool-call confirmation. `selected_option_id` is the option
     /// the user clicked, exactly as the confirmation surfaced it — the
     /// approve-kind options beyond the bare `allow_once` (the network host

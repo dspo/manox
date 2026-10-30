@@ -390,6 +390,17 @@ impl SessionRuntime for GatewayRuntime {
         self.server.ahp_inner().session_thread(session_id)
     }
 
+    fn teardown_container(
+        &self,
+        owner: &str,
+        session_id: &str,
+        mode: &str,
+    ) -> Result<Value, RuntimeError> {
+        self.server
+            .ahp_inner()
+            .teardown_container(owner, session_id, mode)
+    }
+
     fn conversation_metrics(&self, session_id: &str) -> Option<Value> {
         let thread = self.server.ahp_inner().session_thread(session_id)?;
         // `conversation_info` awaits the journal snapshot; the trait method is

@@ -1612,7 +1612,8 @@ fn command_catalogue() -> Value {
     serde_json::json!({ "commands": commands })
 }
 
-/// The `sessions` payload of `x-manox/archivedChanged`: a non-empty array of
+/// The `sessions` payload of a batched-session extension surface
+/// (`x-manox/archivedChanged`, `x-manox/teardown`): a non-empty array of
 /// session ids, or `None` for any other shape.
 fn session_ids_of(value: Option<&Value>) -> Option<Vec<String>> {
     let ids = value?.as_array()?;
@@ -1624,12 +1625,12 @@ fn session_ids_of(value: Option<&Value>) -> Option<Vec<String>> {
         .collect()
 }
 
-/// The ceiling on one `x-manox/archivedChanged` batch. Every id costs the
-/// host a journal entry, a sidecar write and a dispose, and the payload rides
-/// one dispatch frame; a sidebar selection is an order of magnitude below this.
-/// Refused by name rather than truncated, so no caller believes a prefix
-/// landed.
-const MAX_ARCHIVED_BATCH: usize = 1024;
+/// The ceiling on one batched-session payload (`x-manox/archivedChanged`,
+/// `x-manox/teardown`). Every id costs the host a journal entry, a sidecar
+/// write and a dispose, and the payload rides one dispatch frame; a sidebar
+/// selection is an order of magnitude below this. Refused by name rather
+/// than truncated, so no caller believes a prefix landed.
+const MAX_BATCHED_SESSIONS: usize = 1024;
 
 /// Whether the store accounts a row for `session_id`, in either partition —
 /// the same existence the pin write checks.
@@ -2582,9 +2583,9 @@ impl Backend for RuntimeBackend {
                 // decision, not two journal entries for the same flag.
                 let mut seen = HashSet::new();
                 ids.retain(|id| seen.insert(id.clone()));
-                if ids.len() > MAX_ARCHIVED_BATCH {
+                if ids.len() > MAX_BATCHED_SESSIONS {
                     return DispatchOutcome::Rejected(format!(
-                        "x-manox/archivedChanged accepts at most {MAX_ARCHIVED_BATCH} sessions \
+                        "x-manox/archivedChanged accepts at most {MAX_BATCHED_SESSIONS} sessions \
                          per dispatch"
                     ));
                 }
@@ -3033,6 +3034,67 @@ impl Backend for RuntimeBackend {
                 // left without a feed.
                 self.ensure_bridge_if_seeded(&session_id);
                 Ok(Value::Null)
+            }
+            manox_ahp::ext::commands::TEARDOWN => {
+                // The container teardown waterfall, batched like
+                // `archivedChanged`: the ids ride the payload (one dispatch on
+                // the catalogue root), the mode picks stop-all vs
+                // stop-and-archive. All ids are validated before the first
+                // write — a half-applied batch is the worst of both worlds.
+                let Some(mut ids) = session_ids_of(params.get("sessions")) else {
+                    return Err(HostError::InvalidParams(
+                        "x-manox/teardown needs a non-empty `sessions` id array".to_string(),
+                    ));
+                };
+                let Some(mode) = params.get("mode").and_then(Value::as_str) else {
+                    return Err(HostError::InvalidParams(
+                        "x-manox/teardown needs `mode`: \"stop-all\" or \"archive\"".to_string(),
+                    ));
+                };
+                if mode != "stop-all" && mode != "archive" {
+                    return Err(HostError::InvalidParams(format!(
+                        "x-manox/teardown `mode` `{mode}` is not a known value; expected \
+                         \"stop-all\" or \"archive\""
+                    )));
+                }
+                let mut seen = HashSet::new();
+                ids.retain(|id| seen.insert(id.clone()));
+                if ids.len() > MAX_BATCHED_SESSIONS {
+                    return Err(HostError::InvalidParams(format!(
+                        "x-manox/teardown accepts at most {MAX_BATCHED_SESSIONS} sessions per \
+                         dispatch"
+                    )));
+                }
+                let unknown: Vec<&str> = ids
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| !store_has_row(id))
+                    .collect();
+                if !unknown.is_empty() {
+                    return Err(HostError::SessionNotFound(unknown.join(", ")));
+                }
+                let mut receipts = Vec::with_capacity(ids.len());
+                for id in &ids {
+                    let receipt =
+                        self.server
+                            .teardown_container("ahp", id, mode)
+                            .map_err(|error| {
+                                if error.code.as_deref()
+                                    == Some(crate::error::codes::SESSION_NOT_FOUND)
+                                {
+                                    HostError::SessionNotFound(id.clone())
+                                } else {
+                                    HostError::Backend(error.message)
+                                }
+                            })?;
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("session".to_string(), serde_json::json!(id));
+                    if let Value::Object(rest) = receipt {
+                        entry.extend(rest);
+                    }
+                    receipts.push(Value::Object(entry));
+                }
+                Ok(serde_json::json!({ "containers": receipts }))
             }
             // A client asked for a surface this build declares but does not
             // perform. `-32080` tells it apart from "you sent a bad request".

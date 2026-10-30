@@ -131,6 +131,16 @@ pub trait ThreadEngine: Send + Sync {
     /// derivatives. Fire-and-forget; engines without a member bus no-op.
     fn abort_spawned_members(&self) {}
 
+    /// Interrupt every live subagent run this engine's assembly owns — the
+    /// Steer Abort primitive applied to the whole live table (the stop-all
+    /// face). Cancellation rides each run's dispose token, so this returns
+    /// once issued; settlements land through the existing delivery paths.
+    /// Returns the interrupted run ids. Default empty: engines without a
+    /// subagent surface own no runs.
+    fn interrupt_live_runs(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Hot-swap the model for the next provider request.
     fn set_model(&self, model: HarnessModel);
 

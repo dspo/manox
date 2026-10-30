@@ -169,6 +169,13 @@ pub mod commands {
     /// dead turn on its behalf without ever touching one another process is
     /// running. The pid source is the `turnStart` row's `owner` stamp.
     pub const OPEN_TURN: &str = "x-manox/openTurn";
+    /// Container-level teardown: stop every live derivative of the named
+    /// sessions (`mode: "stop-all"` — the active turn, every live subagent
+    /// run, every background task), or stop them and archive the whole
+    /// container tree (`mode: "archive"`). The ids ride the payload like
+    /// [`super::actions::ARCHIVED_CHANGED`]'s — one dispatch on the
+    /// catalogue root, no per-row session-channel subscription.
+    pub const TEARDOWN: &str = "x-manox/teardown";
 
     /// Every command this build **serves**, which is what [`declaration`]
     /// advertises.
@@ -192,7 +199,7 @@ pub mod commands {
     /// - adjudication retraction (`cancelDelivery`) — deliveries are the deleted
     ///   v2 waterfall's concept; AHP settles through channel actions;
     /// - process shutdown — a host-lifecycle concern, not a session one.
-    pub const ALL: &[&str] = &[COMPACT, GOAL, OPEN_TURN];
+    pub const ALL: &[&str] = &[COMPACT, GOAL, OPEN_TURN, TEARDOWN];
 }
 
 /// Client-contributed session tools: an AHP-native action, not an extension

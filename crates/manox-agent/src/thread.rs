@@ -1501,6 +1501,23 @@ impl Thread {
         }
     }
 
+    /// The container-level stop-all: everything `cancel` does, plus
+    /// interrupting every live subagent run the engine's assembly owns.
+    /// Background runs carry their own dispose token precisely so a turn
+    /// abort does NOT reach them; this is the explicit coarse action above
+    /// that default. Returns the interrupted run ids — cancellation is
+    /// issued, not awaited (settlements follow the existing `aborted`
+    /// delivery paths).
+    pub fn stop_all(&mut self) -> Vec<String> {
+        let interrupted = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.interrupt_live_runs())
+            .unwrap_or_default();
+        self.cancel();
+        interrupted
+    }
+
     pub fn is_running(&self) -> bool {
         self.running
     }

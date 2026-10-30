@@ -5816,3 +5816,351 @@ mod create_intent {
         }
     }
 }
+
+// ── the container teardown (`x-manox/teardown`) ──────────────────────────
+
+mod teardown {
+    use super::install;
+    use super::seed_session;
+    use super::uninstall;
+    use super::{turn_finish, user};
+    use crate::agent_server::AgentServer;
+    use manox_ahp::backend::Backend;
+    use manox_ahp::ext;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A server plus the backend under test. The session table starts
+    /// empty: the teardown fixtures seed the store rows (and, for the live
+    /// waterfall, attach a scripted engine) themselves.
+    async fn backend_fixture() -> (
+        Arc<AgentServer>,
+        Arc<manox_ahp_runtime::ahp::backend::RuntimeBackend>,
+    ) {
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
+        (server, backend)
+    }
+
+    /// One live session with the given id on the server (the teardown's
+    /// stop-all leg needs a session the process drives).
+    async fn create_session(server: &Arc<AgentServer>, session_id: &str) {
+        let intent = crate::agent_server::SessionIntent {
+            session_id: Some(session_id.to_string()),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            access_mode: None,
+            reasoning_effort: None,
+            seed: None,
+            working_directories: Vec::new(),
+        };
+        let inner = Arc::clone(server.ahp_inner());
+        crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
+            .await
+            .expect("session opens");
+    }
+
+    /// A scripted engine that answers the stop-all face with a canned
+    /// live-run table and records the turn abort, so the test sees each
+    /// waterfall leg land.
+    struct StopAllEngine {
+        aborted: AtomicUsize,
+        interrupted: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl StopAllEngine {
+        fn new(runs: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                aborted: AtomicUsize::new(0),
+                interrupted: parking_lot::Mutex::new(
+                    runs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                ),
+            })
+        }
+
+        fn abort_count(&self) -> usize {
+            self.aborted.load(Ordering::SeqCst)
+        }
+    }
+
+    impl manox_agent::thread_engine::ThreadEngine for StopAllEngine {
+        fn is_running(&self) -> bool {
+            false
+        }
+        fn history(&self) -> Vec<manox_agent::db::HistoryEntry> {
+            Vec::new()
+        }
+        fn abort(&self) {
+            self.aborted.fetch_add(1, Ordering::SeqCst);
+        }
+        fn interrupt_live_runs(&self) -> Vec<String> {
+            self.interrupted.lock().clone()
+        }
+        fn run(&self, _prompt: String, _content: Vec<manox_harness::types::ContentBlock>) {}
+        fn steer(
+            &self,
+            _prompt: String,
+            _content: Vec<manox_harness::types::ContentBlock>,
+            _origin: Option<String>,
+        ) -> String {
+            String::new()
+        }
+        fn cancel_steer(&self, _id: &str) -> bool {
+            false
+        }
+        fn set_model(&self, _model: manox_harness::types::Model) {}
+        fn set_thinking_level(&self, _level: Option<String>) {}
+        fn open_session(&self, _path: std::path::PathBuf) {}
+        fn active_session_path(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn session_list(&self) -> Vec<manox_agent::db::ThreadSummary> {
+            Vec::new()
+        }
+        fn request_token_usage(
+            &self,
+        ) -> std::collections::HashMap<String, manox_agent::language_model::TokenUsage> {
+            std::collections::HashMap::new()
+        }
+        fn model(&self) -> Option<manox_harness::types::Model> {
+            None
+        }
+        fn set_cwd(&self, _path: std::path::PathBuf) {}
+    }
+
+    /// Poll `condition` to a deadline, yielding to the runtime between checks
+    /// (the task stop is spawned onto the agent runtime, a task the test does
+    /// not own).
+    async fn await_until(condition: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "condition never became true"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Stop-all on a live container: the turn abort lands, every canned
+    /// live run is interrupted, the background task settles Stopped — and
+    /// the command returns once issued, before the task's settlement has
+    /// necessarily drained.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_all_cancels_turn_runs_and_tasks_without_waiting() {
+        let _guards = install();
+        let (server, backend) = backend_fixture().await;
+        create_session(&server, "s-teardown").await;
+        // The store row a scanned session carries (the batch gate checks it).
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.insert_summary_for_test("s-teardown", None));
+        let engine = StopAllEngine::new(&["sub-1", "sub-2"]);
+        let (_notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        server
+            .ahp_inner()
+            .session_thread("s-teardown")
+            .expect("session is live")
+            .with_mut(|t| t.set_engine_for_test(Arc::clone(&engine) as _, notice_rx));
+        // A real background task owned by the container.
+        let (task_id, task) = manox_agent::background_task::register(
+            "s-teardown".to_string(),
+            "long job".to_string(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        let params = json!({
+            "channel": manox_ahp::channels::session::uri("s-teardown"),
+            "sessions": ["s-teardown"],
+            "mode": "stop-all",
+        });
+        let receipt = backend
+            .extension(ext::commands::TEARDOWN, &params)
+            .expect("stop-all is performed");
+        assert_eq!(
+            receipt,
+            json!({
+                "containers": [{
+                    "session": "s-teardown",
+                    "interruptedRuns": ["sub-1", "sub-2"],
+                    "stoppedTasks": 1,
+                    "archived": [],
+                }]
+            }),
+            "the receipt names every cancellation issued: {receipt:?}"
+        );
+        assert!(
+            engine.abort_count() >= 1,
+            "the active-turn leg reached the engine"
+        );
+        // No waiting on delivery: the command returned while the task stop
+        // (spawned onto the runtime inside `cancel`) drains on its own. The
+        // settlement still lands, with TaskStop semantics — Stopped, the
+        // user-cancel verdict, not the thread-teardown SessionEnded.
+        await_until(|| task.status().is_terminal()).await;
+        assert_eq!(
+            task.status(),
+            manox_agent::background_task::TaskStatus::Stopped,
+            "the dispose token settled the task with TaskStop semantics"
+        );
+        let _ = task_id;
+        uninstall();
+    }
+
+    /// Archive mode cascades the container tree through the catalogue's
+    /// parent edges — children first, then the captain — and the archived
+    /// children leave the catalogue walk's unarchived child partition.
+    /// Another container's tree is untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archive_mode_cascades_the_whole_tree() {
+        let _guards = install();
+        let (_server, backend) = backend_fixture().await;
+        // Two containers, one with a materialized journal. `s-teardown`
+        // carries two delegated children; `s-other` one — the cascade must
+        // not cross the parent edge.
+        seed_session(
+            "s-teardown",
+            "s-teardown",
+            "/",
+            vec![("e1", user("hi")), ("e2", turn_finish())],
+        )
+        .await;
+        let store = manox_agent::thread_store::global();
+        store.with_mut(|s| {
+            s.insert_summary_for_test("s-teardown", None);
+            s.insert_child_summary_for_test("sub-a", "s-teardown");
+            s.insert_child_summary_for_test("sub-b", "s-teardown");
+            s.insert_summary_for_test("s-other", None);
+            s.insert_child_summary_for_test("sub-other", "s-other");
+        });
+
+        let params = json!({
+            "channel": manox_ahp::channels::session::uri("s-teardown"),
+            "sessions": ["s-teardown"],
+            "mode": "archive",
+        });
+        let receipt = backend
+            .extension(ext::commands::TEARDOWN, &params)
+            .expect("archive is performed");
+        assert_eq!(
+            receipt,
+            json!({
+                "containers": [{
+                    "session": "s-teardown",
+                    "interruptedRuns": [],
+                    "stoppedTasks": 0,
+                    "archived": ["sub-a", "sub-b", "s-teardown"],
+                }]
+            }),
+            "children archive before the captain: {receipt:?}"
+        );
+
+        // The whole tree reaches the archived state in the store: the
+        // captain sits in the archived partition, the children carry the
+        // flag, and the sibling container is untouched.
+        store.read(|s| {
+            let captain = s
+                .summary_by_id("s-teardown")
+                .expect("a materialized row survives the archive");
+            assert!(captain.archived);
+            for child in ["sub-a", "sub-b"] {
+                let row = s.summary_by_id(child).expect("child row survives");
+                assert!(row.archived, "{child} must be archived");
+            }
+            assert!(
+                !s.summary_by_id("sub-other")
+                    .expect("sibling child")
+                    .archived
+                    && !s
+                        .summary_by_id("s-other")
+                        .expect("sibling captain")
+                        .archived,
+                "another container's tree is untouched"
+            );
+        });
+
+        // The catalogue reflects it: the archived rows leave the walk (the
+        // captain from the ranked partition, the children from the
+        // unarchived child partition); the sibling tree stays.
+        let listed: Vec<String> = backend
+            .list_sessions()
+            .iter()
+            .map(|s| s.resource.as_str().to_string())
+            .collect();
+        assert!(
+            !listed.iter().any(|uri| {
+                uri.ends_with("/s-teardown") || uri.ends_with("/sub-a") || uri.ends_with("/sub-b")
+            }),
+            "the archived tree left the catalogue: {listed:?}"
+        );
+        assert!(
+            listed.iter().any(|uri| uri.ends_with("/s-other"))
+                && listed.iter().any(|uri| uri.ends_with("/sub-other")),
+            "the sibling container stays listed: {listed:?}"
+        );
+        uninstall();
+    }
+
+    /// The batch validates before the first write: an unknown id refuses
+    /// the whole dispatch and nothing lands — no half-teared-down tree.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn teardown_refuses_a_batch_with_an_unknown_session_without_partial_writes() {
+        let _guards = install();
+        let (_server, backend) = backend_fixture().await;
+        seed_session("s-known", "s-known", "/", vec![("e1", user("hi"))]).await;
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.insert_summary_for_test("s-known", None));
+
+        let params = json!({
+            "channel": manox_ahp::channels::session::uri("s-known"),
+            "sessions": ["s-known", "s-ghost"],
+            "mode": "archive",
+        });
+        let error = backend
+            .extension(ext::commands::TEARDOWN, &params)
+            .expect_err("an unknown id refuses the batch");
+        assert_eq!(error.code(), manox_ahp::codes::ahp::SESSION_NOT_FOUND);
+        // Nothing landed: the known row is still unarchived and listed.
+        let listed: Vec<String> = backend
+            .list_sessions()
+            .iter()
+            .map(|s| s.resource.as_str().to_string())
+            .collect();
+        assert!(
+            listed.iter().any(|uri| uri.ends_with("/s-known")),
+            "the known row never archived: {listed:?}"
+        );
+        uninstall();
+    }
+
+    /// A bad mode is an invalid argument, not a silent stop-all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn teardown_refuses_an_unknown_mode() {
+        let _guards = install();
+        let (_server, backend) = backend_fixture().await;
+        for mode in ["", "delete", "Stop-All"] {
+            let params = json!({
+                "channel": manox_ahp::channels::session::uri("s-any"),
+                "sessions": ["s-any"],
+                "mode": mode,
+            });
+            let error = backend
+                .extension(ext::commands::TEARDOWN, &params)
+                .expect_err("an unknown mode refuses");
+            assert_eq!(error.code(), manox_ahp::codes::rpc::INVALID_PARAMS);
+        }
+        // So does a payload with no sessions at all.
+        let empty = json!({
+            "channel": manox_ahp::channels::session::uri("s-any"),
+            "mode": "stop-all",
+        });
+        let error = backend
+            .extension(ext::commands::TEARDOWN, &empty)
+            .expect_err("an empty batch refuses");
+        assert_eq!(error.code(), manox_ahp::codes::rpc::INVALID_PARAMS);
+        uninstall();
+    }
+}
