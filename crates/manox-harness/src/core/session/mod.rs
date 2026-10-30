@@ -141,6 +141,7 @@ impl SessionTreeEntry {
             RunSettled,
             RunEscalated,
             RunContinued,
+            RunGuided,
         )
     }
 
@@ -1577,6 +1578,7 @@ pub enum EntryType {
     RunSettled,
     RunEscalated,
     RunContinued,
+    RunGuided,
 }
 
 impl EntryType {
@@ -1626,6 +1628,7 @@ impl EntryType {
             EntryType::RunSettled => "run/settled",
             EntryType::RunEscalated => "run/escalated",
             EntryType::RunContinued => "run/continued",
+            EntryType::RunGuided => "run/guided",
         }
     }
 }
@@ -1832,6 +1835,7 @@ pub fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
         SessionTreeEntry::RunSettled { .. } => EntryType::RunSettled,
         SessionTreeEntry::RunEscalated { .. } => EntryType::RunEscalated,
         SessionTreeEntry::RunContinued { .. } => EntryType::RunContinued,
+        SessionTreeEntry::RunGuided { .. } => EntryType::RunGuided,
     }
 }
 

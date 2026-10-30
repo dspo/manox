@@ -3107,22 +3107,17 @@ fn request_attribution_backstop_trips_on_over_consumption() {
     let _ = request_attribution(&history, &messages);
 }
 
+/// The unified Steer surface's description teaches the whole loop: the
+/// fresh-context boundary, the background mode, the permission channel,
+/// definition discovery, and the run-id address lifecycle.
 #[test]
-fn delegation_tool_description_carries_definition_and_contract() {
-    let rendered = crate::subagent::delegation_description(
-        "Read-only codebase exploration",
-        "read-only",
-        "Explore",
-        false,
+fn steer_description_teaches_the_dispatch_contract() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let tool = crate::steer_bus::SteerTool::new(
+        crate::steer_bus::AgentBus::new("thread-1".into(), tx),
+        manox_harness::steer_bus::AgentId::Captain,
     );
-    assert!(
-        rendered.contains("[capability: read-only]"),
-        "capability tag present: {rendered}"
-    );
-    assert!(
-        rendered.contains("`Explore`"),
-        "definition name present: {rendered}"
-    );
+    let rendered = tool.description();
     assert!(
         rendered.contains("fresh-context"),
         "description declares the fresh-context boundary: {rendered}"
@@ -3132,33 +3127,48 @@ fn delegation_tool_description_carries_definition_and_contract() {
         "description declares the background mode: {rendered}"
     );
     assert!(
-        rendered.contains("may escalate a denied command"),
-        "description declares the bounded escalation channel: {rendered}"
+        rendered.contains("narrow"),
+        "description declares the permission-narrowing channel: {rendered}"
+    );
+    assert!(
+        rendered.contains("ListAgents"),
+        "description names the definition discovery entry point: {rendered}"
+    );
+    assert!(
+        rendered.contains("permanent address"),
+        "description teaches the run-id address lifecycle: {rendered}"
+    );
+    assert!(
+        rendered.contains("counts as activity"),
+        "description teaches that guidance resets the idle budget: {rendered}"
+    );
+    assert!(
+        rendered.contains("NOT the child's answer"),
+        "the Inject ack is delivery-only: {rendered}"
+    );
+    assert!(
+        rendered.contains("keeps its full context"),
+        "description teaches the continuation contract: {rendered}"
     );
 }
 
 /// The waiting contract tracks the definition's `background` declaration:
-/// a background-default tool must not be taught the foreground default,
-/// and it must state that the flag cannot foreground it.
+/// the flag's schema text states that a background-default definition
+/// cannot be foregrounded.
 #[test]
-fn delegation_tool_description_flips_the_waiting_contract_on_a_background_default() {
-    let rendered = crate::subagent::delegation_description(
-        "Long-running sweep",
-        "write+bash",
-        "Sweeper",
-        true,
+fn steer_schema_states_the_background_default_is_not_an_override() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let tool = crate::steer_bus::SteerTool::new(
+        crate::steer_bus::AgentBus::new("thread-1".into(), tx),
+        manox_harness::steer_bus::AgentId::Captain,
     );
+    let schema = tool.parameters_schema();
+    let hint = schema["properties"]["run_in_background"]["description"]
+        .as_str()
+        .expect("the flag carries a description");
     assert!(
-        rendered.contains("returns immediately"),
-        "background default declares the non-blocking call: {rendered}"
-    );
-    assert!(
-        rendered.contains("cannot foreground it"),
-        "background default states the flag is not an override: {rendered}"
-    );
-    assert!(
-        !rendered.contains("By default the call waits"),
-        "the foreground waiting sentence must not contradict the declaration: {rendered}"
+        hint.contains("cannot foreground it"),
+        "the flag states it is not an override: {hint}"
     );
 }
 
@@ -5732,7 +5742,7 @@ async fn a_sandbox_pinned_child_stays_confined_under_a_full_access_captain() {
     );
 }
 
-/// The two-path tool resolution — `resolve_delegation_tool` filters
+/// The two-path tool resolution — `resolve_definition_filters` filters
 /// definitions against `build(None)` at assembly, `validate_filter_names`
 /// checks the request against `build(Some(decl))` at dispatch — is only
 /// safe while the child snapshot's NAME set is invariant across the
@@ -6357,5 +6367,308 @@ async fn armed_child_bash_budget_spent_refuses_without_a_card() {
     assert!(
         rx.try_recv().is_err(),
         "a spent budget never parks another card"
+    );
+}
+
+// ── Steer unified scheduling surface: the full loop on a real child ──────
+
+/// A stream that parks on barriers so the test can inject mid-run, and
+/// records the user-message texts of every provider request — the witness
+/// that a Steer Inject lands inside the child's current turn.
+struct SteerGuidanceStream {
+    calls: std::sync::atomic::AtomicUsize,
+    seen_user_text: Arc<std::sync::Mutex<Vec<String>>>,
+    parked: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+/// The e2e rig: the stream the child runs on plus the barrier/receipt
+/// handles the test interleaves through.
+struct SteerGuidanceRig {
+    stream: SteerGuidanceStream,
+    parked: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl SteerGuidanceStream {
+    fn rig() -> SteerGuidanceRig {
+        let stream = Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            seen_user_text: Arc::new(std::sync::Mutex::new(Vec::new())),
+            parked: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        SteerGuidanceRig {
+            stream: Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                seen_user_text: Arc::clone(&stream.seen_user_text),
+                parked: Arc::clone(&stream.parked),
+                release: Arc::clone(&stream.release),
+            },
+            parked: stream.parked,
+            release: stream.release,
+            seen: stream.seen_user_text,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl manox_harness::agent_loop::StreamFn for SteerGuidanceStream {
+    async fn stream(
+        &self,
+        context: &manox_harness::types::AgentContext,
+        _signal: tokio_util::sync::CancellationToken,
+        _event_tx: tokio::sync::mpsc::Sender<manox_harness::types::AgentEvent>,
+    ) -> Result<AgentMessage, anyhow::Error> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let users: Vec<String> = context
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::User { content, .. } => Some(
+                    content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text, .. } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                _ => None,
+            })
+            .collect();
+        self.seen_user_text.lock().unwrap().push(users.join(" | "));
+        let _ = self.parked.notify_waiters();
+        self.release.notified().await;
+        Ok(AgentMessage::Assistant {
+            content: if n == 0 {
+                // A tool call keeps the one-shot run alive across a request
+                // boundary — the drain point queued steering injects at.
+                vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "echo".into(),
+                    input: serde_json::json!({"message": "hi"}),
+                    thought_signature: None,
+                }]
+            } else {
+                vec![ContentBlock::Text {
+                    text: "done".into(),
+                    signature: None,
+                }]
+            },
+            model: context.model.id.clone(),
+            provider: context.model.provider.clone(),
+            api: context.model.api.clone(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(if n == 0 {
+                manox_harness::types::StopReason::ToolUse
+            } else {
+                manox_harness::types::StopReason::Stop
+            }),
+            usage: Box::new(manox_harness::types::Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                ..Default::default()
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        })
+    }
+}
+
+/// The whole loop on a real child: `Steer` Dispatch creates the run (the ack
+/// carries the run id), Inject lands the guidance inside the child's live
+/// turn (the second request's context carries it), and Abort cancels it.
+/// The old per-definition delegation tools and InterruptAgent are gone from
+/// the surface — the Captain drives everything through Steer.
+#[tokio::test]
+async fn steer_surface_drives_the_full_run_lifecycle() {
+    use crate::steer_bus::{AgentBus, SubagentDelegation};
+    use crate::subagent::{SubagentCatalog, SubagentDispatcher, SubagentRunObserver};
+    use manox_harness::agent_loop::StreamResolver;
+    use manox_harness::subagent::{SpawnProvider, SubagentDefConfig, SubagentRuntime};
+
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let rig = SteerGuidanceStream::rig();
+    let stream_for_resolver = Arc::new(rig.stream);
+    let parked = rig.parked;
+    let release = rig.release;
+    let seen = rig.seen;
+    let resolver: StreamResolver = Arc::new(move |_m: &HarnessModel| {
+        Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+    });
+
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+    let observer = SubagentRunObserver::new("thread-steer".into(), notice_tx.clone());
+    let runtime = SubagentRuntime::new();
+    let provider = SpawnProvider::new(vec![Arc::new(EchoTool)])
+        .with_model_runtime(ModelRuntime::new(resolver))
+        .with_model(test_model())
+        .with_session_dir(dir.path().join("subagents"))
+        .with_observer(Arc::clone(&observer) as Arc<dyn manox_harness::subagent::RunObserver>);
+    runtime.register_provider_permanent(Arc::new(provider));
+
+    let bus = AgentBus::new("thread-steer".into(), notice_tx);
+    bus.install_delegation(SubagentDelegation {
+        runtime: Arc::clone(&runtime),
+        observer: Arc::clone(&observer),
+        dispatcher: Arc::new(SubagentDispatcher {
+            observer: Arc::clone(&observer),
+            provider_registry: None,
+            env: Arc::new(manox_harness::env::TokioExecutionEnv::new(cwd.clone())),
+            cwd,
+            parent_depth: 0,
+            parent_session: Some("thread-steer".into()),
+        }),
+        catalog: Arc::new(SubagentCatalog::new(vec![SubagentDefConfig {
+            provider: "spawn".into(),
+            name: "Scout".into(),
+            capability: "read-only".into(),
+            description: "explores".into(),
+            persona: "read-only explorer".into(),
+            default_tools: vec![],
+            default_denied_tools: vec![],
+            frontmatter_model_spec: None,
+            config_model_spec: None,
+            frontmatter_effort: None,
+            frontmatter_isolation: None,
+            frontmatter_background: false,
+            frontmatter_max_turns: None,
+            color: None,
+            declared_permissions: Default::default(),
+            max_depth: 1,
+        }])),
+    });
+
+    let params = |extra: serde_json::Value| {
+        let mut base = serde_json::json!({"description": "survey", "prompt": "work"});
+        for (k, v) in extra.as_object().unwrap() {
+            base[k.as_str()] = v.clone();
+        }
+        base
+    };
+    let call = |params: serde_json::Value| crate::steer_bus::SteerCall {
+        tool_call_id: "call-1".into(),
+        signal: tokio_util::sync::CancellationToken::new(),
+        dispatch_params: params,
+    };
+    let to = |addr: &str, spawn: Option<&str>| manox_harness::steer_bus::ToSpec {
+        agent_address: addr.into(),
+        spawn: spawn.map(String::from),
+    };
+
+    // ── create: Dispatch + to.spawn, background so the call returns now.
+    let ack = bus
+        .steer(
+            manox_harness::steer_bus::AgentId::Captain,
+            to("", Some("Scout")),
+            manox_harness::steer_bus::SteerReason::Dispatch,
+            manox_harness::steer_bus::SteerPayload {
+                text: "survey the widget".into(),
+            },
+            call(params(serde_json::json!({"run_in_background": true}))),
+        )
+        .await
+        .expect("the run starts");
+    let ack_json: serde_json::Value = serde_json::from_str(&{
+        match &ack.content[0] {
+            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text: {other:?}"),
+        }
+    })
+    .unwrap();
+    let run_id = ack_json["run_id"]
+        .as_str()
+        .expect("the ack carries the run id")
+        .to_string();
+    assert!(run_id.starts_with("sub-"), "{ack_json}");
+
+    // The child's first request is parked mid-turn.
+    let _ = parked.notified().await;
+
+    // ── guide: Inject into the live run. The ack is the delivery receipt.
+    let guided = bus
+        .steer(
+            manox_harness::steer_bus::AgentId::Captain,
+            to(&run_id, None),
+            manox_harness::steer_bus::SteerReason::Inject,
+            manox_harness::steer_bus::SteerPayload {
+                text: "focus on the widget's edge cases".into(),
+            },
+            call(serde_json::json!({})),
+        )
+        .await
+        .expect("the guidance delivers");
+    let guided_json: serde_json::Value = serde_json::from_str(&{
+        match &guided.content[0] {
+            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text: {other:?}"),
+        }
+    })
+    .unwrap();
+    assert_eq!(guided_json["delivered"], true, "{guided_json}");
+
+    // The guidance lands inside the child's turn: the second request's
+    // context (after the tool call drained the steering queue) carries it.
+    release.notify_waiters();
+    for _ in 0..200 {
+        if seen.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    {
+        let seen_text = seen.lock().unwrap();
+        assert!(
+            seen_text.len() >= 2,
+            "the child made a second request: {seen_text:?}"
+        );
+        assert!(
+            seen_text[1].contains("focus on the widget's edge cases"),
+            "the guidance reached the child's turn: {seen_text:?}"
+        );
+    }
+
+    // ── stop: Abort cancels the still-live run (the second response is
+    // parked again).
+    let aborted = bus
+        .steer(
+            manox_harness::steer_bus::AgentId::Captain,
+            to(&run_id, None),
+            manox_harness::steer_bus::SteerReason::Abort,
+            manox_harness::steer_bus::SteerPayload {
+                text: String::new(),
+            },
+            call(serde_json::json!({})),
+        )
+        .await
+        .expect("the abort lands");
+    let aborted_json: serde_json::Value = serde_json::from_str(&{
+        match &aborted.content[0] {
+            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text: {other:?}"),
+        }
+    })
+    .unwrap();
+    assert_eq!(aborted_json["interrupted"], true, "{aborted_json}");
+    for _ in 0..200 {
+        if !bus.is_live_run(&run_id) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(!bus.is_live_run(&run_id), "the run left the table");
+    assert!(
+        observer.has_settled(&run_id),
+        "the abort landed the durable settlement row"
     );
 }

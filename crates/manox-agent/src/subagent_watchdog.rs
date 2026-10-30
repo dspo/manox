@@ -97,6 +97,16 @@ impl SubagentWatchdog {
         }
     }
 
+    /// External guidance landed on the run (the Captain's Steer Inject): it
+    /// is activity — the idle clock resets and any stall episode closes —
+    /// without counting as a child event (no turns, no tool calls).
+    pub fn note_external_activity(&mut self, now: Instant) {
+        self.last_event_at = now;
+        self.stall_reported = false;
+        self.stall_echo_ticks = 0;
+        self.enter(Health::Working);
+    }
+
     /// Fold one child event into the state machine. Returns whether the
     /// health state changed — the caller throttles health emissions off it.
     pub fn observe(&mut self, event: &AgentEvent, now: Instant) -> bool {
@@ -469,6 +479,28 @@ mod tests {
         }
         assert!(!matches!(wd.health(), Health::Looping { .. }));
         assert_eq!(wd.tool_calls(), 5);
+    }
+
+    /// External guidance (the Captain's Steer Inject) is activity: the idle
+    /// clock resets, a stall episode closes, and no child counters move.
+    #[test]
+    fn external_guidance_resets_the_idle_clock_without_counting_child_work() {
+        let t0 = Instant::now();
+        let mut wd = SubagentWatchdog::new(t0, Some(10_000));
+        wd.observe(&turn_end(), t0);
+        assert_eq!(wd.turns(), 1);
+        // Past the idle budget: the next tick would enforce.
+        let late = t0 + Duration::from_secs(11);
+        assert_eq!(wd.tick(late), TickOutcome::EnforceStall);
+        // Guidance lands: the idle clock restarts, the episode closes.
+        wd.note_external_activity(late);
+        assert_eq!(
+            wd.tick(late + Duration::from_secs(9)),
+            TickOutcome::Idle,
+            "the guidance re-arms the idle budget"
+        );
+        assert_eq!(wd.turns(), 1, "guidance is not a child turn");
+        assert_eq!(wd.tool_calls(), 0, "guidance is not a child tool call");
     }
 
     #[test]

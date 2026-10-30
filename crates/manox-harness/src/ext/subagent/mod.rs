@@ -40,7 +40,7 @@ pub use spawn::{
     register_defaults, sailor_agent_def,
 };
 pub use types::{
-    AgentOptions, Budgets, Capabilities, DelegationToolConfig, Event, HUMAN_INTERACTION_TOOLS,
-    MAX_BUDGET_MS, MIN_BUDGET_MS, RunEndInfo, RunInfo, RunResult, RunSnapshot, StartRequest,
-    StopReason, SubagentError, ToolFilter, test_request,
+    AgentOptions, Budgets, Capabilities, Event, HUMAN_INTERACTION_TOOLS, MAX_BUDGET_MS,
+    MIN_BUDGET_MS, RunEndInfo, RunInfo, RunResult, RunSnapshot, StartRequest, StopReason,
+    SubagentDefConfig, SubagentError, ToolFilter, test_request,
 };

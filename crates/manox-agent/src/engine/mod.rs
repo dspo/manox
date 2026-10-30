@@ -19,7 +19,7 @@ use manox_harness::bash::persistent::PersistentShellOperations;
 use manox_harness::coding_agent::{AgentSession, ModelRuntime, create_agent_session};
 use manox_harness::ext_point_agent::AgentRegistry;
 use manox_harness::subagent::spawn::register_defaults;
-use manox_harness::subagent::{DelegationToolConfig, SpawnProvider, SubagentRuntime};
+use manox_harness::subagent::{SpawnProvider, SubagentDefConfig, SubagentRuntime};
 use manox_harness::tool::AgentTool as HarnessAgentTool;
 use manox_harness::types::{AgentEvent, AgentMessage, ContentBlock, Model as HarnessModel};
 use manox_harness::{BackgroundRegistry, BashOutputTool};

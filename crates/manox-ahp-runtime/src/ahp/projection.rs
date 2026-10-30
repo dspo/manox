@@ -220,7 +220,8 @@ pub(crate) fn target_of(entry: &SessionTreeEntry) -> Target {
         E::RunStarted { .. }
         | E::RunSettled { .. }
         | E::RunEscalated { .. }
-        | E::RunContinued { .. } => Target::Chat,
+        | E::RunContinued { .. }
+        | E::RunGuided { .. } => Target::Chat,
         // ── session state ────────────────────────────────────────────
         E::ModelChange { .. }
         | E::CwdChange { .. }
@@ -1247,6 +1248,20 @@ impl Translator {
                     &row,
                     text,
                     serde_json::json!({ "runEscalated": { "runId": run_id } }),
+                    &mut out,
+                );
+            }
+            SessionTreeEntry::RunGuided { run_id, text, .. } => {
+                // The dispatcher's mid-run guidance, attributed and visible
+                // to the agent and the user alike — the same face as a
+                // settlement or an escalation note. The child's own
+                // transcript carries the injected message itself.
+                let text = format!("Steered run `{run_id}`: {text}");
+                self.push_note(
+                    &chat,
+                    &row,
+                    text,
+                    serde_json::json!({ "runGuided": { "runId": run_id } }),
                     &mut out,
                 );
             }
@@ -3457,6 +3472,47 @@ mod tests {
             .expect("the legacy row still re-opens its entry");
         assert!(action["work"]["_meta"].get("agentType").is_none());
         assert_eq!(action["work"]["_meta"]["agentColor"], "pink");
+    }
+
+    /// A `run/guided` row (the Steer surface's mid-run guidance) folds to a
+    /// captain-transcript note naming the run and carrying the guidance —
+    /// the same face as a settlement or an escalation note.
+    #[test]
+    fn a_run_guided_row_folds_to_a_captain_transcript_note() {
+        let mut translator = Translator::new();
+        let emitted = translator.on_entry(
+            "c-1",
+            "s-1",
+            0,
+            &kernel(json!({
+                "type": "run/guided",
+                "runId": "sub-3",
+                "text": "focus on the projection layer only"
+            })),
+        );
+        let parts: Vec<_> = emitted
+            .iter()
+            .filter(|e| e.channel == "ahp-chat:/c-1")
+            .filter_map(|e| match &e.action {
+                StateAction::ChatResponsePart(action) => Some(action),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            parts.len(),
+            1,
+            "one note on the captain transcript: {emitted:?}"
+        );
+        let ResponsePart::SystemNotification(note) = &parts[0].part else {
+            panic!("expected a systemNotification part: {:?}", parts[0].part);
+        };
+        assert_eq!(
+            note.content.as_text(),
+            "Steered run `sub-3`: focus on the projection layer only"
+        );
+        let meta = note.meta.as_ref().expect("the note carries its payload");
+        let xmanox = &meta[ext::META_KEY];
+        assert_eq!(xmanox["runGuided"]["runId"], "sub-3");
     }
 
     /// The full background-task projection chain, anchored at the real
