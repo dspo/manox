@@ -554,6 +554,87 @@ pub struct Translator {
     /// work, so a progress tick settles to exactly one Set edge per run and
     /// exactly one Removed edge at its terminal status.
     subagents: BTreeMap<String, ()>,
+    /// The persistent child-run roster (PR-U2): every run this journal ever
+    /// dispatched, settled runs included. Settle rows carry no definition
+    /// identity, so each entry holds the fields the start row contributed —
+    /// the full wire row is rebuilt from here on every transition. Journal
+    /// truth only: a run leaves the table never; a cancelled turn does not
+    /// pre-settle anything (the engine's own `run/settled` row — including
+    /// `aborted` — is the durable edge, and a host that died mid-run leaves
+    /// the same `running` a fresh fold of its journal reads).
+    runs: BTreeMap<String, RunRow>,
+}
+
+/// One roster entry's identity, held between its rows.
+#[derive(Debug, Clone)]
+struct RunRow {
+    kind: String,
+    label: String,
+    color: Option<String>,
+    started_at: String,
+    status: RunStatus,
+}
+
+/// A roster entry's lifecycle face: running, or settled with its verdict
+/// (the settlement kind's wire string).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunStatus {
+    Running,
+    Settled,
+}
+
+impl RunRow {
+    /// The row's wire shape: the identity the start row contributed plus the
+    /// current status. `verdict` rides only a settled row.
+    fn wire(&self, run_id: &str) -> Value {
+        let mut row = json!({
+            "runId": run_id,
+            "kind": self.kind,
+            "label": self.label,
+            "status": match self.status {
+                RunStatus::Running => "running",
+                RunStatus::Settled => "settled",
+            },
+            "startedAt": self.started_at,
+            "chat": format!("ahp-chat:/{run_id}"),
+        });
+        if let Some(color) = &self.color {
+            row["color"] = json!(color);
+        }
+        row
+    }
+
+    /// Decode a row back out of its wire shape — the bridge-reset priming
+    /// source is the host's own fold of this same face.
+    fn from_wire(run_id: &str, row: &Value) -> Option<Self> {
+        let status = match row.get("status").and_then(Value::as_str)? {
+            "running" => RunStatus::Running,
+            "settled" => RunStatus::Settled,
+            _ => return None,
+        };
+        if run_id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            kind: row
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            label: row
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            color: row.get("color").and_then(Value::as_str).map(str::to_string),
+            started_at: row
+                .get("startedAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            status,
+        })
+    }
 }
 
 /// One transcript row's decoded fields.
@@ -776,6 +857,20 @@ impl Translator {
         }
     }
 
+    /// Re-list the persistent run roster a reset bridge's subscribers already
+    /// hold, from the host's own fold of the work channel. A reset skips the
+    /// `run/*` rows below its resume point, so the settle or continuation it
+    /// replays next must still emit a full row — which only the start row's
+    /// identity can build. Bookkeeping only: no edge is published, the
+    /// subscribers folded these rows already.
+    pub fn prime_run_roster(&mut self, rows: impl IntoIterator<Item = (String, Value)>) {
+        for (run_id, row) in rows {
+            if let Some(parsed) = RunRow::from_wire(&run_id, &row) {
+                self.runs.insert(run_id, parsed);
+            }
+        }
+    }
+
     /// Adopt an already-folded transcript as the starting view.
     ///
     /// Used when the host starts against an existing journal: the durable fold has
@@ -934,7 +1029,11 @@ impl Translator {
                 // A cancelled turn kills its in-flight subagents (#812) —
                 // the AHP face reports the deaths as removals rather than
                 // leaving entries that never settle. A completed turn's runs
-                // settle through their own terminal rows.
+                // settle through their own terminal rows. The persistent
+                // roster takes neither shortcut: the engine's own
+                // `run/settled` row (verdict `aborted` included) is the
+                // durable edge, and a host that died mid-run leaves the same
+                // `running` any fresh fold of its journal reads.
                 if *cancelled {
                     for id in self.subagents.keys().cloned().collect::<Vec<_>>() {
                         self.subagents.remove(&id);
@@ -1118,6 +1217,30 @@ impl Translator {
                         ),
                     ));
                 }
+                // The persistent roster face (PR-U2): the same facts, kept
+                // past the settle — this action upserts and never removes,
+                // so the child's run is enumerable from the wire alone for
+                // the run's whole life.
+                if !self.runs.contains_key(run_id) {
+                    self.runs.insert(
+                        run_id.clone(),
+                        RunRow {
+                            kind: kind.clone(),
+                            label: label.clone(),
+                            color: color.clone(),
+                            started_at: row.timestamp.clone(),
+                            status: RunStatus::Running,
+                        },
+                    );
+                    let work = Target::Work.uri(chat_id, session_id);
+                    out.push(Emitted::new(
+                        &work,
+                        extension_action(
+                            ext::actions::WORK_CHILD_RUNS,
+                            json!({ "run": self.runs[run_id].wire(run_id) }),
+                        ),
+                    ));
+                }
                 // The spawning tool call's forward pointer — the same edge
                 // the child chat records in reverse through its ChatOrigin
                 // (the spec's MUST-keep-consistent pair). The tool call id
@@ -1148,6 +1271,7 @@ impl Translator {
             }
             SessionTreeEntry::RunSettled {
                 run_id,
+                settlement,
                 verdict,
                 salvage,
                 turns,
@@ -1164,6 +1288,20 @@ impl Translator {
                                 id: run_id.clone(),
                             },
                         ),
+                    ));
+                }
+                // The roster face keeps the entry and stamps the verdict:
+                // settled runs stay enumerable (the settlement kind is the
+                // durable vocabulary the row already carries).
+                if let Some(entry) = self.runs.get_mut(run_id) {
+                    entry.status = RunStatus::Settled;
+                    let work = Target::Work.uri(chat_id, session_id);
+                    let mut wire = entry.wire(run_id);
+                    wire["verdict"] =
+                        json!(serde_json::to_value(settlement).unwrap_or(Value::Null));
+                    out.push(Emitted::new(
+                        &work,
+                        extension_action(ext::actions::WORK_CHILD_RUNS, json!({ "run": wire })),
                     ));
                 }
                 // The settlement notice rides the standard face: the host's
@@ -1229,6 +1367,36 @@ impl Translator {
                         ),
                     ));
                 }
+                // The roster flips the run back to running, refreshing the
+                // identity the continuation row restates (kind is empty on
+                // rows written before the field existed). The original label
+                // and start stamp stay: the roster is the run's account, and
+                // the follow-up is a topic, not a new identity. A run with no
+                // roster entry here is a reset bridge whose priming source
+                // was empty — the continuation row still opens one, built
+                // from what it carries.
+                let entry = self.runs.entry(run_id.clone()).or_insert_with(|| RunRow {
+                    kind: String::new(),
+                    label: follow_up.clone(),
+                    color: None,
+                    started_at: row.timestamp.clone(),
+                    status: RunStatus::Running,
+                });
+                entry.status = RunStatus::Running;
+                if !kind.is_empty() {
+                    entry.kind = kind.clone();
+                }
+                if color.is_some() {
+                    entry.color = color.clone();
+                }
+                let work = Target::Work.uri(chat_id, session_id);
+                out.push(Emitted::new(
+                    &work,
+                    extension_action(
+                        ext::actions::WORK_CHILD_RUNS,
+                        json!({ "run": entry.wire(run_id) }),
+                    ),
+                ));
             }
             SessionTreeEntry::RunEscalated {
                 run_id, question, ..
@@ -5534,6 +5702,20 @@ mod extension_gate_tests {
                 "x-manox-work:/s-1",
             ),
             (
+                kernel(json!({
+                    "type": "run/started",
+                    "runId": "sub-gate",
+                    "kind": "Explore",
+                    "label": "survey the fold",
+                    "childSession": "sub-gate",
+                    "toolCallId": "",
+                    "budgets": {},
+                    "depth": 1,
+                })),
+                ext_actions::WORK_CHILD_RUNS,
+                "x-manox-work:/s-1",
+            ),
+            (
                 kernel(json!({"type": "active_tools_change", "activeToolNames": ["bash"]})),
                 ext_actions::WORK_ACTIVE_TOOLS,
                 "x-manox-work:/s-1",
@@ -5619,6 +5801,21 @@ mod extension_gate_tests {
                     [("bg_7".to_string(), json!({"task_id": "bg_7"}))]
                         .into_iter()
                         .collect()
+                ),
+                child_runs: Some(
+                    [(
+                        "sub-gate".to_string(),
+                        json!({
+                            "runId": "sub-gate",
+                            "kind": "Explore",
+                            "label": "survey the fold",
+                            "status": "running",
+                            "startedAt": "2026-09-27T00:00:00.000Z",
+                            "chat": "ahp-chat:/sub-gate",
+                        }),
+                    )]
+                    .into_iter()
+                    .collect(),
                 ),
                 pinned: Some(true),
                 label: Some("x".to_string()),
@@ -6116,6 +6313,260 @@ mod subagent_roster_tests {
         let (sets, removed) = background_work_edges(&out);
         assert_eq!(sets, 0);
         assert_eq!(removed, 0, "an unlisted settle publishes no removal");
+    }
+}
+
+/// The persistent child-run roster (PR-U2): the `run/*` rows fold into a
+/// registry that keeps settled runs — the wire account a fresh client
+/// rebuilds a captain's roster from. Every assertion here goes through the
+/// real ext reducer, so the fold semantics and the wire shape are pinned
+/// together.
+#[cfg(test)]
+mod run_roster_tests {
+    use super::*;
+    use manox_ahp::ext::XManoxState;
+    use manox_ahp::ext::reducer as ext_reducer;
+
+    fn kernel(mut fields: Value) -> SessionTreeEntry {
+        let mut base = json!({
+            "id": "e-1",
+            "parentId": None::<String>,
+            "timestamp": "2026-10-09T00:00:00.000Z",
+        });
+        let object = base.as_object_mut().expect("base is an object");
+        if let Some(extra) = fields.as_object_mut() {
+            object.append(extra);
+        }
+        serde_json::from_value(base.clone())
+            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
+    }
+
+    fn started(run_id: &str, color: Option<&str>) -> SessionTreeEntry {
+        let mut fields = json!({
+            "type": "run/started",
+            "id": "e-2",
+            "runId": run_id,
+            "kind": "Explore",
+            "label": "survey the fold",
+            "childSession": run_id,
+            "toolCallId": "",
+            "budgets": {},
+            "depth": 1,
+        });
+        if let Some(color) = color {
+            fields["color"] = json!(color);
+        }
+        kernel(fields)
+    }
+
+    fn settled(run_id: &str, settlement: &str) -> SessionTreeEntry {
+        kernel(json!({
+            "type": "run/settled",
+            "id": "e-9",
+            "runId": run_id,
+            "settlement": settlement,
+            "verdict": "done",
+            "turns": 1,
+            "toolCalls": 1,
+        }))
+    }
+
+    fn continued(run_id: &str, kind: &str) -> SessionTreeEntry {
+        kernel(json!({
+            "type": "run/continued",
+            "id": "e-12",
+            "runId": run_id,
+            "followUp": "now write it up",
+            "kind": kind,
+        }))
+    }
+
+    /// The roster rows one fold emitted, decoded off the work channel.
+    fn roster_rows(out: &[Emitted]) -> Vec<Value> {
+        let work = Target::Work.uri("c-1", "s-1");
+        out.iter()
+            .filter(|e| e.channel == work)
+            .filter_map(|e| {
+                let action = serde_json::to_value(&e.action).unwrap();
+                (action["type"] == ext::actions::WORK_CHILD_RUNS).then(|| action["run"].clone())
+            })
+            .collect()
+    }
+
+    /// Fold the records, replaying every emission through the real ext
+    /// reducer — the same path a fresh subscriber's baseline takes.
+    fn fold_roster(records: &[SessionTreeEntry]) -> XManoxState {
+        let mut translator = Translator::new();
+        let mut state = XManoxState::default();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                let action = serde_json::to_value(&emitted.action).unwrap();
+                let _ = ext_reducer::apply(&mut state, &action);
+            }
+        }
+        state
+    }
+
+    fn run_of<'a>(state: &'a XManoxState, run_id: &str) -> &'a Value {
+        state
+            .child_runs
+            .as_ref()
+            .expect("the roster view populated")
+            .get(run_id)
+            .unwrap_or_else(|| panic!("run `{run_id}` is rostered"))
+    }
+
+    /// A start opens the run as `running`, carrying the definition identity
+    /// and the child-chat pointer the face exists to enumerate.
+    #[test]
+    fn a_started_run_opens_a_running_roster_row() {
+        let out = {
+            let mut t = Translator::new();
+            t.on_entry("c-1", "s-1", 0, &started("sub-1", Some("#aabbcc")))
+        };
+        let rows = roster_rows(&out);
+        assert_eq!(rows.len(), 1, "one upsert per start: {out:?}");
+        assert_eq!(rows[0]["runId"], "sub-1");
+        assert_eq!(rows[0]["kind"], "Explore");
+        assert_eq!(rows[0]["label"], "survey the fold");
+        assert_eq!(rows[0]["color"], "#aabbcc");
+        assert_eq!(rows[0]["status"], "running");
+        assert!(
+            rows[0].get("verdict").is_none(),
+            "running rows carry no verdict"
+        );
+        assert_eq!(rows[0]["startedAt"], "2026-10-09T00:00:00.000Z");
+        assert_eq!(rows[0]["chat"], "ahp-chat:/sub-1");
+    }
+
+    /// A definition without a declared color leaves the field out entirely
+    /// (absence, not null).
+    #[test]
+    fn a_colorless_run_omits_the_color_field() {
+        let out = {
+            let mut t = Translator::new();
+            t.on_entry("c-1", "s-1", 0, &started("sub-1", None))
+        };
+        let rows = roster_rows(&out);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get("color").is_none(), "{:?}", rows[0]);
+    }
+
+    /// The settle stamps the verdict and KEEPS the row — the exact opposite
+    /// of the live background-work face, whose removal runs beside it here.
+    #[test]
+    fn a_settled_run_keeps_its_row_with_the_verdict() {
+        let records = [started("sub-1", None), settled("sub-1", "timed-out")];
+        let out = {
+            let mut t = Translator::new();
+            let mut rows = Vec::new();
+            for (seq, entry) in records.iter().enumerate() {
+                rows.extend(t.on_entry("c-1", "s-1", seq as u64, entry));
+            }
+            rows
+        };
+        let rows = roster_rows(&out);
+        assert_eq!(
+            rows.len(),
+            2,
+            "settle re-emits the row, verdict attached: {rows:?}"
+        );
+        assert_eq!(rows[1]["status"], "settled");
+        assert_eq!(rows[1]["verdict"], "timed-out");
+        // The identity the settle row itself does not carry.
+        assert_eq!(rows[1]["kind"], "Explore");
+        assert_eq!(rows[1]["startedAt"], "2026-10-09T00:00:00.000Z");
+
+        let state = fold_roster(&records);
+        assert_eq!(run_of(&state, "sub-1")["status"], "settled");
+        assert_eq!(
+            state.child_runs.as_ref().unwrap().len(),
+            1,
+            "kept, not cleared"
+        );
+    }
+
+    /// A continuation flips the settled row back to `running`: verdict gone,
+    /// the original label and start stamp intact, the identity the row
+    /// restates refreshed.
+    #[test]
+    fn a_continuation_remarks_the_run_running() {
+        let records = [
+            started("sub-1", Some("#aabbcc")),
+            settled("sub-1", "completed"),
+            continued("sub-1", "Explore"),
+        ];
+        let state = fold_roster(&records);
+        let run = run_of(&state, "sub-1");
+        assert_eq!(run["status"], "running");
+        assert!(
+            run.get("verdict").is_none(),
+            "a reopened run has no verdict: {run}"
+        );
+        assert_eq!(
+            run["label"], "survey the fold",
+            "the follow-up is not an identity"
+        );
+        assert_eq!(
+            run["startedAt"], "2026-10-09T00:00:00.000Z",
+            "the original start"
+        );
+        assert_eq!(run["color"], "#aabbcc");
+        assert_eq!(run["kind"], "Explore");
+    }
+
+    /// The whole account is journal-pure: two independent folds of the same
+    /// chain (a fresh subscribe, a host restart) converge on the same roster.
+    #[test]
+    fn the_roster_rebuilds_identically_on_replay() {
+        let records = [
+            started("sub-1", None),
+            started("sub-2", Some("#112233")),
+            settled("sub-1", "completed"),
+            continued("sub-1", "Explore"),
+        ];
+        assert_eq!(fold_roster(&records), fold_roster(&records));
+    }
+
+    /// A reset bridge primes from the host's fold and then replays only the
+    /// settle above its resume point: the emitted row must still be complete
+    /// — the identity comes from the priming, not the settle row.
+    #[test]
+    fn a_primed_roster_settles_into_a_full_row() {
+        let started = started("sub-9", None);
+        // The running row the pre-reset stream already published, folded by
+        // the host — the priming source.
+        let mut host = XManoxState::default();
+        for emitted in Translator::new().on_entry("c-1", "s-1", 0, &started) {
+            let action = serde_json::to_value(&emitted.action).unwrap();
+            let _ = ext_reducer::apply(&mut host, &action);
+        }
+        let mut t = Translator::new();
+        t.prime_run_roster(host.child_runs.clone().unwrap());
+        let rows = roster_rows(&t.on_entry("c-1", "s-1", 1, &settled("sub-9", "aborted")));
+        assert_eq!(
+            rows.len(),
+            1,
+            "the settle still emits above the resume point"
+        );
+        assert_eq!(rows[0]["status"], "settled");
+        assert_eq!(rows[0]["verdict"], "aborted");
+        assert_eq!(rows[0]["kind"], "Explore", "primed identity fills the row");
+        assert_eq!(rows[0]["chat"], "ahp-chat:/sub-9");
+    }
+
+    /// A continuation with no roster entry still opens one — a reset bridge
+    /// whose priming source was empty recovers instead of emitting a row the
+    /// reducer would drop. The continuation row itself is thin (no label),
+    /// so the follow-up stands in until a fuller source exists.
+    #[test]
+    fn a_continuation_opens_an_unlisted_run() {
+        let mut t = Translator::new();
+        let rows = roster_rows(&t.on_entry("c-1", "s-1", 0, &continued("sub-7", "Explore")));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], "running");
+        assert_eq!(rows[0]["kind"], "Explore");
+        assert_eq!(rows[0]["label"], "now write it up");
     }
 }
 

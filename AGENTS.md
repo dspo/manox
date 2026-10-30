@@ -106,7 +106,7 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 - **派生面**：列表、状态位、谱系全是投影；侧栏扫描只读 header 与首条用户消息（有界），`state.json` 只是缓存。
 - **创建**：`createSession` = claim，唯一决策点是 `session::claim::decide`：未占用的 id → 驱动客户端铸的 id；同目录已物化 → 幂等复用（restore，绝不重铸）；活空白 → 复用；归档 → 铸新；目录不符 → 显式冲突（`gateway/bad-request`）；`lineage=subagent` → 拒绝（`session/already-owned`）。**应答携带最终 id，此后不变**。
 - **处置**：未物化会话的 dispose = 内存删行 + `root/sessionRemoved`；已物化会话的 dispose 不写任何 durable 标记（会话仍在列表里）。日志里没有「已处置」行。
-- **Swarm**：每个 run 落父日志恰两行（`run/started` + `run/settled`），进度不上父日志；run id == 子会话 id == 子 chat id。结算 kind 全枚举（completed/timed-out/stalled/aborted/error/refusal/max-tokens）由生产者给出，下游不得按字符串前缀判词（唯一例外：`manox-agent` 的 transcript 重建按 verdict 行**结尾**判状态，见 `ext/subagent/settlement.rs` 顶部）。子会话 chat 只读（`ChatOrigin{tool}` + `ChatInteractivity::ReadOnly`）；`AskParent` 的答案经 `continue_run_id` 续跑同一子会话（不是 AHP InputRequest）。
+- **Swarm**：每个 run 落父日志恰两行（`run/started` + `run/settled`），进度不上父日志；run id == 子会话 id == 子 chat id。结算 kind 全枚举（completed/timed-out/stalled/aborted/error/refusal/max-tokens）由生产者给出，下游不得按字符串前缀判词（唯一例外：`manox-agent` 的 transcript 重建按 verdict 行**结尾**判状态，见 `ext/subagent/settlement.rs` 顶部）。子会话 chat 只读（`ChatOrigin{tool}` + `ChatInteractivity::ReadOnly`）；`AskParent` 的答案经 `continue_run_id` 续跑同一子会话（不是 AHP InputRequest）。子会话的**常驻名册**（live + settled，settled 带 verdict 不摘除）在 `x-manox-work/childRunsChanged`（fold 进 `XManoxState.childRuns`，按 runId upsert）；chat 的 `backgroundWork` 是 live-only 面，settle 即摘行——两套词汇不混用（D12）。
 - **Engine 阶段**：`session::{identity,event,store,claim}` 是 v1.0.0 引擎；当前写入仍走 `jsonl` 树引擎（共用同一 `Event` 词汇与同一 `log.v1.jsonl`），`CoreStore` 的物化/租约/header-only 扫描**尚未接线**（staged，勿当成现役写入路径读）。
 ## crates/manox-harness 接线开发纪律（harness 分层）
 

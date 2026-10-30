@@ -167,9 +167,17 @@ fn is_state_bearing(event: &SessionTreeEntry) -> bool {
 /// host's own fold — the same state the client converges to — read through
 /// the roster accessor so the reset does not clone the whole chat. Bookkeeping
 /// only: no edge is published, the client already holds these entries.
+///
+/// The persistent run roster primes from the same principle, one channel over:
+/// the work channel's ext fold holds every row the pre-reset stream published,
+/// and the settle or continuation above the resume point needs the start
+/// row's identity to re-emit a full row. The same replay rule applies: a
+/// `replay_from` of zero means a full replay, which rebuilds both accounts
+/// from the journal itself, so priming there would only swallow edges.
 fn prime_bridge_roster(
     host: &manox_ahp::Host,
     session_id: &str,
+    thread_id: &str,
     translator: &mut Translator,
     replay_from: u64,
 ) {
@@ -177,6 +185,15 @@ fn prime_bridge_roster(
         host.background_work(session_id),
         replay_from,
     ));
+    if replay_from == 0 {
+        return;
+    }
+    let work = format!("{}{thread_id}", manox_ahp::ext::channels::WORK);
+    if let Some(state) = host.extension_state(&work)
+        && let Some(runs) = state.child_runs
+    {
+        translator.prime_run_roster(runs);
+    }
 }
 
 /// The ids a reset bridge re-lists from the fold. A `replay_from` of zero
@@ -705,6 +722,18 @@ impl RuntimeBackend {
             .unwrap_or_default()
     }
 
+    /// The thread id this session's extension emissions key under (the same
+    /// stamp [`Self::forward_entry`] reads off the seed): the work channel is
+    /// thread-scoped, so the roster priming must read the channel the
+    /// pre-reset stream actually published to.
+    fn bridge_thread(&self, session_id: &str) -> String {
+        self.seeds
+            .lock()
+            .get(session_id)
+            .map(|seeded| seeded.thread_id.clone())
+            .unwrap_or_else(|| session_id.to_string())
+    }
+
     /// The child-session bridge: the same replay-and-forward shape as
     /// [`Self::bridge`], over a running sub-agent's journal broadcast
     /// instead of a thread feed. The channel closes when the child session
@@ -720,7 +749,13 @@ impl RuntimeBackend {
         watermark: Arc<AtomicU64>,
     ) {
         let mut translator = Translator::new();
-        prime_bridge_roster(&host, &session_id, &mut translator, resume_from);
+        prime_bridge_roster(
+            &host,
+            &session_id,
+            &self.bridge_thread(&session_id),
+            &mut translator,
+            resume_from,
+        );
         let mut cursor = Cursor {
             tail: resume_from.saturating_sub(1),
             watermark,
@@ -761,7 +796,13 @@ impl RuntimeBackend {
                     );
                     translator = Translator::new();
                     let replay_from = cursor.tail + 1;
-                    prime_bridge_roster(&host, &session_id, &mut translator, replay_from);
+                    prime_bridge_roster(
+                        &host,
+                        &session_id,
+                        &self.bridge_thread(&session_id),
+                        &mut translator,
+                        replay_from,
+                    );
                     self.replay_journal(
                         &session_id,
                         &host,
@@ -855,7 +896,13 @@ impl RuntimeBackend {
         watermark: Arc<AtomicU64>,
     ) {
         let mut translator = Translator::new();
-        prime_bridge_roster(&host, &session_id, &mut translator, resume_from);
+        prime_bridge_roster(
+            &host,
+            &session_id,
+            &self.bridge_thread(&session_id),
+            &mut translator,
+            resume_from,
+        );
         let mut cursor = Cursor {
             tail: resume_from.saturating_sub(1),
             watermark,
@@ -899,7 +946,13 @@ impl RuntimeBackend {
                     );
                     translator = Translator::new();
                     let replay_from = cursor.tail + 1;
-                    prime_bridge_roster(&host, &session_id, &mut translator, replay_from);
+                    prime_bridge_roster(
+                        &host,
+                        &session_id,
+                        &self.bridge_thread(&session_id),
+                        &mut translator,
+                        replay_from,
+                    );
                     self.replay_journal(
                         &session_id,
                         &host,

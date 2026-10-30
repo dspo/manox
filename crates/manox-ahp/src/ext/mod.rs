@@ -60,9 +60,11 @@ pub const VERSION: u32 = 6;
 pub mod channels {
     /// The execution-plan document (per chat).
     pub const PLAN: &str = "x-manox-plan:/";
-    /// Goal, background tasks, browser suites (per session). The sub-agent
-    /// roster and the child transcripts are standard AHP state — the parent
-    /// chat's background work and `ahp-chat:/<run-id>` — never this channel.
+    /// Goal, background tasks, browser suites, and the child-run roster (per
+    /// session). The child transcripts are standard AHP state —
+    /// `ahp-chat:/<run-id>` — and the *live* sub-agent roster is the parent
+    /// chat's background work; the *persistent* run account (settled runs
+    /// keep their row) is this channel's `childRunsChanged` registry.
     pub const WORK: &str = "x-manox-work:/";
     /// Aggregated conversation metrics — the v2 Q face (per chat).
     pub const METRICS: &str = "x-manox-metrics:/";
@@ -100,6 +102,11 @@ pub mod actions {
     pub const WORK_GOAL_CHANGED: &str = "x-manox-work/goalChanged";
     /// Background-task registry snapshot (host-emitted).
     pub const WORK_BACKGROUND_TASKS: &str = "x-manox-work/backgroundTasksChanged";
+    /// The child-run roster: one run row per action, upserted by `runId`
+    /// (host-emitted). Settled runs keep their row with the verdict; a
+    /// `run/continued` re-marks it running — the persistent account the
+    /// live-only chat background work never carries.
+    pub const WORK_CHILD_RUNS: &str = "x-manox-work/childRunsChanged";
     /// Active browser suites (host-emitted; clients set through `session/configChanged`).
     pub const WORK_BROWSER_SUITES: &str = "x-manox-work/browserSuitesChanged";
     /// The engine's active tool set (host-emitted; AHP's `session/serverToolsChanged`
@@ -141,6 +148,7 @@ pub mod actions {
         PLAN_CHANGED,
         WORK_GOAL_CHANGED,
         WORK_BACKGROUND_TASKS,
+        WORK_CHILD_RUNS,
         WORK_BROWSER_SUITES,
         WORK_ACTIVE_TOOLS,
         METRICS_CHANGED,
