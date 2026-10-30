@@ -1508,12 +1508,14 @@ impl ThreadStore {
     }
 
     /// Archive (or unarchive) a session. The row moves between the active
-    /// and archived partitions immediately; the post-write refresh in
-    /// `write_meta` re-syncs both partitions from disk. Archiving cascades
-    /// to every descendant along `parent_id` (team members, fork children —
-    /// one hierarchy rule); unarchiving moves only the requested row.
-    /// Re-asserting the current state is a no-op: no partition move, meta
-    /// write, or lifecycle hook.
+    /// and archived partitions immediately (a delegated child flips its flag
+    /// in the child partition — the walk filters the flag); the post-write
+    /// refresh in `write_meta` re-syncs both partitions from disk. Archiving
+    /// cascades to every descendant along `parent_id` (team members, fork
+    /// children — one hierarchy rule; the child partition is not walked, a
+    /// container teardown resolves those rows itself); unarchiving moves
+    /// only the requested row. Re-asserting the current state is a no-op:
+    /// no partition move, meta write, or lifecycle hook.
     pub fn archive_thread(&mut self, id: &str, archived: bool) {
         if self.decided_flags(id).is_some_and(|(_, a)| a == archived) {
             return;
@@ -1536,11 +1538,20 @@ impl ThreadStore {
                     let mut summary = self.summaries.swap_remove(pos);
                     summary.archived = true;
                     self.archived_summaries.push(summary);
+                } else if let Some(child) = self.child_summaries.iter_mut().find(|s| s.id == tid) {
+                    // A delegated child stays in the child partition (there
+                    // is no archived child partition — the catalogue walk
+                    // filters the flag); the decision must still be visible
+                    // in memory now, not only after the next refresh pass
+                    // re-reads the sidecar.
+                    child.archived = true;
                 }
             } else if let Some(pos) = self.archived_summaries.iter().position(|s| s.id == tid) {
                 let mut summary = self.archived_summaries.swap_remove(pos);
                 summary.archived = false;
                 self.summaries.push(summary);
+            } else if let Some(child) = self.child_summaries.iter_mut().find(|s| s.id == tid) {
+                child.archived = false;
             }
             // K3 (L3): every cascaded row's flag decision journals its own
             // `pinned_archived` entry (the entry is the authority, K2); a

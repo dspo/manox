@@ -2207,6 +2207,84 @@ impl AgentServerInner {
         }
     }
 
+    /// The container-level teardown, the `x-manox/teardown` waterfall.
+    ///
+    /// `"stop-all"` kills everything the container keeps live in this
+    /// process — the session's active turn, every live subagent run its
+    /// engine assembly owns, every background task it registered — and
+    /// returns once the cancellations are issued (dispose tokens;
+    /// settlements follow the existing delivery paths). A session this
+    /// process does not drive owns nothing live here, so it honestly stops
+    /// nothing. `"archive"` is stop-all plus the cascade: every delegated
+    /// child row the catalogue's parent edges carry is archived through the
+    /// same decision write, then the session itself — the whole container
+    /// tree reaches the archived state in one call.
+    pub(crate) fn teardown_container(
+        &self,
+        owner: &str,
+        session_id: &str,
+        mode: &str,
+    ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
+        if mode != "stop-all" && mode != "archive" {
+            return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                "teardown mode `{mode}` is not a known value; expected \"stop-all\" or \"archive\""
+            ))
+            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+        }
+        // Receipt inputs are read before `stop_all` runs: the interrupt and
+        // the task stop are issued inside it, not awaited.
+        let (interrupted, stopped_tasks) = match self.session_thread(session_id) {
+            Some(thread) => {
+                let stopped = manox_agent::background_task::snapshots_for_thread(session_id)
+                    .iter()
+                    .filter(|snap| !snap.status.is_terminal())
+                    .count();
+                let interrupted = thread.with_mut(|t| t.stop_all());
+                (interrupted, stopped)
+            }
+            // A cold session (journal on disk, no live engine in this
+            // process) owns nothing live here; the archive leg still lands.
+            None => (Vec::new(), 0),
+        };
+        let mut archived: Vec<String> = Vec::new();
+        if mode == "archive" {
+            // The cascade set: delegated children hang off the catalogue's
+            // parent edges; a child already archived skips through the
+            // store's own no-op discipline.
+            let children: Vec<String> = manox_agent::thread_store::global().read(|s| {
+                s.child_summaries()
+                    .iter()
+                    .filter(|row| row.parent_id.as_deref() == Some(session_id) && !row.archived)
+                    .map(|row| row.id.clone())
+                    .collect()
+            });
+            for child in &children {
+                self.teardown_archive_row(owner, child);
+                archived.push(child.clone());
+            }
+            self.teardown_archive_row(owner, session_id);
+            archived.push(session_id.to_string());
+        }
+        Ok(json!({
+            "interruptedRuns": interrupted,
+            "stoppedTasks": stopped_tasks,
+            "archived": archived,
+        }))
+    }
+
+    /// The archive write of the teardown cascade: the store decision (which
+    /// journals its own row, K3) lands, then the live engine leaves this
+    /// process regardless of the connection bookkeeping — a container
+    /// teardown is a host-level gesture, not one client's detach, so every
+    /// owner is cleared and the caller-scoped dispose's "other owners
+    /// remain" skip can never keep a dead container's engine alive.
+    fn teardown_archive_row(&self, owner: &str, session_id: &str) {
+        for held in self.owners(session_id) {
+            self.remove_owner(&held, session_id);
+        }
+        self.archive_thread(owner, session_id, true);
+    }
+
     /// Pin or unpin a session (the AHP extension surface: AHP has no pin bit).
     ///
     /// The durable authority is the store row plus the session's sidecar, the

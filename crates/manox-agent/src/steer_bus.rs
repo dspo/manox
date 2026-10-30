@@ -119,6 +119,28 @@ impl AgentBus {
             .is_some_and(|d| d.observer.has_settled(addr))
     }
 
+    /// Interrupt every live run on the installed surface (the Steer Abort
+    /// primitive applied to the whole live table — the stop-all face).
+    /// Cancellation rides each run's dispose token, so this returns once
+    /// issued; each settlement lands through the existing delivery paths
+    /// with the usual `aborted` verdict. Returns the run ids the
+    /// cancellation was issued to (a snapshot — the run may settle after).
+    pub fn interrupt_all_runs(&self) -> Vec<String> {
+        let Some(delegation) = self.delegation() else {
+            return Vec::new();
+        };
+        let ids: Vec<String> = delegation
+            .runtime
+            .list_runs()
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        for id in &ids {
+            delegation.runtime.interrupt(id);
+        }
+        ids
+    }
+
     /// The main Steer routing entry point. Run addresses resolve against the
     /// installed subagent surface; member addresses against the spawned
     /// member set; everything else falls through to the permission-denied

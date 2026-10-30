@@ -836,6 +836,10 @@ impl ThreadEngine for Engine {
         self.bus.abort_all_members();
     }
 
+    fn interrupt_live_runs(&self) -> Vec<String> {
+        self.bus.interrupt_all_runs()
+    }
+
     fn set_model(&self, model: HarnessModel) {
         let _ = self.cmd_tx.send(SessionCmd::SetModel(model));
     }
