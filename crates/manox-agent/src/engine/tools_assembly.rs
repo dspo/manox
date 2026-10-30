@@ -1246,12 +1246,30 @@ pub(super) fn build_tools(
     );
     for (tool_name, def, allow, denied) in &delegation_defs {
         let capability = subagent_capability(def);
+        // A run always spends at least one turn, so `maxTurns: 0` is an
+        // authoring error, not a cap of zero — warn and leave the child
+        // unbounded rather than honoring a number that means the opposite
+        // of what its author wrote. Sanitized BEFORE the description: a
+        // definition rendered as "capped at 0 turns" while dispatching
+        // unbounded is exactly the contradiction this adapter must not
+        // teach the model.
+        let frontmatter_max_turns = match def.max_turns {
+            Some(0) => {
+                tracing::warn!(
+                    agent = %def.name,
+                    "agent definition declares maxTurns: 0; a run always spends at least \
+                     one turn — treating it as unset"
+                );
+                None
+            }
+            other => other,
+        };
         // The declaration defaults change the dispatch contract the model
         // sees, so the rendered description names them — a tool whose
         // contract text says one thing while the dispatch does another
         // teaches the model the wrong call shape. The waiting contract is
         // the description's own sentence (parameterized, no contradiction);
-        // isolation and the turn cap append.
+        // isolation and the sanitized turn cap append.
         let mut rendered_description = crate::subagent::delegation_description(
             &def.description,
             capability,
@@ -1264,27 +1282,12 @@ pub(super) fn build_tools(
                  its report names where kept work landed.",
             );
         }
-        if let Some(max_turns) = def.max_turns {
+        if let Some(max_turns) = frontmatter_max_turns {
             rendered_description.push_str(&format!(
                 " This agent's runs are capped at {max_turns} turns per drive; \
                  a continuation starts a fresh count."
             ));
         }
-        // A run always spends at least one turn, so `maxTurns: 0` is an
-        // authoring error, not a cap of zero — warn and leave the child
-        // unbounded rather than honoring a number that means the opposite
-        // of what its author wrote.
-        let frontmatter_max_turns = match def.max_turns {
-            Some(0) => {
-                tracing::warn!(
-                    agent = %def.name,
-                    "agent definition declares maxTurns: 0; a run always spends at least \
-                     one turn — treating it as unset"
-                );
-                None
-            }
-            other => other,
-        };
         let config = DelegationToolConfig {
             provider: "spawn".into(),
             name: tool_name.clone(),

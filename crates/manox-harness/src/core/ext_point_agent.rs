@@ -8,8 +8,14 @@
 // the compatibility contract with that ecosystem is Claude Code's own parse
 // behavior: an unrecognized or unmodeled field never drops the definition —
 // it is captured (`unknown_frontmatter`) and reported by the loader, while
-// structural errors (bad YAML, missing `name`, empty body) still do. The
-// disposition of every Claude frontmatter field:
+// structural errors (bad YAML, missing `name`, empty body) still do. One
+// deliberate exception to that tolerance: a key that is a near-miss of an
+// ACCESS-BEARING key (`permissions`, `tools`, `disallowedTools` — case- and
+// separator-insensitive, edit distance ≤ 1) is a structural error, because
+// a misspelling there loses a narrowing the author explicitly wrote and the
+// generic drift warn reads as ecosystem noise. Convenience keys get no such
+// guard: a future Claude rename within distance 1 of one must not brick
+// manifests again. The disposition of every Claude frontmatter field:
 //
 // | field               | disposition                                            |
 // |---------------------|--------------------------------------------------------|
@@ -22,8 +28,10 @@
 // | `effort`            | handled — default reasoning effort (frontmatter tier)  |
 // | `isolation`         | handled — `worktree` dispatches into a throwaway       |
 // |                     | worktree by default                                    |
-// | `background`        | handled — dispatches onto a background card by default |
-// | `maxTurns`          | handled — turn cap; the child ends partial, resumable  |
+// | `background`        | handled — always dispatches onto a background card;    |
+// |                     | `run_in_background: false` cannot foreground it        |
+// | `maxTurns`          | handled — turn cap per drive; the child ends partial,  |
+// |                     | resumable                                              |
 // | `color`             | handled — display data; rides the run rows to hosts    |
 // | `permissionMode`    | declared no-op — Claude approval modes have no         |
 // |                     | counterpart on the access-axis `permissions` block;    |
@@ -42,7 +50,9 @@
 //
 // The `permissions:` block stays a closed vocabulary (`deny_unknown_fields`):
 // it is this runtime's security-bearing surface, where an unknown axis must
-// fail the parse instead of silently widening a child.
+// fail the parse instead of silently widening a child. The lookalike guard
+// above extends that fail-loud face one level out: a misspelled block name
+// or allow/deny key fails the parse instead of registering with defaults.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -362,15 +372,15 @@ impl AgentDef {
         let mut def: AgentDef =
             serde_yaml::from_str(&frontmatter).map_err(|e| format!("invalid frontmatter: {e}"))?;
         // The near-miss guard rides the tolerance contract: an unmodeled key
-        // that looks like a misspelled `permissions` block is an authoring
-        // error, not ecosystem drift — silently registering with the widest
-        // ceiling would drop exactly the narrowing the author wrote.
+        // that looks like a misspelled ACCESS-BEARING key is an authoring
+        // error, not ecosystem drift — silently registering would drop a
+        // narrowing the author wrote (or leave a restricted agent on the
+        // full tool set).
         for key in def.unknown_frontmatter.keys() {
-            if is_near_miss_of_permissions(key) {
+            if let Some(guarded) = near_miss_guarded_key(key) {
                 return Err(format!(
-                    "unknown field `{key}` looks like a misspelled `permissions` block; the \
-                     security declaration must not be silently dropped — fix the spelling or \
-                     remove it"
+                    "unknown field `{key}` looks like a misspelled `{guarded}` key; the access \
+                     declaration must not be silently dropped — fix the spelling or remove it"
                 ));
             }
         }
@@ -379,13 +389,19 @@ impl AgentDef {
     }
 }
 
-/// The one lookalike-guarded key: case/separator-normalized edit distance
-/// ≤ 1 against `permissions` is a structural error. Scoped to this block
-/// on purpose — the generic unknown-field tolerance must stay open for the
-/// evolving Claude vocabulary (a future rename within distance 1 of a
-/// convenience key must not brick manifests again), while a misspelled
-/// security declaration loses narrowing the author explicitly wrote.
-fn is_near_miss_of_permissions(key: &str) -> bool {
+/// The lookalike-guarded keys, normalized. Scoped to the access-bearing
+/// trio on purpose: a misspelling there silently drops a narrowing or
+/// widens the child's tool pool, while the generic unknown-field tolerance
+/// must stay open for the evolving Claude vocabulary (a future rename
+/// within distance 1 of a convenience key must not brick manifests again).
+const GUARDED_KEYS: [&str; 3] = ["permissions", "tools", "disallowedtools"];
+
+/// Whether an unknown key is a near-miss of a guarded key — normalized
+/// (case- and separator-insensitive) equality or edit distance ≤ 1.
+/// Boundary note: the check does not catch transpositions
+/// (`permissinos` is distance 2); it closes the drop-a-character and
+/// wrong-case shapes, which are the common authoring errors.
+fn near_miss_guarded_key(key: &str) -> Option<&'static str> {
     fn normalize(key: &str) -> String {
         key.chars()
             .flat_map(|c| c.to_lowercase())
@@ -426,7 +442,10 @@ fn is_near_miss_of_permissions(key: &str) -> bool {
         edits + (long.len() - i) <= 1
     }
     let normalized = normalize(key);
-    normalized == "permissions" || edit_distance_at_most_one(&normalized, "permissions")
+    GUARDED_KEYS
+        .iter()
+        .find(|guarded| normalized == **guarded || edit_distance_at_most_one(&normalized, guarded))
+        .copied()
 }
 
 /// Split `---\n...\n---\nbody` into the frontmatter YAML and the body.
@@ -782,18 +801,34 @@ mod tests {
         assert_eq!(registry.names(), vec!["Good"]);
     }
 
-    /// The security-bearing block is lookalike-guarded: a misspelled
-    /// `permissions` is an authoring error (the narrowing it declares would
-    /// be silently dropped), while the genuine Claude `permissionMode`
-    /// stays a captured declared no-op.
+    /// The access-bearing keys are lookalike-guarded: a misspelled
+    /// `permissions`/`tools`/`disallowedTools` is an authoring error (the
+    /// declaration it carries would be silently dropped, or a restricted
+    /// agent would land on the full tool set), while near misses of
+    /// convenience keys and the genuine Claude `permissionMode` stay
+    /// captured declared no-ops.
     #[test]
-    fn parse_md_rejects_a_permissions_lookalike() {
-        for lookalike in ["permisions", "Permissions", "per_missions"] {
-            let manifest =
-                format!("---\nname: X\ndescription: d\n{lookalike}:\n  mode: sandbox\n---\nbody");
+    fn parse_md_rejects_guarded_key_lookalikes() {
+        for lookalike in [
+            "permisions",
+            "Permissions",
+            "per_missions",
+            "tool",
+            "toools",
+            "disallowedTool",
+            "disallowed_tools",
+        ] {
+            let manifest = format!("---\nname: X\ndescription: d\n{lookalike}: Read\n---\nbody");
             let err = AgentDef::parse_md(&manifest).unwrap_err();
-            assert!(err.contains("permissions"), "{lookalike}: {err}");
+            assert!(err.contains("misspelled"), "{lookalike}: {err}");
         }
+        // Distance-1 from a CONVENIENCE key is not guarded — the tolerance
+        // contract stays open for the evolving Claude vocabulary.
+        let manifest = "---\nname: X\ndescription: d\ncolr: pink\n---\nbody";
+        let def = AgentDef::parse_md(manifest).unwrap();
+        assert!(def.unknown_frontmatter.contains_key("colr"));
+
+        // The genuine Claude `permissionMode` stays a declared no-op.
         let manifest = "---\nname: X\ndescription: d\npermissionMode: plan\n---\nbody";
         let def = AgentDef::parse_md(manifest).unwrap();
         assert!(def.unknown_frontmatter.contains_key("permissionMode"));
