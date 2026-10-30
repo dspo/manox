@@ -114,13 +114,15 @@ fn register_from_dirs(
     plugins: &[crate::plugin::InstalledPlugin],
 ) {
     if let Some(dir) = user_dir {
-        for (label, def) in load_dir(dir) {
+        for (label, mut def) in load_dir(dir) {
+            def.source = manox_harness::ext_point_agent::AgentSource::User;
             tracing::debug!(agent = %def.name, source = %label, "registered user agent definition");
             registry.register(def);
         }
     }
     if let Some(cwd) = project_cwd {
-        for (label, def) in load_dir(&cwd.join(".claude").join("agents")) {
+        for (label, mut def) in load_dir(&cwd.join(".claude").join("agents")) {
+            def.source = manox_harness::ext_point_agent::AgentSource::Project;
             tracing::debug!(agent = %def.name, source = %label, "registered project agent definition");
             registry.register(def);
         }
@@ -128,6 +130,7 @@ fn register_from_dirs(
     for plugin in plugins {
         for (label, mut def) in load_dir(&plugin.root.join("agents")) {
             def.name = format!("{}:{}", plugin.key, def.name);
+            def.source = manox_harness::ext_point_agent::AgentSource::Plugin;
             tracing::debug!(agent = %def.name, source = %label, "registered plugin agent definition");
             registry.register(def);
         }
