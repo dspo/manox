@@ -3113,6 +3113,7 @@ fn delegation_tool_description_carries_definition_and_contract() {
         "Read-only codebase exploration",
         "read-only",
         "Explore",
+        false,
     );
     assert!(
         rendered.contains("[capability: read-only]"),
@@ -3133,6 +3134,31 @@ fn delegation_tool_description_carries_definition_and_contract() {
     assert!(
         rendered.contains("may escalate a denied command"),
         "description declares the bounded escalation channel: {rendered}"
+    );
+}
+
+/// The waiting contract tracks the definition's `background` declaration:
+/// a background-default tool must not be taught the foreground default,
+/// and it must state that the flag cannot foreground it.
+#[test]
+fn delegation_tool_description_flips_the_waiting_contract_on_a_background_default() {
+    let rendered = crate::subagent::delegation_description(
+        "Long-running sweep",
+        "write+bash",
+        "Sweeper",
+        true,
+    );
+    assert!(
+        rendered.contains("returns immediately"),
+        "background default declares the non-blocking call: {rendered}"
+    );
+    assert!(
+        rendered.contains("cannot foreground it"),
+        "background default states the flag is not an override: {rendered}"
+    );
+    assert!(
+        !rendered.contains("By default the call waits"),
+        "the foreground waiting sentence must not contradict the declaration: {rendered}"
     );
 }
 

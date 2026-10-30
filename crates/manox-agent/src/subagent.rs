@@ -4,7 +4,9 @@
 //!   definition name), bound to the `spawn` provider. Foreground by default
 //!   (the tool result IS the child's final output); `run_in_background`
 //!   parks the run on a background card and delivers the settled result as
-//!   a peer report.
+//!   a peer report. A definition declaring `background: true` flips its
+//!   own default the other way — its dispatches always go to the
+//!   background card, and the flag cannot foreground them.
 //! - [`ListAgentsTool`] / [`InterruptAgentTool`]: the control pair over the
 //!   runtime's live-run table.
 //! - [`SubagentRunObserver`]: the [`RunObserver`] bridge folding ext-level
@@ -105,6 +107,14 @@ pub fn resolve_delegation_tool(
                         tool = %name,
                         "agent definition names a tool children never receive; subagents never \
                          get it (DELEGATED_CALLER guard)"
+                    );
+                    false
+                } else if name.as_str() == manox_harness::subagent::ask::ASK_PARENT {
+                    tracing::warn!(
+                        agent = %def.name,
+                        tool = %name,
+                        "agent definition tries to scope the escalation channel; AskParent is \
+                         appended to every child run after filtering and cannot be denied"
                     );
                     false
                 } else {
@@ -282,18 +292,33 @@ impl DelegationTool {
 }
 
 /// Build the model-facing description: the definition's own description and
-/// capability tag plus the dispatch contract (fresh context, foreground by
-/// default, background semantics, budgets). Model-facing English — never
-/// localized.
-pub fn delegation_description(description: &str, capability: &str, name: &str) -> String {
+/// capability tag plus the dispatch contract (fresh context, the waiting
+/// contract the definition declares, budgets). `background_default` flips
+/// the waiting sentence — the contract the model is taught must match what
+/// the dispatch actually does, per definition, never a generic claim a
+/// `background: true` definition silently contradicts. Model-facing
+/// English — never localized.
+pub fn delegation_description(
+    description: &str,
+    capability: &str,
+    name: &str,
+    background_default: bool,
+) -> String {
+    let waiting = if background_default {
+        "The call returns immediately: the definition declares `background: true`, \
+         so the run goes to a background card and the report arrives as a message \
+         when it settles (`run_in_background: false` cannot foreground it)."
+    } else {
+        "By default the call waits and returns the child's final report; set \
+         `run_in_background: true` to run it on a background card instead and \
+         receive the report as a message when it settles."
+    };
     format!(
         "{description} [capability: {capability}] Dispatch a `{name}` subagent — a \
          fresh-context worker that cannot see this conversation. Required: \
          `description` (short task label) and `prompt` (the full task; the child \
-         only knows what you write). By default the call waits and returns the \
-         child's final report; set `run_in_background: true` to run it on a \
-         background card instead and receive the report as a message when it \
-         settles. `timeout_ms`/`idle_timeout_ms` (min {}ms, max 30 days) arm \
+         only knows what you write). {waiting} `timeout_ms`/`idle_timeout_ms` \
+         (min {}ms, max 30 days) arm \
          kill budgets that deliver a partial report on expiry. The optional \
          `permissions` object ({{ mode: inherit|sandbox|full-access, \
          network: inherit|off|on }}) narrows the child's access for this \
@@ -325,6 +350,18 @@ impl AgentTool for DelegationTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        // A background-default definition keeps the flag in the schema (the
+        // request still parses) but says what it actually does there, so
+        // the model is never taught an override that does nothing.
+        let run_in_background_hint = if self.config.frontmatter_background {
+            "Run on a background card and deliver the report as a message on \
+             settlement instead of blocking this call until the final report. \
+             This definition always dispatches to the background; the flag \
+             cannot foreground it."
+        } else {
+            "Run on a background card and deliver the report as a message on \
+             settlement instead of blocking this call until the final report."
+        };
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -351,7 +388,7 @@ impl AgentTool for DelegationTool {
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Run on a background card and deliver the report as a message on settlement instead of blocking this call until the final report."
+                    "description": run_in_background_hint,
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -559,6 +596,7 @@ impl AgentTool for DelegationTool {
                 "run/continued",
                 with_color(serde_json::json!({
                     "runId": run_id.clone(),
+                    "kind": self.config.name,
                     "followUp": prompt,
                 })),
             ),

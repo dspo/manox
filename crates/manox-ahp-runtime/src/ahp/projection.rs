@@ -1188,18 +1188,24 @@ impl Translator {
             }
             SessionTreeEntry::RunContinued {
                 run_id,
+                kind,
                 follow_up,
                 color,
                 ..
             } => {
                 // A continuation re-opens the run's roster entry: the same
-                // child chat, a fresh start line, every pointer intact — the
-                // definition identity and display color ride along so the
-                // reopened surface keeps them.
+                // child chat, a fresh start line, every pointer intact. The
+                // `agentColor` key rides the row's color; `agentType` needs
+                // the row's `kind`, which rows written before the field
+                // existed leave empty — those surfaces keep whatever
+                // fallback they have rather than an invented identity.
                 let listed = self.subagents.contains_key(run_id);
                 if !listed {
                     self.subagents.insert(run_id.clone(), ());
                     let mut meta = JsonObject::new();
+                    if !kind.is_empty() {
+                        meta.insert("agentType".to_string(), Value::String(kind.clone()));
+                    }
                     if let Some(color) = &color {
                         meta.insert("agentColor".to_string(), Value::String(color.clone()));
                     }
@@ -3398,6 +3404,59 @@ mod tests {
             .expect("the second run opens its entry");
         assert_eq!(action["work"]["_meta"]["agentType"], "Explore");
         assert!(action["work"]["_meta"].get("agentColor").is_none());
+    }
+
+    /// A `run/continued` row keeps the reopened entry's identity: `kind`
+    /// stamps `agentType`, `color` stamps `agentColor`. A row written
+    /// before `kind` existed (empty) stamps the color alone rather than
+    /// inventing an identity.
+    #[test]
+    fn a_run_continued_row_stamps_the_definition_identity_and_color() {
+        let mut translator = Translator::new();
+        let emitted = translator.on_entry(
+            "c-1",
+            "s-1",
+            0,
+            &kernel(json!({
+                "type": "run/continued",
+                "runId": "sub-9",
+                "kind": "Explore",
+                "followUp": "keep going",
+                "color": "cyan"
+            })),
+        );
+        let action = emitted
+            .iter()
+            .filter(|e| e.channel == "ahp-chat:/c-1")
+            .find_map(|e| {
+                let action = serde_json::to_value(&e.action).ok()?;
+                (action["type"] == "chat/backgroundWorkSet").then_some(action)
+            })
+            .expect("the continuation re-opens the entry");
+        assert_eq!(action["work"]["_meta"]["agentType"], "Explore");
+        assert_eq!(action["work"]["_meta"]["agentColor"], "cyan");
+
+        let emitted = translator.on_entry(
+            "c-1",
+            "s-1",
+            1,
+            &kernel(json!({
+                "type": "run/continued",
+                "runId": "sub-8",
+                "followUp": "keep going",
+                "color": "pink"
+            })),
+        );
+        let action = emitted
+            .iter()
+            .filter(|e| e.channel == "ahp-chat:/c-1")
+            .find_map(|e| {
+                let action = serde_json::to_value(&e.action).ok()?;
+                (action["type"] == "chat/backgroundWorkSet").then_some(action)
+            })
+            .expect("the legacy row still re-opens its entry");
+        assert!(action["work"]["_meta"].get("agentType").is_none());
+        assert_eq!(action["work"]["_meta"]["agentColor"], "pink");
     }
 
     /// The full background-task projection chain, anchored at the real

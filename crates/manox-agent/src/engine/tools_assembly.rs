@@ -1247,17 +1247,17 @@ pub(super) fn build_tools(
     for (tool_name, def, allow, denied) in &delegation_defs {
         let capability = subagent_capability(def);
         // The declaration defaults change the dispatch contract the model
-        // sees, so the rendered description names them — a tool whose schema
-        // says "foreground by default" while the definition says otherwise
-        // would teach the model the wrong call shape.
-        let mut rendered_description =
-            crate::subagent::delegation_description(&def.description, capability, tool_name);
-        if def.background {
-            rendered_description.push_str(
-                " This agent dispatches onto a background card by default; the \
-                           report arrives as a message when the run settles.",
-            );
-        }
+        // sees, so the rendered description names them — a tool whose
+        // contract text says one thing while the dispatch does another
+        // teaches the model the wrong call shape. The waiting contract is
+        // the description's own sentence (parameterized, no contradiction);
+        // isolation and the turn cap append.
+        let mut rendered_description = crate::subagent::delegation_description(
+            &def.description,
+            capability,
+            tool_name,
+            def.background,
+        );
         if def.isolation.as_deref() == Some("worktree") {
             rendered_description.push_str(
                 " This agent dispatches into a throwaway git worktree by default; \
@@ -1266,9 +1266,25 @@ pub(super) fn build_tools(
         }
         if let Some(max_turns) = def.max_turns {
             rendered_description.push_str(&format!(
-                " This agent's runs are capped at {max_turns} turns."
+                " This agent's runs are capped at {max_turns} turns per drive; \
+                 a continuation starts a fresh count."
             ));
         }
+        // A run always spends at least one turn, so `maxTurns: 0` is an
+        // authoring error, not a cap of zero — warn and leave the child
+        // unbounded rather than honoring a number that means the opposite
+        // of what its author wrote.
+        let frontmatter_max_turns = match def.max_turns {
+            Some(0) => {
+                tracing::warn!(
+                    agent = %def.name,
+                    "agent definition declares maxTurns: 0; a run always spends at least \
+                     one turn — treating it as unset"
+                );
+                None
+            }
+            other => other,
+        };
         let config = DelegationToolConfig {
             provider: "spawn".into(),
             name: tool_name.clone(),
@@ -1292,7 +1308,7 @@ pub(super) fn build_tools(
                 .as_deref()
                 .and_then(crate::subagent::declared_isolation),
             frontmatter_background: def.background,
-            frontmatter_max_turns: def.max_turns,
+            frontmatter_max_turns,
             color: def.color.clone(),
             declared_permissions: def.permissions,
             max_depth: 1,

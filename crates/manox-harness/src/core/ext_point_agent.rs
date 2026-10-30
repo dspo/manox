@@ -103,19 +103,25 @@ pub struct AgentDef {
     /// other value is reported by the assembly and ignored.
     #[serde(default)]
     pub isolation: Option<String>,
-    /// Dispatch onto a background card by default: the call returns
-    /// immediately and the report arrives as a message when the run
-    /// settles. A per-call `run_in_background` stays available.
+    /// Dispatch onto a background card: the call returns immediately and
+    /// the report arrives as a message when the run settles. This is a
+    /// durable statement about where the definition's runs live — the
+    /// per-call `run_in_background` flag can send an undeclared agent to
+    /// the background but cannot foreground a declaration.
     #[serde(default)]
     pub background: bool,
-    /// Turn cap for dispatches through this definition: the child ends
-    /// with whatever it accumulated (partial output, resumable via
-    /// `continue_run_id`).
+    /// Turn cap per drive of dispatches through this definition: the child
+    /// ends with whatever it accumulated (partial output, resumable via
+    /// `continue_run_id`). A continuation starts a fresh count. Zero is
+    /// rejected at assembly (a run always spends at least one turn).
     #[serde(default)]
     pub max_turns: Option<u32>,
-    /// Display color from the Claude vocabulary (`red|blue|green|yellow|
-    /// purple|orange|pink|cyan`). No behavior; hosts tint their subagent
-    /// surfaces with it and fall back on anything else.
+    /// Display color from the Claude vocabulary. The reference docs list
+    /// `red|blue|green|yellow|purple|orange|pink|cyan`; the authoring SDK
+    /// has also shipped `magenta`, and the vocabulary is not stably
+    /// documented upstream — treat the list as open-ended. No behavior;
+    /// hosts tint their subagent surfaces with it and fall back on
+    /// anything else.
     #[serde(default)]
     pub color: Option<String>,
     /// Declared access permissions for the children this definition
@@ -131,9 +137,10 @@ pub struct AgentDef {
     pub unknown_frontmatter: BTreeMap<String, serde_yaml::Value>,
 }
 
-/// The `tools:` allow list. Claude manifests write it either as a YAML
-/// sequence or as a comma-separated scalar (`tools: Read, Grep`); a bare
-/// `tools:` (null) means the omitted case — inherit all tools.
+/// The `tools:`/`disallowedTools:` lists. Claude manifests write them
+/// either as a YAML sequence or as a comma-separated scalar
+/// (`tools: Read, Grep`); a bare scalar (null) means the omitted case —
+/// inherit all tools.
 fn deserialize_tool_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -145,9 +152,8 @@ where
             f.write_str("a tool list or a comma-separated string")
         }
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            Ok(v.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
+            Ok(split_tool_scalar(v)
+                .into_iter()
                 .map(str::to_string)
                 .collect())
         }
@@ -166,6 +172,31 @@ where
         }
     }
     deserializer.deserialize_any(ToolList)
+}
+
+/// Split a comma scalar at paren depth zero. Claude's list syntax may nest
+/// comma groups (`Agent(a, b), Read` — delegation-permission specifiers),
+/// and a blind split would fragment every group; the fragments then all
+/// fail snapshot resolution and a restricted agent silently lands on the
+/// full tool set (empty allow = allow-all).
+fn split_tool_scalar(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(s[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim());
+    out.retain(|entry| !entry.is_empty());
+    out
 }
 
 /// The `permissions:` frontmatter block: how far a dispatched child may reach.
@@ -330,9 +361,72 @@ impl AgentDef {
         let (frontmatter, body) = split_frontmatter(input)?;
         let mut def: AgentDef =
             serde_yaml::from_str(&frontmatter).map_err(|e| format!("invalid frontmatter: {e}"))?;
+        // The near-miss guard rides the tolerance contract: an unmodeled key
+        // that looks like a misspelled `permissions` block is an authoring
+        // error, not ecosystem drift — silently registering with the widest
+        // ceiling would drop exactly the narrowing the author wrote.
+        for key in def.unknown_frontmatter.keys() {
+            if is_near_miss_of_permissions(key) {
+                return Err(format!(
+                    "unknown field `{key}` looks like a misspelled `permissions` block; the \
+                     security declaration must not be silently dropped — fix the spelling or \
+                     remove it"
+                ));
+            }
+        }
         def.system_prompt = body.trim().to_string();
         Ok(def)
     }
+}
+
+/// The one lookalike-guarded key: case/separator-normalized edit distance
+/// ≤ 1 against `permissions` is a structural error. Scoped to this block
+/// on purpose — the generic unknown-field tolerance must stay open for the
+/// evolving Claude vocabulary (a future rename within distance 1 of a
+/// convenience key must not brick manifests again), while a misspelled
+/// security declaration loses narrowing the author explicitly wrote.
+fn is_near_miss_of_permissions(key: &str) -> bool {
+    fn normalize(key: &str) -> String {
+        key.chars()
+            .flat_map(|c| c.to_lowercase())
+            .filter(|c| !matches!(c, '-' | '_'))
+            .collect()
+    }
+    fn edit_distance_at_most_one(a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+        let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+        if long.len() - short.len() > 1 {
+            return false;
+        }
+        let (mut i, mut j, mut edits) = (0, 0, 0);
+        while i < long.len() && j < short.len() {
+            if long[i] == short[j] {
+                i += 1;
+                j += 1;
+            } else {
+                edits += 1;
+                if edits > 1 {
+                    return false;
+                }
+                if long.len() == short.len() {
+                    // Substitution: both advance.
+                    i += 1;
+                    j += 1;
+                } else {
+                    // Insertion in the long string: skip one long char and
+                    // retry this short char against the next.
+                    i += 1;
+                }
+            }
+        }
+        // A trailing extra long char is the one edit.
+        edits + (long.len() - i) <= 1
+    }
+    let normalized = normalize(key);
+    normalized == "permissions" || edit_distance_at_most_one(&normalized, "permissions")
 }
 
 /// Split `---\n...\n---\nbody` into the frontmatter YAML and the body.
@@ -686,5 +780,43 @@ mod tests {
         let mut registry = AgentRegistry::new();
         registry.from_dir(dir.path());
         assert_eq!(registry.names(), vec!["Good"]);
+    }
+
+    /// The security-bearing block is lookalike-guarded: a misspelled
+    /// `permissions` is an authoring error (the narrowing it declares would
+    /// be silently dropped), while the genuine Claude `permissionMode`
+    /// stays a captured declared no-op.
+    #[test]
+    fn parse_md_rejects_a_permissions_lookalike() {
+        for lookalike in ["permisions", "Permissions", "per_missions"] {
+            let manifest =
+                format!("---\nname: X\ndescription: d\n{lookalike}:\n  mode: sandbox\n---\nbody");
+            let err = AgentDef::parse_md(&manifest).unwrap_err();
+            assert!(err.contains("permissions"), "{lookalike}: {err}");
+        }
+        let manifest = "---\nname: X\ndescription: d\npermissionMode: plan\n---\nbody";
+        let def = AgentDef::parse_md(manifest).unwrap();
+        assert!(def.unknown_frontmatter.contains_key("permissionMode"));
+        assert_eq!(
+            def.permissions,
+            AgentPermissions::default(),
+            "the declared no-op keeps the default ceiling — and stays visible in the capture"
+        );
+    }
+
+    /// Comma scalars split at paren depth zero: delegation-permission
+    /// specifiers nest commas, and fragmenting them would leave a
+    /// restricted agent on the full tool set.
+    #[test]
+    fn parse_md_splits_the_comma_scalar_at_paren_depth_zero() {
+        let manifest =
+            "---\nname: X\ndescription: d\ntools: Agent(a:1, b:2), Read, Write\n---\nbody";
+        let def = AgentDef::parse_md(manifest).unwrap();
+        assert_eq!(def.tools, vec!["Agent(a:1, b:2)", "Read", "Write"]);
+
+        let nested =
+            "---\nname: X\ndescription: d\ndisallowedTools: Workflow(x(y, z)), Bash\n---\nbody";
+        let def = AgentDef::parse_md(nested).unwrap();
+        assert_eq!(def.disallowed_tools, vec!["Workflow(x(y, z))", "Bash"]);
     }
 }

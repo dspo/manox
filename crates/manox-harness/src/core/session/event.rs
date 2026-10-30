@@ -527,8 +527,13 @@ pub enum Event {
         timestamp: DateTime<Utc>,
         run_id: String,
         follow_up: String,
+        /// The definition kind the continuation dispatches through —
+        /// mirrors `run/started` so a reopened run's surface keeps the
+        /// agent identity. Empty on rows written before the field existed.
+        #[serde(default)]
+        kind: String,
         /// The definition's display color, mirroring `run/started` so a
-        /// reopened run's surface keeps its identity.
+        /// reopened run's surface keeps its color.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         color: Option<String>,
     },
