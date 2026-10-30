@@ -26,6 +26,13 @@ pub struct ThreadSummary {
     pub project: String,
     pub depth: i32,
     pub parent_id: Option<String>,
+    /// The member kind from the session header's `metadata.subagent` stamp:
+    /// true for a delegated child (run id == session id), false for a
+    /// captain conversation. Drives the catalogue's parent/kind annotation;
+    /// the `parent_id` of a subagent row is the container edge (the
+    /// spawning session), never the team or fork edge a captain row can
+    /// carry.
+    pub subagent: bool,
     pub archived: bool,
     /// Pinned flag toggled from the title bar menu.
     pub pinned: bool,

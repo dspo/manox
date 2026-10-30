@@ -45,6 +45,12 @@ pub struct ThreadStore {
     /// Archived rows, partitioned out of `summaries` so the sidebar list
     /// stays clean while surfaces can still render them on demand.
     archived_summaries: Vec<ThreadSummary>,
+    /// Delegated child sessions (the run rows: header `metadata.subagent`),
+    /// partitioned out of the sidebar the same way archived rows are. They
+    /// never rank in the sidebar order account — the catalogue walk
+    /// (`listSessions`) is their consumer, and it annotates them with the
+    /// container edges (parent + kind) clients fold into container trees.
+    child_summaries: Vec<ThreadSummary>,
     /// Session file path per summary id, for sidecar writes and reopen.
     session_paths: HashMap<String, PathBuf>,
     known_projects: Vec<String>,
@@ -360,12 +366,13 @@ impl StoreHandle {
         let dir = self.read(|s| s.sessions_dir.clone());
         let registry = crate::thread_registry::load().await;
         let order = crate::sidebar_order::load().await;
-        let rows = {
+        let (rows, child_rows) = {
             let mut index = self.0.index.lock().await;
             reconcile_summaries(&dir, &mut index).await
         };
         self.with_mut(|s| {
-            let (session_paths, summaries, mut archived) = group_by_thread(rows, &registry);
+            let (session_paths, summaries, mut archived, mut children) =
+                group_by_thread(rows, child_rows, &registry);
             let mut summaries = summaries;
             resolve_depths(&mut summaries);
             // The scan read the sidecars as of the pass's head; stamps this
@@ -375,13 +382,24 @@ impl StoreHandle {
             // monotone inputs into the fresh rows, then the parked views on
             // top; a park whose stamp the disk now carries retires.
             let mut held: HashMap<String, (Option<i64>, Option<i64>)> = HashMap::new();
-            for row in s.summaries.iter().chain(s.archived_summaries.iter()) {
+            for row in s
+                .summaries
+                .iter()
+                .chain(s.archived_summaries.iter())
+                .chain(s.child_summaries.iter())
+            {
                 held.insert(row.id.clone(), (row.last_settled_at, row.last_viewed_at));
             }
             // Archived rows join the merge: a view parked before an
             // archive must still retire against the disk, or it lingers
-            // (and re-fires its sidecar write) forever.
-            for summary in summaries.iter_mut().chain(archived.iter_mut()) {
+            // (and re-fires its sidecar write) forever. Child rows join
+            // too: their run may settle (a disk stamp) while no sidebar
+            // surface ever focused them.
+            for summary in summaries
+                .iter_mut()
+                .chain(archived.iter_mut())
+                .chain(children.iter_mut())
+            {
                 // The scan's own value, before the held/park merges: the
                 // lowering overlay below retires only against THIS (the disk),
                 // never against an in-memory stamp.
@@ -433,11 +451,13 @@ impl StoreHandle {
             let changed = s.scanned_once
                 && (!rows_match_ignoring_order(&s.summaries, &summaries)
                     || !rows_match_ignoring_order(&s.archived_summaries, &archived)
+                    || !rows_match_ignoring_order(&s.child_summaries, &children)
                     || s.session_paths != session_paths);
             s.session_paths = session_paths;
             s.flush_materialized_working_dirs();
             s.summaries = summaries;
             s.archived_summaries = archived;
+            s.child_summaries = children;
             // The persisted account is the authority over the row order; the
             // scan's timestamp order is only ever an input to first-sight.
             s.order = order;
@@ -531,6 +551,7 @@ pub fn init() {
     let handle = StoreHandle::new(ThreadStore {
         summaries: Vec::new(),
         archived_summaries: Vec::new(),
+        child_summaries: Vec::new(),
         session_paths: HashMap::new(),
         known_projects,
         project_aliases,
@@ -626,21 +647,32 @@ impl ThreadStore {
         &self.archived_summaries
     }
 
-    /// Mutable lookup across both partitions by id.
+    /// Delegated child sessions (the run rows), partitioned out of the
+    /// sidebar the same way archived rows are. The catalogue is their
+    /// consumer: each row carries the container edges (`parent_id` names
+    /// the owning thread row, `subagent` the kind) clients fold into
+    /// container trees.
+    pub fn child_summaries(&self) -> &[ThreadSummary] {
+        &self.child_summaries
+    }
+
+    /// Mutable lookup across every partition by id.
     fn summary_mut(&mut self, id: &str) -> Option<&mut ThreadSummary> {
         self.summaries
             .iter_mut()
             .find(|s| s.id == id)
             .or_else(|| self.archived_summaries.iter_mut().find(|s| s.id == id))
+            .or_else(|| self.child_summaries.iter_mut().find(|s| s.id == id))
     }
 
-    /// Immutable lookup across both partitions by id.
+    /// Immutable lookup across every partition by id.
     /// The summary mirror row for one session id (sidecar-merged truth).
     pub fn summary_by_id(&self, id: &str) -> Option<&ThreadSummary> {
         self.summaries
             .iter()
             .find(|s| s.id == id)
             .or_else(|| self.archived_summaries.iter().find(|s| s.id == id))
+            .or_else(|| self.child_summaries.iter().find(|s| s.id == id))
     }
 
     /// A row's effective (pinned, archived): the decision overlay wins
@@ -681,6 +713,7 @@ impl ThreadStore {
         let Self {
             summaries,
             archived_summaries,
+            child_summaries,
             known_projects,
             order,
             order_dirty,
@@ -735,7 +768,14 @@ impl ThreadStore {
         *known_projects = groups;
         // The archived partition owns no account; a deterministic
         // interaction-then-id sort keeps its list stable across refreshes.
+        // The child partition owns none either and gets the same rule —
+        // the catalogue walks it row-wise, order is presentation only.
         archived_summaries.sort_by(|a, b| {
+            b.interacted_at
+                .cmp(&a.interacted_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        child_summaries.sort_by(|a, b| {
             b.interacted_at
                 .cmp(&a.interacted_at)
                 .then_with(|| a.id.cmp(&b.id))
@@ -1366,6 +1406,7 @@ impl ThreadStore {
             project: String::new(),
             depth: parent.is_some() as i32,
             parent_id: parent.map(str::to_string),
+            subagent: false,
             archived: false,
             pinned: false,
             tag: None,
@@ -1378,6 +1419,21 @@ impl ThreadStore {
             updated_at: 0,
             cumulative_total_tokens: 0,
         });
+    }
+
+    /// Seed a child-partition row without touching disk: the container-edge
+    /// shape the catalogue annotates (a delegated subagent run whose parent
+    /// names the owning thread row).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_child_summary_for_test(&mut self, id: &str, parent: &str) {
+        self.child_summaries.push(crate::db::ThreadSummary {
+            subagent: true,
+            parent_id: Some(parent.to_string()),
+            ..crate::db::ThreadSummary::default()
+        });
+        let row = self.child_summaries.last_mut().expect("just inserted");
+        row.id = id.to_string();
+        row.summary = id.to_string();
     }
 
     /// Like `insert_summary_for_test`, with explicit recency columns —
@@ -1708,7 +1764,10 @@ struct Stat {
 /// shrunk files, refresh sidecars whose fingerprint moved, and persist the
 /// index wholesale (best-effort). Returns the rows the sidebar renders —
 /// identical CONTENT to a full scan, at O(files) steady-state cost.
-async fn reconcile_summaries(dir: &std::path::Path, index: &mut SessionIndex) -> Vec<SessionRow> {
+async fn reconcile_summaries(
+    dir: &std::path::Path,
+    index: &mut SessionIndex,
+) -> (Vec<SessionRow>, Vec<SessionRow>) {
     // The cold-cache layer retired with the db: the in-memory index still
     // accelerates a live process's repeat scans, but every restart starts
     // from a bounded header scan — the list's content never depended on the
@@ -1717,6 +1776,7 @@ async fn reconcile_summaries(dir: &std::path::Path, index: &mut SessionIndex) ->
     let stats = stat_session_files(dir).await;
     let live: std::collections::HashSet<PathBuf> = stats.iter().map(|s| s.path.clone()).collect();
     let mut rows = Vec::with_capacity(stats.len());
+    let mut child_rows = Vec::new();
     for stat in stats {
         // Negative-cache hit: the file failed its scan wearing exactly this
         // fingerprint — skip silently until it changes.
@@ -1851,14 +1911,16 @@ async fn reconcile_summaries(dir: &std::path::Path, index: &mut SessionIndex) ->
         if meta.interacted_at.is_none() {
             seed_interaction_stamp(dir, &stat.path, &entry.id, stat.mtime_ns / 1_000_000_000);
         }
-        // The sidebar renders only the current host's sessions; subagent
-        // transcripts persist for usage accounting but never surface.
-        if !crate::host::belongs_to_current_host(entry.metadata.as_ref())
-            || entry
-                .metadata
-                .as_ref()
-                .is_some_and(|m| m.get("subagent").is_some())
-        {
+        // The sidebar renders only the current host's sessions. A session
+        // stamped `metadata.subagent` is a delegated child (run id ==
+        // session id): it persists for usage accounting and the container
+        // tree, but never ranks as a sidebar row — it lands in the child
+        // partition the catalogue annotates instead.
+        let is_child = entry
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.get("subagent").is_some());
+        if !crate::host::belongs_to_current_host(entry.metadata.as_ref()) {
             continue;
         }
         let modified_at = nanos_to_datetime(entry.mtime_ns).unwrap_or(entry.created_at);
@@ -1869,11 +1931,16 @@ async fn reconcile_summaries(dir: &std::path::Path, index: &mut SessionIndex) ->
             .and_then(|t| t.as_str())
             .filter(|t| !t.is_empty())
             .map(str::to_string);
-        rows.push(SessionRow {
+        let row = SessionRow {
             summary: summary_from_cached(entry, modified_at, meta),
             path: stat.path.clone(),
             thread_key,
-        });
+        };
+        if is_child {
+            child_rows.push(row);
+        } else {
+            rows.push(row);
+        }
         if torn_tail {
             index.rows.remove(&stat.path);
             index.dirty = true;
@@ -1883,7 +1950,7 @@ async fn reconcile_summaries(dir: &std::path::Path, index: &mut SessionIndex) ->
     // from the cold layer with them.
     index.rows.retain(|path, _| live.contains(path));
     index.dirty = false;
-    rows
+    (rows, child_rows)
 }
 
 /// The shared default sidecar for sessions without one (borrow target so
@@ -1905,19 +1972,50 @@ fn summary_from_cached(
     } else {
         entry.first_user_text.clone()
     };
-    // Team affiliation over fork lineage (`team_parent_id`'s precedence).
-    let parent_id = entry
+    // The container edges. A child row hangs off `metadata.subagent.parent`
+    // (the spawning session — the reverse edge the child chat's ChatOrigin
+    // carries); a captain row keeps the team affiliation over the fork
+    // lineage (`team_parent_id`'s precedence). Two different vocabularies:
+    // a subagent row never carries the team or fork edge.
+    let subagent = entry
         .metadata
         .as_ref()
-        .and_then(|m| m.get("team"))
-        .and_then(|t| t.get("parent"))
+        .and_then(|m| m.get("subagent"))
+        .and_then(|s| s.as_object());
+    let subagent_parent = subagent
+        .and_then(|s| s.get("parent"))
         .and_then(|p| p.as_str())
-        .map(str::to_string)
-        .or_else(|| entry.parent_session_path.clone());
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    let is_subagent = subagent.is_some();
+    // The dispatch label is the child's display title (the `run/started`
+    // row carries the same string); an LLM title must not outrank it.
+    let title = if is_subagent {
+        subagent
+            .and_then(|s| s.get("label"))
+            .and_then(|l| l.as_str())
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .or_else(|| meta.title.clone())
+    } else {
+        meta.title.clone()
+    };
+    let parent_id = if is_subagent {
+        subagent_parent
+    } else {
+        entry
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("team"))
+            .and_then(|t| t.get("parent"))
+            .and_then(|p| p.as_str())
+            .map(str::to_string)
+            .or_else(|| entry.parent_session_path.clone())
+    };
     ThreadSummary {
         id: entry.id.clone(),
         summary,
-        title: meta.title.clone(),
+        title,
         title_override: None,
         model_id: String::new(),
         provider_id: None,
@@ -1930,6 +2028,7 @@ fn summary_from_cached(
             .unwrap_or_else(|| entry.cwd.clone()),
         depth: 0,
         parent_id,
+        subagent: is_subagent,
         archived: meta.archived,
         pinned: meta.pinned,
         tag: meta.tag.clone(),
@@ -2086,14 +2185,19 @@ fn resolve_depths(list: &mut [ThreadSummary]) {
 /// hits, else the newest; the row carries the THREAD's id (stable across
 /// swaps and restarts) and the active session's fields. Sessions without a
 /// thread stamp (legacy files) pass through as singleton rows keyed by
-/// their own id. Returns the id→active-session-path map (every surfaced row
-/// stays addressable for `load_thread` and sidecar flag writes), the active
-/// rows, and the archived rows.
+/// their own id. Child rows (delegated subagent sessions) never group —
+/// their parent edge resolves against the same session→thread map so the
+/// catalogue annotation names the row the client actually sees. Returns
+/// the id→active-session-path map (every surfaced row stays addressable
+/// for `load_thread` and sidecar flag writes), the active rows, the
+/// archived rows, and the child rows.
 fn group_by_thread(
     rows: Vec<SessionRow>,
+    child_rows: Vec<SessionRow>,
     registry: &HashMap<String, crate::thread_registry::ThreadRegistryEntry>,
 ) -> (
     HashMap<String, PathBuf>,
+    Vec<ThreadSummary>,
     Vec<ThreadSummary>,
     Vec<ThreadSummary>,
 ) {
@@ -2166,7 +2270,21 @@ fn group_by_thread(
             active.push(row.summary);
         }
     }
-    (session_paths, active, archived)
+    // Child rows stay singleton (they carry no thread stamp); their parent
+    // session remaps to the parent's THREAD row id when that parent is in
+    // this scan — the catalogue's join key — keeping the raw session id
+    // when it does not resolve (the team-edge remap's rule).
+    let mut children = Vec::with_capacity(child_rows.len());
+    for row in child_rows {
+        session_paths.insert(row.summary.id.clone(), row.path);
+        let mut sum = row.summary;
+        sum.parent_id = sum
+            .parent_id
+            .take()
+            .map(|parent| session_to_thread.get(&parent).cloned().unwrap_or(parent));
+        children.push(sum);
+    }
+    (session_paths, active, archived, children)
 }
 
 /// Set equality on row id: same rows, any order. The scan rebuilds rows
@@ -2230,6 +2348,7 @@ pub fn standalone_for_test_at(dir: &std::path::Path) -> StoreHandle {
         project_aliases: HashMap::new(),
         summaries: Vec::new(),
         archived_summaries: Vec::new(),
+        child_summaries: Vec::new(),
         session_paths: HashMap::new(),
         known_projects: Vec::new(),
         order: crate::sidebar_order::SidebarOrder::default(),
@@ -2467,6 +2586,7 @@ mod tests {
             project_aliases: HashMap::new(),
             summaries: Vec::new(),
             archived_summaries: Vec::new(),
+            child_summaries: Vec::new(),
             session_paths: HashMap::new(),
             known_projects: Vec::new(),
             order: crate::sidebar_order::SidebarOrder::default(),
@@ -2547,6 +2667,26 @@ mod tests {
                 .map(|row| row.summary.clone())
                 .expect("the row is listed")
         })
+    }
+
+    /// A delegated child run fixture: a header stamped `metadata.subagent`
+    /// (the durable lineage the spawn writes) plus one user message, so the
+    /// bounded scan sees a live transcript. `parent` is the spawning
+    /// session's id; `label` is the dispatch label the `run/started` row
+    /// carries.
+    fn write_child_session_fixture(
+        dir: &std::path::Path,
+        id: &str,
+        parent: &str,
+        label: &str,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("{id}.jsonl"));
+        let content = format!(
+            "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{{\"host\":\"manox\",\"subagent\":{{\"type\":\"Explore\",\"label\":\"{label}\",\"parent\":\"{parent}\",\"depth\":1}}}}}}\n{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-09-13T00:00:01Z\",\"seq\":0,\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"survey the auth module\"}}],\"timestamp\":1770000000000}}}}\n",
+        );
+        std::fs::write(&path, content).unwrap();
+        path
     }
 
     /// The fact-layer rule: append-only GROWTH never rescans a session's
@@ -2680,6 +2820,7 @@ mod tests {
             project_aliases: HashMap::new(),
             summaries: Vec::new(),
             archived_summaries: Vec::new(),
+            child_summaries: Vec::new(),
             session_paths: HashMap::new(),
             known_projects: Vec::new(),
             order: crate::sidebar_order::SidebarOrder::default(),
@@ -2717,6 +2858,7 @@ mod tests {
             project_aliases: HashMap::new(),
             summaries: Vec::new(),
             archived_summaries: Vec::new(),
+            child_summaries: Vec::new(),
             session_paths: HashMap::new(),
             known_projects: read_projects_file(&path)
                 .iter()
@@ -2857,6 +2999,7 @@ mod tests {
             project: String::new(),
             depth: 0,
             parent_id: None,
+            subagent: false,
             archived,
             pinned: false,
             tag: None,
@@ -2899,7 +3042,7 @@ mod tests {
             sample_row("fork", Some("t"), 20, false),
         ];
         let registry = HashMap::from([("t".to_string(), pointer("base"))]);
-        let (paths, active, archived) = group_by_thread(rows, &registry);
+        let (paths, active, archived, _) = group_by_thread(rows, Vec::new(), &registry);
         assert!(archived.is_empty());
         assert_eq!(active.len(), 1, "one thread = one row");
         assert_eq!(active[0].id, "t", "row keyed by thread id");
@@ -2917,12 +3060,12 @@ mod tests {
             sample_row("fork", Some("t"), 20, false),
         ];
         // No registry entry → the newest session surfaces.
-        let (paths, active, _) = group_by_thread(rows.clone(), &HashMap::new());
+        let (paths, active, _, _) = group_by_thread(rows.clone(), Vec::new(), &HashMap::new());
         assert_eq!(active.len(), 1);
         assert_eq!(paths.get("t").cloned(), Some(PathBuf::from("fork.jsonl")));
         // A stale pointer to a foreign session id degrades the same way.
         let stale = HashMap::from([("t".to_string(), pointer("gone"))]);
-        let (_, active, _) = group_by_thread(rows, &stale);
+        let (_, active, _, _) = group_by_thread(rows, Vec::new(), &stale);
         assert_eq!(active.len(), 1);
     }
 
@@ -2931,7 +3074,8 @@ mod tests {
         let leader = sample_row("leader-sess", Some("TL"), 10, false);
         let mut member = sample_row("member-sess", Some("TM"), 10, false);
         member.summary.parent_id = Some("leader-sess".to_string());
-        let (paths, active, _) = group_by_thread(vec![leader, member], &HashMap::new());
+        let (paths, active, _, _) =
+            group_by_thread(vec![leader, member], Vec::new(), &HashMap::new());
         assert_eq!(active.len(), 2);
         let member_row = active.iter().find(|s| s.id == "TM").expect("member row");
         assert_eq!(
@@ -2948,7 +3092,7 @@ mod tests {
             sample_row("legacy", None, 10, false),
             sample_row("threaded", Some("t"), 20, false),
         ];
-        let (paths, active, _) = group_by_thread(rows, &HashMap::new());
+        let (paths, active, _, _) = group_by_thread(rows, Vec::new(), &HashMap::new());
         assert_eq!(active.len(), 2);
         assert!(active.iter().any(|s| s.id == "legacy"));
         assert!(active.iter().any(|s| s.id == "t"));
@@ -2966,7 +3110,7 @@ mod tests {
         ];
         // Pointer on the archived fork → the thread row retires with it.
         let registry = HashMap::from([("t".to_string(), pointer("fork"))]);
-        let (_, active, archived) = group_by_thread(rows, &registry);
+        let (_, active, archived, _) = group_by_thread(rows, Vec::new(), &registry);
         assert!(active.is_empty());
         assert_eq!(archived.len(), 1);
         assert_eq!(archived[0].id, "t");
@@ -3015,13 +3159,14 @@ mod tests {
         .unwrap();
 
         let mut index = SessionIndex::default();
-        let rows = reconcile_summaries(sessions, &mut index).await;
+        let (rows, children) = reconcile_summaries(sessions, &mut index).await;
         assert_eq!(rows.len(), 2);
+        assert_eq!(children.len(), 0, "no child stamps in this fixture");
 
         // Pointer on the fork (inside the worktree): one row, thread-keyed,
         // project stays the source's.
         let registry = HashMap::from([(thread_key.to_string(), pointer(fork_id))]);
-        let (paths, active, archived) = group_by_thread(rows.clone(), &registry);
+        let (paths, active, archived, _) = group_by_thread(rows.clone(), Vec::new(), &registry);
         assert!(archived.is_empty());
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, thread_key);
@@ -3032,10 +3177,185 @@ mod tests {
         // Pointer back on the base: same single row,
         // now addressable at the base session.
         let registry = HashMap::from([(thread_key.to_string(), pointer(base_id))]);
-        let (paths, active, _) = group_by_thread(rows, &registry);
+        let (paths, active, _, _) = group_by_thread(rows, Vec::new(), &registry);
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, thread_key);
         assert_eq!(paths.get(thread_key).cloned(), Some(base_path));
+    }
+
+    /// One `listSessions` walk must be enough to organize sessions into
+    /// container trees: a dispatched run scans into the child partition —
+    /// parent remapped to the thread row the catalogue serves, dispatch
+    /// label as the title — while the sidebar partitions never see it. The
+    /// catalogue walk appends the partition (the AHP backend's job); this
+    /// pins the store half of that contract.
+    #[tokio::test]
+    async fn child_runs_scan_into_the_child_partition_with_container_edges() {
+        let store = standalone_for_test();
+        let dir = store.read(|s| s.sessions_dir.clone());
+        write_session_fixture(&dir, "captain-1", "captain prompt");
+        write_child_session_fixture(&dir, "run-1", "captain-1", "survey auth");
+
+        store.refresh_now().await;
+
+        let captain_ids: Vec<String> =
+            store.read(|s| s.summaries().iter().map(|r| r.id.clone()).collect());
+        assert_eq!(
+            captain_ids,
+            vec!["captain-1".to_string()],
+            "the child never ranks as a sidebar row"
+        );
+        assert!(
+            !store.read(|s| s.archived_summaries().iter().any(|r| r.id == "run-1")),
+            "the child is not an archived row either"
+        );
+        let rows = store.read(|s| s.child_summaries().to_vec());
+        assert_eq!(rows.len(), 1, "the run scans exactly one child row");
+        let child = &rows[0];
+        assert_eq!(child.id, "run-1", "the child row id is the run id");
+        assert!(child.subagent, "the row carries the member kind");
+        assert_eq!(
+            child.parent_id.as_deref(),
+            Some("captain-1"),
+            "the parent resolves to the thread row the catalogue serves (v1.0.0: thread id == session id)"
+        );
+        assert_eq!(child.display_title(), "survey auth");
+        // Addressable for reopen and flag writes; lookup reaches the
+        // partition.
+        assert!(store.read(|s| s.session_paths.contains_key("run-1")));
+        assert_eq!(
+            store.read(|s| s.summary_by_id("run-1").map(|r| r.id.clone())),
+            Some("run-1".to_string())
+        );
+    }
+
+    /// The parent edge names the catalogue's join key: a spawning session
+    /// grouped under a legacy thread key remaps the child's parent to that
+    /// row id (the team-edge remap's rule), so the client's fold finds the
+    /// parent row the list actually carries.
+    #[tokio::test]
+    async fn a_child_parent_remaps_to_the_parent_thread_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path();
+        // The captain's session id differs from its thread key (a
+        // worktree-era multi-session thread).
+        let header = r#"{"type":"session","version":4,"id":"captain-old","timestamp":"2026-09-13T00:00:00Z","cwd":"/proj","metadata":{"host":"manox","thread":"thread-old"}}"#;
+        std::fs::write(sessions.join("captain-old.jsonl"), header).unwrap();
+        write_child_session_fixture(sessions, "run-1", "captain-old", "survey auth");
+
+        let store = standalone_for_test();
+        store.with_mut(|s| s.sessions_dir = sessions.to_path_buf());
+        store.refresh_now().await;
+
+        let child = store
+            .read(|s| s.child_summaries().first().cloned())
+            .expect("the child row is listed");
+        assert_eq!(
+            child.parent_id.as_deref(),
+            Some("thread-old"),
+            "the parent names the thread row, not the spawning session"
+        );
+    }
+
+    /// A parent the scan cannot resolve (a foreign host, a vanished
+    /// journal) keeps its raw session id — the client degrades the row to
+    /// top-level, the same rule an unresolvable team edge follows.
+    #[tokio::test]
+    async fn a_child_parent_without_a_scan_row_keeps_the_raw_session_id() {
+        let store = standalone_for_test();
+        let dir = store.read(|s| s.sessions_dir.clone());
+        write_child_session_fixture(&dir, "run-orphan", "vanished-parent", "survey auth");
+
+        store.refresh_now().await;
+
+        let child = store
+            .read(|s| s.child_summaries().first().cloned())
+            .expect("the child row is listed");
+        assert_eq!(child.parent_id.as_deref(), Some("vanished-parent"));
+    }
+
+    /// A restart rebuilds the container edges from the headers alone: the
+    /// annotation a live dispatch produced and the annotation a cold rescan
+    /// produces are the same rows, byte for byte.
+    #[tokio::test]
+    async fn a_restart_rebuilds_the_child_rows_identically() {
+        let store = standalone_for_test();
+        let dir = store.read(|s| s.sessions_dir.clone());
+        write_session_fixture(&dir, "captain-1", "captain prompt");
+        write_child_session_fixture(&dir, "run-1", "captain-1", "survey auth");
+        store.refresh_now().await;
+        let live_rows = store.read(|s| s.child_summaries().to_vec());
+
+        // A fresh store over the same root — the restore-after-restart
+        // shape: cold cache, headers only.
+        let sessions_dir = dir.clone();
+        let projects_path = sessions_dir.join("projects.json");
+        let restarted = StoreHandle::new(ThreadStore {
+            project_aliases: HashMap::new(),
+            summaries: Vec::new(),
+            archived_summaries: Vec::new(),
+            child_summaries: Vec::new(),
+            session_paths: HashMap::new(),
+            known_projects: Vec::new(),
+            order: crate::sidebar_order::SidebarOrder::default(),
+            order_dirty: false,
+            running: HashSet::new(),
+            pending_auth: HashSet::new(),
+            live_threads: HashMap::new(),
+            sessions_dir,
+            projects_path,
+            decision_overlay: HashMap::new(),
+            pending_events: Vec::new(),
+            pending_meta_writes: Vec::new(),
+            pending_working_dirs: HashMap::new(),
+            pending_viewed: HashMap::new(),
+            pending_unread: HashMap::new(),
+            scanned_once: false,
+        });
+        restarted.refresh_now().await;
+        assert_eq!(
+            restarted.read(|s| s.child_summaries().to_vec()),
+            live_rows,
+            "replay resolves the same parent/kind annotation"
+        );
+        assert_eq!(
+            restarted.read(|s| s
+                .summaries()
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()),
+            vec!["captain-1".to_string()],
+            "the restarted walk keeps the child out of the sidebar partitions"
+        );
+    }
+
+    /// A run dispatched mid-session lands as a catalogue row on attached
+    /// clients: the child partition joins the broadcast-gate diff, so a
+    /// quiet sweep never re-announces but a new child row does.
+    #[tokio::test]
+    async fn a_new_child_run_announces_a_store_change() {
+        let store = standalone_for_test();
+        let dir = store.read(|s| s.sessions_dir.clone());
+        write_session_fixture(&dir, "captain-1", "captain prompt");
+        store.refresh_now().await;
+        let events = store.subscribe();
+        while events.try_recv().is_ok() {}
+
+        // A quiet pass announces nothing.
+        store.refresh_now().await;
+        assert_eq!(
+            events.len(),
+            0,
+            "a child-less rescan does not re-announce the catalogue"
+        );
+
+        write_child_session_fixture(&dir, "run-1", "captain-1", "survey auth");
+        store.refresh_now().await;
+        assert_eq!(
+            events.len(),
+            1,
+            "the new child row is a catalogue change the clients must see"
+        );
     }
 
     fn sample_entry(id: &str, metadata: Option<serde_json::Value>) -> IndexedSession {
@@ -3080,6 +3400,76 @@ mod tests {
         entry.parent_session_path = Some("source".to_string());
         let summary = cached_summary(&entry, &manox_harness::session_meta::SessionMeta::default());
         assert_eq!(summary.parent_id.as_deref(), Some("source"));
+    }
+
+    /// The container edges live on the row: a `metadata.subagent` stamp
+    /// makes the row a child (`subagent`), `subagent.parent` names the
+    /// spawning session (the reverse edge the child chat's ChatOrigin
+    /// carries), and the dispatch label — the string the `run/started` row
+    /// carries — is the display title, outranking an LLM sidecar title.
+    #[test]
+    fn summary_carries_the_subagent_container_edges() {
+        let entry = sample_entry(
+            "run-1",
+            Some(serde_json::json!({
+                "subagent": {
+                    "type": "Explore",
+                    "label": "survey auth",
+                    "parent": "captain-1",
+                    "depth": 1,
+                }
+            })),
+        );
+        let summary = cached_summary(&entry, &manox_harness::session_meta::SessionMeta::default());
+        assert!(summary.subagent, "the subagent stamp is the member kind");
+        assert_eq!(summary.parent_id.as_deref(), Some("captain-1"));
+        assert_eq!(
+            summary.title.as_deref(),
+            Some("survey auth"),
+            "the dispatch label is the child's title"
+        );
+        assert_eq!(summary.display_title(), "survey auth");
+        let titled = manox_harness::session_meta::SessionMeta {
+            title: Some("llm said".into()),
+            ..Default::default()
+        };
+        let summary = cached_summary(&entry, &titled);
+        assert_eq!(
+            summary.display_title(),
+            "survey auth",
+            "an LLM title never outranks the dispatch label on a child row"
+        );
+
+        // A captain row carries no kind bit, and keeps the team-over-fork
+        // precedence — the subagent edge is a different vocabulary.
+        let captain = sample_entry(
+            "captain-1",
+            Some(serde_json::json!({ "team": { "parent": "lead" } })),
+        );
+        let row = cached_summary(
+            &captain,
+            &manox_harness::session_meta::SessionMeta::default(),
+        );
+        assert!(!row.subagent);
+        assert_eq!(row.parent_id.as_deref(), Some("lead"));
+
+        // A subagent stamp without a parent or label degrades per-field,
+        // never into a captain row.
+        let orphan = sample_entry(
+            "run-2",
+            Some(serde_json::json!({ "subagent": { "type": "Explore" } })),
+        );
+        let row = cached_summary(
+            &orphan,
+            &manox_harness::session_meta::SessionMeta::default(),
+        );
+        assert!(row.subagent);
+        assert_eq!(row.parent_id, None);
+        assert_eq!(
+            row.display_title(),
+            "hi",
+            "no label falls back to the transcript"
+        );
     }
 
     #[test]
@@ -3257,6 +3647,7 @@ mod tests {
             project: String::new(),
             depth: parent.is_some() as i32,
             parent_id: parent.map(str::to_string),
+            subagent: false,
             archived: false,
             pinned: false,
             tag: None,

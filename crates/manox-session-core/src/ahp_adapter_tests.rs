@@ -3834,6 +3834,84 @@ mod dispatch {
         uninstall();
     }
 
+    /// PR-U3's wire contract: one `listSessions` walk answers the container
+    /// question — ranked rows first (their order untouched), child rows
+    /// appended as ordinary rows carrying the container edges in
+    /// `_meta.x-manox`. No chat-channel read, no roster face.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_sessions_returns_child_runs_annotated_with_parent_and_kind() {
+        use ahp_types::commands::ListSessionsParams;
+        use manox_agent::thread_store;
+        let _guards = install();
+        let (_server, _backend) = fixture().await;
+        thread_store::global().with_mut(|s| {
+            s.insert_summary_for_test("s-captain", None);
+            s.insert_summary_for_test("s-captain-2", None);
+            s.insert_child_summary_for_test("run-child", "s-captain");
+        });
+
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        let transport = runtime.inproc();
+        let client = ahp::Client::connect(transport, ahp::ClientConfig::default())
+            .await
+            .expect("client connects");
+        client
+            .initialize(
+                "probe".to_string(),
+                vec![PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes");
+
+        let listed: ahp_types::commands::ListSessionsResult = client
+            .request(
+                "listSessions",
+                ListSessionsParams {
+                    channel: ahp_types::common::ROOT_RESOURCE_URI.to_string(),
+                    meta: None,
+                    limit: None,
+                    cursor: None,
+                },
+            )
+            .await
+            .expect("lists sessions");
+        let ids: Vec<&str> = listed.items.iter().map(|s| s.resource.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "ahp-session:/s-captain",
+                "ahp-session:/s-captain-2",
+                "ahp-session:/run-child",
+            ],
+            "ranked rows first, the child appended as an ordinary row"
+        );
+        let meta_of = |resource: &str| {
+            listed
+                .items
+                .iter()
+                .find(|s| s.resource == resource)
+                .map(|s| {
+                    s.meta
+                        .as_ref()
+                        .and_then(|m| m.get(manox_ahp::ext::META_KEY))
+                        .cloned()
+                        .expect("the summary carries the x-manox slot")
+                })
+                .expect("the row is listed")
+        };
+        let captain = meta_of("ahp-session:/s-captain");
+        assert_eq!(captain["memberKind"], "captain");
+        assert!(captain.get("parentSessionId").is_none());
+        let child = meta_of("ahp-session:/run-child");
+        assert_eq!(child["memberKind"], "subagent");
+        assert_eq!(child["parentSessionId"], "s-captain");
+        uninstall();
+    }
+
     /// `x-manox/archivedChanged` is the batch archive write: the ids ride the
     /// payload, so the dispatch lands on the catalogue root (the channel every
     /// client holds) instead of paying a session-channel subscription — a

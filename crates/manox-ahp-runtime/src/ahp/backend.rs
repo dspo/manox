@@ -1760,10 +1760,23 @@ fn summary_from_row(
         // it): ride the summary's `_meta` extension slot so a client's list
         // render sees the pin without subscribing the thread channel. Always
         // present — clients read the field uniformly, and a pinned=false is
-        // as much a fact as a pinned=true.
+        // as much a fact as a pinned=true. The same slot carries the
+        // container edges: every row declares its member kind, and a child
+        // row (a delegated subagent session) additionally names the row it
+        // hangs from — the catalogue's own join key, so one `listSessions`
+        // walk is enough to organize every session into container trees.
         meta: Some({
             let mut xmanox = serde_json::Map::new();
             xmanox.insert("pinned".to_string(), serde_json::json!(row.pinned));
+            xmanox.insert(
+                "memberKind".to_string(),
+                serde_json::json!(if row.subagent { "subagent" } else { "captain" }),
+            );
+            if row.subagent
+                && let Some(parent) = &row.parent_id
+            {
+                xmanox.insert("parentSessionId".to_string(), serde_json::json!(parent));
+            }
             let mut meta = ahp_types::common::JsonObject::new();
             meta.insert("x-manox".to_string(), serde_json::Value::Object(xmanox));
             meta
@@ -1784,6 +1797,12 @@ impl Backend for RuntimeBackend {
         // both the first call a client makes and the source of every later
         // page. The v2 list path (`threads_snapshot`) reads the same rows for
         // the same reason.
+        //
+        // The child partition rides the same walk: delegated subagent
+        // sessions come back as ordinary rows (annotated with parent/kind in
+        // `_meta.x-manox`), ranked rows first and children appended — the
+        // interaction rank of the ranked rows never moves, and folding
+        // children under their parent is the client's job.
         let Some(store) = manox_agent::thread_store::try_global() else {
             return Vec::new();
         };
@@ -1791,6 +1810,7 @@ impl Backend for RuntimeBackend {
             state
                 .summaries()
                 .iter()
+                .chain(state.child_summaries().iter().filter(|row| !row.archived))
                 .map(|row| summary_from_row(row, state, self.seeded_status(&row.id)))
                 .collect()
         })
@@ -3812,6 +3832,75 @@ mod mcp_dispatch_tests {
         };
         assert!(read_pin("s-pinned"), "the pinned row reads pinned");
         assert!(!read_pin("s-plain"), "the unpinned row reads unpinned");
+    }
+
+    /// The same `_meta` slot carries the container edges: every row declares
+    /// its member kind, and a child row names the row it hangs from. One
+    /// `listSessions` walk then answers "which sessions belong to which
+    /// container" without any chat-channel read.
+    #[test]
+    fn summaries_carry_member_kind_and_parent_in_the_meta_slot() {
+        crate::test_support::init_globals();
+        let store = manox_agent::thread_store::standalone_for_test();
+        store.with_mut(|st| {
+            st.insert_summary_for_test("s-captain", None);
+            st.insert_child_summary_for_test("run-child", "s-captain");
+        });
+        store.read(|state| {
+            let xmanox_of = |id: &str| {
+                let row = state.summary_by_id(id).expect("the seeded row exists");
+                summary_from_row(row, state, None)
+                    .meta
+                    .expect("the meta slot is always populated")
+                    .get("x-manox")
+                    .cloned()
+                    .expect("the x-manox object is always present")
+            };
+            let captain = xmanox_of("s-captain");
+            assert_eq!(captain["memberKind"], "captain");
+            assert!(
+                captain.get("parentSessionId").is_none(),
+                "a captain names no parent — the team edge is a different vocabulary"
+            );
+            let child = xmanox_of("run-child");
+            assert_eq!(child["memberKind"], "subagent");
+            assert_eq!(child["parentSessionId"], "s-captain");
+        });
+    }
+
+    /// The catalogue aggregation: ranked rows first — their interaction-rank
+    /// order is the catalogue's own contract and never moves — then the
+    /// child rows appended as ordinary annotated rows. Folding them under
+    /// their parent is the client's job.
+    #[test]
+    fn list_sessions_appends_child_rows_after_the_ranked_rows() {
+        let _globals = crate::test_support::lock_globals();
+        let _store_lock = manox_agent::thread_store::store_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::test_support::init_globals();
+        manox_agent::thread_store::init_for_test();
+        let store = manox_agent::thread_store::try_global().expect("the override is installed");
+        store.with_mut(|st| {
+            st.insert_summary_for_test("t-a", None);
+            st.insert_summary_for_test("t-b", None);
+            st.insert_child_summary_for_test("run-1", "t-a");
+            st.insert_child_summary_for_test("run-2", "t-b");
+        });
+        let backend = backend(McpOnlyRuntime::serving());
+        let list = backend.list_sessions();
+        let ids: Vec<&str> = list.iter().map(|s| s.resource.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "ahp-session:/t-a",
+                "ahp-session:/t-b",
+                "ahp-session:/run-1",
+                "ahp-session:/run-2",
+            ],
+            "ranked rows keep their order; children ride the same walk"
+        );
+        manox_agent::thread_store::drop_for_test();
     }
 
     /// AHP 1.0's lightweight catalogue rides the row summary: one journal per
