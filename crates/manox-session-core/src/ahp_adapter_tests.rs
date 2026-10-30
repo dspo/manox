@@ -3912,6 +3912,157 @@ mod dispatch {
         uninstall();
     }
 
+    /// PR-U2's wire contract: a FRESH client that subscribes to the
+    /// captain's work channel receives the whole child-run roster in the
+    /// baseline — live and settled runs alike, the settled one keeping its
+    /// verdict. The D12 boundary rides along in the same journal: the
+    /// chat's live-only background work removed the settled run, the
+    /// persistent roster keeps it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fresh_clients_work_baseline_carries_the_full_child_run_roster() {
+        let _guards = install();
+        seed_session(
+            "s-roster",
+            "thread-roster",
+            "/",
+            vec![
+                ("e1", user("dispatch the crew")),
+                ("e2", turn_start()),
+                (
+                    "e3",
+                    E::RunStarted {
+                        id: String::new(),
+                        parent_id: None,
+                        timestamp: stamp(),
+                        run_id: "sub-live".into(),
+                        kind: "Explore".into(),
+                        label: "survey the fold".into(),
+                        child_session: "sub-live".into(),
+                        tool_call_id: "tu_1".into(),
+                        budgets: Default::default(),
+                        depth: 1,
+                        color: Some("#aabbcc".into()),
+                    },
+                ),
+                (
+                    "e4",
+                    E::RunStarted {
+                        id: String::new(),
+                        parent_id: None,
+                        timestamp: stamp(),
+                        run_id: "sub-done".into(),
+                        kind: "Write".into(),
+                        label: "draft the report".into(),
+                        child_session: "sub-done".into(),
+                        tool_call_id: "tu_2".into(),
+                        budgets: Default::default(),
+                        depth: 1,
+                        color: None,
+                    },
+                ),
+                (
+                    "e5",
+                    E::RunSettled {
+                        id: String::new(),
+                        parent_id: None,
+                        timestamp: stamp(),
+                        run_id: "sub-done".into(),
+                        settlement: manox_harness::session::event::SettlementKind::Completed,
+                        verdict: "done".into(),
+                        salvage: None,
+                        turns: 2,
+                        tool_calls: 3,
+                        gated_denials: None,
+                    },
+                ),
+                ("e6", turn_finish()),
+            ],
+        )
+        .await;
+
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        let transport = runtime.inproc();
+        let client = ahp::Client::connect(transport, ahp::ClientConfig::default())
+            .await
+            .expect("client connects");
+        client
+            .initialize(
+                "probe".to_string(),
+                vec![PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes");
+
+        // The work channel is thread-scoped; the roster lives there.
+        let (_result, mut sub) = client
+            .subscribe(format!("{}thread-roster", manox_ahp::ext::channels::WORK))
+            .await
+            .expect("the work channel subscribes");
+        assert!(
+            _result.snapshot.is_none(),
+            "extension channels answer no typed snapshot"
+        );
+        // The baseline rides an action envelope targeted at this connection.
+        let mut baseline = None;
+        for _ in 0..16 {
+            match sub.recv().await {
+                Some(ahp::SubscriptionEvent::Action(envelope)) => {
+                    let action = serde_json::to_value(&envelope.action).unwrap();
+                    if action["type"] == manox_ahp::ext::actions::BASELINE {
+                        baseline = Some(action["state"].clone());
+                        break;
+                    }
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        let state = baseline.expect("the work channel answers a baseline");
+        let roster = state["childRuns"]
+            .as_object()
+            .expect("the roster view rides the baseline")
+            .clone();
+        assert_eq!(roster.len(), 2, "live and settled alike: {state}");
+        let live = &roster["sub-live"];
+        assert_eq!(live["status"], "running");
+        assert_eq!(live["kind"], "Explore");
+        assert_eq!(live["label"], "survey the fold");
+        assert_eq!(live["color"], "#aabbcc");
+        assert_eq!(live["chat"], "ahp-chat:/sub-live");
+        assert!(live.get("verdict").is_none());
+        let done = &roster["sub-done"];
+        assert_eq!(done["status"], "settled");
+        assert_eq!(done["verdict"], "completed");
+        assert_eq!(done["kind"], "Write");
+        assert_eq!(done["chat"], "ahp-chat:/sub-done");
+
+        // The same journal, the live-only face: the settle removed the run
+        // there — the two faces are distinct by design (D12).
+        let chat = manox_ahp_runtime::ahp::chat_state("s-roster")
+            .await
+            .expect("the captain's fold answers");
+        let work_ids: Vec<&str> = chat
+            .background_work
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|w| match w {
+                ahp_types::state::BackgroundWork::Subagent(sub) => Some(sub.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            work_ids,
+            vec!["sub-live"],
+            "the live face removed the settled run, the roster kept it"
+        );
+        uninstall();
+    }
+
     /// `x-manox/archivedChanged` is the batch archive write: the ids ride the
     /// payload, so the dispatch lands on the catalogue root (the channel every
     /// client holds) instead of paying a session-channel subscription — a

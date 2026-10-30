@@ -48,6 +48,13 @@ pub struct XManoxState {
     /// session's distinct task count).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_tasks: Option<BTreeMap<String, Value>>,
+    /// Child-run roster view: run id → the run's latest wire row. Like
+    /// `background_tasks` this upserts by key and has no clear edge, but it
+    /// is the *persistent* sub-agent account: a settled run keeps its row
+    /// with the verdict, and a `run/continued` re-marks it running — the
+    /// face the live-only chat background work never carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_runs: Option<BTreeMap<String, Value>>,
     /// Thread pinned flag — AHP has no pin bit, only read/archived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned: Option<bool>,
@@ -111,11 +118,14 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
     let Some(tag) = action.get("type").and_then(Value::as_str) else {
         return Outcome::Unrecognised;
     };
-    // The generic NoOp detector clones the whole bag; the two keyed
+    // The generic NoOp detector clones the whole bag; the keyed
     // registries are exempt — their rows carry up-to-8KiB output tails, so a
     // whole-bag clone per journal row is quadratic in session history — and
     // report their own change instead.
-    let keyed = matches!(tag, super::actions::WORK_BACKGROUND_TASKS);
+    let keyed = matches!(
+        tag,
+        super::actions::WORK_BACKGROUND_TASKS | super::actions::WORK_CHILD_RUNS
+    );
     let before = (!keyed).then(|| state.clone());
     let mut registry_changed = false;
     match tag {
@@ -147,6 +157,18 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
                 && let Some(task_id) = snapshot.get("task_id").and_then(Value::as_str)
             {
                 registry_changed = upsert_row(&mut state.background_tasks, task_id, snapshot);
+            }
+        }
+        super::actions::WORK_CHILD_RUNS => {
+            // One run row per action, upserted by `runId` (the projection
+            // emits the full row on every transition, so a restated status
+            // simply replaces its predecessor). A row without a string
+            // `runId` cannot be keyed and is dropped; the producer shape is
+            // pinned by the runtime projection's roster tests.
+            if let Some(run) = action.get("run")
+                && let Some(run_id) = run.get("runId").and_then(Value::as_str)
+            {
+                registry_changed = upsert_row(&mut state.child_runs, run_id, run);
             }
         }
         super::actions::WORK_ACTIVE_TOOLS => {
@@ -323,6 +345,72 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// The persistent run roster upserts by run id and never clears: a
+    /// settle keeps the row (with the verdict), a continuation re-marks it
+    /// running, and a row without a keyable `runId` cannot enter the view.
+    #[test]
+    fn child_run_rows_upsert_the_roster_view_by_run_id() {
+        let action_for = |run: Value| json!({"type": "x-manox-work/childRunsChanged", "run": run});
+        let started = json!({
+            "runId": "sub-1", "kind": "Explore", "label": "survey",
+            "status": "running", "startedAt": "t0", "chat": "ahp-chat:/sub-1",
+        });
+        let mut state = XManoxState::default();
+        assert_eq!(
+            apply(&mut state, &action_for(started.clone())),
+            Outcome::Applied
+        );
+        assert_eq!(
+            state.child_runs,
+            Some([("sub-1".to_string(), started)].into_iter().collect())
+        );
+
+        // A second run joins; the settled run keeps its row, verdict and all.
+        let other = json!({
+            "runId": "sub-2", "kind": "Write", "label": "draft",
+            "status": "running", "startedAt": "t1", "chat": "ahp-chat:/sub-2",
+        });
+        assert_eq!(apply(&mut state, &action_for(other)), Outcome::Applied);
+        let settled = json!({
+            "runId": "sub-1", "kind": "Explore", "label": "survey",
+            "status": "settled", "verdict": "completed",
+            "startedAt": "t0", "chat": "ahp-chat:/sub-1",
+        });
+        assert_eq!(
+            apply(&mut state, &action_for(settled.clone())),
+            Outcome::Applied
+        );
+        let roster = state.child_runs.as_ref().expect("roster view populated");
+        assert_eq!(roster.len(), 2, "a settle keeps the row");
+        assert_eq!(roster["sub-1"]["status"], "settled");
+
+        // A continuation flips the same row back to running.
+        let continued = json!({
+            "runId": "sub-1", "kind": "Explore", "label": "survey",
+            "status": "running", "startedAt": "t0", "chat": "ahp-chat:/sub-1",
+        });
+        assert_eq!(apply(&mut state, &action_for(continued)), Outcome::Applied);
+        assert_eq!(
+            state.child_runs.as_ref().expect("still populated")["sub-1"]["status"],
+            "running"
+        );
+
+        // A row without a keyable `runId` cannot enter the view and does
+        // not disturb it (there is no clear edge on this action).
+        assert_eq!(
+            apply(
+                &mut state,
+                &json!({"type": "x-manox-work/childRunsChanged"})
+            ),
+            Outcome::NoOp
+        );
+        assert_eq!(
+            apply(&mut state, &action_for(json!({"status": "running"}))),
+            Outcome::NoOp
+        );
+        assert_eq!(state.child_runs.as_ref().expect("still populated").len(), 2);
     }
 
     /// The client-dispatched rows fold straight from the action the client
