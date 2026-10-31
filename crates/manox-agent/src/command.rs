@@ -245,7 +245,7 @@ fn tool_id_from_spec(spec: &str) -> Option<String> {
         "bashoutput" | "bash_output" => crate::tools::BASH_OUTPUT.to_string(),
         "grep" => crate::tools::GREP.to_string(),
         "glob" => crate::tools::GLOB.to_string(),
-        "ls" | "list" | "list_directory" => "Ls".to_string(),
+        "ls" | "list" | "list_directory" => crate::tools::LS.to_string(),
         "askuserquestion" | "ask_user" => crate::tools::ASK_USER_QUESTION.to_string(),
         "skill" => crate::tools::SKILL.to_string(),
         other => other.to_string(),
