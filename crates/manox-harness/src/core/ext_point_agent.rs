@@ -138,6 +138,11 @@ pub struct AgentDef {
     /// dispatches. Defaults to inheriting everything from the dispatcher.
     #[serde(default)]
     pub permissions: AgentPermissions,
+    /// Where the definition was loaded from. Not manifest data: the
+    /// registry stamps it at registration, so display layers can group by
+    /// origin instead of guessing from names.
+    #[serde(skip)]
+    pub source: AgentSource,
     /// The agent's system prompt (manifest body).
     #[serde(skip)]
     pub system_prompt: String,
@@ -362,6 +367,20 @@ impl NetworkPermission {
             _ => None,
         }
     }
+}
+
+/// The registration layer a definition came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentSource {
+    /// The embedded presets (`register_defaults`).
+    #[default]
+    Builtin,
+    /// The user's agent directory.
+    User,
+    /// The foreground project's `.claude/agents/`.
+    Project,
+    /// A plugin's namespaced `agents/` directory.
+    Plugin,
 }
 
 impl AgentDef {
@@ -761,6 +780,7 @@ mod tests {
             max_turns: None,
             color: None,
             permissions: AgentPermissions::default(),
+            source: Default::default(),
             system_prompt: "p".into(),
             unknown_frontmatter: BTreeMap::new(),
         };
@@ -777,12 +797,31 @@ mod tests {
             max_turns: None,
             color: None,
             permissions: AgentPermissions::default(),
+            source: Default::default(),
             system_prompt: "p2".into(),
             unknown_frontmatter: BTreeMap::new(),
         });
         assert_eq!(registry.names(), vec!["A"]);
         assert_eq!(registry.get("A").unwrap().description, "two");
         assert_eq!(registry.get("missing"), None);
+    }
+
+    /// The registry stamps the layer at registration: same-name later
+    /// layers override earlier ones AND re-stamp the source, so a
+    /// user-layer def overridden by a project def reads as Project.
+    #[test]
+    fn register_stamps_the_source_layer() {
+        use super::AgentSource;
+        let manifest = |name: &str| format!("---\nname: {name}\ndescription: d\n---\nbody");
+        let mut registry = AgentRegistry::new();
+        let mut user = AgentDef::parse_md(&manifest("X")).unwrap();
+        user.source = AgentSource::User;
+        registry.register(user);
+        assert_eq!(registry.get("X").unwrap().source, AgentSource::User);
+        let mut project = AgentDef::parse_md(&manifest("X")).unwrap();
+        project.source = AgentSource::Project;
+        registry.register(project);
+        assert_eq!(registry.get("X").unwrap().source, AgentSource::Project);
     }
 
     #[test]

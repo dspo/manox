@@ -1582,6 +1582,7 @@ mod tests {
             max_turns: None,
             color: None,
             permissions: Default::default(),
+            source: Default::default(),
             system_prompt: "p".into(),
             unknown_frontmatter: Default::default(),
         };
@@ -1625,6 +1626,7 @@ mod tests {
             max_turns: None,
             color: None,
             permissions: Default::default(),
+            source: Default::default(),
             system_prompt: "p".into(),
             unknown_frontmatter: Default::default(),
         };
