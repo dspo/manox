@@ -346,9 +346,11 @@ impl SubagentDispatcher {
         let permissions = resolve_dispatch_permissions(config.declared_permissions, params)?;
         // Model precedence: explicit parameter > dedicated config spec >
         // frontmatter override. A parameter naming a model resolves it; an
-        // unresolvable name fails the dispatch loudly.
+        // unresolvable name fails the dispatch loudly. Like its sibling
+        // scalars, a present-but-wrong-typed value is a loud invalid
+        // argument, never a silent fallthrough to the declared route.
         let declared = self.resolve_declared_model(config)?;
-        let (model, declared_effort) = match string_param(params, "model") {
+        let (model, declared_effort) = match optional_str(params, "model")? {
             Some(spec) => {
                 let registry = self.provider_registry.as_ref().ok_or_else(|| {
                     ToolError::InvalidArguments(
@@ -1714,6 +1716,10 @@ mod tests {
             (
                 serde_json::json!({"description": "d", "prompt": "p", "replay_thinking": 1}),
                 "replay_thinking",
+            ),
+            (
+                serde_json::json!({"description": "d", "prompt": "p", "model": 7}),
+                "model",
             ),
         ] {
             let err = dispatcher

@@ -3173,7 +3173,8 @@ fn steer_schema_states_the_background_default_is_not_an_override() {
 }
 
 /// The capability tag distinguishes write+bash defs (Sailor) from
-/// read-only defs (Explore), surfaced in each definition's description.
+/// read-only defs (Explore), surfaced through the `ListAgents` catalog —
+/// no per-definition tool description exists anymore.
 #[test]
 fn subagent_capability_tags_write_bash_vs_read_only() {
     let mut registry = manox_harness::ext_point_agent::AgentRegistry::new();

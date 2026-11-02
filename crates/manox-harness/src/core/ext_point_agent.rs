@@ -121,9 +121,10 @@ pub struct AgentDef {
     #[serde(default)]
     pub background: bool,
     /// Turn cap per drive of dispatches through this definition: the child
-    /// ends with whatever it accumulated (partial output, resumable via
-    /// `continue_run_id`). A continuation starts a fresh count. Zero is
-    /// rejected at assembly (a run always spends at least one turn).
+    /// ends with whatever it accumulated (partial output, resumable by
+    /// dispatching again to the run id — the `Steer` continuation shape). A
+    /// continuation starts a fresh count. Zero is rejected at assembly (a
+    /// run always spends at least one turn).
     #[serde(default)]
     pub max_turns: Option<u32>,
     /// Display color from the Claude vocabulary. The reference docs list
