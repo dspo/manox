@@ -6,9 +6,12 @@
 //! (`HarnessHandle::steer`), and `Abort` stops it. The per-definition
 //! delegation tools retired from the model face; their definition
 //! resolution stays as engine-internal config ([`crate::subagent`]) the
-//! run arms route through. The bus also retains the TeamMember member
-//! operations (real manox Threads), which are pure gpui facade round trips
-//! (`BusOp`). The cross-session agent bus is a manox host extension.
+//! run arms route through. The rewrite was aggressive by design: the
+//! retired tools' `continue_run_id` parameter has no compat alias —
+//! continuation is `Dispatch` + run id, period. The bus also retains the
+//! TeamMember member operations (real manox Threads), which are pure gpui
+//! facade round trips (`BusOp`). The cross-session agent bus is a manox
+//! host extension.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, Weak};
@@ -23,7 +26,7 @@ use crate::thread_engine::{BackendNotice, send_notice};
 
 /// The literal `to.spawn` value that spawns a real manox Thread (the frozen
 /// member arm). Every other spawn value names a subagent definition.
-const MEMBER_SPAWN: &str = "TeamMember";
+pub(crate) const MEMBER_SPAWN: &str = "TeamMember";
 
 /// The engine-installed subagent scheduling surface: the runtime run table,
 /// the host observer, the dispatch path, and the definition catalog. The
@@ -98,6 +101,35 @@ impl AgentBus {
         *locked(&self.delegation) = Some(Arc::new(delegation));
     }
 
+    /// Test-support: install a scheduling surface from caller-supplied
+    /// parts (a runtime with providers already registered, the host
+    /// observer, the definition catalog). Integration tests outside this
+    /// crate drive the real Steer → runtime chain without a full engine
+    /// assembly; the tool assembly is the production installer.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn install_delegation_for_test(
+        &self,
+        runtime: Arc<manox_harness::subagent::SubagentRuntime>,
+        observer: Arc<crate::subagent::SubagentRunObserver>,
+        defs: Vec<manox_harness::subagent::SubagentDefConfig>,
+    ) {
+        self.install_delegation(SubagentDelegation {
+            runtime,
+            observer: Arc::clone(&observer),
+            dispatcher: Arc::new(crate::subagent::SubagentDispatcher {
+                observer,
+                provider_registry: None,
+                env: Arc::new(manox_harness::env::TokioExecutionEnv::new(
+                    std::env::temp_dir(),
+                )),
+                cwd: std::env::temp_dir(),
+                parent_depth: 0,
+                parent_session: Some(self.owner_thread_id().to_string()),
+            }),
+            catalog: Arc::new(crate::subagent::SubagentCatalog::new(defs)),
+        });
+    }
+
     fn delegation(&self) -> Option<Arc<SubagentDelegation>> {
         locked(&self.delegation).clone()
     }
@@ -143,8 +175,9 @@ impl AgentBus {
 
     /// The main Steer routing entry point. Run addresses resolve against the
     /// installed subagent surface; member addresses against the spawned
-    /// member set; everything else falls through to the permission-denied
-    /// reply.
+    /// member set; a Captain address that resolves to neither run nor member
+    /// gets the address-contract coach (the permission wall answers only the
+    /// non-Captain callers).
     pub(crate) async fn steer(
         &self,
         from: AgentId,
@@ -159,6 +192,15 @@ impl AgentBus {
             (AgentId::Captain, SteerReason::Dispatch)
                 if to.spawn.as_deref() == Some(MEMBER_SPAWN) =>
             {
+                // The frozen member arm carries the prompt alone — a stray
+                // dispatch budget would silently run under a different
+                // contract than asked.
+                if let Some(stray) = first_stray_dispatch_param(&call.dispatch_params) {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "`{stray}` only applies to a subagent run dispatch — a TeamMember \
+                         spawn carries the `prompt` alone."
+                    )));
+                }
                 self.dispatch_member(addr, &payload.text).await
             }
 
@@ -172,24 +214,53 @@ impl AgentBus {
             (AgentId::Captain, SteerReason::Dispatch) if to.spawn.is_some() => {
                 let spawn = to.spawn.clone().unwrap_or_default();
                 let delegation = self.require_delegation()?;
-                let config = delegation
-                    .catalog
-                    .get(&spawn)
-                    .ok_or_else(no_such_definition(&spawn))?;
-                self.continue_dispatch(&delegation, config, addr, &call)
-                    .await
+                Self::reject_live_continuation(&delegation, addr)?;
+                // The explicit definition must be the run's own: a mismatch
+                // would reopen the child under a different persona than the
+                // one its context was built by. The exception is the
+                // recovery path — the remembered kind is no longer
+                // registered, so a current definition takes over.
+                match delegation.observer.kind_of(addr) {
+                    Some(remembered) => match delegation.catalog.get(&remembered) {
+                        Some(config) if remembered == spawn => {
+                            self.continue_dispatch(&delegation, config, addr, &call)
+                                .await
+                        }
+                        Some(_) => Err(ToolError::InvalidArguments(format!(
+                            "run `{addr}` was dispatched through definition `{remembered}`, \
+                             not `{spawn}`; continue it with `to.agent_address` alone, or \
+                             with `to.spawn: \"{remembered}\"`"
+                        ))),
+                        // The remembered kind is no longer registered: the
+                        // explicit definition is the takeover path.
+                        None => {
+                            let config = delegation
+                                .catalog
+                                .get(&spawn)
+                                .ok_or_else(no_such_definition(&spawn))?;
+                            self.continue_dispatch(&delegation, config, addr, &call)
+                                .await
+                        }
+                    },
+                    None => Err(unknown_run(addr)),
+                }
             }
 
             // ── Dispatch: continue a run through its own definition ────
             (AgentId::Captain, SteerReason::Dispatch) => {
+                if addr.is_empty() {
+                    return Err(ToolError::InvalidArguments(
+                        "a run dispatch needs `to.spawn` = a definition name (see \
+                         ListAgents); continuing a run needs `to.agent_address` = its run id"
+                            .into(),
+                    ));
+                }
                 let delegation = self.require_delegation()?;
-                let kind = delegation.observer.kind_of(addr).ok_or_else(|| {
-                    ToolError::InvalidArguments(format!(
-                        "no subagent run `{addr}` is known to this thread; take run ids from \
-                         the Dispatch results (or ListAgents) and continue them by addressing \
-                         the run id"
-                    ))
-                })?;
+                Self::reject_live_continuation(&delegation, addr)?;
+                let kind = delegation
+                    .observer
+                    .kind_of(addr)
+                    .ok_or_else(|| unknown_run(addr))?;
                 let config = delegation.catalog.get(&kind).ok_or_else(|| {
                     ToolError::InvalidArguments(format!(
                         "run `{addr}` dispatched through definition `{kind}`, which is no \
@@ -224,6 +295,9 @@ impl AgentBus {
                 )))
             }
 
+            // ── Inject to an unknown address: name the address contract ─
+            (AgentId::Captain, SteerReason::Inject) => Err(unknown_run(addr)),
+
             // ── Abort member thread ─────────────────────────────────────
             (AgentId::Captain, SteerReason::Abort) if self.is_member(addr) => self
                 .bus_request(BusOp::AbortMember {
@@ -235,10 +309,18 @@ impl AgentBus {
             // ── Abort a live run ────────────────────────────────────────
             (AgentId::Captain, SteerReason::Abort) if self.is_live_run(addr) => {
                 let delegation = self.require_delegation()?;
-                let _ = delegation.runtime.interrupt(addr);
+                if !delegation.runtime.interrupt(addr) {
+                    // Lost the race with settlement: no live run took the
+                    // cancel, so `interrupted: true` would be a lie.
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "run `{addr}` is no longer live (it just settled); to rework it, \
+                         dispatch to the run id (`reason: \"Dispatch\"`, `to.agent_address: \
+                         \"{addr}\"`)"
+                    )));
+                }
                 Ok(AgentToolResult::text(
                     serde_json::json!({
-                        "delivered": true,
+                        "aborted": true,
                         "agent_address": addr,
                         "interrupted": true,
                     })
@@ -253,6 +335,9 @@ impl AgentBus {
                 )))
             }
 
+            // ── Abort an unknown address: name the address contract ─────
+            (AgentId::Captain, SteerReason::Abort) => Err(unknown_run(addr)),
+
             // ── Permission denied ───────────────────────────────────────
             _ => Err(ToolError::InvalidArguments(format!(
                 "steer not allowed: from={from:?} to={addr} reason={reason:?} — the \
@@ -260,6 +345,23 @@ impl AgentBus {
                  TeamMember threads; a subagent cannot steer"
             ))),
         }
+    }
+
+    /// A continuation addresses a SETTLED run: a run id that is still live
+    /// would otherwise re-open the child mid-flight (and at the runtime
+    /// layer overwrite its live-table entry, dropping the capacity permit
+    /// and dispose token). The refusal names the mid-run alternatives.
+    fn reject_live_continuation(
+        delegation: &Arc<SubagentDelegation>,
+        addr: &str,
+    ) -> Result<(), ToolError> {
+        if delegation.runtime.is_live(addr) {
+            return Err(ToolError::InvalidArguments(format!(
+                "run `{addr}` is still live — Inject to guide it, Abort to stop it; \
+                 continuations address settled runs"
+            )));
+        }
+        Ok(())
     }
 
     /// Check if `addr` is a known member thread id.
@@ -340,12 +442,24 @@ impl AgentBus {
 
     /// Guide a live run mid-flight: the kernel's steer primitive injects the
     /// text into the child's current (or next) turn; the durable witness is
-    /// one `run/guided` row in the parent journal; the run's idle watchdog
-    /// treats the guidance as activity. The ack confirms DELIVERY — it is
-    /// never the child's answer.
+    /// one `run/guided` row in the parent journal, and it lands BEFORE the
+    /// delivery — a crash between the kernel steer and the row append must
+    /// not lose the guidance record (the row is written first; a run that
+    /// settles in the race window bounces the delivery, and the coaching
+    /// error keeps the ack delivery-only). The run's idle watchdog treats
+    /// the guidance as activity. The ack confirms DELIVERY — it is never
+    /// the child's answer.
     async fn guide_run(&self, run_id: &str, text: &str) -> Result<AgentToolResult, ToolError> {
         let delegation = self.require_delegation()?;
         let message = manox_harness::types::AgentMessage::user(text.to_string());
+        // Durable witness first (the disposition above), then the delivery.
+        delegation.observer.journal_swarm_row(
+            "run/guided",
+            serde_json::json!({
+                "runId": run_id,
+                "text": text,
+            }),
+        );
         if !manox_harness::subagent::feeds::steer_child(run_id, message) {
             // Lost the race with settlement: coach the continuation contract.
             return Err(ToolError::ExecutionFailed(format!(
@@ -354,13 +468,6 @@ impl AgentBus {
             )));
         }
         delegation.observer.note_guidance(run_id);
-        delegation.observer.journal_swarm_row(
-            "run/guided",
-            serde_json::json!({
-                "runId": run_id,
-                "text": text,
-            }),
-        );
         Ok(guided_ack(run_id))
     }
 
@@ -414,6 +521,25 @@ fn no_such_definition(spawn: &str) -> impl FnOnce() -> ToolError + '_ {
     }
 }
 
+/// The unknown-address coach, shared by the continuation arm and the
+/// Inject/Abort arms' explicit unknown-address refusals: run ids come from
+/// dispatch results, never from thin air.
+fn unknown_run(addr: &str) -> ToolError {
+    ToolError::InvalidArguments(format!(
+        "no subagent run `{addr}` is known to this thread; take run ids from the Dispatch \
+         results (or ListAgents) and address them from there"
+    ))
+}
+
+/// The first Dispatch-only parameter carrying a non-null value, if any —
+/// the fail-loud check the non-run arms apply.
+fn first_stray_dispatch_param(params: &serde_json::Value) -> Option<&'static str> {
+    DISPATCH_PARAMS
+        .iter()
+        .copied()
+        .find(|p| params.get(*p).is_some_and(|v| !v.is_null()))
+}
+
 /// Build a JSON ack tool_result.
 fn ack(addr: &str, spawned: bool, thread_id: Option<String>) -> AgentToolResult {
     AgentToolResult::text(
@@ -456,8 +582,9 @@ impl SteerTool {
 
 /// The Dispatch-only optional parameters, carried over from the retired
 /// delegation tools' schema. Rejected on a non-Dispatch reason.
+/// `description` is not among them: the schema marks it required on every
+/// call, so it can never be stray.
 const DISPATCH_PARAMS: &[&str] = &[
-    "description",
     "run_in_background",
     "timeout_ms",
     "idle_timeout_ms",
@@ -486,14 +613,16 @@ const STEER_DESCRIPTION: &str = "Steer your subagents and TeamMembers — the si
      than the definition's ceiling or this session's authority; `model`/`reasoning_effort` \
      override the route; `replay_thinking` replays the child's earlier thinking blocks. \
      Guide a live run mid-flight with `reason: \"Inject\"`, `to.agent_address` = the run \
-     id — the guidance lands in the child's current turn and counts as activity for its \
-     idle budget, and the ack confirms delivery (it is NOT the child's answer). Stop a run \
-     with `reason: \"Abort\"`. Continue a settled run by dispatching to it: `reason: \
-     \"Dispatch\"`, `to.agent_address` = the run id, no `to.spawn`, and the follow-up as \
-     `prompt` — the child keeps its full context. `description` is the required short task \
-     label for run dispatches. To create a real manox Thread that persists, appears in the \
-     sidebar, and can be resumed, spawn `to.spawn: \"TeamMember\"` (Captain only; its \
-     reply carries the thread id).";
+     id — the guidance lands in the child's current (or next) turn and counts as activity \
+     for its idle budget, and the ack confirms delivery (it is NOT the child's answer). \
+     Stop a run with `reason: \"Abort\"`. Continue a settled run by dispatching to it: \
+     `reason: \"Dispatch\"`, `to.agent_address` = the run id, no `to.spawn`, and the \
+     follow-up as `prompt` — the child keeps its full context. Continuation addresses a \
+     SETTLED run: a run that is still live takes Inject (to guide) or Abort (to stop), \
+     never a re-dispatch. `description` is the required short task label for run \
+     dispatches. To create a real manox Thread that persists, appears in the sidebar, and \
+     can be resumed, spawn `to.spawn: \"TeamMember\"` (Captain only; its reply carries \
+     the thread id).";
 
 #[async_trait::async_trait]
 impl AgentTool for SteerTool {
@@ -522,19 +651,20 @@ impl AgentTool for SteerTool {
                     "properties": {
                         "agent_address": {
                             "type": "string",
-                            "description": "Target address. Inject/Abort/continue: the run id (from the dispatch result). TeamMember ops: the member's name or thread id. Omit when creating a new run. Reserved: 'Captain', 'User'."
+                            "description": "Target address. Inject/Abort: the live run's id (from the dispatch result). Continue: a SETTLED run's id — a live run takes Inject or Abort. TeamMember ops: the member's name or thread id. Omit when creating a new run. Reserved: 'Captain', 'User'."
                         },
                         "spawn": {
                             "type": "string",
                             "description": "The subagent definition to create — take values from ListAgents' definitions list — or the literal \"TeamMember\" for a real manox Thread (Captain only, process: persisted, sidebar-visible, resumable, own Captain session + own bus; error if the name exists). Omit when addressing an existing run by id."
                         }
                     },
-                    "description": "Target of the steer."
+                    "description": "Target of the steer.",
+                    "additionalProperties": false
                 },
                 "reason": {
                     "type": "string",
                     "enum": ["Dispatch", "Inject", "Abort"],
-                    "description": "Dispatch creates a run (to.spawn = definition) or continues one (to.agent_address = run id, no to.spawn); Inject messages a live run mid-flight; Abort cancels it."
+                    "description": "Dispatch creates a run (to.spawn = definition) or continues a SETTLED one (to.agent_address = run id, no to.spawn — a live run takes Inject or Abort); Inject messages a live run mid-flight; Abort cancels it."
                 },
                 "prompt": {
                     "type": "string",
@@ -592,7 +722,7 @@ impl AgentTool for SteerTool {
                     "additionalProperties": false
                 }
             },
-            "required": ["to", "reason", "prompt"],
+            "required": ["to", "reason", "prompt", "description"],
             "additionalProperties": false
         })
     }
@@ -610,13 +740,18 @@ impl AgentTool for SteerTool {
             .as_object()
             .ok_or_else(|| ToolError::InvalidArguments("params must be an object".into()))?
             .keys()
-            .filter(|k| k.as_str() != "to" && k.as_str() != "reason" && k.as_str() != "prompt")
+            .filter(|k| {
+                k.as_str() != "to"
+                    && k.as_str() != "reason"
+                    && k.as_str() != "prompt"
+                    && k.as_str() != "description"
+            })
             .filter(|k| !DISPATCH_PARAMS.contains(&k.as_str()))
             .collect();
         if !unknown.is_empty() {
             return Err(ToolError::InvalidArguments(format!(
-                "unknown field(s) {unknown:?}; Steer takes `to`, `reason`, `prompt`, and the \
-                 Dispatch-only {}",
+                "unknown field(s) {unknown:?}; Steer takes `to`, `reason`, `prompt`, \
+                 `description`, and the Dispatch-only {}",
                 DISPATCH_PARAMS
                     .iter()
                     .map(|p| format!("`{p}`"))
@@ -690,16 +825,12 @@ impl AgentTool for SteerTool {
         // Dispatch-only parameters are meaningless on Inject/Abort — a
         // silently ignored budget would run the child under a different
         // contract than asked.
-        if reason != SteerReason::Dispatch {
-            let stray: Vec<&&str> = DISPATCH_PARAMS
-                .iter()
-                .filter(|p| params.get(**p).is_some_and(|v| !v.is_null()))
-                .collect();
-            if !stray.is_empty() {
-                return Err(ToolError::InvalidArguments(format!(
-                    "{stray:?} only applies to Dispatch."
-                )));
-            }
+        if reason != SteerReason::Dispatch
+            && let Some(stray) = first_stray_dispatch_param(&params)
+        {
+            return Err(ToolError::InvalidArguments(format!(
+                "`{stray}` only applies to Dispatch."
+            )));
         }
         // The run dispatches label their card; the member arm carries the
         // prompt alone.
@@ -793,7 +924,9 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("not allowed"), "{err}");
+        // A reserved address is not a steer target: the refusal names the
+        // address contract, not a permission wall.
+        assert!(err.to_string().contains("no subagent run"), "{err}");
     }
 
     #[tokio::test]
@@ -809,7 +942,9 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("not allowed"), "{err}");
+        // An unknown address has its own arm before the permission
+        // fallthrough — the refusal names the address contract.
+        assert!(err.to_string().contains("no subagent run"), "{err}");
     }
 
     /// Without an installed surface (no session assembly ran), a run
@@ -886,7 +1021,8 @@ mod tests {
     /// A scripted provider for the run arms: full caps, records every
     /// start's continuation field, fires the host observer's lifecycle like
     /// the real spawn drive, and settles immediately (foreground create) or
-    /// holds until aborted (the live-run arms).
+    /// holds until aborted (the live-run arms). A CONTINUATION start always
+    /// settles immediately — the reopened run has nothing left to hold on.
     struct ScriptedProvider {
         settle: bool,
         continuations: Mutex<Vec<Option<String>>>,
@@ -955,7 +1091,7 @@ mod tests {
             let cancel = request.inner.cancel.clone();
             let run_id = request.run_id.clone();
             let label = request.inner.label.clone();
-            let settle = self.settle;
+            let settle = self.settle || request.inner.continuation_of.is_some();
             let settle_observer = observer.clone();
             Ok(manox_harness::subagent::SubagentRun::new(
                 request.run_id,
@@ -1115,6 +1251,203 @@ mod tests {
             &[Some("sub-known".to_string())],
             "the run id rode to the provider as the continuation"
         );
+    }
+
+    /// A continuation addresses a SETTLED run: while the run is live the
+    /// dispatch is refused with the mid-run alternatives named; once it has
+    /// settled, the same dispatch continues it.
+    #[tokio::test]
+    async fn dispatch_to_a_live_run_refuses_until_it_settles() {
+        crate::runtime::init_hermetic_for_test();
+        let bus = bus();
+        let provider = ScriptedProvider::new(false);
+        install(&bus, Arc::clone(&provider), vec![def_config("Scout")]);
+        let result = bus
+            .steer(
+                AgentId::Captain,
+                to("", Some("Scout")),
+                SteerReason::Dispatch,
+                payload("do it"),
+                dispatch_params(serde_json::json!({"run_in_background": true})),
+            )
+            .await
+            .expect("the background run starts");
+        let envelope: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        let run_id = envelope["run_id"].as_str().unwrap().to_string();
+        assert!(bus.is_live_run(&run_id), "the run is live");
+
+        let err = bus
+            .steer(
+                AgentId::Captain,
+                to(&run_id, None),
+                SteerReason::Dispatch,
+                payload("the follow-up"),
+                dispatch_params(serde_json::json!({})),
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("still live") && text.contains("Inject") && text.contains("Abort"),
+            "the refusal coaches the mid-run alternatives: {err}"
+        );
+        assert_eq!(
+            provider.continuations.lock().unwrap().as_slice(),
+            [None],
+            "only the create rode; the live continuation never reached the provider"
+        );
+
+        // Settle the run (Abort), then the continuation goes through.
+        bus.steer(
+            AgentId::Captain,
+            to(&run_id, None),
+            SteerReason::Abort,
+            payload("ignored"),
+            dispatch_params(serde_json::json!({})),
+        )
+        .await
+        .expect("the abort lands");
+        for _ in 0..200 {
+            if !bus.is_live_run(&run_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!bus.is_live_run(&run_id), "the run settled");
+        bus.steer(
+            AgentId::Captain,
+            to(&run_id, None),
+            SteerReason::Dispatch,
+            payload("the follow-up"),
+            dispatch_params(serde_json::json!({})),
+        )
+        .await
+        .expect("the settled run continues");
+        assert_eq!(
+            provider.continuations.lock().unwrap().as_slice(),
+            [None, Some(run_id.clone())],
+            "the continuation rode to the provider"
+        );
+    }
+
+    /// An explicit-`to.spawn` continuation must name the run's remembered
+    /// definition: a mismatch is refused with the run's own kind named, the
+    /// matching spawn rides, and the mismatch is forgiven only when the
+    /// remembered kind is no longer registered (the takeover path).
+    #[tokio::test]
+    async fn explicit_spawn_continuation_must_match_the_remembered_kind() {
+        crate::runtime::init_hermetic_for_test();
+        let bus = bus();
+        let provider = ScriptedProvider::new(true);
+        install(
+            &bus,
+            Arc::clone(&provider),
+            vec![def_config("Scout"), def_config("Sailor")],
+        );
+        let observer = bus.delegation().unwrap().observer.clone();
+        use manox_harness::subagent::RunObserver as _;
+        observer.on_start(&run_info("sub-known"));
+        observer.on_settled(&settled_info("sub-known"));
+
+        let err = bus
+            .steer(
+                AgentId::Captain,
+                to("sub-known", Some("Sailor")),
+                SteerReason::Dispatch,
+                payload("the follow-up"),
+                dispatch_params(serde_json::json!({})),
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("`Scout`") && text.contains("`Sailor`"),
+            "the refusal names the run's own definition: {err}"
+        );
+        assert!(
+            provider.continuations.lock().unwrap().is_empty(),
+            "the mismatch never reached the provider"
+        );
+
+        // The matching spawn is the explicit shape of the same continuation.
+        bus.steer(
+            AgentId::Captain,
+            to("sub-known", Some("Scout")),
+            SteerReason::Dispatch,
+            payload("the follow-up"),
+            dispatch_params(serde_json::json!({})),
+        )
+        .await
+        .expect("the matching spawn continues the run");
+        assert_eq!(
+            provider.continuations.lock().unwrap().as_slice(),
+            &[Some("sub-known".to_string())],
+        );
+
+        // A run whose kind is no longer registered takes any current
+        // definition — the takeover path the plain arm's refusal coaches.
+        observer.on_start(&run_info_kind("sub-orphan", "Retired"));
+        observer.on_settled(&settled_info("sub-orphan"));
+        bus.steer(
+            AgentId::Captain,
+            to("sub-orphan", Some("Sailor")),
+            SteerReason::Dispatch,
+            payload("the follow-up"),
+            dispatch_params(serde_json::json!({})),
+        )
+        .await
+        .expect("the takeover continuation starts");
+        assert_eq!(
+            provider.continuations.lock().unwrap().as_slice(),
+            &[
+                Some("sub-known".to_string()),
+                Some("sub-orphan".to_string())
+            ],
+        );
+    }
+
+    /// The frozen member arm carries the prompt alone: a stray dispatch
+    /// parameter is refused loudly instead of silently ignored.
+    #[tokio::test]
+    async fn member_spawn_rejects_stray_dispatch_params() {
+        let bus = bus();
+        let err = bus
+            .steer(
+                AgentId::Captain,
+                to("alice", Some("TeamMember")),
+                SteerReason::Dispatch,
+                payload("hello"),
+                dispatch_params(serde_json::json!({"timeout_ms": 5_000})),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("timeout_ms") && err.to_string().contains("TeamMember"),
+            "{err}"
+        );
+    }
+
+    /// A run dispatch with no spawn and no address has its own copy — never
+    /// a coaching message quoting an empty run id.
+    #[tokio::test]
+    async fn bare_dispatch_gets_the_address_copy() {
+        let bus = bus();
+        let err = bus
+            .steer(
+                AgentId::Captain,
+                to("", None),
+                SteerReason::Dispatch,
+                payload("do it"),
+                dispatch_params(serde_json::json!({})),
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("to.spawn") && text.contains("to.agent_address"),
+            "{err}"
+        );
+        assert!(!text.contains("``"), "no empty address in the copy: {err}");
     }
 
     /// The guide arm routes by the runtime's liveness table: a live run's
@@ -1278,11 +1611,15 @@ mod tests {
     }
 
     fn run_info(run_id: &str) -> manox_harness::subagent::RunInfo {
+        run_info_kind(run_id, "Scout")
+    }
+
+    fn run_info_kind(run_id: &str, kind: &str) -> manox_harness::subagent::RunInfo {
         manox_harness::subagent::RunInfo {
             run_id: run_id.to_string(),
             provider: "scripted".to_string(),
             label: "survey".to_string(),
-            kind: "Scout".to_string(),
+            kind: kind.to_string(),
             model: None,
             local: true,
             budgets: manox_harness::subagent::Budgets::default(),
@@ -1341,5 +1678,226 @@ mod tests {
         }
         aborted.sort();
         assert_eq!(aborted, vec!["m1", "m2", "m3"]);
+    }
+
+    // ── the tool's execute face (schema + journaling) ────────────────────
+
+    /// The serialized store tests' lock, as a guard (the store-backed
+    /// journal test holds it for its whole body).
+    fn steer_store_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::thread_store::store_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn tool_context() -> manox_harness::tool::LocalToolContext {
+        manox_harness::tool::LocalToolContext::new(
+            Arc::new(manox_harness::env::TokioExecutionEnv::new(
+                std::path::PathBuf::from("/tmp"),
+            )),
+            std::path::PathBuf::from("/tmp"),
+            Arc::new(manox_harness::tool::ToolState::default()),
+        )
+    }
+
+    /// An unknown top-level field is a typo'd contract, refused before any
+    /// arm routes.
+    #[tokio::test]
+    async fn execute_rejects_an_unknown_top_level_field() {
+        let tool = SteerTool::new(bus(), AgentId::Captain);
+        let err = tool
+            .execute(
+                "call-1",
+                serde_json::json!({
+                    "to": {"spawn": "Scout"}, "reason": "Dispatch",
+                    "prompt": "p", "description": "d", "budget_ms": 1,
+                }),
+                CancellationToken::new(),
+                &tool_context(),
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("unknown field"), "{err}");
+        assert!(text.contains("budget_ms"), "{err}");
+    }
+
+    /// An unknown `to` field is refused the same way.
+    #[tokio::test]
+    async fn execute_rejects_an_unknown_to_field() {
+        let tool = SteerTool::new(bus(), AgentId::Captain);
+        let err = tool
+            .execute(
+                "call-1",
+                serde_json::json!({
+                    "to": {"agent_address": "", "spawn": "Scout", "who": "x"},
+                    "reason": "Dispatch", "prompt": "p", "description": "d",
+                }),
+                CancellationToken::new(),
+                &tool_context(),
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("`to` has unknown field"), "{err}");
+        assert!(text.contains("who"), "{err}");
+    }
+
+    /// Dispatch-only parameters on an Inject are refused — a silently
+    /// ignored budget would run the child under a different contract.
+    #[tokio::test]
+    async fn execute_rejects_dispatch_only_params_on_an_inject() {
+        let tool = SteerTool::new(bus(), AgentId::Captain);
+        let err = tool
+            .execute(
+                "call-1",
+                serde_json::json!({
+                    "to": {"agent_address": "sub-1"}, "reason": "Inject",
+                    "prompt": "x", "timeout_ms": 100,
+                }),
+                CancellationToken::new(),
+                &tool_context(),
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("timeout_ms") && text.contains("Dispatch"),
+            "{err}"
+        );
+    }
+
+    /// A run dispatch without the `description` label is refused: the card
+    /// and the child's creation label both need it.
+    #[tokio::test]
+    async fn execute_rejects_a_run_dispatch_without_a_description() {
+        let tool = SteerTool::new(bus(), AgentId::Captain);
+        let err = tool
+            .execute(
+                "call-1",
+                serde_json::json!({
+                    "to": {"spawn": "Scout"}, "reason": "Dispatch", "prompt": "p",
+                }),
+                CancellationToken::new(),
+                &tool_context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("description"), "{err}");
+    }
+
+    /// The execute-path Inject lands the durable `run/guided` row BEFORE the
+    /// delivery attempt: even a delivery that bounces (no steer face here —
+    /// a scripted provider has no child session) leaves the witness in the
+    /// parent journal. A sync test driving a local runtime: the store lock
+    /// guards the global override for the whole body, and a guard must not
+    /// sit across an `await` in an async test.
+    #[test]
+    fn inject_journals_the_run_guided_row_before_the_delivery() {
+        crate::runtime::init_hermetic_for_test();
+        let _store_lock = steer_store_lock();
+        crate::thread_store::init_for_test();
+        let journal_dir = crate::thread_store::global_sessions_dir()
+            .join("t")
+            .join("thread-1");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        let journal = journal_dir.join(manox_harness::session::identity::JOURNAL_FILE);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // A real journal file (header included): the cold append opens
+            // the storage, so an empty stub would bounce the row.
+            manox_harness::session::jsonl::JsonlSessionStorage::create(
+                &journal,
+                manox_harness::session::jsonl::JsonlSessionMetadata {
+                    id: "thread-1".into(),
+                    cwd: "/tmp".into(),
+                    created_at: chrono::Utc::now(),
+                    parent_session_path: None,
+                    metadata: None,
+                },
+            )
+            .await
+            .expect("the journal seeds");
+
+            let bus = bus();
+            install(
+                &bus,
+                ScriptedProvider::new(false),
+                vec![def_config("Scout")],
+            );
+            let result = bus
+                .steer(
+                    AgentId::Captain,
+                    to("", Some("Scout")),
+                    SteerReason::Dispatch,
+                    payload("do it"),
+                    dispatch_params(serde_json::json!({"run_in_background": true})),
+                )
+                .await
+                .expect("the background run starts");
+            let envelope: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+            let run_id = envelope["run_id"].as_str().unwrap().to_string();
+            assert!(bus.is_live_run(&run_id));
+
+            // The Inject's delivery bounces (no steer face), but the durable
+            // witness landed first.
+            bus.steer(
+                AgentId::Captain,
+                to(&run_id, None),
+                SteerReason::Inject,
+                payload("narrow the scope"),
+                dispatch_params(serde_json::json!({})),
+            )
+            .await
+            .unwrap_err();
+        });
+        let landed = (0..200).any(|_| {
+            let ok = std::fs::read_to_string(&journal)
+                .is_ok_and(|content| content.contains("run/guided") && content.contains("sub-"));
+            if ok {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            false
+        });
+        assert!(
+            landed,
+            "the run/guided row is the durable witness: {}",
+            std::fs::read_to_string(&journal).unwrap_or_default()
+        );
+        crate::thread_store::drop_for_test();
+    }
+
+    /// The `ListAgents` execute face carries the definition catalog — the
+    /// entry point the Steer `to.spawn` values are picked from.
+    #[tokio::test]
+    async fn list_agents_execute_lists_the_definition_catalog() {
+        let (notice_tx, _notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = manox_harness::subagent::SubagentRuntime::new();
+        let observer = crate::subagent::SubagentRunObserver::new("thread-1".into(), notice_tx);
+        let tool = crate::subagent::ListAgentsTool::new(
+            Arc::clone(&runtime),
+            Arc::clone(&observer),
+            Arc::new(SubagentCatalog::new(vec![def_config("Scout")])),
+        );
+        let result = tool
+            .execute(
+                "call-1",
+                serde_json::json!({}),
+                CancellationToken::new(),
+                &tool_context(),
+            )
+            .await
+            .expect("the list lands");
+        let listed: serde_json::Value = serde_json::from_str(&text_of(&result)).unwrap();
+        assert_eq!(listed["runs"], serde_json::json!([]), "{listed}");
+        let definitions = listed["definitions"].as_array().expect("definitions ride");
+        assert_eq!(definitions.len(), 1, "{listed}");
+        assert_eq!(definitions[0]["name"], "Scout", "{listed}");
+        assert_eq!(definitions[0]["capability"], "read-only", "{listed}");
     }
 }

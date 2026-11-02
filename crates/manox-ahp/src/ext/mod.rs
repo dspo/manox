@@ -54,6 +54,12 @@ pub const META_KEY: &str = "x-manox";
 /// child's transcript is that channel, `ahp-chat:/<run-id>`, read-only with a
 /// `ChatOrigin::Tool` naming the spawning call. A client that keyed its
 /// sub-agent view off this channel's rows reads those instead.
+///
+/// The version advances only on a REMOVING or RE-SHAPING change — the
+/// changelog above is that history, and every entry is a removal. Additive
+/// evolution (a new action kind, a new optional field) bumps nothing: a
+/// caching client's baseline never loses a fact it could read. Keep that
+/// policy — no bump for additions alone.
 pub const VERSION: u32 = 6;
 
 /// State-bearing extension channel prefixes, in declaration order.

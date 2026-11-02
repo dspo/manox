@@ -203,13 +203,25 @@ impl SubagentRuntime {
         descriptor.persona = request.persona.clone();
         descriptor.tool_filter = request.tool_filter.clone();
 
-        let run_id = explicit_id.unwrap_or_else(|| {
+        let run_id = explicit_id.clone().unwrap_or_else(|| {
             format!(
                 "sub-{}-{}",
                 self.namespace,
                 self.run_seq.fetch_add(1, Ordering::SeqCst)
             )
         });
+        // Continuation backstop: an explicitly-named id that still sits in
+        // the live table would be overwritten by the insert below — the old
+        // entry's capacity permit and dispose token drop with it, leaving
+        // that run un-Abortable. The Steer arms refuse a live continuation
+        // first (with the coach); this guard is the loud backstop, not the
+        // contract.
+        if explicit_id.is_some() && mutex(&self.runs).contains_key(&run_id) {
+            return Err(SubagentError::InvalidRequest(format!(
+                "run `{run_id}` is still live; continuations address settled runs — \
+                 Inject to guide it, Abort to stop it"
+            )));
+        }
         let label = request.label.clone();
         let kind = request.kind.clone();
         let request_kind = request.kind.clone();
@@ -586,6 +598,27 @@ mod tests {
         assert!(runtime.is_live(&run.id));
         assert!(runtime.interrupt(&run.id));
         assert!(!runtime.interrupt("sub-999"), "unknown id");
+    }
+
+    /// The continuation backstop: an explicitly-named run id that still sits
+    /// in the live table is refused instead of overwritten — the overwrite
+    /// would drop the old entry's capacity permit and dispose token, leaving
+    /// that run un-Abortable. The original entry survives the refusal.
+    #[tokio::test]
+    async fn continue_run_refuses_an_id_that_is_still_live() {
+        let runtime = SubagentRuntime::new();
+        runtime.register_provider_permanent(Arc::new(PendingProvider));
+        let run = runtime
+            .start("pending", test_request("l", "p"))
+            .await
+            .expect("start");
+        let err = runtime
+            .continue_run("pending", &run.id, test_request("l", "the follow-up"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("still live"), "{err}");
+        assert!(runtime.is_live(&run.id), "the live entry was not clobbered");
+        assert!(runtime.interrupt(&run.id), "the run is still abortable");
     }
 
     /// A provider whose run never produces a result: the settle watcher never

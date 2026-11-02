@@ -1071,11 +1071,11 @@ pub(super) fn build_tools(
     // an already-mounted tool — or one of the fixed names mounted after
     // this block — is skipped loudly: by convention app-layer names are
     // lower_snake_case and native names UpCamelCase, so a collision is a
-    // caller breach, never a shadowing. Delegation definitions
-    // collision-check themselves against this table when they assemble
-    // below. The mounted names are recorded: the record is what the
-    // per-prompt refresh strips the old set by (the bare names carry no
-    // prefix to match on).
+    // caller breach, never a shadowing. The fixed names are the unified
+    // subagent surface (`Steer` + `ListAgents`), mounted below — no
+    // per-definition tool assembles anymore. The mounted names are
+    // recorded: the record is what the per-prompt refresh strips the old
+    // set by (the bare names carry no prefix to match on).
     let mut embedder_mounted: Vec<String> = Vec::new();
     if let Some(provider) = crate::embedder_tools::provider() {
         for tool in provider.tools_for(session_id) {
@@ -1177,7 +1177,19 @@ pub(super) fn build_tools(
         registry
             .all()
             .into_iter()
-            .map(|def| {
+            .filter_map(|def| {
+                // The literal `to.spawn: "TeamMember"` is the frozen member
+                // arm's — a definition wearing the name would be
+                // unreachable (the member arm owns the match arm first).
+                // Skip it loudly rather than mount a shadowed entry.
+                if def.name == crate::steer_bus::MEMBER_SPAWN {
+                    tracing::warn!(
+                        agent = %def.name,
+                        "agent definition is named `TeamMember` — the literal belongs to the \
+                         frozen member spawn arm; the definition is skipped"
+                    );
+                    return None;
+                }
                 let (allow, denied) =
                     crate::subagent::resolve_definition_filters(def, &child_snapshot_names);
                 // A run always spends at least one turn, so `maxTurns: 0` is
@@ -1195,7 +1207,7 @@ pub(super) fn build_tools(
                     }
                     other => other,
                 };
-                SubagentDefConfig {
+                Some(SubagentDefConfig {
                     provider: "spawn".into(),
                     name: def.name.clone(),
                     capability: subagent_capability(def).to_string(),
@@ -1222,7 +1234,7 @@ pub(super) fn build_tools(
                     color: def.color.clone(),
                     declared_permissions: def.permissions,
                     max_depth: 1,
-                }
+                })
             })
             .collect(),
     ));

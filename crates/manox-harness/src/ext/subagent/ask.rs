@@ -5,9 +5,9 @@
 // on a parked result. The delivery ends the child's turn (the run settles
 // with whatever it produced), the question surfaces on the parent chat as
 // an attributed settlement-class notice, and the answer comes back as a
-// CONTINUATION of the same run (`continue_run_id` — the child session and
-// every pointer stay intact). The tool result text teaches the child model
-// exactly that contract.
+// CONTINUATION of the same run (`Steer` with `reason: "Dispatch"` addressed
+// to the run id — the child session and every pointer stay intact). The
+// tool result text teaches the child model exactly that contract.
 
 use std::sync::Arc;
 

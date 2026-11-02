@@ -396,9 +396,17 @@ impl SessionRuntime for GatewayRuntime {
         session_id: &str,
         mode: &str,
     ) -> Result<Value, RuntimeError> {
-        self.server
-            .ahp_inner()
-            .teardown_container(owner, session_id, mode)
+        // The waterfall awaits a store refresh in archive mode (the cascade
+        // set must read fresh parent edges); the trait seam is synchronous,
+        // so the await rides the same block_in_place discipline as `set_cwd`.
+        let owner = owner.to_string();
+        let session_id = session_id.to_string();
+        block_on(async move {
+            self.server
+                .ahp_inner()
+                .teardown_container(&owner, &session_id, mode)
+                .await
+        })
     }
 
     fn conversation_metrics(&self, session_id: &str) -> Option<Value> {
