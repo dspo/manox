@@ -1189,6 +1189,9 @@ impl ThreadStore {
     /// store only ever held the row.
     pub fn drop_session_row(&mut self, id: &str) {
         self.summaries.retain(|row| row.id != id);
+        // A delegated child row wears the same id namespace: a dropped id
+        // must not linger in the child partition either.
+        self.child_summaries.retain(|row| row.id != id);
         self.session_paths.remove(id);
         self.live_threads.remove(id);
         self.pending_working_dirs.remove(id);
@@ -1202,6 +1205,32 @@ impl ThreadStore {
     /// The journal file path the store has for a session, when it has one.
     pub fn journal_path(&self, id: &str) -> Option<std::path::PathBuf> {
         self.session_paths.get(id).cloned()
+    }
+
+    /// The ACTIVE session id a surfaced row id resolves to. The scan maps
+    /// every row id — thread key or singleton session id — to its active
+    /// session's journal path; the id the engine assembles lives in that
+    /// path: the per-session DIRECTORY name in the core layout (the file is
+    /// the fixed `session.jsonl`), the file stem in the flat legacy layout
+    /// (`<id>.jsonl` beside the buckets). This is the row-id → session-id
+    /// seam for host gestures that must reach the live engine (container
+    /// teardown): a legacy journal's row id (the thread key) is not the
+    /// session id, and a caller that consults the engine with the raw row
+    /// id finds nothing live. An id the store never scanned answers `None`.
+    pub fn active_session_id(&self, row_id: &str) -> Option<String> {
+        let path = self.session_paths.get(row_id)?;
+        if path.file_name().and_then(|n| n.to_str())
+            == Some(manox_harness::session::identity::JOURNAL_FILE)
+        {
+            path.parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        } else {
+            path.file_stem()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        }
     }
 
     /// The journal file for one session id as it exists ON DISK: the
@@ -1512,10 +1541,11 @@ impl ThreadStore {
     /// in the child partition — the walk filters the flag); the post-write
     /// refresh in `write_meta` re-syncs both partitions from disk. Archiving
     /// cascades to every descendant along `parent_id` (team members, fork
-    /// children — one hierarchy rule; the child partition is not walked, a
-    /// container teardown resolves those rows itself); unarchiving moves
-    /// only the requested row. Re-asserting the current state is a no-op:
-    /// no partition move, meta write, or lifecycle hook.
+    /// children, delegated child rows — one hierarchy rule over all three
+    /// partitions; the `x-manox/archivedChanged` gesture must not leave
+    /// unarchived orphan child rows behind); unarchiving moves only the
+    /// requested row. Re-asserting the current state is a no-op: no
+    /// partition move, meta write, or lifecycle hook.
     pub fn archive_thread(&mut self, id: &str, archived: bool) {
         if self.decided_flags(id).is_some_and(|(_, a)| a == archived) {
             return;
@@ -1580,13 +1610,22 @@ impl ThreadStore {
         self.rerank();
     }
 
-    /// `id` plus every transitive child across both partitions, each parent
-    /// before its children (the archive cascade set).
+    /// `id` plus every transitive child across all three partitions
+    /// (active, archived, delegated child rows), each parent before its
+    /// children (the archive cascade set). The child partition is walked
+    /// like the others: a user-side archive gesture must not leave
+    /// unarchived orphan child rows behind — the container teardown's
+    /// cascade resolves those rows itself AND this walk now covers them.
     fn descendant_ids(&self, id: &str) -> Vec<String> {
         let mut out = vec![id.to_string()];
         let mut frontier = vec![id.to_string()];
         while let Some(parent) = frontier.pop() {
-            for s in self.summaries.iter().chain(self.archived_summaries.iter()) {
+            for s in self
+                .summaries
+                .iter()
+                .chain(self.archived_summaries.iter())
+                .chain(self.child_summaries.iter())
+            {
                 if s.parent_id.as_deref() == Some(parent.as_str()) && !out.contains(&s.id) {
                     frontier.push(s.id.clone());
                     out.push(s.id.clone());
@@ -1927,10 +1966,7 @@ async fn reconcile_summaries(
         // session id): it persists for usage accounting and the container
         // tree, but never ranks as a sidebar row — it lands in the child
         // partition the catalogue annotates instead.
-        let is_child = entry
-            .metadata
-            .as_ref()
-            .is_some_and(|m| m.get("subagent").is_some());
+        let is_child = subagent_stamp(entry.metadata.as_ref()).is_some();
         if !crate::host::belongs_to_current_host(entry.metadata.as_ref()) {
             continue;
         }
@@ -1969,6 +2005,20 @@ async fn reconcile_summaries(
 static DEFAULT_SESSION_META: std::sync::OnceLock<manox_harness::session_meta::SessionMeta> =
     std::sync::OnceLock::new();
 
+/// The `metadata.subagent` stamp, when it is a JSON object — the delegated
+/// child header's container edges (the `parent` join key, the dispatch
+/// `label`). The one classification shared by the scan's child partitioning
+/// and [`summary_from_cached`]: a non-object stamp (`true`, a string —
+/// foreign shapes) does not classify, so a row can never land in the child
+/// partition while its summary claims otherwise.
+fn subagent_stamp(
+    metadata: Option<&serde_json::Value>,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    metadata
+        .and_then(|m| m.get("subagent"))
+        .and_then(|s| s.as_object())
+}
+
 /// The cache-hit row's summary, built by borrowing: no `SessionInfo`
 /// roundtrip (that would deep-clone the header metadata JSON) and no
 /// full-`SessionMeta` clone — only the small fields the summary carries.
@@ -1988,11 +2038,7 @@ fn summary_from_cached(
     // carries); a captain row keeps the team affiliation over the fork
     // lineage (`team_parent_id`'s precedence). Two different vocabularies:
     // a subagent row never carries the team or fork edge.
-    let subagent = entry
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("subagent"))
-        .and_then(|s| s.as_object());
+    let subagent = subagent_stamp(entry.metadata.as_ref());
     let subagent_parent = subagent
         .and_then(|s| s.get("parent"))
         .and_then(|p| p.as_str())
@@ -3718,6 +3764,78 @@ mod tests {
                     .any(|s| s.id == "member" && s.archived)
             );
         });
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// The cascade descends into the child partition too: a user-side
+    /// archive gesture must not leave unarchived orphan child rows behind
+    /// (the container teardown resolves those rows itself AND this walk
+    /// covers them). A dropped row's namespace covers child rows as well,
+    /// and the row-id → active-session-id seam reads the id back from the
+    /// recorded journal path (core-layout directory name, flat-layout
+    /// stem).
+    #[test]
+    fn archive_cascades_into_the_child_partition_and_ids_resolve() {
+        let db_path = temp_db();
+        let store = store_handle();
+        store.with_mut(|s| {
+            s.summaries.push(cascade_summary("lead", None));
+            s.summaries.push(cascade_summary("sibling", None));
+            s.insert_child_summary_for_test("sub-a", "lead");
+            s.insert_child_summary_for_test("sub-b", "lead");
+            s.insert_child_summary_for_test("sub-other", "sibling");
+        });
+        store.with_mut(|s| s.archive_thread("lead", true));
+        store.read(|s| {
+            assert!(s.summary_by_id("lead").is_some_and(|row| row.archived));
+            for child in ["sub-a", "sub-b"] {
+                assert!(
+                    s.child_summaries
+                        .iter()
+                        .any(|row| row.id == child && row.archived),
+                    "{child} archived with its container"
+                );
+            }
+            assert!(
+                !s.summary_by_id("sibling").is_some_and(|row| row.archived)
+                    && !s
+                        .child_summaries
+                        .iter()
+                        .any(|row| row.id == "sub-other" && row.archived),
+                "another container's tree is untouched"
+            );
+        });
+
+        // A dropped id clears a matching child row too.
+        store.with_mut(|s| {
+            s.drop_session_row("sub-a");
+            assert!(s.child_summaries.iter().all(|row| row.id != "sub-a"));
+        });
+
+        // The row-id → active-session-id seam over both journal layouts.
+        let dir = store.read(|s| s.sessions_dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let flat = dir.join("lead.jsonl");
+        std::fs::write(&flat, b"").unwrap();
+        store.with_mut(|s| s.note_session_path("lead", &flat));
+        let core = dir
+            .join("t")
+            .join("sub-b")
+            .join(manox_harness::session::identity::JOURNAL_FILE);
+        std::fs::create_dir_all(core.parent().unwrap()).unwrap();
+        std::fs::write(&core, b"").unwrap();
+        store.with_mut(|s| s.note_session_path("sub-b", &core));
+        assert_eq!(
+            store.read(|s| s.active_session_id("lead")).as_deref(),
+            Some("lead"),
+            "flat layout: the stem is the session id"
+        );
+        assert_eq!(
+            store.read(|s| s.active_session_id("sub-b")).as_deref(),
+            Some("sub-b"),
+            "core layout: the per-session directory names the id"
+        );
+        assert_eq!(store.read(|s| s.active_session_id("ghost")), None);
         std::fs::remove_file(db_path).ok();
     }
 

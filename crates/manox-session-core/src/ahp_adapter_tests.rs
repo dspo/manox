@@ -208,6 +208,28 @@ async fn seed_session(id: &str, thread: &str, cwd: &str, events: Vec<(&str, E)>)
     storage.append_entries(&entries).await.unwrap();
 }
 
+/// Write one delegated child session journal (header-only): the
+/// `metadata.subagent` stamp (the parent join key + the dispatch label) is
+/// what lands the row in the scan's child partition. No thread stamp —
+/// child rows never group.
+async fn seed_child_session(id: &str, parent: &str) {
+    let path = core_journal(id);
+    JsonlSessionStorage::create(
+        &path,
+        JsonlSessionMetadata {
+            id: id.into(),
+            cwd: "/".into(),
+            created_at: stamp(),
+            parent_session_path: None,
+            metadata: Some(json!({
+                "subagent": {"parent": parent, "label": id},
+            })),
+        },
+    )
+    .await
+    .unwrap();
+}
+
 // ── sample entry constructors (chain fields filled by `with_chain`) ─────
 
 fn user(text: &str) -> E {
@@ -5972,6 +5994,7 @@ mod create_intent {
 
 mod teardown {
     use super::install;
+    use super::seed_child_session;
     use super::seed_session;
     use super::uninstall;
     use super::{turn_finish, user};
@@ -6106,9 +6129,16 @@ mod teardown {
         let _guards = install();
         let (server, backend) = backend_fixture().await;
         create_session(&server, "s-teardown").await;
-        // The store row a scanned session carries (the batch gate checks it).
-        manox_agent::thread_store::global()
-            .with_mut(|s| s.insert_summary_for_test("s-teardown", None));
+        // The store row a scanned session carries (the batch gate checks it)
+        // and the row-id → active-session-path map entry the live leg
+        // resolves through (the scanned rows always have one).
+        manox_agent::thread_store::global().with_mut(|s| {
+            s.insert_summary_for_test("s-teardown", None);
+            s.note_session_path(
+                "s-teardown",
+                &manox_agent::thread_store::global_sessions_dir().join("s-teardown.jsonl"),
+            );
+        });
         let engine = StopAllEngine::new(&["sub-1", "sub-2"]);
         let (_notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
         server
@@ -6161,6 +6191,274 @@ mod teardown {
         uninstall();
     }
 
+    /// The REAL stop-all chain: a subagent run dispatched through the Steer
+    /// tool's `AgentBus` (the model-facing surface, not a canned interrupt
+    /// list), then `x-manox/teardown` `mode: "stop-all"` — the run settles
+    /// out of the runtime's live table and the parent journal carries the
+    /// `run/settled` row with the `aborted` vocabulary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_all_settles_a_really_dispatched_run_with_the_aborted_vocabulary() {
+        use manox_harness::subagent::RunObserver as _;
+        use manox_harness::subagent::{
+            Capabilities, RunEndInfo, RunInfo, StopReason, SubagentProvider, SubagentRun,
+            SubagentRuntime,
+        };
+
+        // A scripted provider that holds the run live until cancelled, then
+        // settles Aborted and fires the host observer — the same shape the
+        // real spawn drive wires.
+        struct HeldProvider {
+            observer: Arc<manox_agent::subagent::SubagentRunObserver>,
+        }
+        #[async_trait::async_trait]
+        impl SubagentProvider for HeldProvider {
+            fn name(&self) -> &str {
+                "held"
+            }
+            fn capabilities(&self) -> Capabilities {
+                Capabilities {
+                    agent_options: true,
+                    output_schema: false,
+                    depth_limit: true,
+                    tool_filter: true,
+                    permissions: true,
+                    persona: true,
+                    max_turns: true,
+                }
+            }
+            async fn start(
+                &self,
+                request: manox_harness::subagent::types::ResolvedStartRequest,
+            ) -> Result<SubagentRun, manox_harness::subagent::SubagentError> {
+                self.observer.on_start(&RunInfo {
+                    run_id: request.run_id.clone(),
+                    provider: "held".to_string(),
+                    label: request.inner.label.clone(),
+                    kind: request.inner.kind.clone(),
+                    model: None,
+                    local: true,
+                    budgets: request.inner.budgets,
+                    tool_call_id: request.inner.tool_call_id.clone(),
+                });
+                let cancel = request.inner.cancel.clone();
+                let run_id = request.run_id.clone();
+                let label = request.inner.label.clone();
+                let observer = Arc::clone(&self.observer);
+                Ok(SubagentRun::new(
+                    request.run_id,
+                    cancel.clone(),
+                    Box::pin(async move {
+                        cancel.cancelled().await;
+                        let result = manox_harness::subagent::RunResult {
+                            output: String::new(),
+                            structured: None,
+                            diagnostic: None,
+                            stop_reason: StopReason::Aborted,
+                        };
+                        observer.on_settled(&RunEndInfo {
+                            run_id,
+                            provider: "held".to_string(),
+                            label,
+                            local: true,
+                            stop_reason: result.stop_reason.clone(),
+                            output: result.output.clone(),
+                        });
+                        result
+                    }),
+                ))
+            }
+        }
+
+        let _guards = install();
+        let (server, backend) = backend_fixture().await;
+        // A live container this process drives (fresh mint — no journal yet,
+        // so the create cannot trip the cold-restore claim).
+        create_session(&server, "s-teardown").await;
+        // The container's journal exists on disk (the observer's run rows
+        // cold-append into it: the test engine owns no journal route), and
+        // the store row + path map give the batch gate and the live leg
+        // their resolution inputs.
+        seed_session(
+            "s-teardown",
+            "s-teardown",
+            "/",
+            vec![("e1", user("hi")), ("e2", turn_finish())],
+        )
+        .await;
+        manox_agent::thread_store::global().with_mut(|s| {
+            s.insert_summary_for_test("s-teardown", None);
+            s.note_session_path("s-teardown", &super::core_journal("s-teardown"));
+        });
+
+        let journal = super::core_journal("s-teardown");
+        let (notice_tx, _notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let bus = Arc::new(manox_agent::steer_bus::AgentBus::new(
+            "s-teardown".into(),
+            notice_tx,
+        ));
+        let runtime = SubagentRuntime::new();
+        let observer = Arc::new(manox_agent::subagent::SubagentRunObserver::new(
+            "s-teardown".into(),
+            tokio::sync::mpsc::unbounded_channel().0,
+        ));
+        runtime.register_provider_permanent(Arc::new(HeldProvider {
+            observer: Arc::clone(&observer),
+        }));
+        bus.install_delegation_for_test(
+            runtime,
+            Arc::clone(&observer),
+            vec![manox_harness::subagent::SubagentDefConfig {
+                provider: "held".into(),
+                name: "Scout".into(),
+                capability: "read-only".into(),
+                description: "explores".into(),
+                persona: "read-only explorer".into(),
+                default_tools: vec![],
+                default_denied_tools: vec![],
+                frontmatter_model_spec: None,
+                config_model_spec: None,
+                frontmatter_effort: None,
+                frontmatter_isolation: None,
+                frontmatter_background: false,
+                frontmatter_max_turns: None,
+                color: None,
+                declared_permissions: Default::default(),
+                max_depth: 1,
+            }],
+        );
+        // The engine the stop-all waterfall reaches: its interrupt leg is
+        // the bus's interrupt-all (the real production wiring).
+        struct BusEngine {
+            bus: Arc<manox_agent::steer_bus::AgentBus>,
+            aborted: AtomicUsize,
+        }
+        impl manox_agent::thread_engine::ThreadEngine for BusEngine {
+            fn is_running(&self) -> bool {
+                false
+            }
+            fn history(&self) -> Vec<manox_agent::db::HistoryEntry> {
+                Vec::new()
+            }
+            fn abort(&self) {
+                self.aborted.fetch_add(1, Ordering::SeqCst);
+            }
+            fn interrupt_live_runs(&self) -> Vec<String> {
+                self.bus.interrupt_all_runs()
+            }
+            fn run(&self, _prompt: String, _content: Vec<manox_harness::types::ContentBlock>) {}
+            fn steer(
+                &self,
+                _prompt: String,
+                _content: Vec<manox_harness::types::ContentBlock>,
+                _origin: Option<String>,
+            ) -> String {
+                String::new()
+            }
+            fn cancel_steer(&self, _id: &str) -> bool {
+                false
+            }
+            fn set_model(&self, _model: manox_harness::types::Model) {}
+            fn set_thinking_level(&self, _level: Option<String>) {}
+            fn open_session(&self, _path: std::path::PathBuf) {}
+            fn active_session_path(&self) -> Option<std::path::PathBuf> {
+                None
+            }
+            fn session_list(&self) -> Vec<manox_agent::db::ThreadSummary> {
+                Vec::new()
+            }
+            fn request_token_usage(
+                &self,
+            ) -> std::collections::HashMap<String, manox_agent::language_model::TokenUsage>
+            {
+                std::collections::HashMap::new()
+            }
+            fn model(&self) -> Option<manox_harness::types::Model> {
+                None
+            }
+            fn set_cwd(&self, _path: std::path::PathBuf) {}
+        }
+        let engine = Arc::new(BusEngine {
+            bus: Arc::clone(&bus),
+            aborted: AtomicUsize::new(0),
+        });
+        let (_engine_notice_tx, engine_notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        server
+            .ahp_inner()
+            .session_thread("s-teardown")
+            .expect("session is live")
+            .with_mut(|t| t.set_engine_for_test(Arc::clone(&engine) as _, engine_notice_rx));
+
+        // Dispatch through the model-facing Steer tool, background so the
+        // call returns now.
+        use manox_harness::tool::AgentTool as _;
+        let tool = manox_agent::steer_bus::SteerTool::new(
+            Arc::clone(&bus),
+            manox_harness::steer_bus::AgentId::Captain,
+        );
+        let ctx = manox_harness::tool::LocalToolContext::new(
+            Arc::new(manox_harness::env::TokioExecutionEnv::new(
+                std::env::temp_dir(),
+            )),
+            std::env::temp_dir(),
+            Arc::new(manox_harness::tool::ToolState::default()),
+        );
+        let ack = tool
+            .execute(
+                "call-1",
+                serde_json::json!({
+                    "to": {"spawn": "Scout"},
+                    "reason": "Dispatch",
+                    "prompt": "work",
+                    "description": "survey",
+                    "run_in_background": true,
+                }),
+                tokio_util::sync::CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .expect("the dispatch starts");
+        let ack_text = match &ack.content[0] {
+            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text: {other:?}"),
+        };
+        let ack_json: serde_json::Value = serde_json::from_str(&ack_text).unwrap();
+        let run_id = ack_json["run_id"].as_str().unwrap().to_string();
+
+        // The durable start row is the readiness signal.
+        await_until(|| {
+            std::fs::read_to_string(&journal)
+                .map(|content| content.contains("run/started") && content.contains(&run_id))
+                .unwrap_or(false)
+        })
+        .await;
+
+        let params = serde_json::json!({
+            "channel": manox_ahp::channels::session::uri("s-teardown"),
+            "sessions": ["s-teardown"],
+            "mode": "stop-all",
+        });
+        let receipt = backend
+            .extension(ext::commands::TEARDOWN, &params)
+            .expect("stop-all is performed");
+        assert_eq!(
+            receipt["containers"][0]["interruptedRuns"],
+            serde_json::json!([run_id]),
+            "the receipt names the run the bus actually interrupted: {receipt:?}"
+        );
+
+        // The settlement lands through the real chain: run/settled with the
+        // aborted vocabulary, in the parent journal.
+        await_until(|| {
+            std::fs::read_to_string(&journal).is_ok_and(|content| {
+                content.contains("run/settled")
+                    && content.contains(&run_id)
+                    && content.contains("\"settlement\":\"aborted\"")
+            })
+        })
+        .await;
+        uninstall();
+    }
+
     /// Archive mode cascades the container tree through the catalogue's
     /// parent edges — children first, then the captain — and the archived
     /// children leave the catalogue walk's unarchived child partition.
@@ -6171,7 +6469,10 @@ mod teardown {
         let (_server, backend) = backend_fixture().await;
         // Two containers, one with a materialized journal. `s-teardown`
         // carries two delegated children; `s-other` one — the cascade must
-        // not cross the parent edge.
+        // not cross the parent edge. The children live ON DISK (the
+        // subagent stamp is the scan's child-partition classifier): the
+        // teardown awaits a store refresh before resolving the cascade set,
+        // so the set is computed against what the scan sees.
         seed_session(
             "s-teardown",
             "s-teardown",
@@ -6179,14 +6480,21 @@ mod teardown {
             vec![("e1", user("hi")), ("e2", turn_finish())],
         )
         .await;
+        seed_child_session("sub-a", "s-teardown").await;
+        seed_child_session("sub-b", "s-teardown").await;
         let store = manox_agent::thread_store::global();
         store.with_mut(|s| {
             s.insert_summary_for_test("s-teardown", None);
-            s.insert_child_summary_for_test("sub-a", "s-teardown");
-            s.insert_child_summary_for_test("sub-b", "s-teardown");
             s.insert_summary_for_test("s-other", None);
-            s.insert_child_summary_for_test("sub-other", "s-other");
         });
+        seed_session(
+            "s-other",
+            "s-other",
+            "/",
+            vec![("e1", user("hi")), ("e2", turn_finish())],
+        )
+        .await;
+        seed_child_session("sub-other", "s-other").await;
 
         let params = json!({
             "channel": manox_ahp::channels::session::uri("s-teardown"),

@@ -2213,13 +2213,33 @@ impl AgentServerInner {
     /// process — the session's active turn, every live subagent run its
     /// engine assembly owns, every background task it registered — and
     /// returns once the cancellations are issued (dispose tokens;
-    /// settlements follow the existing delivery paths). A session this
-    /// process does not drive owns nothing live here, so it honestly stops
-    /// nothing. `"archive"` is stop-all plus the cascade: every delegated
-    /// child row the catalogue's parent edges carry is archived through the
-    /// same decision write, then the session itself — the whole container
-    /// tree reaches the archived state in one call.
-    pub(crate) fn teardown_container(
+    /// settlements follow the existing delivery paths). `"archive"` is
+    /// stop-all plus the cascade: every delegated child row the catalogue's
+    /// parent edges carry is archived through the same decision write, then
+    /// the session itself — the whole container tree reaches the archived
+    /// state in one call.
+    ///
+    /// Both legs resolve ids through the store before acting:
+    ///
+    /// - The cascade set is computed against a FRESH store state — the
+    ///   archive mode awaits one store refresh first, so a child journal
+    ///   that materialized after the last scan still hangs off the parent
+    ///   edges (the registry is set-only; a missed child would never
+    ///   self-heal). The refresh is fingerprint-driven — a stat sweep in
+    ///   steady state — so the await is cheap enough for a user gesture.
+    /// - The live leg resolves the catalogue row id to its ACTIVE session
+    ///   id first: a legacy journal's row id (the thread key) is not the
+    ///   session id the engine assembled, and consulting the engine with
+    ///   the raw row id would archive without stopping anything.
+    ///   Unresolvable (the store never scanned the row's path) skips the
+    ///   live leg with a log line — the row exists (the batch validated
+    ///   it), so the archive half is still legitimate.
+    ///
+    /// Note: the batched form is validated all-or-nothing but APPLIED one
+    /// container at a time; a container in the middle of a batch can leave
+    /// the earlier ones applied if its waterfall errors. That is the
+    /// accepted shape — receipts name what each container did.
+    pub(crate) async fn teardown_container(
         &self,
         owner: &str,
         session_id: &str,
@@ -2231,20 +2251,43 @@ impl AgentServerInner {
             ))
             .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
         }
+        if mode == "archive" {
+            // The cascade reads parent edges; the edges are only as fresh
+            // as the last scan.
+            manox_agent::thread_store::global().refresh_now().await;
+        }
+        let live_session =
+            manox_agent::thread_store::global().read(|s| s.active_session_id(session_id));
+        let thread = live_session
+            .as_deref()
+            .and_then(|active| self.session_thread(active));
         // Receipt inputs are read before `stop_all` runs: the interrupt and
-        // the task stop are issued inside it, not awaited.
-        let (interrupted, stopped_tasks) = match self.session_thread(session_id) {
+        // the task stop are issued inside it, not awaited. The background
+        // tasks are counted by the SAME resolved thread id the interrupt
+        // leg uses — both legs must see one container.
+        let (interrupted, stopped_tasks) = match thread {
             Some(thread) => {
-                let stopped = manox_agent::background_task::snapshots_for_thread(session_id)
-                    .iter()
-                    .filter(|snap| !snap.status.is_terminal())
-                    .count();
+                let stopped = manox_agent::background_task::snapshots_for_thread(
+                    live_session.as_deref().expect("resolved above"),
+                )
+                .iter()
+                .filter(|snap| !snap.status.is_terminal())
+                .count();
                 let interrupted = thread.with_mut(|t| t.stop_all());
                 (interrupted, stopped)
             }
-            // A cold session (journal on disk, no live engine in this
-            // process) owns nothing live here; the archive leg still lands.
-            None => (Vec::new(), 0),
+            None => {
+                if live_session.is_none() {
+                    tracing::warn!(
+                        session = %session_id,
+                        "teardown: the row id resolves to no active session; the live leg \
+                         is skipped (the archive half still lands)"
+                    );
+                }
+                // A cold session (journal on disk, no live engine in this
+                // process) owns nothing live here; the archive leg lands.
+                (Vec::new(), 0)
+            }
         };
         let mut archived: Vec<String> = Vec::new();
         if mode == "archive" {
