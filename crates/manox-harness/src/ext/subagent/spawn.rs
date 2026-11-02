@@ -511,11 +511,23 @@ impl SubagentProvider for SpawnProvider {
         // exit below), so a bridge attaching at any moment during the run
         // finds the feed, a flip reaches a live child only, and a guidance
         // message reaches a live turn only. The pin rides the writer entry:
-        // a pinned run's mode cannot change, so flips land no row.
-        let feed_guard = ChildFeedGuard(run_id.clone());
-        super::feeds::register_child_feed(&run_id, &session.subscribe_journal_sender());
-        super::feeds::register_child_writer(&run_id, session.journal_appender(), pinned_mode);
-        super::feeds::register_child_steer(&run_id, &handle);
+        // a pinned run's mode cannot change, so flips land no row. The
+        // registrations share one activation generation — a recovered old
+        // drive's exit (its guard carries its own, older generation) strips
+        // nothing of this activation's faces.
+        let activation = super::feeds::mint_activation();
+        let feed_guard = ChildFeedGuard {
+            run_id: run_id.clone(),
+            activation,
+        };
+        super::feeds::register_child_feed(&run_id, &session.subscribe_journal_sender(), activation);
+        super::feeds::register_child_writer(
+            &run_id,
+            session.journal_appender(),
+            pinned_mode,
+            activation,
+        );
+        super::feeds::register_child_steer(&run_id, &handle, activation);
 
         let info = crate::ext::subagent::types::RunInfo {
             run_id: run_id.clone(),
@@ -636,14 +648,20 @@ enum Ending {
 /// Removes the run's registry entries (the child feed, the mode-writer,
 /// and the steer face) when the drive task exits, on every ending — the guard is
 /// moved into the run task, so it lives to the loop's return, not the
-/// dispatch return.
-struct ChildFeedGuard(String);
+/// dispatch return. The removals are scoped to the guard's activation
+/// generation: one run id can host more than one activation over time, and
+/// a recovered old drive's exit strips nothing of a newer activation's
+/// freshly registered faces.
+struct ChildFeedGuard {
+    run_id: String,
+    activation: super::feeds::Activation,
+}
 
 impl Drop for ChildFeedGuard {
     fn drop(&mut self) {
-        super::feeds::remove_child_feed(&self.0);
-        super::feeds::remove_child_writer(&self.0);
-        super::feeds::remove_child_steer(&self.0);
+        super::feeds::remove_child_feed(&self.run_id, self.activation);
+        super::feeds::remove_child_writer(&self.run_id, self.activation);
+        super::feeds::remove_child_steer(&self.run_id, self.activation);
     }
 }
 

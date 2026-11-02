@@ -210,12 +210,15 @@ impl SubagentRuntime {
                 self.run_seq.fetch_add(1, Ordering::SeqCst)
             )
         });
-        // Continuation backstop: an explicitly-named id that still sits in
-        // the live table would be overwritten by the insert below — the old
-        // entry's capacity permit and dispose token drop with it, leaving
-        // that run un-Abortable. The Steer arms refuse a live continuation
-        // first (with the coach); this guard is the loud backstop, not the
-        // contract.
+        // Continuation fast refusal: an explicitly-named id that still sits
+        // in the live table is rejected before any provider work. The Steer
+        // arms refuse a live continuation first (with the coach); this guard
+        // is the loud backstop, not the contract. It reads the table BEFORE
+        // `provider.start` yields — the atomic contains-key + insert re-check
+        // below the await closes the window against concurrent starts of the
+        // same id (whose second insert would overwrite the first entry,
+        // dropping its capacity permit and dispose token, leaving that run
+        // un-Abortable).
         if explicit_id.is_some() && mutex(&self.runs).contains_key(&run_id) {
             return Err(SubagentError::InvalidRequest(format!(
                 "run `{run_id}` is still live; continuations address settled runs — \
@@ -234,23 +237,47 @@ impl SubagentRuntime {
             descriptor,
         };
         let run = provider_impl.start(resolved).await?;
-        mutex(&self.runs).insert(
-            run_id.clone(),
-            ActiveRun {
-                snapshot: RunSnapshot {
-                    id: run_id.clone(),
-                    kind,
-                    label: label.clone(),
-                    provider: provider.to_string(),
-                    status: "running",
-                    running_for_ms: 0,
-                    local: true,
-                },
-                dispose: run.dispose_token().clone(),
-                started_at: Instant::now(),
-                _capacity: capacity,
-            },
-        );
+        // Registration is atomic: one lock scope covers the contains-key
+        // re-check and the insert. The fast refusal above read the table
+        // before `provider.start` yielded, so two same-turn continuations of
+        // one settled id can both pass it; without this scope the second
+        // insert would clobber the first entry, dropping its capacity permit
+        // and dispose token (leaving that run un-Abortable).
+        let id_conflict = {
+            let mut runs = mutex(&self.runs);
+            if runs.contains_key(&run_id) {
+                true
+            } else {
+                runs.insert(
+                    run_id.clone(),
+                    ActiveRun {
+                        snapshot: RunSnapshot {
+                            id: run_id.clone(),
+                            kind,
+                            label: label.clone(),
+                            provider: provider.to_string(),
+                            status: "running",
+                            running_for_ms: 0,
+                            local: true,
+                        },
+                        dispose: run.dispose_token().clone(),
+                        started_at: Instant::now(),
+                        _capacity: capacity,
+                    },
+                );
+                false
+            }
+        };
+        if id_conflict {
+            // Refused after the fact: tear the just-started run down instead
+            // of leaving it running untracked — its capacity permit drops
+            // with this early return, and the dispose token ends its drive.
+            run.dispose_token().cancel();
+            return Err(SubagentError::InvalidRequest(format!(
+                "run `{run_id}` is still live; continuations address settled runs — \
+                 Inject to guide it, Abort to stop it"
+            )));
+        }
         if self
             .events_tx
             .send(Event::Start(RunInfo {
@@ -619,6 +646,65 @@ mod tests {
         assert!(err.to_string().contains("still live"), "{err}");
         assert!(runtime.is_live(&run.id), "the live entry was not clobbered");
         assert!(runtime.interrupt(&run.id), "the run is still abortable");
+    }
+
+    /// The concurrent continuation race: two same-turn continuations of one
+    /// settled id both pass the fast refusal (it reads the table before
+    /// `provider.start` yields), so exactly one may win the atomic
+    /// contains-key + insert re-check below the await. The loser's
+    /// just-started run is cancelled and refused; the winner stays live and
+    /// interruptible, and the table holds exactly one entry for the id.
+    #[tokio::test]
+    async fn concurrent_continuations_of_one_settled_id_admit_exactly_one() {
+        let runtime = SubagentRuntime::new();
+        runtime.register_provider_permanent(Arc::new(ScriptedProvider::new(full_caps())));
+        runtime.register_provider_permanent(Arc::new(YieldingHoldingProvider));
+        // A genuinely settled run: start it, let it complete, and wait for
+        // its settle watcher to empty the table — the shape the continuations
+        // address.
+        let original = runtime
+            .start("scripted", test_request("l", "p"))
+            .await
+            .expect("start");
+        let run_id = original.id.clone();
+        let _ = original.result().await;
+        for _ in 0..50 {
+            if !runtime.is_live(&run_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !runtime.is_live(&run_id),
+            "the settle watcher emptied the table"
+        );
+
+        let (first, second) = tokio::join!(
+            runtime.continue_run("yielding", &run_id, test_request("l", "first")),
+            runtime.continue_run("yielding", &run_id, test_request("l", "second")),
+        );
+        let (winner, loser) = match (first, second) {
+            (Ok(run), Err(err)) => (run, err),
+            (Err(err), Ok(run)) => (run, err),
+            _ => panic!("exactly one concurrent continuation is admitted"),
+        };
+        assert!(loser.to_string().contains("still live"), "{loser}");
+        assert_eq!(
+            winner.id, run_id,
+            "the continuation keeps the addressed run id"
+        );
+        assert!(runtime.is_live(&winner.id), "the winner is registered");
+        assert!(runtime.interrupt(&winner.id), "the winner stays abortable");
+        for _ in 0..50 {
+            if runtime.list_runs().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            runtime.list_runs().is_empty(),
+            "one entry for the id, and it leaves on abort — the table is unpolluted"
+        );
     }
 
     /// A provider whose run never produces a result: the settle watcher never
