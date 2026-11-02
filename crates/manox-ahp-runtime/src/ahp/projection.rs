@@ -1292,18 +1292,44 @@ impl Translator {
                 }
                 // The roster face keeps the entry and stamps the verdict:
                 // settled runs stay enumerable (the settlement kind is the
-                // durable vocabulary the row already carries).
-                if let Some(entry) = self.runs.get_mut(run_id) {
-                    entry.status = RunStatus::Settled;
-                    let work = Target::Work.uri(chat_id, session_id);
-                    let mut wire = entry.wire(run_id);
-                    wire["verdict"] =
-                        json!(serde_json::to_value(settlement).unwrap_or(Value::Null));
-                    out.push(Emitted::new(
-                        &work,
-                        extension_action(ext::actions::WORK_CHILD_RUNS, json!({ "run": wire })),
-                    ));
+                // durable vocabulary the row already carries). A settle for
+                // a run the roster never opened — a start row lost to a
+                // truncated journal, a synthetic fold — must not silently
+                // drop: the registry is set-only, so the run would never
+                // surface again. A degraded entry opens from the settle
+                // row's own metadata (empty identity, the row's timestamp).
+                if !self.runs.contains_key(run_id) {
+                    tracing::warn!(
+                        run = %run_id,
+                        session = %session_id,
+                        "run/settled names a run the roster never opened; a degraded \
+                         entry keeps it enumerable"
+                    );
                 }
+                let entry = self.runs.entry(run_id.clone()).or_insert_with(|| RunRow {
+                    kind: String::new(),
+                    label: String::new(),
+                    color: None,
+                    started_at: row.timestamp.clone(),
+                    status: RunStatus::Settled,
+                });
+                entry.status = RunStatus::Settled;
+                let work = Target::Work.uri(chat_id, session_id);
+                let mut wire = entry.wire(run_id);
+                // The verdict rides only when there is one — never a null
+                // placeholder (absent facts are omitted on this wire; the
+                // settle row's strict typed decode is what keeps unknown
+                // verdict shapes out this far).
+                if let Some(verdict) = serde_json::to_value(settlement)
+                    .ok()
+                    .filter(|v| !v.is_null())
+                {
+                    wire["verdict"] = verdict;
+                }
+                out.push(Emitted::new(
+                    &work,
+                    extension_action(ext::actions::WORK_CHILD_RUNS, json!({ "run": wire })),
+                ));
                 // The settlement notice rides the standard face: the host's
                 // verdict, the salvaged output or the explicit line that
                 // there is none, and the counters. Visible to the agent and
@@ -1403,13 +1429,14 @@ impl Translator {
             } => {
                 // The child's clarifying question, attributed and visible to
                 // the agent and the user alike: the note names the run and
-                // coaches the continuation contract (the answer re-dispatches
-                // with `continue_run_id`; the child session keeps its
-                // context).
+                // coaches the unified continuation contract — `Steer` with
+                // `reason: "Dispatch"` addressed to the run id (no
+                // `to.spawn`); the child session keeps its context.
                 let text = format!(
                     "Sub-agent `{run_id}` asks: {question}\n\nAnswer the user, then \
-                     continue the run with `continue_run_id = \"{run_id}\"` carrying the \
-                     answer as the prompt."
+                     continue the run with `Steer` (`reason: \"Dispatch\"`, \
+                     `to.agent_address: \"{run_id}\"`, no `to.spawn`), carrying the \
+                     answer as the `prompt`."
                 );
                 self.push_note(
                     &chat,
@@ -6256,6 +6283,61 @@ mod subagent_roster_tests {
         }))
     }
 
+    fn escalated(run_id: &str) -> SessionTreeEntry {
+        kernel(json!({
+            "type": "run/escalated",
+            "id": "e-4",
+            "runId": run_id,
+            "question": "Which of the two files is authoritative?",
+            "authId": "auth-1",
+        }))
+    }
+
+    /// The note texts one fold pushed onto the chat channel.
+    fn note_texts(out: &[Emitted]) -> Vec<String> {
+        let chat = manox_ahp::channels::chat::uri("c-1");
+        out.iter()
+            .filter(|e| e.channel == chat)
+            .filter_map(|e| match &e.action {
+                StateAction::ChatResponsePart(part) => match &part.part {
+                    ResponsePart::SystemNotification(note) => match &note.content {
+                        StringOrMarkdown::Plain(text) => Some(text.clone()),
+                        StringOrMarkdown::Markdown { markdown } => Some(markdown.clone()),
+                    },
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The escalation note coaches the unified surface: `Steer` with
+    /// `reason: "Dispatch"` addressed to the run id, no `to.spawn`. The
+    /// retired per-definition vocabulary must not resurface here — the note
+    /// is the only place the child's contract reaches the Captain's context.
+    #[test]
+    fn an_escalation_note_coaches_the_unified_continuation() {
+        let mut t = Translator::new();
+        let out = t.on_entry("c-1", "s-1", 0, &escalated("sub-9"));
+        let notes = note_texts(&out);
+        assert_eq!(notes.len(), 1, "one attributed note: {out:?}");
+        let text = &notes[0];
+        assert!(
+            text.contains("Sub-agent `sub-9` asks:"),
+            "the note names the run and the question: {text}"
+        );
+        assert!(
+            text.contains("`reason: \"Dispatch\"`")
+                && text.contains("`to.agent_address: \"sub-9\"`")
+                && text.contains("no `to.spawn`"),
+            "the note teaches the unified continuation shape: {text}"
+        );
+        assert!(
+            !text.contains("continue_run_id"),
+            "the retired parameter is gone from the coach: {text}"
+        );
+    }
+
     fn background_work_edges(out: &[Emitted]) -> (usize, usize) {
         let chat = manox_ahp::channels::chat::uri("c-1");
         let mut sets = 0;
@@ -6379,6 +6461,38 @@ mod run_roster_tests {
             "followUp": "now write it up",
             "kind": kind,
         }))
+    }
+
+    /// A settle for a run the roster never opened still lands a roster
+    /// entry — degraded (built from the settle row's own metadata), but
+    /// enumerable: the registry is set-only, so a silently dropped settle
+    /// would never recover. The verdict rides attached, never null.
+    #[test]
+    fn a_settle_without_a_start_opens_a_degraded_roster_entry() {
+        let records = [settled("sub-orphan", "completed")];
+        let out = {
+            let mut t = Translator::new();
+            let mut rows = Vec::new();
+            for (seq, entry) in records.iter().enumerate() {
+                rows.extend(t.on_entry("c-1", "s-1", seq as u64, entry));
+            }
+            rows
+        };
+        let rows = roster_rows(&out);
+        assert_eq!(
+            rows.len(),
+            1,
+            "the settle still emits the wire row: {rows:?}"
+        );
+        assert_eq!(rows[0]["runId"], "sub-orphan");
+        assert_eq!(rows[0]["status"], "settled", "{rows:?}");
+        assert_eq!(rows[0]["verdict"], "completed", "{rows:?}");
+        assert!(
+            rows[0].get("color").is_none(),
+            "a degraded entry invents no identity: {rows:?}"
+        );
+        let state = fold_roster(&records);
+        assert_eq!(run_of(&state, "sub-orphan")["status"], "settled");
     }
 
     /// The roster rows one fold emitted, decoded off the work channel.
