@@ -2914,7 +2914,8 @@ mod dispatch {
         )
         .await;
         let (feed, _rx) = tokio::sync::broadcast::channel(8);
-        manox_harness::subagent::feeds::register_child_feed("sub-live", &feed);
+        let activation = manox_harness::subagent::feeds::mint_activation();
+        manox_harness::subagent::feeds::register_child_feed("sub-live", &feed, activation);
         let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
         let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
@@ -2923,7 +2924,7 @@ mod dispatch {
             .chat_state("s-liverun")
             .expect("the cold seed answers");
         let listed = state.background_work.as_deref().unwrap_or_default().len();
-        manox_harness::subagent::feeds::remove_child_feed("sub-live");
+        manox_harness::subagent::feeds::remove_child_feed("sub-live", activation);
         assert_eq!(listed, 1, "a live child keeps its roster entry: {state:?}");
         uninstall();
     }

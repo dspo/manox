@@ -2253,7 +2253,10 @@ impl AgentServerInner {
         }
         if mode == "archive" {
             // The cascade reads parent edges; the edges are only as fresh
-            // as the last scan.
+            // as the last scan. The refresh's stat sweep is O(files) (it
+            // runs on the blocking pool), so the archive gesture carries
+            // that latency on a large store — accepted by decision; revisit
+            // with a throttle only if large-store data demands it.
             manox_agent::thread_store::global().refresh_now().await;
         }
         let live_session =

@@ -446,13 +446,16 @@ impl AgentBus {
     /// delivery — a crash between the kernel steer and the row append must
     /// not lose the guidance record (the row is written first; a run that
     /// settles in the race window bounces the delivery, and the coaching
-    /// error keeps the ack delivery-only). The run's idle watchdog treats
-    /// the guidance as activity. The ack confirms DELIVERY — it is never
-    /// the child's answer.
+    /// error keeps the ack delivery-only). The row is the durable witness of
+    /// the delivery ATTEMPT, not a delivery guarantee: a bounced delivery
+    /// still leaves the row, and what was actually delivered is what the
+    /// ack reports. The run's idle watchdog treats the guidance as activity.
+    /// The ack confirms DELIVERY — it is never the child's answer.
     async fn guide_run(&self, run_id: &str, text: &str) -> Result<AgentToolResult, ToolError> {
         let delegation = self.require_delegation()?;
         let message = manox_harness::types::AgentMessage::user(text.to_string());
-        // Durable witness first (the disposition above), then the delivery.
+        // Durable witness of the ATTEMPT first (the disposition above), then
+        // the delivery — what was actually delivered is what the ack reports.
         delegation.observer.journal_swarm_row(
             "run/guided",
             serde_json::json!({
@@ -582,8 +585,10 @@ impl SteerTool {
 
 /// The Dispatch-only optional parameters, carried over from the retired
 /// delegation tools' schema. Rejected on a non-Dispatch reason.
-/// `description` is not among them: the schema marks it required on every
-/// call, so it can never be stray.
+/// `description` is not among them: it is only meaningful on run dispatches
+/// and enforced there fail-loud (the schema does not globally require it —
+/// Inject/Abort need no label — so it may ride along harmlessly, never a
+/// different contract).
 const DISPATCH_PARAMS: &[&str] = &[
     "run_in_background",
     "timeout_ms",
@@ -619,8 +624,12 @@ const STEER_DESCRIPTION: &str = "Steer your subagents and TeamMembers — the si
      `reason: \"Dispatch\"`, `to.agent_address` = the run id, no `to.spawn`, and the \
      follow-up as `prompt` — the child keeps its full context. Continuation addresses a \
      SETTLED run: a run that is still live takes Inject (to guide) or Abort (to stop), \
-     never a re-dispatch. `description` is the required short task label for run \
-     dispatches. To create a real manox Thread that persists, appears in the sidebar, and \
+     never a re-dispatch. A takeover continuation — the run's remembered \
+     definition deregistered, `to.spawn` naming a current one — is re-governed \
+     under the NEW definition's tool filter and permission ceiling. \
+     `description` is the required short task label for run dispatches only — \
+     Inject and Abort need none. To create a real manox Thread that persists, \
+     appears in the sidebar, and \
      can be resumed, spawn `to.spawn: \"TeamMember\"` (Captain only; its reply carries \
      the thread id).";
 
@@ -672,7 +681,7 @@ impl AgentTool for SteerTool {
                 },
                 "description": {
                     "type": "string",
-                    "description": "Required short task label for run dispatches (shown on the run card and used as the child's creation label)."
+                    "description": "Required for run dispatches (the short task label shown on the run card, used as the child's creation label); Inject/Abort need none."
                 },
                 "model": {
                     "type": "string",
@@ -722,7 +731,7 @@ impl AgentTool for SteerTool {
                     "additionalProperties": false
                 }
             },
-            "required": ["to", "reason", "prompt", "description"],
+            "required": ["to", "reason", "prompt"],
             "additionalProperties": false
         })
     }
@@ -1784,6 +1793,36 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("description"), "{err}");
+    }
+
+    /// `description` is only meaningful on run dispatches: an Inject without
+    /// one passes the shape gate (the schema no longer demands the label on
+    /// every call, and the model must not invent one to guide or abort).
+    /// The Inject below still refuses — on the unknown ADDRESS, never a
+    /// demanded label.
+    #[tokio::test]
+    async fn execute_accepts_an_inject_without_a_description() {
+        let tool = SteerTool::new(bus(), AgentId::Captain);
+        let err = tool
+            .execute(
+                "call-1",
+                serde_json::json!({
+                    "to": {"agent_address": "sub-1"}, "reason": "Inject", "prompt": "x",
+                }),
+                CancellationToken::new(),
+                &tool_context(),
+            )
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            !text.contains("'description'"),
+            "the Inject is never asked for a label: {err}"
+        );
+        assert!(
+            text.contains("no subagent run"),
+            "the refusal is the address coach, past the shape gate: {err}"
+        );
     }
 
     /// The execute-path Inject lands the durable `run/guided` row BEFORE the
