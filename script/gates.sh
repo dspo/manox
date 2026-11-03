@@ -78,9 +78,9 @@ run_leg "fmt" cargo fmt --all -- --check
 run_leg "prod-libs" cargo check \
     -p manox-agent -p manox-session-core -p manox-ahp -p manox-ahp-runtime \
     -p manox-harness -p manox-napi --lib
-# The lean napi edge: the #[cfg(not(feature = "terminal"))] production arms
-# (and every other gated-off path) never compile under the full-configuration
-# legs above — this leg is their compile gate (review #790).
+# The lean napi edge: the gated-off production arms (no MCP, no WS gateway)
+# never compile under the full-configuration legs above — this leg is their
+# compile gate (review #790).
 run_leg "lean-libs" cargo check -p manox-napi --no-default-features --lib
 run_leg "clippy" env RUSTFLAGS="-D warnings" \
     cargo clippy --workspace --all-targets -- -D warnings

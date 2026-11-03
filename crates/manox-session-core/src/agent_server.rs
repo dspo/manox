@@ -15,8 +15,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 
 use manox_ahp_runtime::base64_bytes;
 use manox_ahp_runtime::runtime_trait::{ClientToolSpec, ImageAttachment};
@@ -117,18 +117,6 @@ fn spawn_settle_watcher(
     })
 }
 
-/// One live wire terminal (#13): the gpui-free [`TerminalHandle`] owns the
-/// PTY and the grid.
-#[cfg(feature = "terminal")]
-struct TerminalEntry {
-    handle: manox_terminal::TerminalHandle,
-    /// The session this terminal was attached for: the cwd source.
-    session_id: String,
-    #[allow(dead_code)] // kept for the terminal panel's future restore face
-    cwd: String,
-    exited: StdMutex<Option<i32>>,
-}
-
 /// A submission parked while a turn runs; drained into one follow-up turn when
 /// the turn settles, mirroring the legacy host's queued-follow-up behavior.
 struct QueuedSubmit {
@@ -159,8 +147,6 @@ pub(crate) struct AgentServerInner {
     /// Live wire terminals (#13): id → entry. Spawned by `TerminalAttach`,
     /// fed by per-stream forwarder tasks, mirrored into the threads db and
     /// the `TerminalsUpdated` host snapshot.
-    #[cfg(feature = "terminal")]
-    terminals: Mutex<HashMap<String, Arc<TerminalEntry>>>,
     /// Embedder tool registrations (RegisterSessionTools): session →
     /// client → full-replacement tool set. Consulted by the
     /// EmbedderToolProvider below each time the engine assembles a
@@ -213,275 +199,6 @@ impl AgentServerInner {
         }
         sessions.insert(session_id, session);
         None
-    }
-
-    // ── #13 wire terminals. ─────────────────────────────────────────────────
-
-    /// `TerminalAttach`: re-attach by id or spawn a fresh shell terminal
-    /// bound to the session's cwd. Response carries the id + a text
-    /// snapshot of the visible grid.
-    #[cfg(feature = "terminal")]
-    pub(crate) fn attach_terminal(
-        self: &Arc<Self>,
-        session_id: &str,
-        cols: u16,
-        rows: u16,
-        terminal_id: Option<String>,
-    ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
-        if let Some(id) = terminal_id.clone() {
-            let existing = self.terminals.lock().get(&id).cloned();
-            if let Some(entry) = existing {
-                return Ok(self.terminal_attach_response(&entry));
-            }
-        }
-        let id = terminal_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let cwd = self
-            .session_thread(session_id)
-            .map(|t| t.read(|t| t.cwd().to_path_buf()))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let pty = manox_terminal::pty::open(&cwd, cols, rows, None, &[]).map_err(|e| {
-            manox_ahp_runtime::error::RuntimeError::new(format!("terminal spawn failed: {e}"))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
-        })?;
-        let handle = manox_terminal::Terminal::spawn(
-            id.clone(),
-            cwd.clone(),
-            cols as usize,
-            rows as usize,
-            Box::new(pty),
-        )
-        .map_err(|e| {
-            manox_ahp_runtime::error::RuntimeError::new(format!("terminal spawn failed: {e}"))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
-        })?;
-        let entry = Arc::new(TerminalEntry {
-            handle,
-            session_id: session_id.to_string(),
-            cwd: cwd.to_string_lossy().into_owned(),
-            exited: StdMutex::new(None),
-        });
-        self.terminals.lock().insert(id.clone(), entry.clone());
-        self.upsert_terminal_db(&entry, None);
-        Ok(self.terminal_attach_response(&entry))
-    }
-
-    /// The raw PTY byte tap of a terminal, for the AHP output pump.
-    ///
-    /// Raw rather than the decoded event stream: `terminal/data` carries the
-    /// process's own bytes, and the pump is where a byte-fragment stream is
-    /// reassembled into text at character boundaries.
-    #[cfg(feature = "terminal")]
-    pub(crate) fn terminal_raw_tap(
-        &self,
-        terminal_id: &str,
-    ) -> Option<tokio::sync::broadcast::Receiver<std::sync::Arc<Vec<u8>>>> {
-        self.terminals
-            .lock()
-            .get(terminal_id)
-            .map(|entry| entry.handle.subscribe_raw())
-    }
-
-    /// `terminal/input`: forward keystrokes to a terminal's PTY.
-    ///
-    /// AHP types this as a side-effect-only action (the reducer no-ops it), so
-    /// the only observable effect is what the PTY does with the bytes — which
-    /// comes back on the wire as `terminal/data`.
-    #[cfg(feature = "terminal")]
-    pub(crate) fn terminal_input(&self, terminal_id: &str, data: &str) -> Result<(), String> {
-        let Some(entry) = self.terminals.lock().get(terminal_id).cloned() else {
-            return Err(format!("unknown terminal {terminal_id}"));
-        };
-        // A dead child takes no input: refusing here is the honest answer a
-        // client needs (its PTY is gone), rather than bytes into the void.
-        if entry.handle.read(|t| t.child_exited).is_some() {
-            return Err(format!("terminal {terminal_id} has exited"));
-        }
-        entry
-            .handle
-            .read(|t| t.input(data.as_bytes()))
-            .map_err(|error| format!("terminal input failed: {error}"))
-    }
-
-    /// `terminal/resized`: resize a terminal's PTY grid.
-    #[cfg(feature = "terminal")]
-    pub(crate) fn terminal_resize(
-        &self,
-        terminal_id: &str,
-        cols: u16,
-        rows: u16,
-    ) -> Result<(), String> {
-        let Some(entry) = self.terminals.lock().get(terminal_id).cloned() else {
-            return Err(format!("unknown terminal {terminal_id}"));
-        };
-        entry
-            .handle
-            .with_mut(|t| t.resize(cols as usize, rows as usize));
-        Ok(())
-    }
-
-    /// `DisposeTerminal`: release a terminal.
-    ///
-    /// Dropping the entry is the release — the PTY handle reaps its child on
-    /// `Drop` — so the removed entry must actually be dropped here rather than
-    /// left to a lingering watcher clone. That is why the map removal is the
-    /// last statement and the value is not retained.
-    #[cfg(feature = "terminal")]
-    pub(crate) fn dispose_terminal(&self, terminal_id: &str) -> bool {
-        let Some(entry) = self.terminals.lock().remove(terminal_id) else {
-            return false;
-        };
-        // The drop is the release: the PTY handle reaps its child on `Drop`.
-        drop(entry);
-        true
-    }
-
-    #[cfg(feature = "terminal")]
-    fn terminal_snapshot_value(&self, entry: &TerminalEntry) -> Value {
-        let (lines, cursor_col, cursor_row) = entry.handle.read(|t| t.text_snapshot());
-        let (cols, rows) = entry.handle.read(|t| (t.cols, t.rows));
-        serde_json::json!({
-            "cols": cols,
-            "rows": rows,
-            "cursor": { "x": cursor_col, "y": cursor_row },
-            "lines": lines,
-        })
-    }
-
-    #[cfg(feature = "terminal")]
-    fn terminal_attach_response(&self, entry: &TerminalEntry) -> Value {
-        let id = entry.handle.read(|t| t.id.clone());
-        serde_json::json!({
-            "terminal_id": id,
-            "snapshot": self.terminal_snapshot_value(entry),
-        })
-    }
-
-    /// Every live wire terminal's root-channel catalogue entry, in insertion
-    /// order — the list `RootState.terminals` seeds from and
-    /// `root/terminalsChanged` replaces with.
-    ///
-    /// Deliberately *not* a projection of [`Self::ahp_terminal_state`]: the
-    /// catalogue wants three metadata fields per terminal, and going through
-    /// the channel state would format and copy every terminal's whole grid on
-    /// every root snapshot and every create/dispose fan-out.
-    ///
-    /// Known gap (pre-existing, shared with the per-channel state): the exit
-    /// write path is not wired, so `lifecycle` is `running` for every live
-    /// entry and an exited process stays in the catalogue until dispose.
-    #[cfg(feature = "terminal")]
-    pub(crate) fn ahp_terminal_infos(&self) -> Vec<ahp_types::state::TerminalInfo> {
-        use ahp_types::state as ahp;
-        let entries: Vec<_> = self
-            .terminals
-            .lock()
-            .iter()
-            .map(|(id, entry)| {
-                let title = entry.handle.read(|t| t.title.clone());
-                let exited = entry
-                    .handle
-                    .read(|t| t.child_exited)
-                    .or(*entry.exited.lock().unwrap());
-                (id.clone(), entry.session_id.clone(), title, exited)
-            })
-            .collect();
-        entries
-            .into_iter()
-            .map(|(id, session_id, title, exited)| ahp::TerminalInfo {
-                resource: manox_ahp::channels::terminal::uri(&id),
-                title: title.unwrap_or_default(),
-                claim: ahp::TerminalClaim::Session(ahp::TerminalSessionClaim {
-                    session: manox_ahp_runtime::ahp::session_uri_of_terminal(&session_id),
-                    chat: manox_ahp_runtime::ahp::session_uri_of_terminal(&session_id),
-                    turn_id: None,
-                    tool_call_id: None,
-                }),
-                lifecycle: match exited {
-                    Some(code) => {
-                        ahp::TerminalLifecycleState::Exited(ahp::TerminalExitedLifecycleState {
-                            exit_code: Some(code as i64),
-                        })
-                    }
-                    None => {
-                        ahp::TerminalLifecycleState::Running(ahp::TerminalRunningLifecycleState {})
-                    }
-                },
-            })
-            .collect()
-    }
-
-    /// The AHP view of one live terminal, for the `ahp-terminal:/<id>` channel.
-    ///
-    /// Unlike the v2 summary this is the channel's *state*, so it carries the
-    /// visible grid: a subscriber that arrives late needs the screen, not just
-    /// the fact that a terminal exists.
-    #[cfg(feature = "terminal")]
-    pub(crate) fn ahp_terminal_state(
-        &self,
-        terminal_id: &str,
-    ) -> Option<ahp_types::state::TerminalState> {
-        use ahp_types::state as ahp;
-        let entry = self.terminals.lock().get(terminal_id).cloned()?;
-        let (lines, cols, rows, title, cwd, child_exited) = entry.handle.read(|t| {
-            let (lines, _, _) = t.text_snapshot();
-            (
-                lines,
-                t.cols,
-                t.rows,
-                t.title.clone(),
-                t.cwd.clone(),
-                t.child_exited,
-            )
-        });
-        // The core's own reaper folds the child's exit; the entry mirror is
-        // the fallback. This is AHP 1.0's reconstruction contract: the exited
-        // state carries the retained grid, answered long after the process
-        // died, with no live PTY behind it.
-        let exited = child_exited.or(*entry.exited.lock().unwrap());
-        Some(ahp::TerminalState {
-            title: title.unwrap_or_default(),
-            cwd: cwd.to_str().map(str::to_string),
-            cols: Some(cols as i64),
-            rows: Some(rows as i64),
-            // The visible grid is what a late subscriber must have. AHP allows a
-            // command/output split (`TerminalContentPart::Command`); this slice
-            // does not track command boundaries, so the whole screen is one
-            // unclassified part rather than a fabricated split.
-            content: vec![ahp::TerminalContentPart::Unclassified(
-                ahp::TerminalUnclassifiedPart {
-                    value: lines.join("\n"),
-                },
-            )],
-            lifecycle: match exited {
-                Some(code) => {
-                    ahp::TerminalLifecycleState::Exited(ahp::TerminalExitedLifecycleState {
-                        exit_code: Some(code as i64),
-                    })
-                }
-                None => ahp::TerminalLifecycleState::Running(ahp::TerminalRunningLifecycleState {}),
-            },
-            // One process-local host serves every client, and the runtime does
-            // not arbitrate input ownership, so `Watched` is the honest claim:
-            // announcing a client claim we do not enforce would invite two
-            // clients to type into one PTY.
-            claim: ahp::TerminalClaim::Session(ahp::TerminalSessionClaim {
-                session: manox_ahp_runtime::ahp::session_uri_of_terminal(&entry.session_id),
-                chat: manox_ahp_runtime::ahp::session_uri_of_terminal(&entry.session_id),
-                turn_id: None,
-                tool_call_id: None,
-            }),
-            supports_command_detection: Some(false),
-            is_pty: Some(true),
-        })
-    }
-
-    #[cfg(feature = "terminal")]
-    fn upsert_terminal_db(&self, entry: &TerminalEntry, exit: Option<i32>) {
-        let store = manox_terminal::store::try_global();
-        let _ = exit; // exit code rides the summary, not the row
-        let Some(store) = store else {
-            return;
-        };
-        store.save_terminal(&entry.handle);
     }
 }
 
@@ -568,16 +285,10 @@ impl AgentServer {
     }
 
     fn new_inner(cwd: PathBuf, store_watcher: bool) -> Self {
-        // #13: the terminal pumps need a runtime; first registration wins
-        // and the agent runtime is already live here.
-        #[cfg(feature = "terminal")]
-        manox_terminal::runtime::set_runtime(manox_agent::runtime::handle().clone());
         let inner = Arc::new(AgentServerInner {
             cwd,
             sessions: Mutex::new(HashMap::new()),
             session_owners: Mutex::new(HashMap::new()),
-            #[cfg(feature = "terminal")]
-            terminals: Mutex::new(HashMap::new()),
             embedder_tools: Mutex::new(HashMap::new()),
             members: Mutex::new(HashMap::new()),
         });

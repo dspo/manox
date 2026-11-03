@@ -56,38 +56,6 @@ impl GatewayRuntime {
 
 impl SessionRuntime for GatewayRuntime {
     fn terminal_state(&self, terminal_id: &str) -> Option<TerminalSnapshot> {
-        #[cfg(feature = "terminal")]
-        {
-            let state = self.server.ahp_inner().ahp_terminal_state(terminal_id)?;
-            let lines = match state.content.first() {
-                Some(ahp_types::state::TerminalContentPart::Unclassified(part)) => {
-                    part.value.split('\n').map(str::to_string).collect()
-                }
-                _ => Vec::new(),
-            };
-            let exit_code = match state.lifecycle {
-                ahp_types::state::TerminalLifecycleState::Exited(exited) => exited.exit_code,
-                ahp_types::state::TerminalLifecycleState::Running(_) => None,
-            };
-            let session_id = match state.claim {
-                ahp_types::state::TerminalClaim::Session(claim) => {
-                    manox_ahp::channels::session::id(&claim.session)
-                        .map(str::to_string)
-                        .unwrap_or_default()
-                }
-                ahp_types::state::TerminalClaim::Client(_) => String::new(),
-            };
-            Some(TerminalSnapshot {
-                title: state.title,
-                cwd: state.cwd,
-                cols: state.cols.unwrap_or_default(),
-                rows: state.rows.unwrap_or_default(),
-                lines,
-                exit_code,
-                session_id,
-            })
-        }
-        #[cfg(not(feature = "terminal"))]
         {
             let _ = terminal_id;
             None
@@ -95,25 +63,13 @@ impl SessionRuntime for GatewayRuntime {
     }
 
     fn terminal_infos(&self) -> Vec<ahp_types::state::TerminalInfo> {
-        #[cfg(feature = "terminal")]
-        {
-            self.server.ahp_inner().ahp_terminal_infos()
-        }
-        #[cfg(not(feature = "terminal"))]
-        {
-            Vec::new()
-        }
+        Vec::new()
     }
 
     fn terminal_raw_tap(
         &self,
         terminal_id: &str,
     ) -> Option<tokio::sync::broadcast::Receiver<std::sync::Arc<Vec<u8>>>> {
-        #[cfg(feature = "terminal")]
-        {
-            self.server.ahp_inner().terminal_raw_tap(terminal_id)
-        }
-        #[cfg(not(feature = "terminal"))]
         {
             let _ = terminal_id;
             None
@@ -127,15 +83,6 @@ impl SessionRuntime for GatewayRuntime {
         cols: u16,
         rows: u16,
     ) -> Result<(), RuntimeError> {
-        #[cfg(feature = "terminal")]
-        {
-            self.server
-                .ahp_inner()
-                .attach_terminal(session_id, cols, rows, Some(terminal_id.to_string()))
-                .map(|_| ())
-                .map_err(|error| RuntimeError::new(error.message))
-        }
-        #[cfg(not(feature = "terminal"))]
         {
             let _ = (session_id, terminal_id, cols, rows);
             Err(RuntimeError::new(
@@ -145,15 +92,6 @@ impl SessionRuntime for GatewayRuntime {
     }
 
     fn dispose_terminal(&self, terminal_id: &str) -> Result<(), RuntimeError> {
-        #[cfg(feature = "terminal")]
-        {
-            self.server
-                .ahp_inner()
-                .dispose_terminal(terminal_id)
-                .then_some(())
-                .ok_or_else(|| RuntimeError::new(format!("unknown terminal {terminal_id}")))
-        }
-        #[cfg(not(feature = "terminal"))]
         {
             let _ = terminal_id;
             Err(RuntimeError::new(
@@ -163,14 +101,6 @@ impl SessionRuntime for GatewayRuntime {
     }
 
     fn terminal_input(&self, terminal_id: &str, data: &str) -> Result<(), RuntimeError> {
-        #[cfg(feature = "terminal")]
-        {
-            self.server
-                .ahp_inner()
-                .terminal_input(terminal_id, data)
-                .map_err(RuntimeError::new)
-        }
-        #[cfg(not(feature = "terminal"))]
         {
             let _ = (terminal_id, data);
             Err(RuntimeError::new(
@@ -180,14 +110,6 @@ impl SessionRuntime for GatewayRuntime {
     }
 
     fn terminal_resize(&self, terminal_id: &str, cols: u16, rows: u16) -> Result<(), RuntimeError> {
-        #[cfg(feature = "terminal")]
-        {
-            self.server
-                .ahp_inner()
-                .terminal_resize(terminal_id, cols, rows)
-                .map_err(RuntimeError::new)
-        }
-        #[cfg(not(feature = "terminal"))]
         {
             let _ = (terminal_id, cols, rows);
             Err(RuntimeError::new(

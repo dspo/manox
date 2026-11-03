@@ -9,7 +9,6 @@ manox-agent.workspace = true
 manox-harness.workspace = true
 manox-ahp.workspace = true
 base64.workspace = true
-manox-terminal = { workspace = true, optional = true }
 # The mcp:// side-channel proxy: typed `Peer<RoleClient>` calls plus the
 # model types the wire round-trips. Only the client face is linked.
 rmcp = { workspace = true, optional = true, features = ["client"] }
@@ -31,7 +30,10 @@ libc.workspace = true
 
 [features]
 default = ["terminal", "mcp"]
-terminal = ["dep:manox-terminal"]
+# Protocol-side plumbing only: the AHP terminal channel pumps in `ahp/`.
+# The PTY/grid implementation lived in manox-terminal (removed); the arms
+# now answer through the SessionRuntime trait's refusal paths.
+terminal = []
 # The MCP face: the process-global registry snapshot mirrors into every
 # session's `customizations`, start/stop requests drive the registry, and
 # lifecycle transitions republish as `session/mcpServerStateChanged`. Lean
@@ -43,7 +45,6 @@ mcp = ["manox-agent/mcp", "dep:rmcp"]
 ws-gateway = ["dep:axum", "manox-ahp/axum-ws"]
 
 [dev-dependencies]
-manox-terminal.workspace = true
 manox-agent = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 
