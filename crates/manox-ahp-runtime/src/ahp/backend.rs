@@ -1730,7 +1730,9 @@ pub(crate) fn summary_delta(
 /// last settled turn, both second-precision sidecar stamps. `interacted_at`
 /// carries the scan's mtime fallback for a session whose sidecar was never
 /// stamped, so the key degrades to "last durable write" there and self-heals
-/// on the session's next real interaction (§ `manox_ahp::summary_meta`).
+/// on the session's next real interaction; a turn that never settled leaves
+/// only the interaction stamp, an approximation of the last message (§
+/// `manox_ahp::summary_meta` for the full contract).
 fn row_last_message_at(row: &manox_agent::db::ThreadSummary) -> i64 {
     row.last_settled_at
         .map_or(row.interacted_at, |settled| settled.max(row.interacted_at))
@@ -1850,11 +1852,15 @@ fn summary_from_row(
                 xmanox.insert("parentSessionId".to_string(), serde_json::json!(parent));
             }
             let mut meta = ahp_types::common::JsonObject::new();
-            meta.insert("x-manox".to_string(), serde_json::Value::Object(xmanox));
-            // The catalogue's objective recency key (§ `manox_ahp::summary_meta`
-            // for the full contract): present only for transcripts with at least
-            // one user/assistant message, so a session that never exchanged a
-            // message is filtered out of recency-ordered surfaces, not ranked.
+            meta.insert(
+                manox_ahp::summary_meta::NAMESPACE.to_string(),
+                serde_json::Value::Object(xmanox),
+            );
+            // The catalogue's objective recency key, in that same seat (§
+            // `manox_ahp::summary_meta` for the full contract): present only
+            // for transcripts with at least one message entry, so a session
+            // that never exchanged a message is filtered out of
+            // recency-ordered surfaces, not ranked.
             if row.has_messages {
                 manox_ahp::summary_meta::set_last_message_at(&mut meta, row_last_message_at(row));
             }
@@ -4010,11 +4016,12 @@ mod mcp_dispatch_tests {
 
     /// The catalogue's objective recency key, over the real chain (journal
     /// + sidecar on disk → scan → summary): a transcript with at least one
-    /// message publishes `_meta.manox.lastMessageAt` — the later of the
-    /// interaction and settle stamps — a message-less transcript publishes
-    /// none (it must be filtered from recency-ordered surfaces, not ranked),
-    /// and the live delta carries the slot wholesale so a stamp move reaches
-    /// subscribers without a resubscribe.
+    /// message publishes `_meta["x-manox"].lastMessageAt` — the later of the
+    /// interaction and settle stamps, in the seat the pin/container facts
+    /// already occupy — a message-less transcript publishes the seat without
+    /// the key (it must be filtered from recency-ordered surfaces, not
+    /// ranked), and the live delta carries the slot wholesale so a stamp move
+    /// reaches subscribers without a resubscribe.
     #[tokio::test]
     async fn summaries_carry_the_recency_stamp_only_for_transcripts_with_messages() {
         // The scan and its sidecar reads spawn on the agent runtime.
@@ -4045,6 +4052,12 @@ mod mcp_dispatch_tests {
                 Some(150),
                 "the stamp is the later of interaction (100) and settle (150)"
             );
+            assert_eq!(
+                meta.get(manox_ahp::summary_meta::NAMESPACE)
+                    .and_then(|seat| seat.get(manox_ahp::summary_meta::LAST_MESSAGE_AT_KEY)),
+                Some(&serde_json::json!(150)),
+                "the stamp rides the shared x-manox seat, not a second namespace"
+            );
 
             let silent = state.summary_by_id("s-silent").expect("the row is listed");
             assert!(!silent.has_messages, "the header-only journal has none");
@@ -4054,16 +4067,33 @@ mod mcp_dispatch_tests {
                 .as_ref()
                 .expect("the meta slot is always populated");
             assert!(
-                silent_meta
+                !silent_meta
                     .get(manox_ahp::summary_meta::NAMESPACE)
-                    .is_none(),
-                "a transcript without messages carries no recency key"
+                    .and_then(|seat| seat.as_object())
+                    .expect("the x-manox seat is always populated")
+                    .contains_key(manox_ahp::summary_meta::LAST_MESSAGE_AT_KEY),
+                "a transcript without messages carries the seat but no recency key"
             );
 
             // The delta replaces the slot wholesale (the chat catalogue's
-            // policy), for both shapes.
-            assert_eq!(summary_delta(&summary).meta, summary.meta);
-            assert_eq!(summary_delta(&silent_summary).meta, silent_summary.meta);
+            // policy): the stamped row restates the key, the silent row
+            // restates the seat without it.
+            let delta_meta = summary_delta(&summary)
+                .meta
+                .expect("the delta carries the meta slot");
+            assert_eq!(
+                manox_ahp::summary_meta::last_message_at(&delta_meta),
+                Some(150),
+                "the stamped row's delta restates the key"
+            );
+            let silent_delta_meta = summary_delta(&silent_summary)
+                .meta
+                .expect("the delta carries the meta slot");
+            assert_eq!(
+                manox_ahp::summary_meta::last_message_at(&silent_delta_meta),
+                None,
+                "the message-less row's delta carries the seat without the key"
+            );
         });
         std::fs::remove_dir_all(&dir).ok();
     }

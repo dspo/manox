@@ -33,10 +33,11 @@ pub struct ThreadSummary {
     /// spawning session), never the team or fork edge a captain row can
     /// carry.
     pub subagent: bool,
-    /// Whether the transcript holds at least one user or assistant message
-    /// (the bounded scan's verdict). Sessions without one have no message
-    /// timeline at all: consumers that rank by message recency must filter
-    /// them out rather than rank them.
+    /// Whether the transcript holds at least one message entry (the bounded
+    /// scan's verdict; any message role counts, in practice user or
+    /// assistant). Sessions without one have no message timeline at all:
+    /// consumers that rank by message recency must filter them out rather
+    /// than rank them.
     pub has_messages: bool,
     pub archived: bool,
     /// Pinned flag toggled from the title bar menu.
