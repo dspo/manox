@@ -25,8 +25,10 @@ manox-workspace.workspace = true
 # journal, and reads the durable vocabulary from the leaf journal crate.
 manox-ahp.workspace = true
 # The AHP runtime half: its `SessionRuntime` trait is the seam this gateway
-# implements, so the adapter never names a gateway type.
-manox-ahp-runtime = { workspace = true, features = ["terminal", "ws-gateway"] }
+# implements, so the adapter never names a gateway type. No `terminal` request:
+# this host can no longer tap a PTY, and `manox-ahp-runtime` carries that flag in
+# its own default features for out-of-tree hosts that can.
+manox-ahp-runtime = { workspace = true, features = ["ws-gateway"] }
 ahp.workspace = true
 ahp-types.workspace = true
 parking_lot.workspace = true

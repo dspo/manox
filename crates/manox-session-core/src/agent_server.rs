@@ -1,8 +1,8 @@
 //! The session store and the runtime intents that act on it.
 //!
 //! The gateway owns this process's live sessions: one [`ThreadHandle`] per
-//! open session, the ownership table, the queued-submit queues, the live
-//! terminals, and the client-contributed tool registrations. Protocol
+//! open session, the ownership table, the queued-submit queues, and the
+//! client-contributed tool registrations. Protocol
 //! mechanics live elsewhere — `manox-ahp` owns the channels, JSON-RPC and
 //! transports, and `manox-ahp-runtime` adapts this crate onto that host's
 //! `Backend` seam through [`crate::ahp_gateway`].
@@ -144,9 +144,6 @@ pub(crate) struct AgentServerInner {
     /// session_id → client_ids that own (view) it. A session may have several
     /// owners; each receives its streamed notes.
     session_owners: Mutex<HashMap<String, Vec<String>>>,
-    /// Live wire terminals (#13): id → entry. Spawned by `TerminalAttach`,
-    /// fed by per-stream forwarder tasks, mirrored into the threads db and
-    /// the `TerminalsUpdated` host snapshot.
     /// Embedder tool registrations (RegisterSessionTools): session →
     /// client → full-replacement tool set. Consulted by the
     /// EmbedderToolProvider below each time the engine assembles a
