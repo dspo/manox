@@ -1716,11 +1716,24 @@ pub(crate) fn summary_delta(
         working_directories: summary.working_directories.clone(),
         annotations: summary.annotations.clone(),
         // The compact chat catalogue replaces wholesale when carried — a list
-        // render tracks per-chat status bits through the same delta.
+        // render tracks per-chat status bits through the same delta. The
+        // `_meta` slot follows the same policy: a recency-stamp move reaches
+        // delta subscribers without a resubscribe.
         chats: summary.chats.clone(),
         default_chat: summary.default_chat.clone(),
+        meta: summary.meta.clone(),
         ..Default::default()
     }
+}
+
+/// The row's recency stamp: the later of the last human interaction and the
+/// last settled turn, both second-precision sidecar stamps. `interacted_at`
+/// carries the scan's mtime fallback for a session whose sidecar was never
+/// stamped, so the key degrades to "last durable write" there and self-heals
+/// on the session's next real interaction (§ `manox_ahp::summary_meta`).
+fn row_last_message_at(row: &manox_agent::db::ThreadSummary) -> i64 {
+    row.last_settled_at
+        .map_or(row.interacted_at, |settled| settled.max(row.interacted_at))
 }
 
 /// One `SessionSummary` from a store row plus the live facts, if any.
@@ -1838,6 +1851,13 @@ fn summary_from_row(
             }
             let mut meta = ahp_types::common::JsonObject::new();
             meta.insert("x-manox".to_string(), serde_json::Value::Object(xmanox));
+            // The catalogue's objective recency key (§ `manox_ahp::summary_meta`
+            // for the full contract): present only for transcripts with at least
+            // one user/assistant message, so a session that never exchanged a
+            // message is filtered out of recency-ordered surfaces, not ranked.
+            if row.has_messages {
+                manox_ahp::summary_meta::set_last_message_at(&mut meta, row_last_message_at(row));
+            }
             meta
         }),
     }
@@ -3986,6 +4006,82 @@ mod mcp_dispatch_tests {
             assert_eq!(child["memberKind"], "subagent");
             assert_eq!(child["parentSessionId"], "s-captain");
         });
+    }
+
+    /// The catalogue's objective recency key, over the real chain (journal
+    /// + sidecar on disk → scan → summary): a transcript with at least one
+    /// message publishes `_meta.manox.lastMessageAt` — the later of the
+    /// interaction and settle stamps — a message-less transcript publishes
+    /// none (it must be filtered from recency-ordered surfaces, not ranked),
+    /// and the live delta carries the slot wholesale so a stamp move reaches
+    /// subscribers without a resubscribe.
+    #[tokio::test]
+    async fn summaries_carry_the_recency_stamp_only_for_transcripts_with_messages() {
+        // The scan and its sidecar reads spawn on the agent runtime.
+        crate::test_support::init_globals();
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = manox_agent::thread_store::standalone_for_test_at(&dir);
+        write_journal_fixture(&dir, "s-stamped", Some("hello"));
+        write_journal_fixture(&dir, "s-silent", None);
+        manox_harness::session_meta::update(&dir, &dir.join("s-stamped.jsonl"), |meta| {
+            meta.interacted_at = Some(100);
+            meta.last_settled_at = Some(150);
+        })
+        .await
+        .expect("the sidecar stamps write");
+        store.refresh_now().await;
+
+        store.read(|state| {
+            let stamped = state.summary_by_id("s-stamped").expect("the row is listed");
+            assert!(stamped.has_messages, "the scan saw the user message");
+            let summary = summary_from_row(stamped, state, None);
+            let meta = summary
+                .meta
+                .as_ref()
+                .expect("the meta slot is always populated");
+            assert_eq!(
+                manox_ahp::summary_meta::last_message_at(meta),
+                Some(150),
+                "the stamp is the later of interaction (100) and settle (150)"
+            );
+
+            let silent = state.summary_by_id("s-silent").expect("the row is listed");
+            assert!(!silent.has_messages, "the header-only journal has none");
+            let silent_summary = summary_from_row(silent, state, None);
+            let silent_meta = silent_summary
+                .meta
+                .as_ref()
+                .expect("the meta slot is always populated");
+            assert!(
+                silent_meta
+                    .get(manox_ahp::summary_meta::NAMESPACE)
+                    .is_none(),
+                "a transcript without messages carries no recency key"
+            );
+
+            // The delta replaces the slot wholesale (the chat catalogue's
+            // policy), for both shapes.
+            assert_eq!(summary_delta(&summary).meta, summary.meta);
+            assert_eq!(summary_delta(&silent_summary).meta, silent_summary.meta);
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A flat journal fixture: the header plus, when `first_user` is set,
+    /// one user message (the shape the store suite's fixtures use). The
+    /// header-only variant is the never-spoke session.
+    fn write_journal_fixture(dir: &std::path::Path, id: &str, first_user: Option<&str>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut content = format!(
+            "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{id}\"}}}}\n"
+        );
+        if let Some(text) = first_user {
+            content.push_str(&format!(
+                "{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-09-13T00:00:01Z\",\"seq\":0,\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"timestamp\":1770000000000}}}}\n"
+            ));
+        }
+        std::fs::write(dir.join(format!("{id}.jsonl")), content).unwrap();
     }
 
     /// The catalogue aggregation: ranked rows first — their interaction-rank
