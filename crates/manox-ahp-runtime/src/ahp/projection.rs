@@ -4031,6 +4031,22 @@ mod turn_message_tests {
 mod fold_semantics_tests {
     use super::*;
 
+    /// Fold a journal's rows through one fresh translator and the chat
+    /// reducer — the live fold's shape, and the shape the seed fold
+    /// (`fold_journal_snapshot`) replays on attach.
+    fn fold(records: &[SessionTreeEntry]) -> (Vec<Emitted>, ahp_types::state::ChatState) {
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut emitted = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for action in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                let _ = ahp::reducers::apply_action_to_chat(&mut state, &action.action);
+                emitted.push(action);
+            }
+        }
+        (emitted, state)
+    }
+
     /// A turn, a mid-run steer under the client's steer id, and the turn's
     /// close — the rows a live steer produces on the kernel journal.
     fn mid_run_steer_records() -> Vec<SessionTreeEntry> {
@@ -5363,17 +5379,14 @@ mod fold_semantics_tests {
                 },
             })),
         ];
-        let mut translator = Translator::new();
-        let mut state = manox_ahp::channels::chat::initial("c-1");
-        let mut requested = Vec::new();
-        for (seq, entry) in records.into_iter().enumerate() {
-            for emitted in translator.on_entry("c-1", "s-1", seq as u64, &entry) {
-                if let StateAction::ChatInputRequested(r) = &emitted.action {
-                    requested.push(r.request.id.clone());
-                }
-                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
-            }
-        }
+        let (emitted, state) = fold(&records);
+        let requested: Vec<String> = emitted
+            .iter()
+            .filter_map(|e| match &e.action {
+                StateAction::ChatInputRequested(r) => Some(r.request.id.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
             requested,
             vec!["call_ask".to_string()],
@@ -5385,8 +5398,13 @@ mod fold_semantics_tests {
         );
         let active = state.active_turn.as_ref().expect("the turn stayed open");
         assert_eq!(
+            active.id, "t-sentry-1",
+            "the ask rides the turn the turn_start row opened, not an \
+             `ensure_turn` replacement"
+        );
+        assert_eq!(
             active.message.text, "ship the release",
-            "the ask rides the turn the submission opened, not a synthetic one"
+            "that turn carries the submission it opened with"
         );
         let ask = active
             .response_parts
@@ -5462,17 +5480,14 @@ mod fold_semantics_tests {
                 })),
                 kernel(decision),
             ];
-            let mut translator = Translator::new();
-            let mut state = manox_ahp::channels::chat::initial("c-1");
-            let mut completions = Vec::new();
-            for (seq, entry) in records.into_iter().enumerate() {
-                for emitted in translator.on_entry("c-1", "s-1", seq as u64, &entry) {
-                    if let StateAction::ChatInputCompleted(done) = &emitted.action {
-                        completions.push(done.response);
-                    }
-                    ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
-                }
-            }
+            let (emitted, state) = fold(&records);
+            let completions: Vec<_> = emitted
+                .iter()
+                .filter_map(|e| match &e.action {
+                    StateAction::ChatInputCompleted(done) => Some(done.response),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(
                 completions,
                 vec![expected],
@@ -5534,25 +5549,21 @@ mod fold_semantics_tests {
                 "payload": {"toolName": "AskUserQuestion", "verdict": "answered"},
             })),
         ];
-        let mut translator = Translator::new();
-        let mut state = manox_ahp::channels::chat::initial("c-1");
-        let mut completions = Vec::new();
-        for (seq, entry) in records.iter().enumerate() {
-            let emitted = translator.on_entry("c-1", "s-1", seq as u64, entry);
-            if seq + 1 == records.len() {
-                assert!(
-                    emitted.is_empty(),
-                    "a verdict for a closed turn must not re-open the \
-                     settlement: {emitted:?}"
-                );
-            }
-            for e in emitted {
-                if let StateAction::ChatInputCompleted(done) = &e.action {
-                    completions.push(done.response);
-                }
-                ahp::reducers::apply_action_to_chat(&mut state, &e.action);
-            }
-        }
+        let (parked, _) = fold(&records[..records.len() - 1]);
+        let (emitted, _) = fold(&records);
+        assert_eq!(
+            emitted.len(),
+            parked.len(),
+            "a verdict for a closed turn must not re-open the settlement: \
+             {emitted:?}"
+        );
+        let completions: Vec<_> = emitted
+            .iter()
+            .filter_map(|e| match &e.action {
+                StateAction::ChatInputCompleted(done) => Some(done.response),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
             completions,
             vec![ahp_types::state::ChatInputResponseKind::Cancel],
@@ -5562,18 +5573,17 @@ mod fold_semantics_tests {
     }
 
     /// Cold restore re-parks the ask. The seed fold (`fold_journal_snapshot`)
-    /// is a fresh Translator over the journal rows, and a client that
-    /// re-attaches while the question is parked replays rows truncated at
-    /// the park — no decision row, no turn finish. The replayed fold must
-    /// emit `chat/inputRequested` again and leave the unanswered elicitation
-    /// on the active turn: that re-armed card is the window a re-attached
-    /// client still answers in (the app's re-decline window, upstream
-    /// dspo/manox#840). A restore that swallowed the re-emission would
-    /// strand a live park behind a silent channel.
-    #[test]
-    fn a_cold_restore_replay_re_parks_the_unanswered_ask() {
+    /// is what a client that re-attaches while the question is parked reads:
+    /// the journal rows truncated at the park — no decision row, no turn
+    /// finish — replayed through a fresh translator. Its chat state must still
+    /// carry the unanswered elicitation on the active turn: that re-armed card
+    /// is the window a re-attached client answers in (the app's re-decline
+    /// window, upstream dspo/manox#840). A seed fold that swallowed the
+    /// elicitation would strand a live park behind a silent channel.
+    #[tokio::test]
+    async fn a_cold_restore_replay_re_parks_the_unanswered_ask() {
         // The park, truncated: no decision row follows.
-        let records = [
+        let records = vec![
             kernel(json!({
                 "type": "message",
                 "id": "sentry-0",
@@ -5595,40 +5605,23 @@ mod fold_semantics_tests {
                 },
             })),
         ];
-        // The live fold opened the card...
-        let mut live = Translator::new();
-        let mut live_requested = Vec::new();
-        for (seq, entry) in records.iter().enumerate() {
-            for emitted in live.on_entry("c-1", "s-1", seq as u64, entry) {
-                if let StateAction::ChatInputRequested(r) = &emitted.action {
-                    live_requested.push(r.request.id.clone());
-                }
-            }
-        }
-        assert_eq!(
-            live_requested,
-            vec!["call_ask".to_string()],
-            "the live fold emitted the card"
-        );
-        // ...and the restore fold — a fresh Translator over the same
-        // truncated rows — must emit it again onto its active turn.
-        let mut restore = Translator::new();
-        let mut state = manox_ahp::channels::chat::initial("c-1");
-        let mut re_requested = Vec::new();
-        for (seq, entry) in records.iter().enumerate() {
-            for emitted in restore.on_entry("c-1", "s-1", seq as u64, entry) {
-                if let StateAction::ChatInputRequested(r) = &emitted.action {
-                    re_requested.push(r.request.id.clone());
-                }
-                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
-            }
-        }
-        assert_eq!(
-            re_requested,
-            vec!["call_ask".to_string()],
-            "the restore fold re-emits the card"
-        );
-        let active = state
+        let journal: Vec<manox_harness::session::jsonl::JournalRecord> = records
+            .into_iter()
+            .enumerate()
+            .map(
+                |(seq, entry)| manox_harness::session::jsonl::JournalRecord {
+                    seq: seq as u64,
+                    entry,
+                },
+            )
+            .collect();
+        let snapshot = manox_agent::engine::JournalSnapshotData {
+            cursor: journal.len() as u64,
+            records: journal,
+        };
+        let folded = crate::ahp::fold_journal_snapshot("c-1", "s-1", &snapshot).await;
+        let active = folded
+            .chat
             .active_turn
             .as_ref()
             .expect("the replayed park sits on an active turn");
