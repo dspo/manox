@@ -118,6 +118,10 @@ turn id 方案。结论如下，三条证据相互印证：
 `session/inputNeededSet{request:ToolConfirmation}`（**原生**，且 AHP 要求由它派生
 `InputNeeded` 状态位）；`depth`·`branch`·`agent_label`·`self_author`→ `_meta`（`x-manox` 子对象）。
 
+另：会话目录的客观近因键 `_meta["x-manox"]["lastMessageAt"]`（unix 秒；仅当 transcript 至少有一条
+message 行时存在，无消息的会话不可排序）不是 v2 projection key，故不计入上表。契约与读写器在
+`manox_ahp::summary_meta`，下游的会话选择器按它排 newest-first。
+
 🔴 `has_interacted`：客户端从 `ChatState.turns` 是否非空即可推导（协议面已有该信息），不再占位。
 
 ### §2.4 请求 / 命令面

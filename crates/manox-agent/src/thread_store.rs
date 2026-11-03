@@ -1436,6 +1436,7 @@ impl ThreadStore {
             depth: parent.is_some() as i32,
             parent_id: parent.map(str::to_string),
             subagent: false,
+            has_messages: false,
             archived: false,
             pinned: false,
             tag: None,
@@ -1777,7 +1778,9 @@ struct SessionIndex {
 #[derive(Clone)]
 struct IndexedSession {
     /// File size when the facts were read — the FACT-layer fingerprint:
-    /// growth keeps the facts (appends never touch them), a shrink rescans.
+    /// growth keeps the facts (appends never touch them — except the
+    /// message-less → first-message transition, which must re-read), a shrink
+    /// always rescans.
     size: u64,
     /// The activity layer — refreshed from stat every scan, never a fact
     /// invalidator.
@@ -1835,17 +1838,21 @@ async fn reconcile_summaries(
         }) {
             continue;
         }
-        // Fact layer: an unknown or SHRUNK file rescans (bounded); growth or
-        // an unchanged size reuses the cached facts untouched. A FAILED
-        // entry reaching here (its fingerprint changed — the skip arm above
-        // handled the unchanged case) has no facts to reuse and rescans
-        // whatever the size says.
+        // Fact layer: an unknown, SHRUNK, or still MESSAGE-LESS file rescans
+        // (bounded); growth with the message fact already true reuses the
+        // cached facts untouched. The message-less exception is the one fact a
+        // growing append can flip — and it gates the catalogue's recency key,
+        // so pinning it false until a shrink (which an append-only writer
+        // never produces) would drop a session from recency ordering for the
+        // process's lifetime. A FAILED entry reaching here (its fingerprint
+        // changed — the skip arm above handled the unchanged case) has no
+        // facts to reuse and rescans whatever the size says.
         let mut torn_tail = false;
-        if index
-            .rows
-            .get(&stat.path)
-            .is_none_or(|entry| entry.failed || stat.size < entry.size)
-        {
+        if index.rows.get(&stat.path).is_none_or(|entry| {
+            entry.failed
+                || stat.size < entry.size
+                || (!entry.has_messages && stat.size > entry.size)
+        }) {
             match manox_harness::session::repository::scan_session(&stat.path).await {
                 Ok(scanned) => {
                     // A possibly-torn tail (facts read off an unterminated
@@ -2086,6 +2093,7 @@ fn summary_from_cached(
         depth: 0,
         parent_id,
         subagent: is_subagent,
+        has_messages: entry.has_messages,
         archived: meta.archived,
         pinned: meta.pinned,
         tag: meta.tag.clone(),
@@ -2716,6 +2724,19 @@ mod tests {
         path
     }
 
+    /// A header-only v4 fixture: the journal a session leaves before its
+    /// first message (a subagent's dispatch declaration, a legacy
+    /// never-materialized row).
+    fn write_header_only_fixture(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("{id}.jsonl"));
+        let content = format!(
+            "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{id}\"}}}}\n"
+        );
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
     fn first_summary_of(store: &StoreHandle, id: &str) -> String {
         store.read(|s| {
             s.summaries()
@@ -2774,6 +2795,42 @@ mod tests {
         write_session_fixture(&dir, "rule", "shrunk");
         store.refresh_now().await;
         assert_eq!(first_summary_of(&store, "rule"), "shrunk");
+    }
+
+    /// The one append that DOES touch a cached fact: a journal first scanned
+    /// before any message landed (a subagent's dispatch declaration, a legacy
+    /// header-only file) must re-read once a message arrives. The message-less
+    /// row's `has_messages` gates the catalogue's recency key, so pinning it
+    /// false until a shrink that an append-only writer never produces would
+    /// drop the session from recency ordering for this process's lifetime.
+    #[tokio::test]
+    async fn a_message_less_journal_rechecks_its_facts_on_growth() {
+        let _db_path = temp_db();
+        let store = standalone_for_test();
+        let dir = store.read(|s| s.sessions_dir.clone());
+        write_header_only_fixture(&dir, "late");
+        store.refresh_now().await;
+        assert!(
+            !store.read(|s| s
+                .summary_by_id("late")
+                .expect("the row is listed")
+                .has_messages),
+            "the header-only journal has no message entry yet"
+        );
+        assert_eq!(first_summary_of(&store, "late"), "(no messages)");
+
+        // The first real message grows the file: the facts rescan and the row
+        // publishes the message timeline (and its first user text).
+        write_session_fixture(&dir, "late", "the first prompt");
+        store.refresh_now().await;
+        assert!(
+            store.read(|s| s
+                .summary_by_id("late")
+                .expect("the row is listed")
+                .has_messages),
+            "the grown journal's message fact is re-read"
+        );
+        assert_eq!(first_summary_of(&store, "late"), "the first prompt");
     }
 
     /// While a runner owns the gate loop, `refresh()` marks pending
@@ -3057,6 +3114,7 @@ mod tests {
             depth: 0,
             parent_id: None,
             subagent: false,
+            has_messages: false,
             archived,
             pinned: false,
             tag: None,
@@ -3705,6 +3763,7 @@ mod tests {
             depth: parent.is_some() as i32,
             parent_id: parent.map(str::to_string),
             subagent: false,
+            has_messages: false,
             archived: false,
             pinned: false,
             tag: None,

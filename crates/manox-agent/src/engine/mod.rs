@@ -3255,6 +3255,7 @@ fn session_info_to_summary(
         parent_id: crate::thread_store::team_parent_id(info)
             .or_else(|| info.parent_session_path.clone()),
         subagent: false,
+        has_messages: info.has_messages,
         archived: false,
         pinned: false,
         // The actor's mirror never reads the sidecar; tags stay sidebar-only.

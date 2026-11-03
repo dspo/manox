@@ -45,6 +45,7 @@ pub mod jsonrpc;
 pub mod resource;
 pub mod router;
 pub mod sequencer;
+pub mod summary_meta;
 pub mod transport;
 pub mod wire;
 
