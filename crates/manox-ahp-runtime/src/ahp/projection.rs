@@ -4031,6 +4031,22 @@ mod turn_message_tests {
 mod fold_semantics_tests {
     use super::*;
 
+    /// Fold a journal's rows through one fresh translator and the chat
+    /// reducer — the live fold's shape, and the shape the seed fold
+    /// (`fold_journal_snapshot`) replays on attach.
+    fn fold(records: &[SessionTreeEntry]) -> (Vec<Emitted>, ahp_types::state::ChatState) {
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut emitted = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for action in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                let _ = ahp::reducers::apply_action_to_chat(&mut state, &action.action);
+                emitted.push(action);
+            }
+        }
+        (emitted, state)
+    }
+
     /// A turn, a mid-run steer under the client's steer id, and the turn's
     /// close — the rows a live steer produces on the kernel journal.
     fn mid_run_steer_records() -> Vec<SessionTreeEntry> {
@@ -5327,6 +5343,302 @@ mod fold_semantics_tests {
             })
             .expect("the ask part survives the archive");
         assert!(ask.response.is_some(), "the decision settled the card");
+    }
+
+    /// The elicitation that parks behind a tool loop's `stop`
+    /// (reason `tool_use`) rides the turn the stop left open: the stop row is
+    /// per-message metadata and closes nothing, so the `question kind=request`
+    /// folds onto the still-active turn as an unanswered InputRequest — the
+    /// open card a client reads and answers. A fold that split the turn at
+    /// the stop (or opened a synthetic replacement for the ask) would strand
+    /// the card in an archived turn, which the ahp reducer can never settle
+    /// (it settles input requests on the active turn only).
+    #[test]
+    fn a_parked_ask_lands_on_the_turn_the_tool_use_stop_left_open() {
+        let records = vec![
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "ship the release"}]},
+            })),
+            kernel(json!({"type": "turn_start", "id": "sentry-1"})),
+            kernel(json!({"type": "agent_text_delta", "id": "sentry-2", "delta": "Working."})),
+            kernel(json!({"type": "stop", "id": "sentry-3", "reason": "tool_use"})),
+            kernel(json!({
+                "type": "question",
+                "id": "sentry-4",
+                "kind": "request",
+                "authId": "call_ask",
+                "payload": {
+                    "toolName": "AskUserQuestion",
+                    "input": {"questions": [{
+                        "question": "版本号怎么定？", "header": "版本号", "multiSelect": false,
+                        "options": [{"label": "v1.4.0", "description": "minor"}],
+                    }]},
+                },
+            })),
+        ];
+        let (emitted, state) = fold(&records);
+        let requested: Vec<String> = emitted
+            .iter()
+            .filter_map(|e| match &e.action {
+                StateAction::ChatInputRequested(r) => Some(r.request.id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            requested,
+            vec!["call_ask".to_string()],
+            "the parked ask still reaches the client"
+        );
+        assert!(
+            state.turns.is_empty(),
+            "the stop closed nothing — no turn may be archived mid-loop"
+        );
+        let active = state.active_turn.as_ref().expect("the turn stayed open");
+        assert_eq!(
+            active.id, "t-sentry-1",
+            "the ask rides the turn the turn_start row opened, not an \
+             `ensure_turn` replacement"
+        );
+        assert_eq!(
+            active.message.text, "ship the release",
+            "that turn carries the submission it opened with"
+        );
+        let ask = active
+            .response_parts
+            .iter()
+            .find_map(|p| match p {
+                ahp_types::state::ResponsePart::InputRequest(input) => Some(input),
+                _ => None,
+            })
+            .expect("the card is on the active turn");
+        assert_eq!(ask.request.id, "call_ask");
+        assert!(
+            ask.response.is_none(),
+            "the card is open — nothing has settled it yet"
+        );
+    }
+
+    /// The decision row's verdict names the settlement the card carries:
+    /// `answered` accepts, `dismissed` declines, and anything else — the
+    /// cancel vocabulary (`cancelled`), an unknown future verdict, or the
+    /// verdict field absent — cancels. A drift here rewrites what the user
+    /// did: an accepted ask surfacing as a denial poisons the transcript and
+    /// the model's follow-up alike.
+    #[test]
+    fn the_journalled_verdict_names_the_response_the_card_settles_with() {
+        for (verdict, expected) in [
+            (
+                Some("answered"),
+                ahp_types::state::ChatInputResponseKind::Accept,
+            ),
+            (
+                Some("dismissed"),
+                ahp_types::state::ChatInputResponseKind::Decline,
+            ),
+            (
+                Some("cancelled"),
+                ahp_types::state::ChatInputResponseKind::Cancel,
+            ),
+            (
+                Some("retracted"),
+                ahp_types::state::ChatInputResponseKind::Cancel,
+            ),
+            (None, ahp_types::state::ChatInputResponseKind::Cancel),
+        ] {
+            let mut decision = json!({
+                "type": "question",
+                "id": "sentry-3",
+                "kind": "decision",
+                "authId": "call_ask",
+                "payload": {"toolName": "AskUserQuestion"},
+            });
+            if let Some(v) = verdict {
+                decision["payload"]["verdict"] = json!(v);
+            }
+            let records = vec![
+                kernel(json!({
+                    "type": "message",
+                    "id": "sentry-0",
+                    "message": {"role": "user",
+                                "content": [{"type": "text", "text": "pick one"}]},
+                })),
+                kernel(json!({"type": "turn_start", "id": "sentry-1"})),
+                kernel(json!({
+                    "type": "question",
+                    "id": "sentry-2",
+                    "kind": "request",
+                    "authId": "call_ask",
+                    "payload": {
+                        "toolName": "AskUserQuestion",
+                        "input": {"questions": [{
+                            "question": "q", "header": "h", "multiSelect": false,
+                        }]},
+                    },
+                })),
+                kernel(decision),
+            ];
+            let (emitted, state) = fold(&records);
+            let completions: Vec<_> = emitted
+                .iter()
+                .filter_map(|e| match &e.action {
+                    StateAction::ChatInputCompleted(done) => Some(done.response),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                completions,
+                vec![expected],
+                "verdict {verdict:?} must settle the ask as {expected:?}"
+            );
+            let active = state.active_turn.as_ref().expect("the turn stayed open");
+            let ask = active
+                .response_parts
+                .iter()
+                .find_map(|p| match p {
+                    ahp_types::state::ResponsePart::InputRequest(input) => Some(input),
+                    _ => None,
+                })
+                .expect("the ask part is on the active turn");
+            assert_eq!(
+                ask.response,
+                Some(expected),
+                "the card must carry the verdict's own response, not a default"
+            );
+        }
+    }
+
+    /// A verdict that arrives after the turn closed is a debug no-op: the
+    /// boundary settlement already answered the card (the settlement the
+    /// turn close owes every parked ask), and a second completion would
+    /// claim a settlement the journal never carried. The `decision` row is
+    /// the crash tail's last row exactly because the turn beat it — its
+    /// verdict, whatever it names, must add nothing.
+    #[test]
+    fn a_verdict_after_the_turn_closed_is_a_no_op() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "pick one"}]},
+            })),
+            kernel(json!({"type": "turn_start", "id": "sentry-1"})),
+            kernel(json!({
+                "type": "question",
+                "id": "sentry-2",
+                "kind": "request",
+                "authId": "call_ask",
+                "payload": {
+                    "toolName": "AskUserQuestion",
+                    "input": {"questions": [{
+                        "question": "q", "header": "h", "multiSelect": false,
+                    }]},
+                },
+            })),
+            kernel(json!({"type": "turn_finish", "id": "sentry-3",
+                          "cancelled": true, "failed": false, "strandedSteerIds": []})),
+            // The crash tail: an accept verdict for a turn that is gone.
+            kernel(json!({
+                "type": "question",
+                "id": "sentry-4",
+                "kind": "decision",
+                "authId": "call_ask",
+                "payload": {"toolName": "AskUserQuestion", "verdict": "answered"},
+            })),
+        ];
+        let (parked, _) = fold(&records[..records.len() - 1]);
+        let (emitted, _) = fold(&records);
+        assert_eq!(
+            emitted.len(),
+            parked.len(),
+            "a verdict for a closed turn must not re-open the settlement: \
+             {emitted:?}"
+        );
+        let completions: Vec<_> = emitted
+            .iter()
+            .filter_map(|e| match &e.action {
+                StateAction::ChatInputCompleted(done) => Some(done.response),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completions,
+            vec![ahp_types::state::ChatInputResponseKind::Cancel],
+            "the boundary settlement is the card's only completion — the late \
+             verdict adds none"
+        );
+    }
+
+    /// Cold restore re-parks the ask. The seed fold (`fold_journal_snapshot`)
+    /// is what a client that re-attaches while the question is parked reads:
+    /// the journal rows truncated at the park — no decision row, no turn
+    /// finish — replayed through a fresh translator. Its chat state must still
+    /// carry the unanswered elicitation on the active turn: that re-armed card
+    /// is the window a re-attached client answers in (the app's re-decline
+    /// window, upstream dspo/manox#840). A seed fold that swallowed the
+    /// elicitation would strand a live park behind a silent channel.
+    #[tokio::test]
+    async fn a_cold_restore_replay_re_parks_the_unanswered_ask() {
+        // The park, truncated: no decision row follows.
+        let records = vec![
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "plan the release"}]},
+            })),
+            kernel(json!({"type": "turn_start", "id": "sentry-1"})),
+            kernel(json!({
+                "type": "question",
+                "id": "sentry-2",
+                "kind": "request",
+                "authId": "call_ask",
+                "payload": {
+                    "toolName": "AskUserQuestion",
+                    "input": {"questions": [{
+                        "question": "版本号怎么定？", "header": "版本号", "multiSelect": false,
+                        "options": [{"label": "v1.4.0", "description": "minor"}],
+                    }]},
+                },
+            })),
+        ];
+        let journal: Vec<manox_harness::session::jsonl::JournalRecord> = records
+            .into_iter()
+            .enumerate()
+            .map(
+                |(seq, entry)| manox_harness::session::jsonl::JournalRecord {
+                    seq: seq as u64,
+                    entry,
+                },
+            )
+            .collect();
+        let snapshot = manox_agent::engine::JournalSnapshotData {
+            cursor: journal.len() as u64,
+            records: journal,
+        };
+        let folded = crate::ahp::fold_journal_snapshot("c-1", "s-1", &snapshot).await;
+        let active = folded
+            .chat
+            .active_turn
+            .as_ref()
+            .expect("the replayed park sits on an active turn");
+        let ask = active
+            .response_parts
+            .iter()
+            .find_map(|p| match p {
+                ahp_types::state::ResponsePart::InputRequest(input) => Some(input),
+                _ => None,
+            })
+            .expect("the re-parked card is on the active turn");
+        assert_eq!(ask.request.id, "call_ask");
+        assert!(
+            ask.response.is_none(),
+            "the re-parked card is still open — the re-attached client can \
+             answer it"
+        );
     }
 }
 
