@@ -364,6 +364,11 @@ impl RuntimeBackend {
     /// from the runtime's metadata-only seam. A no-op until a host is
     /// attached (a terminal spawned before the host exists is picked up by
     /// the next root seed instead).
+    ///
+    /// Gated with the arms that create and dispose terminals: with the
+    /// `terminal` feature off nothing calls it, and this crate builds under
+    /// `-D warnings` (the lean napi leg).
+    #[cfg(feature = "terminal")]
     fn publish_terminals_changed(&self) {
         let Some(host) = self.host() else {
             return;
