@@ -4,7 +4,7 @@ Guidance for coding agents working in this repo.（本文件是 manox 仓库指�
 
 ## 项目概述
 
-manox 是**自研 agent runtime 库仓**（gpui-free、headless）：内核（harness）、宿主层（agent）、会话编排（session-core）、协议（protocol）、provider 配置（providers）、进程基础设施（supervisor）、终端仿真核心（terminal/hyperlinks）与 napi 绑定。对外以 git 依赖形式提供给 host——gpui 桌面应用与 cx 启动器在独立仓库 **dspo/manox-app** 维护（拆分点 tag `pre-manox-app-split`）。逐文件架构靠读代码获得——本文件只承载不可从代码推导的约束。
+manox 是**自研 agent runtime 库仓**（gpui-free、headless）：内核（harness）、宿主层（agent）、会话编排（session-core）、协议（protocol）、provider 配置（providers）、进程基础设施（supervisor）、超链接检测（hyperlinks）与 napi 绑定。对外以 git 依赖形式提供给 host——gpui 桌面应用与 cx 启动器在独立仓库 **dspo/manox-app** 维护（拆分点 tag `pre-manox-app-split`）。逐文件架构靠读代码获得——本文件只承载不可从代码推导的约束。
 
 ### 代码结构
 
@@ -18,8 +18,7 @@ crates/                    # Rust workspace 成员（全部 gpui-free）
   manox-ahp/               # AHP 宿主层（频道、JSON-RPC、传输、x-manox 扩展面）
   manox-ahp-runtime/       # AHP 宿主背后的运行时半边（SessionRuntime 缝 + 适配器）
   manox-session-core/      # 会话核心（会话存储 + SessionRuntime 缝的实现 + loopback ws）
-  manox-terminal/          # 终端仿真核心（自 manox-app 回流，UI 层 terminal-ui 在下游仓）
-  hyperlinks/              # 终端超链接检测（随 manox-terminal 一同回流）
+  hyperlinks/              # URL/路径检测积木（宿主 markdown 渲染消费；原终端超链接用途随 manox-terminal 退役）
   supervisor/              # 子进程监督
   manox-lsp/               # LSP client 库（唯一零仓内消费者的成员，为宿主预留的积木：宿主层不集成，宿主 app 按需装配为工具或经 AHP session/activeClientSet 注册）
   manox-napi/              # napi 宿主绑定（休眠保留：VS Code 扩展已删除）
@@ -43,7 +42,7 @@ crates/                    # Rust workspace 成员（全部 gpui-free）
 
 ### 仓库边界（manox / manox-app 拆分）
 
-- 本仓库**不得引入 gpui 或任何 UI 依赖**；apps、cx 启动器、ext-agents、terminal-ui（GPUI 渲染层）已迁至 `dspo/manox-app`。终端仿真核心 `manox-terminal` 与 `hyperlinks` 已回流本仓，由 manox-app 经 git 依赖消费。
+- 本仓库**不得引入 gpui 或任何 UI 依赖**；apps、cx 启动器、ext-agents、terminal-ui（GPUI 渲染层）已迁至 `dspo/manox-app`。终端仿真核心 `manox-terminal` 已随宿主迁移 Ghostty 整体退役（AHP terminal 通道词汇保留于 manox-ahp，host 侧走 `feature/unavailable` 拒绝路径）；`hyperlinks` 仍在本仓，供宿主 markdown 渲染消费。
 - manox-app 经 git 依赖（tag pin `tag = "vX.Y.Z"` + Cargo.lock 锁 rev）消费本仓库；本仓库 main 的每次 push 都可能很快成为下一个发布 tag 的内容——破坏性 API 变更须在 commit message 标注（`!`）。下游约定：manox-app 合并前会把对本仓的依赖 bump 到最新发布 tag，故 main 上任何提交都可能很快进入下游合并，保持 main 常绿。
 - 本仓库运行时状态根 `~/.manox/` 与 manox-app 共享（见下）；协议/磁盘格式（journal、db、sessions）的变更即两仓联合变更。
 
@@ -85,12 +84,12 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 - 单一状态根：`~/.manox/`（`manox_agent::paths::manox_config_dir()` 与 `manox_providers::cx_state_dir()` 均指向它）。**多进程共享**：runtime 允许多实例共用同一状态根，跨进程协调在资源粒度——per-session 写租约（`manox_agent::session_lease`，锁文件是 journal 的同级 `<journal>.lock`，驱动即独占、进程死自动释放、冲突报 `session/already-owned`）、共享状态文件（registry/sidebar/sidecar）走 per-file flock、网关单例走 `~/.manox/gateway.lock`。无全 store 级单实例锁。
 - 生态根：`~/.claude/`（`manox_agent::paths::claude_home()`）。用户技能 `~/.claude/skills/`、斜杠命令 `~/.claude/commands/`、子 agent 定义 `~/.claude/agents/`、规则 `~/.claude/rules/`（与 CLAUDE.md 层级一同由 `claude_md.rs` 装载）；插件与市场存储亦在此根下（见 `plugin.rs`）。
 - LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/manox-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；首启时会从旧根 `~/.config/cx/` 自动复制一次（旧文件保留）
-- SQLite（v1.0.0 已退役）：`threads.db` 及其 WAL 文件不再读写；六类状态各归其家——UI 注释卡 = journal `custom` 行（`manox_ui_note`）、右侧页签注册表 = 客户端内存（manox-app 侧）、终端注册表 = 内存易失（`manox_terminal::store`）、列表扫描 = header/首条消息的有界读取、token 用量 = 事件派生（`metrics` 行 → `x-manox-metrics`）、项目注册表 = `~/.manox/core/projects.registry`（每行一个项目路径，读取时排序去重）。
+- SQLite（v1.0.0 已退役）：`threads.db` 及其 WAL 文件不再读写；六类状态各归其家——UI 注释卡 = journal `custom` 行（`manox_ui_note`）、右侧页签注册表 = 客户端内存（manox-app 侧）、终端注册表 = 已随 manox-terminal 退役（wire 终端不复存在）、列表扫描 = header/首条消息的有界读取、token 用量 = 事件派生（`metrics` 行 → `x-manox-metrics`）、项目注册表 = `~/.manox/core/projects.registry`（每行一个项目路径，读取时排序去重）。
 - 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；v1.0.0 起新建会话 thread id == session id，指针仍服务于既有 journal 的打开/恢复；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`manox_agent::thread_registry`；跨进程 RMW 经 per-file flock 串行化）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork；多工作目录会话经 `CreateSession.workingDirectories` seed granted-root 围栏。
 - 会话（v1.0.0 core 布局，dsh 对齐）：`~/.manox/core/--<projectKey>--/<session-id>/` —— `session.jsonl`（唯一 durable 事件日志；首行即 header，`formatVersion` 在 header 内，未来格式升级把旧文件物化为 `session.v<N>.jsonl` 世代文件，dsh 的 generation 方案）。`<projectKey>` 是 `originCwd` 的 dsh `projectKey` 编码（`/`、`\`、`:` 折叠为 `-`、`[A-Za-z0-9._-]` 原样保留大小写、其余码点 `~XXXX` 转义、`--`…`--` 包裹、内段 251 上限；`manox_harness::session::identity::project_slug`）——桶是存储局部性不是身份，journal header 的 `cwd` 才是事实。派生/显示状态（pin/archive/errored/title/tag/工作目录授权/交互时间戳/read 两输入 last_settled_at+last_viewed_at——read 是派生事实不在 journal，翻转由宿主 publish 到 session 通道，客户端只声明查看）= `~/.manox/core/cache/<id>.json`（会话目录只留 journal 与锁，dsh storages/projcache 的关注点分离；`manox_harness::session_meta`）。`~/.manox/core/projects.registry` 是项目注册表。旧 `~/.manox/sessions/` 平铺树**永不再读**（无迁移、无兼容读）。
 - 子代理会话：`~/.manox/core/--<projectKey>--/<run-id>/`（run id == 子会话 id == 子 chat id；持久化、不进侧栏）
 - 外部会话：`~/.manox/external-sessions/`（外部 CLI 会话由 manox-app 侧的 cx 驱动，目录约定在本仓库文档维护）
-- 设置：`~/.manox/settings.toml`；主题：`~/.manox/themes/`
+- 设置：`~/.manox/settings.toml`（终端主题目录 `~/.manox/themes/` 随 `.ottytheme` 与 `manox-terminal` 一并退役，不再读取）
 - 子 agent：`~/.claude/agents/*.md`（frontmatter name/description/tools/model + 正文；每个定义解析为引擎内部调度配置，模型面统一走 Captain 的 `Steer` 工具：`ext/subagent/` 的 SubagentRuntime/SubagentProvider/能力协商/descriptor）；MCP：`~/.manox/mcp.json`（Claude Code `mcpServers` schema，stdio 或 HTTP；项目级 `.mcp.json` 与插件 `.mcp.json` 同 schema，合并序 plugin < global < project）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
 - WS 网关端点（`cx web`，CLI 在 manox-app）：`~/.manox/gateway-ws.json`（0600；启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ws?token=…`；每次启动覆盖，进程退出后过期）。网关每机单例：`ws::start` 以非阻塞 flock 持 `~/.manox/gateway.lock`，他进程已持锁时本次 start 不绑定不发布（loud no-op）。
 - cx CLI 状态：`~/.manox/cx.db`、IPC socket `~/.manox/sessions/`（该目录自 v1.0.0 起只承载 cx 的 socket 与注册 JSON，不再是会话 journal 目录）、codex 注入目录 `~/.manox/.codex/`、`~/.manox/.patch_source`（CLI 本体在 manox-app，状态目录与本仓库共享）

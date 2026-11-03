@@ -590,6 +590,13 @@ reconnect 快照腿、dispatch 句柄。
 实测（官方 TS client over WS）：create → 订阅拿到 **80×24 / running / isPty:true** → dispose，
 三步全绿。`--no-default-features` 腿仍干净（helper 与 `terminal_state` 双臂 cfg）。
 
+> **已退役（manox 侧）**：`manox-terminal` 整体删除后，这一整面（`attach_terminal`、
+> `terminal_input/resize/raw_tap`、`ahp_terminal_state`、终端注册表镜像）从本仓库移除。
+> **AHP 侧的 `ahp-terminal:/` 词汇保留**（`manox-ahp` 的通道、reducer、`ahp-types` 类型仍在），
+> 宿主经 `SessionRuntime` 的 `feature/unavailable` 稳定拒绝回答——客户端拿到的是拒绝，
+> 不是静默等待。以上「已服务」的记录是退役前的实现事实，作历史读；终端面改由宿主
+> （dspo/manox-app）在本地渲染，不过 AHP 通道。
+
 **3. 六个扩展通道声明了却不服务。** `extension_baseline` 是 trait 默认 `None`，runtime 侧无覆盖；
 扩展通道 `is_state_bearing()` 为 false，所以订阅它们**只**走这条路——结果是客户端读
 `_meta["x-manox"]` 看到 6 个通道，订阅任意一个收到**静默**。
@@ -706,6 +713,8 @@ W4 开工前逐文件核实，发现**计划 §一「`manox-session-core` 整体
 ### H.2h 版本注记
 
 - 本轮新增 `x-manox/baseline` 通知（扩展通道基线），已进 `_meta["x-manox"]` 声明。
+- **terminal 面随后整体退役**（见 §H.2 第 2 条的注记）：词汇保留、宿主回稳定拒绝，
+  下列实现记录为历史。
 - **terminal 快照面已服务**（`createTerminal`/`disposeTerminal` + `TerminalState` 快照）；
   `terminal/input`、`terminal/resized`、`terminal/data` 三个 action **未接**——客户端能建能看
   但不能打字、不能改尺寸、收不到活输出。W4 前必补。
@@ -732,7 +741,8 @@ W4 开工前逐文件核实，发现**计划 §一「`manox-session-core` 整体
    按此公式的 W4 准入账（2026-09-24 复核）：
    - ✅ `extension_baseline`（§H.2g）
    - ✅ 四个 `x-manox` server→client 请求（§H.2i）
-   - ✅ `terminal` 写路径 `input`/`resized`/`data`（§H.2i）
+   - ⛔ `terminal` 写路径 `input`/`resized`/`data`（§H.2i）—— 该面此后随 `manox-terminal`
+    退役（宿主改本地 Ghostty 面，AHP 只保留词汇 + 稳定拒绝），故此项从准入账上撤销
    - ✅ 客户端贡献工具（`session/activeClientSet` → 既有 `embedder_tools` 路径，§H.2i）
    - ✅ 四个 host→client 请求的**调用点**（`CapabilityClient` 的 browser/clipboard/
      openExternal 经 `route_ahp_capability` 优先问 AHP，无合格声明者则回退 v2 腿；见 §H.2i）

@@ -63,7 +63,7 @@ tempfile = "3"
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler.workspace = true
 # `net` for the sandbox bridge's SCM_RIGHTS listener handoff (sendmsg/
-# recvmsg ancillary buffers); same 0.38 line manox-terminal consumes.
+# recvmsg ancillary buffers).
 rustix = { workspace = true, features = ["net"] }
 
 [dev-dependencies]

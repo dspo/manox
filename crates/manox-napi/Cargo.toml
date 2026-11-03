@@ -32,12 +32,11 @@ napi-build = "2"
 workspace = true
 [features]
 # Full runtime by default — the same capability set as the gpui app. Embedders
-# that want a lean addon (the VS Code extension: no MCP, no terminal
-# stack, no WS gateway) build with --no-default-features and re-enable only
-# what they need.
-default = ["mcp", "terminal"]
+# that want a lean addon (the VS Code extension: no MCP, no WS gateway) build
+# with --no-default-features and re-enable only what they need. Terminal
+# support rode the same wire commands and is retired with manox-terminal.
+default = ["mcp"]
 # The full MCP face: the agent-side registry *and* the session-core gateway
 # that serves start/stop. Forwarding only the agent half left a host whose
 # clients could see the servers but could not drive them.
 mcp = ["manox-agent/mcp", "manox-session-core/mcp"]
-terminal = ["manox-session-core/terminal"]
