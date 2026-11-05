@@ -156,6 +156,12 @@ mod tests {
             render_header_value("static", Some("abc")),
             Some("static".to_string())
         );
+        // Tera's built-in filters ride along — the developer doc promises
+        // them (docs/cx/request-headers.md).
+        assert_eq!(
+            render_header_value("{{ session_id | upper }}", Some("abc")),
+            Some("ABC".to_string())
+        );
     }
 
     #[test]
