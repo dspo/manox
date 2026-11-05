@@ -36,6 +36,74 @@ pub trait RequestObserver: Send + Sync {
     fn after_response(&self, attempt: u32, status: u16, headers: &reqwest::header::HeaderMap);
 }
 
+/// Identity substituted when validating a template outside a live request:
+/// a template only has to render with *some* session id to be well formed.
+const VALIDATION_SESSION_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Render a config-supplied header value template against one request's
+/// session identity. Tera syntax — the same engine the prompt templates
+/// use — with `session_id` as the only variable the context carries, so a
+/// template referencing anything else fails to render. Any render failure
+/// (unknown field, missing session id, unclosed braces) drops the header
+/// (`None`) instead of shipping a broken value upstream. Autoescape stays
+/// off: header values are wire text, never HTML.
+pub fn render_header_value(template: &str, session_id: Option<&str>) -> Option<String> {
+    let mut ctx = tera::Context::new();
+    if let Some(id) = session_id {
+        ctx.insert("session_id", id);
+    }
+    match tera::Tera::one_off(template, &ctx, false) {
+        Ok(rendered) => Some(rendered),
+        Err(err) => {
+            tracing::warn!(
+                template = %template,
+                error = %err,
+                "header template failed to render — header dropped"
+            );
+            None
+        }
+    }
+}
+
+/// Check a config-supplied template without a live request, so a broken one
+/// surfaces once at provider-registration time instead of as a silently
+/// missing header (and an upstream complaint) on every request.
+pub fn validate_header_value_template(template: &str) -> Result<(), String> {
+    let mut ctx = tera::Context::new();
+    ctx.insert("session_id", VALIDATION_SESSION_ID);
+    tera::Tera::one_off(template, &ctx, false)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+/// Build one request's extra headers from config-supplied `(name, value)`
+/// pairs. Values render against `session_id`; an unrenderable template or a
+/// name/value that is not a legal HTTP header drops that entry.
+///
+/// Later entries win on a same-name collision — header names compare
+/// case-insensitively — which is what makes the registry's injected auth
+/// header (appended after the configured headers) override a same-name
+/// config entry instead of putting two values on the wire.
+pub fn build_extra_headers(
+    headers: &[(String, String)],
+    session_id: Option<&str>,
+) -> reqwest::header::HeaderMap {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (name, template) in headers {
+        let Some(value) = render_header_value(template, session_id) else {
+            continue;
+        };
+        let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = value.parse::<reqwest::header::HeaderValue>() else {
+            continue;
+        };
+        map.insert(name, value);
+    }
+    map
+}
+
 use crate::types::{Cost, Model, Usage};
 
 /// The model's rate card from registration metadata (`cost`, USD per 1M
@@ -115,6 +183,78 @@ mod tests {
     use crate::types::ThinkingKind;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn header_template_renders_session_id() {
+        assert_eq!(
+            render_header_value("{{ session_id }}", Some("77c6f3e6")),
+            Some("77c6f3e6".to_string())
+        );
+        // Whitespace inside the braces is insignificant; surrounding text
+        // is preserved verbatim.
+        assert_eq!(
+            render_header_value("prefix-{{session_id}}-suffix", Some("abc")),
+            Some("prefix-abc-suffix".to_string())
+        );
+        assert_eq!(
+            render_header_value("static", Some("abc")),
+            Some("static".to_string())
+        );
+        // Tera's built-in filters ride along — the developer doc promises
+        // them (docs/cx/request-headers.md).
+        assert_eq!(
+            render_header_value("{{ session_id | upper }}", Some("abc")),
+            Some("ABC".to_string())
+        );
+    }
+
+    #[test]
+    fn header_template_drops_when_unrenderable() {
+        // No session id on the request: the placeholder must not reach the
+        // wire.
+        assert_eq!(render_header_value("{{ session_id }}", None), None);
+        // Unsupported fields and malformed braces drop the header too.
+        assert_eq!(render_header_value("{{ model }}", Some("abc")), None);
+        assert_eq!(render_header_value("{{ session_id", Some("abc")), None);
+    }
+
+    /// Registration-time validation accepts every template a live request
+    /// can render and rejects the ones that would be dropped on the wire.
+    #[test]
+    fn header_template_validation_matches_the_render_path() {
+        assert!(validate_header_value_template("static").is_ok());
+        assert!(validate_header_value_template("go-{{ session_id }}").is_ok());
+        assert!(validate_header_value_template("{{ session_id | upper }}").is_ok());
+        assert!(validate_header_value_template("{{ model }}").is_err());
+        assert!(validate_header_value_template("{{ session_id").is_err());
+    }
+
+    /// A later same-name entry overrides an earlier one — case-insensitively,
+    /// as HTTP header names compare — so a runtime-injected auth header wins
+    /// over a config entry instead of doubling it on the wire.
+    #[test]
+    fn build_extra_headers_renders_drops_and_overrides() {
+        let headers = vec![
+            ("x-static".to_string(), "value".to_string()),
+            ("x-session".to_string(), "go-{{ session_id }}".to_string()),
+            ("x-broken".to_string(), "{{ model }}".to_string()),
+            ("X-Overridden".to_string(), "from-config".to_string()),
+            ("x-overridden".to_string(), "from-runtime".to_string()),
+        ];
+        let map = build_extra_headers(&headers, Some("sess_1"));
+        assert_eq!(map.get("x-static").unwrap(), "value");
+        assert_eq!(map.get("x-session").unwrap(), "go-sess_1");
+        assert!(
+            map.get("x-broken").is_none(),
+            "unrenderable value must drop"
+        );
+        assert_eq!(
+            map.get("x-overridden").unwrap(),
+            "from-runtime",
+            "the later entry must replace, not append"
+        );
+        assert_eq!(map.get_all("x-overridden").iter().count(), 1);
+    }
 
     fn model_with_cost(card: Option<serde_json::Value>) -> Model {
         let mut metadata = HashMap::new();

@@ -59,6 +59,9 @@ struct CxProvider {
     endpoints: BTreeMap<String, EndpointSpec>,
     #[serde(default)]
     models: BTreeMap<String, Option<CxModel>>,
+    /// Headers merged into every request across the provider's endpoints.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
     /// Process env for cx agents — parsed but intentionally not applied to
     /// provider registrations.
     #[serde(default)]
@@ -82,6 +85,9 @@ struct EndpointDetail {
     #[allow(dead_code)] // parsed for schema completeness; bearer_token is
     // covered by the registration's auth_header.
     copilot_auth: Option<String>,
+    /// Endpoint-level headers; same-name keys override the provider's.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
 }
 
 impl EndpointSpec {
@@ -202,6 +208,38 @@ pub fn register_providers_yaml(
                 continue;
             }
             let name = provider_registration_name(&provider.name, wire_api);
+            // Endpoint headers override same-name provider-level keys, and
+            // values may carry `{{ session_id }}` templates rendered per
+            // request by the wire clients. HTTP header names compare
+            // case-insensitively, so the override does too: the merged map
+            // is keyed by the lowercased name (the wire name is lowercase
+            // regardless).
+            let mut headers: HashMap<String, String> = HashMap::new();
+            let endpoint_headers = match spec {
+                EndpointSpec::Url(_) => None,
+                EndpointSpec::Detail(detail) => Some(&detail.headers),
+            };
+            for (header, value) in provider
+                .headers
+                .iter()
+                .chain(endpoint_headers.into_iter().flatten())
+            {
+                headers.insert(header.to_ascii_lowercase(), value.clone());
+            }
+            for (header, value) in &headers {
+                // A template that cannot render is dropped on every request;
+                // say so once, at registration, instead of per turn.
+                if let Err(err) = crate::core::provider::validate_header_value_template(value) {
+                    tracing::warn!(
+                        provider = %provider.name,
+                        endpoint = %wire_api,
+                        header = %header,
+                        error = %err,
+                        "header template can never render — the header is dropped on every request"
+                    );
+                }
+            }
+            let headers = (!headers.is_empty()).then_some(headers);
             registry
                 .register_provider(
                     &name,
@@ -210,7 +248,7 @@ pub fn register_providers_yaml(
                         base_url: Some(spec.url().to_string()),
                         api_key: api_key.clone(),
                         api: Some(api),
-                        headers: None,
+                        headers,
                         auth_header: true,
                         models,
                     },
@@ -675,11 +713,20 @@ mod tests {
 providers:
 - name: DeepSeek
   apikey_source: literal:sk-test
+  # Provider-level headers flow into every endpoint's requests.
+  headers:
+    x-provider-header: from-provider
+    # Mixed case on purpose: header names compare case-insensitively, so the
+    # endpoint-level `x-shared` below still overrides this one.
+    X-Shared: from-provider
   endpoints:
     anthropic:
       url: https://api.deepseek.com/anthropic
       agents: []
       copilot_auth: null
+      headers:
+        # Endpoint-level keys override same-name provider-level ones.
+        x-shared: from-anthropic-endpoint
     responses: https://api.deepseek.com
   models:
     deepseek-v4-pro[1m]:
@@ -691,6 +738,13 @@ providers:
   endpoints:
     anthropic:
       url: https://tp.example.com/apps/anthropic
+      headers:
+        x-endpoint-header: from-endpoint
+        # Endpoint-level keys override same-name provider-level ones.
+        x-shared: from-endpoint
+        # Template values stay verbatim through registration and render at
+        # request time (see `registered_headers_render_at_request_time`).
+        x-session: "{{ session_id }}"
     completions:
       url: https://tp.example.com/compatible-mode/v1
   models:
@@ -727,6 +781,91 @@ agents:
                 "Token Plan-anthropic",
                 "Token Plan-completions",
             ]
+        );
+    }
+
+    /// Provider-level headers flow into every endpoint (including the
+    /// plain-URL form); endpoint-level keys override same-name provider
+    /// ones regardless of case; endpoints without any header config
+    /// register none.
+    #[test]
+    fn headers_merge_provider_level_under_endpoint_level() {
+        let registry = register_fixture();
+        let deepseek = registry
+            .provider_config("DeepSeek-anthropic")
+            .expect("deepseek registered");
+        let deepseek_headers = deepseek.headers.expect("headers kept");
+        assert_eq!(
+            deepseek_headers
+                .get("x-provider-header")
+                .map(String::as_str),
+            Some("from-provider")
+        );
+        assert_eq!(
+            deepseek_headers.get("x-shared").map(String::as_str),
+            Some("from-anthropic-endpoint"),
+            "endpoint-level key must override a differently-cased provider one"
+        );
+        assert_eq!(
+            deepseek_headers.keys().filter(|k| *k == "x-shared").count(),
+            1,
+            "the merged map keeps a single entry per header name"
+        );
+
+        let responses = registry
+            .provider_config("DeepSeek-responses")
+            .expect("responses registered");
+        assert_eq!(
+            responses
+                .headers
+                .expect("plain-url endpoint inherits provider headers")
+                .get("x-shared")
+                .map(String::as_str),
+            Some("from-provider")
+        );
+
+        let token_plan = registry
+            .provider_config("Token Plan-anthropic")
+            .expect("token plan registered");
+        let token_plan_headers = token_plan.headers.expect("endpoint headers kept");
+        assert_eq!(
+            token_plan_headers
+                .get("x-endpoint-header")
+                .map(String::as_str),
+            Some("from-endpoint")
+        );
+        assert_eq!(
+            token_plan_headers.get("x-shared").map(String::as_str),
+            Some("from-endpoint"),
+            "endpoint-level key must override the provider-level one"
+        );
+
+        assert!(
+            registry
+                .provider_config("Token Plan-completions")
+                .expect("completions registered")
+                .headers
+                .is_none(),
+            "an endpoint with no header config carries none"
+        );
+    }
+
+    /// Registration keeps a template verbatim; the wire layer renders it
+    /// against the turn's session id — the two halves of the config→request
+    /// path agree on the value the endpoint finally sees.
+    #[test]
+    fn registered_headers_render_at_request_time() {
+        let registry = register_fixture();
+        let headers = registry
+            .provider_config("Token Plan-anthropic")
+            .expect("token plan registered")
+            .headers
+            .expect("headers kept");
+        let template = headers.get("x-session").expect("template kept verbatim");
+        assert_eq!(template, "{{ session_id }}");
+        assert_eq!(
+            crate::core::provider::render_header_value(template, Some("sess_9")),
+            Some("sess_9".to_string())
         );
     }
 

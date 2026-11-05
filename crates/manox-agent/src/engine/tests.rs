@@ -5507,10 +5507,14 @@ async fn child_journal_opens_with_the_inherited_mode_and_follows_a_live_flip() {
         manox_harness::subagent::feeds::child_journal_writer(&run_id),
         "the child writer is registered for the run's whole life"
     );
-    assert_eq!(
-        journal_row_types(&journal).await,
-        ["session", "access_mode_change"],
-        "the journal's first batch is the header then the inherited mode"
+    // The opening batch is a PREFIX invariant, not an exact snapshot: the
+    // read races the live run, which may already have appended turn rows
+    // by the time the file lands on disk. Only the first two rows are
+    // ordered by construction.
+    let row_types = journal_row_types(&journal).await;
+    assert!(
+        row_types.starts_with(&["session".to_string(), "access_mode_change".to_string()]),
+        "the journal's first batch is the header then the inherited mode, got {row_types:?}"
     );
     assert_eq!(
         access_mode_rows(&journal).await[0]["mode"],

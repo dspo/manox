@@ -42,6 +42,11 @@ pub fn to_request(context: &AgentContext, options: &StreamOptions) -> ResponsesP
         tools: tools_param(context),
         reasoning,
         include,
+        // Unlike the completions path, the key is not gated on the official
+        // endpoint: `prompt_cache_key` is part of the Responses API shape, so
+        // a compatible endpoint that implements caching is expected to honor
+        // (or ignore) it. Hosts that must stay byte-identical with a stricter
+        // gateway keep caching off via `CacheRetention::None`.
         prompt_cache_key: match context.cache_retention {
             CacheRetention::None => None,
             _ => context.session_id.as_deref().map(clamp_cache_key),

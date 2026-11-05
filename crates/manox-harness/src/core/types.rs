@@ -773,7 +773,9 @@ pub struct StreamOptions {
     pub max_tokens: Option<usize>,
     /// Temperature override.
     pub temperature: Option<f32>,
-    /// Extra headers merged into every request, e.g. gateway auth.
+    /// Extra headers merged into every request, e.g. gateway auth. Values
+    /// may carry `{{ session_id }}`, rendered per request against the
+    /// turn's session id; an unrenderable template drops the header.
     pub headers: Vec<(String, String)>,
     /// Per-request timeout; `None` uses the client's default.
     pub timeout: Option<std::time::Duration>,

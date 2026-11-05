@@ -101,17 +101,20 @@ impl StreamFn for AnthropicStreamFn {
             .map_err(|e| anyhow::anyhow!("request payload serialization failed: {e}"))?;
         let url = format!("{}/v1/messages", self.base_url);
 
-        // Extra headers are merged into every request; invalid names or
-        // values are a configuration bug and surface at the first call.
-        let extra_headers: reqwest::header::HeaderMap = options
-            .headers
-            .iter()
-            .filter_map(|(k, v)| {
-                let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).ok()?;
-                let value = v.parse().ok()?;
-                Some((name, value))
-            })
-            .collect();
+        // Extra headers are merged into every request; `{{ session_id }}`
+        // templates render against this request's session. Unrenderable
+        // templates and invalid names or values drop the header — a
+        // configuration bug surfaces as the provider's own complaint, not
+        // braces on the wire.
+        let mut extra_headers = crate::core::provider::build_extra_headers(
+            &options.headers,
+            context.session_id.as_deref(),
+        );
+        // The builder owns these protocol headers, so a config-supplied
+        // same-name entry is dropped rather than sent as a second value.
+        for owned in ["x-api-key", "anthropic-version", "content-type"] {
+            extra_headers.remove(owned);
+        }
         let response = retry::send_with_retry(
             |payload| {
                 let mut builder = self
@@ -1027,8 +1030,146 @@ mod tests {
         addr
     }
 
+    /// Serve one SSE body per connection and capture each request's raw
+    /// head — the wire-level assertions for config-supplied headers.
+    async fn serve_capture(body: String, captured: Arc<std::sync::Mutex<Vec<String>>>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..read]).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        addr
+    }
+
+    /// A complete, successful SSE exchange: start, stop reason, stop.
+    fn complete_stream_body() -> String {
+        format!(
+            "{MESSAGE_START}data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}}}}\n\n{MESSAGE_STOP}"
+        )
+    }
+
     const MESSAGE_START: &str = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-test\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{}}}\n\n";
     const MESSAGE_STOP: &str = "data: {\"type\":\"message_stop\"}\n\n";
+
+    /// A config header carrying `{{ session_id }}` rides the request with
+    /// the turn's session id rendered in.
+    #[tokio::test]
+    async fn session_header_template_renders_onto_the_wire() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = serve_capture(complete_stream_body(), Arc::clone(&captured)).await;
+        let mut stream_fn = anthropic_fixture(&addr);
+        stream_fn.options.headers = vec![(
+            "x-opencode-session".to_string(),
+            "go-{{ session_id }}".to_string(),
+        )];
+        let mut context = ctx();
+        context.session_id = Some("sess_77c6f3e6".to_string());
+        let (tx, _rx) = chan();
+        stream_fn
+            .stream(&context, CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        let head = captured.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(
+            head.contains("x-opencode-session: go-sess_77c6f3e6"),
+            "rendered session header must ride the request, got: {head}"
+        );
+    }
+
+    /// A template that cannot render — here: no session id on the turn —
+    /// drops the header instead of shipping braces upstream.
+    #[tokio::test]
+    async fn unrenderable_session_header_drops_off_the_wire() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = serve_capture(complete_stream_body(), Arc::clone(&captured)).await;
+        let mut stream_fn = anthropic_fixture(&addr);
+        stream_fn.options.headers = vec![(
+            "x-opencode-session".to_string(),
+            "{{ session_id }}".to_string(),
+        )];
+        let (tx, _rx) = chan();
+        stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        let head = captured.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(
+            !head.contains("x-opencode-session"),
+            "dropped header must not reach the wire, got: {head}"
+        );
+    }
+
+    /// Provider-owned protocol headers are not configurable: a same-name
+    /// config entry is dropped instead of riding the request as a second
+    /// value alongside the one the builder sets (`x-api-key`, here).
+    #[tokio::test]
+    async fn provider_owned_headers_are_not_duplicated_on_the_wire() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = serve_capture(complete_stream_body(), Arc::clone(&captured)).await;
+        let mut stream_fn = anthropic_fixture(&addr);
+        stream_fn.options.headers = vec![
+            ("x-api-key".to_string(), "from-config".to_string()),
+            ("content-type".to_string(), "text/plain".to_string()),
+        ];
+        let (tx, _rx) = chan();
+        stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        let head = captured.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(
+            !head.contains("from-config"),
+            "config value must not win: {head}"
+        );
+        assert_eq!(head.matches("x-api-key:").count(), 1, "got: {head}");
+        assert_eq!(head.matches("content-type:").count(), 1, "got: {head}");
+    }
+
+    /// The runtime's injected auth header is appended after the configured
+    /// ones, so on a same-name collision it replaces the config value
+    /// instead of putting two `Authorization` values on the wire.
+    #[tokio::test]
+    async fn runtime_auth_header_overrides_a_config_one() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = serve_capture(complete_stream_body(), Arc::clone(&captured)).await;
+        let mut stream_fn = anthropic_fixture(&addr);
+        stream_fn.options.headers = vec![
+            ("Authorization".to_string(), "from-config".to_string()),
+            (
+                "Authorization".to_string(),
+                "Bearer runtime-key".to_string(),
+            ),
+        ];
+        let (tx, _rx) = chan();
+        stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        let head = captured.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(
+            !head.contains("from-config"),
+            "runtime key must win: {head}"
+        );
+        assert!(
+            head.contains("authorization: bearer runtime-key"),
+            "got: {head}"
+        );
+        assert_eq!(head.matches("authorization:").count(), 1, "got: {head}");
+    }
 
     /// A stream that began but never reached `message_stop` was cut short:
     /// the partial reply must not be persisted as a completed response.
