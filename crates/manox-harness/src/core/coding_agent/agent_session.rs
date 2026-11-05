@@ -1140,11 +1140,18 @@ impl AgentSessionBuilder {
 
         let stream_fn = runtime.resolver()(&model)?;
         let resolver = runtime.resolver();
+        // The session's persisted id is what every provider request
+        // attributes itself with — session-aware routing and caching key
+        // off it (OpenAI `prompt_cache_key`, cx endpoints' `{{ session_id
+        // }}` header templates). Read before the session moves into the
+        // harness.
+        let session_id = session.storage().metadata.id.clone();
         let mut harness = AgentHarness::new(session, system_prompt.clone(), model, stream_fn)
             .with_stream_resolver(resolver.clone())
             .with_tools(Arc::from(tools.clone()))
             .with_tool_cwd(cwd.clone())
-            .with_resources(resources);
+            .with_resources(resources)
+            .set_session_id(session_id);
         if let Some(snapshot_dir) = self.snapshot_dir.clone() {
             harness.set_snapshot_dir(snapshot_dir);
         }

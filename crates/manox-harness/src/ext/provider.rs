@@ -59,6 +59,9 @@ struct CxProvider {
     endpoints: BTreeMap<String, EndpointSpec>,
     #[serde(default)]
     models: BTreeMap<String, Option<CxModel>>,
+    /// Headers merged into every request across the provider's endpoints.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
     /// Process env for cx agents — parsed but intentionally not applied to
     /// provider registrations.
     #[serde(default)]
@@ -82,6 +85,9 @@ struct EndpointDetail {
     #[allow(dead_code)] // parsed for schema completeness; bearer_token is
     // covered by the registration's auth_header.
     copilot_auth: Option<String>,
+    /// Endpoint-level headers; same-name keys override the provider's.
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
 }
 
 impl EndpointSpec {
@@ -96,6 +102,13 @@ impl EndpointSpec {
         match self {
             EndpointSpec::Url(_) => &[],
             EndpointSpec::Detail(detail) => &detail.agents,
+        }
+    }
+
+    fn headers(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            EndpointSpec::Url(_) => None,
+            EndpointSpec::Detail(detail) => Some(&detail.headers),
         }
     }
 }
@@ -202,6 +215,18 @@ pub fn register_providers_yaml(
                 continue;
             }
             let name = provider_registration_name(&provider.name, wire_api);
+            // Endpoint headers override same-name provider-level keys;
+            // values may carry `{{ session_id }}` templates rendered at
+            // request time by the wire clients.
+            let mut headers: HashMap<String, String> = provider
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if let Some(endpoint_headers) = spec.headers() {
+                headers.extend(endpoint_headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            let headers = (!headers.is_empty()).then_some(headers);
             registry
                 .register_provider(
                     &name,
@@ -210,7 +235,7 @@ pub fn register_providers_yaml(
                         base_url: Some(spec.url().to_string()),
                         api_key: api_key.clone(),
                         api: Some(api),
-                        headers: None,
+                        headers,
                         auth_header: true,
                         models,
                     },
@@ -675,6 +700,10 @@ mod tests {
 providers:
 - name: DeepSeek
   apikey_source: literal:sk-test
+  # Provider-level headers flow into every endpoint's requests.
+  headers:
+    x-provider-header: from-provider
+    x-shared: from-provider
   endpoints:
     anthropic:
       url: https://api.deepseek.com/anthropic
@@ -691,6 +720,10 @@ providers:
   endpoints:
     anthropic:
       url: https://tp.example.com/apps/anthropic
+      headers:
+        x-endpoint-header: from-endpoint
+        # Endpoint-level keys override same-name provider-level ones.
+        x-shared: from-endpoint
     completions:
       url: https://tp.example.com/compatible-mode/v1
   models:
@@ -727,6 +760,53 @@ agents:
                 "Token Plan-anthropic",
                 "Token Plan-completions",
             ]
+        );
+    }
+
+    /// Provider-level headers flow into every endpoint; endpoint-level
+    /// keys override same-name provider ones; endpoints without any
+    /// header config register none.
+    #[test]
+    fn headers_merge_provider_level_under_endpoint_level() {
+        let registry = register_fixture();
+        let deepseek = registry
+            .provider_config("DeepSeek-anthropic")
+            .expect("deepseek registered");
+        let deepseek_headers = deepseek.headers.expect("provider-level headers kept");
+        assert_eq!(
+            deepseek_headers
+                .get("x-provider-header")
+                .map(String::as_str),
+            Some("from-provider")
+        );
+        assert_eq!(
+            deepseek_headers.get("x-shared").map(String::as_str),
+            Some("from-provider")
+        );
+
+        let token_plan = registry
+            .provider_config("Token Plan-anthropic")
+            .expect("token plan registered");
+        let token_plan_headers = token_plan.headers.expect("endpoint headers kept");
+        assert_eq!(
+            token_plan_headers
+                .get("x-endpoint-header")
+                .map(String::as_str),
+            Some("from-endpoint")
+        );
+        assert_eq!(
+            token_plan_headers.get("x-shared").map(String::as_str),
+            Some("from-endpoint"),
+            "endpoint-level key must override the provider-level one"
+        );
+
+        assert!(
+            registry
+                .provider_config("Token Plan-completions")
+                .expect("completions registered")
+                .headers
+                .is_none(),
+            "an endpoint with no header config carries none"
         );
     }
 

@@ -105,15 +105,19 @@ impl StreamFn for ResponsesStreamFn {
             .map_err(|e| anyhow::anyhow!("request payload serialization failed: {e}"))?;
         let url = format!("{}/responses", self.base_url);
 
-        // Extra headers are merged into every request; invalid names or
-        // values are a configuration bug and surface at the first call.
+        // Extra headers are merged into every request; `{{ session_id }}`
+        // templates render against this request's session. Unrenderable
+        // templates and invalid names or values drop the header — a
+        // configuration bug surfaces as the provider's own complaint, not
+        // braces on the wire.
         let extra_headers: reqwest::header::HeaderMap = options
             .headers
             .iter()
             .filter_map(|(k, v)| {
+                let value =
+                    crate::core::provider::render_header_value(v, context.session_id.as_deref())?;
                 let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).ok()?;
-                let value = v.parse().ok()?;
-                Some((name, value))
+                Some((name, value.parse().ok()?))
             })
             .collect();
         let response = retry::send_with_retry(

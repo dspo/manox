@@ -1143,6 +1143,17 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         }
     }
 
+    /// Pin the session id forwarded into every turn's provider request:
+    /// session-aware providers route and cache by it (OpenAI
+    /// `prompt_cache_key`, cx endpoints' `{{ session_id }}` header
+    /// templates). The concrete session facade wires this from its
+    /// persisted session id — the harness is storage-generic and cannot
+    /// read one itself.
+    pub fn set_session_id(mut self, id: impl Into<String>) -> Self {
+        self.agent.set_session_id(Some(id.into()));
+        self
+    }
+
     /// Run tools against `cwd` instead of the process working directory —
     /// the session's project directory. Rebuilds the execution environment
     /// and tool context so read/bash/grep/find/ls resolve relative paths

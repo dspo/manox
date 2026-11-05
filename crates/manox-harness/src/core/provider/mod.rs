@@ -36,6 +36,31 @@ pub trait RequestObserver: Send + Sync {
     fn after_response(&self, attempt: u32, status: u16, headers: &reqwest::header::HeaderMap);
 }
 
+/// Render a config-supplied header value template against one request's
+/// session identity. Tera syntax — the same engine the prompt templates
+/// use — with `session_id` as the only variable the context carries, so a
+/// template referencing anything else fails to render. Any render failure
+/// (unknown field, missing session id, unclosed braces, a stray `{%` block)
+/// drops the header (`None`) instead of shipping an error upstream.
+/// Autoescape stays off: header values are wire text, never HTML.
+pub fn render_header_value(template: &str, session_id: Option<&str>) -> Option<String> {
+    let mut ctx = tera::Context::new();
+    if let Some(id) = session_id {
+        ctx.insert("session_id", id);
+    }
+    match tera::Tera::one_off(template, &ctx, false) {
+        Ok(rendered) => Some(rendered),
+        Err(err) => {
+            tracing::warn!(
+                template = %template,
+                error = %err,
+                "header template failed to render — header dropped"
+            );
+            None
+        }
+    }
+}
+
 use crate::types::{Cost, Model, Usage};
 
 /// The model's rate card from registration metadata (`cost`, USD per 1M
@@ -114,6 +139,34 @@ mod tests {
     use super::*;
     use crate::types::ThinkingKind;
     use serde_json::json;
+
+    #[test]
+    fn header_template_renders_session_id() {
+        assert_eq!(
+            render_header_value("{{ session_id }}", Some("77c6f3e6")),
+            Some("77c6f3e6".to_string())
+        );
+        // Whitespace inside the braces is insignificant; surrounding text
+        // is preserved verbatim.
+        assert_eq!(
+            render_header_value("prefix-{{session_id}}-suffix", Some("abc")),
+            Some("prefix-abc-suffix".to_string())
+        );
+        assert_eq!(
+            render_header_value("static", Some("abc")),
+            Some("static".to_string())
+        );
+    }
+
+    #[test]
+    fn header_template_drops_when_unrenderable() {
+        // No session id on the request: the placeholder must not reach the
+        // wire.
+        assert_eq!(render_header_value("{{ session_id }}", None), None);
+        // Unsupported fields and malformed braces drop the header too.
+        assert_eq!(render_header_value("{{ model }}", Some("abc")), None);
+        assert_eq!(render_header_value("{{ session_id", Some("abc")), None);
+    }
     use std::collections::HashMap;
 
     fn model_with_cost(card: Option<serde_json::Value>) -> Model {

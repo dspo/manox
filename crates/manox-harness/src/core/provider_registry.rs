@@ -137,7 +137,9 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
     /// Provider-level protocol; models inherit it unless they override.
     pub api: Option<Api>,
-    /// Extra headers merged into every request.
+    /// Extra headers merged into every request. Values may carry
+    /// `{{ session_id }}`, rendered per request against the turn's session
+    /// id; an unrenderable template drops the header.
     pub headers: Option<HashMap<String, String>>,
     /// When true, `Authorization: Bearer <resolved key>` is added on top
     /// of the protocol's native key header.

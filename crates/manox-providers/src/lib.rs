@@ -275,6 +275,10 @@ pub struct ProviderConfig {
     pub models: ProviderModels,
     #[serde(default)]
     pub endpoints: BTreeMap<String, ProviderEndpointSpec>,
+    /// Headers merged into every request across all endpoints. Same-name
+    /// keys lose to the endpoint's own `headers`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
@@ -293,6 +297,29 @@ pub struct ProviderEndpointDetail {
     pub agents: Vec<String>,
     #[serde(default)]
     pub copilot_auth: Option<String>,
+    /// Headers merged into every request on this endpoint. Values may carry
+    /// `{{ session_id }}`, rendered per request from the session identity;
+    /// a value whose placeholders cannot be rendered drops the header.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl ProviderEndpointSpec {
+    pub fn url(&self) -> &str {
+        match self {
+            ProviderEndpointSpec::Url(url) => url,
+            ProviderEndpointSpec::Detailed(detail) => &detail.url,
+        }
+    }
+
+    /// The endpoint's configured request headers; `None` for the plain-URL
+    /// form (which carries no header map).
+    pub fn headers(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            ProviderEndpointSpec::Url(_) => None,
+            ProviderEndpointSpec::Detailed(detail) => Some(&detail.headers),
+        }
+    }
 }
 
 /// A normalized endpoint (wire_api → url + agents + copilot_auth + the models it serves).
@@ -1673,6 +1700,12 @@ providers:
                 url: "https://example.com/anthropic".into(),
                 agents: vec!["claude".into()],
                 copilot_auth: Some("bearer_token".into()),
+                headers: [(
+                    "X-Opencode-Session".to_string(),
+                    "{{ session_id }}".to_string(),
+                )]
+                .into_iter()
+                .collect(),
             }),
         );
         let config = CxConfig {
@@ -1681,6 +1714,9 @@ providers:
                 apikey_source: Some("literal:sk-test".into()),
                 models: ProviderModels::Inline(models),
                 endpoints,
+                headers: [("x-common".to_string(), "provider-level".to_string())]
+                    .into_iter()
+                    .collect(),
                 env: [("MANOX_PROMPT_CACHING".into(), "full".into())]
                     .into_iter()
                     .collect(),
@@ -1722,11 +1758,19 @@ providers:
             provider.env.get("MANOX_PROMPT_CACHING").map(String::as_str),
             Some("full")
         );
+        assert_eq!(
+            provider.headers.get("x-common").map(String::as_str),
+            Some("provider-level")
+        );
         match provider.endpoints.get("anthropic").unwrap() {
             ProviderEndpointSpec::Detailed(detail) => {
                 assert_eq!(detail.url, "https://example.com/anthropic");
                 assert_eq!(detail.agents, vec!["claude".to_string()]);
                 assert_eq!(detail.copilot_auth.as_deref(), Some("bearer_token"));
+                assert_eq!(
+                    detail.headers.get("X-Opencode-Session").map(String::as_str),
+                    Some("{{ session_id }}")
+                );
             }
             ProviderEndpointSpec::Url(_) => panic!("endpoint detail lost in round trip"),
         }
