@@ -4,8 +4,10 @@
 //! Model-visible prompts live as `.tera.md` text files under `templates/`,
 //! embedded at compile time. Business code constructs typed
 //! [`data`] payloads (or [`draft`]s) and hands them to [`renderer::render`],
-//! which is the only place outside tests that touches `tera::`. No `format!` /
-//! `push_str` / `replace()` of model prose is permitted outside this module.
+//! which is the only place in this crate outside tests that touches `tera::`
+//! (provider header-value templates render in `manox-harness` instead). No
+//! `format!` / `push_str` / `replace()` of model prose is permitted outside
+//! this module.
 //!
 //! Layout:
 //! - [`template`] — the [`PromptTemplate`] enum (every built-in key) + `ALL`.

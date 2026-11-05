@@ -1149,7 +1149,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// templates). The concrete session facade wires this from its
     /// persisted session id — the harness is storage-generic and cannot
     /// read one itself.
-    pub fn set_session_id(mut self, id: impl Into<String>) -> Self {
+    pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
         self.agent.set_session_id(Some(id.into()));
         self
     }

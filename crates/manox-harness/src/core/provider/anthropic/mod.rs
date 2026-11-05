@@ -106,16 +106,15 @@ impl StreamFn for AnthropicStreamFn {
         // templates and invalid names or values drop the header — a
         // configuration bug surfaces as the provider's own complaint, not
         // braces on the wire.
-        let extra_headers: reqwest::header::HeaderMap = options
-            .headers
-            .iter()
-            .filter_map(|(k, v)| {
-                let value =
-                    crate::core::provider::render_header_value(v, context.session_id.as_deref())?;
-                let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).ok()?;
-                Some((name, value.parse().ok()?))
-            })
-            .collect();
+        let mut extra_headers = crate::core::provider::build_extra_headers(
+            &options.headers,
+            context.session_id.as_deref(),
+        );
+        // The builder owns these protocol headers, so a config-supplied
+        // same-name entry is dropped rather than sent as a second value.
+        for owned in ["x-api-key", "anthropic-version", "content-type"] {
+            extra_headers.remove(owned);
+        }
         let response = retry::send_with_retry(
             |payload| {
                 let mut builder = self
@@ -1113,6 +1112,65 @@ mod tests {
             "dropped header must not reach the wire, got: {head}"
         );
     }
+
+    /// Provider-owned protocol headers are not configurable: a same-name
+    /// config entry is dropped instead of riding the request as a second
+    /// value alongside the one the builder sets (`x-api-key`, here).
+    #[tokio::test]
+    async fn provider_owned_headers_are_not_duplicated_on_the_wire() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = serve_capture(complete_stream_body(), Arc::clone(&captured)).await;
+        let mut stream_fn = anthropic_fixture(&addr);
+        stream_fn.options.headers = vec![
+            ("x-api-key".to_string(), "from-config".to_string()),
+            ("content-type".to_string(), "text/plain".to_string()),
+        ];
+        let (tx, _rx) = chan();
+        stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        let head = captured.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(
+            !head.contains("from-config"),
+            "config value must not win: {head}"
+        );
+        assert_eq!(head.matches("x-api-key:").count(), 1, "got: {head}");
+        assert_eq!(head.matches("content-type:").count(), 1, "got: {head}");
+    }
+
+    /// The runtime's injected auth header is appended after the configured
+    /// ones, so on a same-name collision it replaces the config value
+    /// instead of putting two `Authorization` values on the wire.
+    #[tokio::test]
+    async fn runtime_auth_header_overrides_a_config_one() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = serve_capture(complete_stream_body(), Arc::clone(&captured)).await;
+        let mut stream_fn = anthropic_fixture(&addr);
+        stream_fn.options.headers = vec![
+            ("Authorization".to_string(), "from-config".to_string()),
+            (
+                "Authorization".to_string(),
+                "Bearer runtime-key".to_string(),
+            ),
+        ];
+        let (tx, _rx) = chan();
+        stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        let head = captured.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(
+            !head.contains("from-config"),
+            "runtime key must win: {head}"
+        );
+        assert!(
+            head.contains("authorization: bearer runtime-key"),
+            "got: {head}"
+        );
+        assert_eq!(head.matches("authorization:").count(), 1, "got: {head}");
+    }
+
     /// A stream that began but never reached `message_stop` was cut short:
     /// the partial reply must not be persisted as a completed response.
     #[tokio::test]

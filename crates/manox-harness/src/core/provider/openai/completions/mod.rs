@@ -113,16 +113,16 @@ impl StreamFn for CompletionsStreamFn {
         // templates and invalid names or values drop the header — a
         // configuration bug surfaces as the provider's own complaint, not
         // braces on the wire.
-        let extra_headers: reqwest::header::HeaderMap = options
-            .headers
-            .iter()
-            .filter_map(|(k, v)| {
-                let value =
-                    crate::core::provider::render_header_value(v, context.session_id.as_deref())?;
-                let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).ok()?;
-                Some((name, value.parse().ok()?))
-            })
-            .collect();
+        let mut extra_headers = crate::core::provider::build_extra_headers(
+            &options.headers,
+            context.session_id.as_deref(),
+        );
+        // The builder owns the bearer auth and content-type headers, so a
+        // config-supplied same-name entry is dropped rather than sent as a
+        // second value (the runtime's key wins, as documented).
+        for owned in ["authorization", "content-type"] {
+            extra_headers.remove(owned);
+        }
         let response = retry::send_with_retry(
             |payload| {
                 let mut builder = self

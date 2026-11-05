@@ -203,6 +203,7 @@ pub async fn run_title_agent(
     runtime: &ModelRuntime,
     session_model: &HarnessModel,
     cwd: &Path,
+    session_id: &str,
     request: &TitleRequest,
 ) -> anyhow::Result<Option<String>> {
     let policy = crate::settings::side_calls().title_policy();
@@ -221,6 +222,10 @@ pub async fn run_title_agent(
         Arc::new(ToolState::new()),
     ));
     let mut agent = Agent::new(SYSTEM_PROMPT, model, stream, context).with_tools(tools);
+    // Side calls ride the session's provider too, so they must attribute
+    // themselves the same way a turn does: endpoints that render
+    // `{{ session_id }}` into a required header reject a request without it.
+    agent.set_session_id(Some(session_id.to_string()));
     agent.set_stream_resolver(runtime.resolver());
     agent.set_thinking_level(
         crate::settings::side_call_effort(

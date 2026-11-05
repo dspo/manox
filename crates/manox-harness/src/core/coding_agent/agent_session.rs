@@ -1151,7 +1151,7 @@ impl AgentSessionBuilder {
             .with_tools(Arc::from(tools.clone()))
             .with_tool_cwd(cwd.clone())
             .with_resources(resources)
-            .set_session_id(session_id);
+            .with_session_id(session_id);
         if let Some(snapshot_dir) = self.snapshot_dir.clone() {
             harness.set_snapshot_dir(snapshot_dir);
         }

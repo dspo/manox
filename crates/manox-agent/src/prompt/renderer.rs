@@ -1,5 +1,7 @@
-//! The single Tera instance + the only place outside tests that touches
-//! `tera::`.
+//! The single Tera instance for **prompt** rendering, and the only place in
+//! this crate outside tests that touches `tera::` (the provider layer's
+//! per-request header-value templates are the one other site, in
+//! `manox-harness`).
 //!
 //! Every model-visible prompt is rendered here. The module boundary rule:
 //! callers pass a [`PromptTemplate`] key + a [`Serialize`] payload and get a

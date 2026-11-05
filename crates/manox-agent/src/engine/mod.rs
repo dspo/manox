@@ -1250,6 +1250,7 @@ async fn run_actor(
         Arc::clone(&live_mirror),
         state.goal_bridge.clone(),
         session.path().to_path_buf(),
+        session.session_id().to_string(),
         cwd.clone(),
         cmd_tx.clone(),
         load_title_scheduler(
@@ -1867,6 +1868,7 @@ async fn run_actor(
                 let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
                 title_scheduler.retarget(
                     path.clone(),
+                    session.session_id().to_string(),
                     cwd.clone(),
                     load_title_scheduler(
                         &sessions_dir,
@@ -2018,6 +2020,10 @@ struct TitleScheduler {
     live: Arc<Mutex<LiveTranscript>>,
     goal: Option<Arc<crate::goal_tools::GoalBridge>>,
     session_path: Arc<Mutex<PathBuf>>,
+    /// Session id the title side call attributes its provider request with —
+    /// endpoints that template `{{ session_id }}` into a required header
+    /// reject requests without it.
+    session_id: Arc<Mutex<String>>,
     cwd: Arc<Mutex<PathBuf>>,
     cmd_tx: mpsc::UnboundedSender<SessionCmd>,
 }
@@ -2030,6 +2036,7 @@ impl TitleScheduler {
         live: Arc<Mutex<LiveTranscript>>,
         goal: Option<Arc<crate::goal_tools::GoalBridge>>,
         session_path: PathBuf,
+        session_id: String,
         cwd: PathBuf,
         cmd_tx: mpsc::UnboundedSender<SessionCmd>,
         persisted: PersistedTitleScheduler,
@@ -2045,13 +2052,21 @@ impl TitleScheduler {
             live,
             goal,
             session_path: Arc::new(Mutex::new(session_path)),
+            session_id: Arc::new(Mutex::new(session_id)),
             cwd: Arc::new(Mutex::new(cwd)),
             cmd_tx,
         }
     }
 
-    fn retarget(&self, session_path: PathBuf, cwd: PathBuf, persisted: PersistedTitleScheduler) {
+    fn retarget(
+        &self,
+        session_path: PathBuf,
+        session_id: String,
+        cwd: PathBuf,
+        persisted: PersistedTitleScheduler,
+    ) {
         *self.session_path.lock().unwrap() = session_path;
+        *self.session_id.lock().unwrap() = session_id;
         *self.cwd.lock().unwrap() = cwd;
         let generation = self.state.lock().unwrap().generation.wrapping_add(1);
         *self.state.lock().unwrap() = TitleSchedulerState {
@@ -2153,9 +2168,11 @@ impl TitleScheduler {
         };
         let model = self.model.lock().unwrap().clone();
         let cwd = self.cwd.lock().unwrap().clone();
+        let session_id = self.session_id.lock().unwrap().clone();
         let result = match model {
             Some(model) => {
-                crate::title::run_title_agent(&self.runtime, &model, &cwd, &request).await
+                crate::title::run_title_agent(&self.runtime, &model, &cwd, &session_id, &request)
+                    .await
             }
             None => Ok(None),
         };
@@ -2221,6 +2238,7 @@ mod title_scheduler_tests {
             Arc::new(Mutex::new(LiveTranscript::default())),
             None,
             PathBuf::new(),
+            "sess_test".to_string(),
             PathBuf::new(),
             tx,
             PersistedTitleScheduler::default(),

@@ -276,7 +276,8 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub endpoints: BTreeMap<String, ProviderEndpointSpec>,
     /// Headers merged into every request across all endpoints. Same-name
-    /// keys lose to the endpoint's own `headers`.
+    /// keys lose to the endpoint's own `headers` (names compare
+    /// case-insensitively, as HTTP header names do).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -311,14 +312,31 @@ impl ProviderEndpointSpec {
             ProviderEndpointSpec::Detailed(detail) => &detail.url,
         }
     }
+}
 
-    /// The endpoint's configured request headers; `None` for the plain-URL
-    /// form (which carries no header map).
-    pub fn headers(&self) -> Option<&BTreeMap<String, String>> {
-        match self {
-            ProviderEndpointSpec::Url(_) => None,
-            ProviderEndpointSpec::Detailed(detail) => Some(&detail.headers),
+impl ProviderConfig {
+    /// Effective request headers for the endpoint serving `wire_api`: the
+    /// provider's own map overlaid by that endpoint's, with same-name keys
+    /// compared case-insensitively (HTTP header names do) losing to the
+    /// endpoint. An endpoint written in the plain-URL form carries just the
+    /// provider-level headers.
+    pub fn request_headers(&self, wire_api: WireApi) -> BTreeMap<String, String> {
+        let mut headers: BTreeMap<String, String> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+            .collect();
+        let endpoint = self
+            .endpoints
+            .iter()
+            .find(|(key, _)| WireApi::from_str(key) == wire_api)
+            .map(|(_, spec)| spec);
+        if let Some(ProviderEndpointSpec::Detailed(detail)) = endpoint {
+            for (name, value) in &detail.headers {
+                headers.insert(name.to_ascii_lowercase(), value.clone());
+            }
         }
+        headers
     }
 }
 
@@ -1676,6 +1694,64 @@ providers:
         let migrated = migrate_legacy_root_provider_config(&current_path, &old_root).unwrap();
         assert!(!migrated);
         assert!(!current_path.exists());
+    }
+
+    /// Endpoint headers override provider-level ones, case-insensitively;
+    /// a plain-URL endpoint carries just the provider-level map.
+    #[test]
+    fn request_headers_merge_endpoint_over_provider_case_insensitively() {
+        let mut endpoints = BTreeMap::new();
+        endpoints.insert(
+            "anthropic".to_string(),
+            ProviderEndpointSpec::Detailed(ProviderEndpointDetail {
+                url: "https://example.com/anthropic".into(),
+                agents: Vec::new(),
+                copilot_auth: None,
+                headers: [
+                    ("x-shared".to_string(), "from-endpoint".to_string()),
+                    ("X-Endpoint".to_string(), "ep".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+        );
+        endpoints.insert(
+            "responses".to_string(),
+            ProviderEndpointSpec::Url("https://example.com/v1".into()),
+        );
+        let provider = ProviderConfig {
+            name: "P".into(),
+            apikey_source: None,
+            models: ProviderModels::Inline(BTreeMap::new()),
+            endpoints,
+            headers: [
+                ("X-Shared".to_string(), "from-provider".to_string()),
+                ("x-common".to_string(), "common".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            env: BTreeMap::new(),
+        };
+
+        let anthropic = provider.request_headers(WireApi::Anthropic);
+        assert_eq!(
+            anthropic.get("x-shared").map(String::as_str),
+            Some("from-endpoint"),
+            "the differently-cased endpoint key must still override"
+        );
+        assert_eq!(anthropic.get("x-endpoint").map(String::as_str), Some("ep"));
+        assert_eq!(
+            anthropic.get("x-common").map(String::as_str),
+            Some("common")
+        );
+        assert_eq!(anthropic.len(), 3, "one entry per header name");
+
+        let responses = provider.request_headers(WireApi::Responses);
+        assert_eq!(
+            responses.get("x-shared").map(String::as_str),
+            Some("from-provider")
+        );
+        assert_eq!(responses.len(), 2);
     }
 
     #[test]
