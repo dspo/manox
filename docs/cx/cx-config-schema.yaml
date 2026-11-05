@@ -13,11 +13,19 @@
 providers:
   - name: "string (required, unique)"
     apikey_source: "string (optional)"
+    # 请求级 header，合并进本 provider 全部 endpoint 的每次请求；
+    # 值支持 Tera 模板（见 docs/cx/request-headers.md）
+    headers:
+      Header-Name: "string (optional; 值支持 {{ session_id }} 模板)"
     endpoints:
       anthropic:
         url: "string (required)"
         agents: ["string (optional override filter)"]
         copilot_auth: "enum: api_key | bearer_token (optional; bearer_token sends the Bearer auth header)"
+        # endpoint 级 header；同名键覆盖 provider 级。值支持 Tera 模板，
+        # 渲染失败（引用了不存在的变量等）时该 header 整条丢弃
+        headers:
+          Header-Name: "string (optional; 值支持 {{ session_id }} 模板)"
       responses:
         url: "string (required)"
       completions:
