@@ -1349,6 +1349,21 @@ impl ThreadStore {
         &mut self,
         id: &str,
     ) -> Result<Option<ThreadHandle>, crate::session_lease::LeaseError> {
+        self.load_thread_with_roots(id, &[])
+    }
+
+    /// `load_thread` with a create's declared grant group folded in. A
+    /// seeded create materializes its journal synchronously but queues its
+    /// sidecar write with the asynchronous meta-write batch, so the
+    /// synchronous open right behind it cannot read the grants back from
+    /// disk — the declared roots ride the open itself, the same
+    /// construction-time seam `new_fresh`/`new_in_project` use for the
+    /// deferred create.
+    pub fn load_thread_with_roots(
+        &mut self,
+        id: &str,
+        declared_roots: &[String],
+    ) -> Result<Option<ThreadHandle>, crate::session_lease::LeaseError> {
         if let Some(weak) = self.live_threads.get(id)
             && let Some(handle) = ThreadHandle::upgrade(weak)
         {
@@ -1362,7 +1377,21 @@ impl ThreadStore {
             .summary_by_id(id)
             .map(|s| PathBuf::from(s.project.clone()))
             .unwrap_or_else(|| PathBuf::from("."));
-        let handle = Thread::open_existing(ThreadId(id.to_string()), cwd, path.clone(), lease);
+        // Multi-root restore (multi-working-dirs): declared and pending lead
+        // (the sidecar write is asynchronous — a set queued moments ago is
+        // not on disk yet), the sidecar's settled entries dedup behind, and
+        // the snapshot rides the open: the spawn admits every root with no
+        // post-spawn grant race. The snapshot is read before the flush
+        // below, which consumes the pending entries.
+        let mut roots: Vec<PathBuf> = declared_roots.iter().map(PathBuf::from).collect();
+        for dir in self.restorable_working_directories(id, &path) {
+            if !roots.contains(&dir) {
+                roots.push(dir);
+            }
+        }
+        self.flush_working_dirs_if_materialized(id);
+        let handle =
+            Thread::open_existing(ThreadId(id.to_string()), cwd, path.clone(), lease, &roots);
         // Re-surface the bound project from the sidecar so the chip shows it.
         if let Some(sum) = self.summary_by_id(id)
             && !sum.project.is_empty()
@@ -1370,34 +1399,37 @@ impl ThreadStore {
             let dir = PathBuf::from(&sum.project);
             handle.with_mut(|t| t.restore_project(dir));
         }
-        // Multi-root restore (multi-working-dirs): the sidecar's granted
-        // directories re-widen the restored engine's fence — `open`
-        // spawned it cwd-only.
-        self.flush_working_dirs_if_materialized(id);
-        for dir in self.persisted_working_directories(&path) {
-            handle.with_mut(|t| t.grant_working_directory(dir));
-        }
         self.live_threads.insert(id.to_string(), handle.downgrade());
         Ok(Some(handle))
     }
 
-    /// The sidecar's granted working directories for a session file, read
-    /// synchronously (multi-root restore). The scan cache is not
-    /// consulted: a cold id seeded through `note_session_path` has no
-    /// indexed row yet, and one bounded read beats a refresh round-trip.
-    fn persisted_working_directories(&self, path: &std::path::Path) -> Vec<PathBuf> {
+    /// The granted working directories a cold open rides in: the create's
+    /// pending grants (its sidecar write is asynchronous, so a set queued
+    /// moments ago is not on disk yet) unioned with the sidecar's settled
+    /// set, pending first, deduplicated. Read this BEFORE
+    /// `flush_working_dirs_if_materialized`, which consumes the pending
+    /// entries. The scan cache is not consulted: a cold id seeded through
+    /// `note_session_path` has no indexed row yet, and one bounded read
+    /// beats a refresh round-trip.
+    fn restorable_working_directories(&self, id: &str, path: &std::path::Path) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self
+            .pending_working_dirs
+            .get(id)
+            .map(|pending| pending.iter().map(PathBuf::from).collect())
+            .unwrap_or_default();
         let meta = manox_harness::session_meta::meta_path(&self.sessions_dir, path);
-        let Ok(json) = std::fs::read_to_string(&meta) else {
-            return Vec::new();
-        };
-        serde_json::from_str::<manox_harness::session_meta::SessionMeta>(&json)
-            .map(|m| {
-                m.working_directories
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .collect()
-            })
-            .unwrap_or_default()
+        if let Ok(json) = std::fs::read_to_string(&meta)
+            && let Ok(meta) =
+                serde_json::from_str::<manox_harness::session_meta::SessionMeta>(&json)
+        {
+            for dir in meta.working_directories {
+                let dir = PathBuf::from(dir);
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        dirs
     }
 
     /// Seed one session path from an authoritative on-disk probe: a cold

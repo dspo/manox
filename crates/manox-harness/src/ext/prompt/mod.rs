@@ -106,10 +106,36 @@ struct AssemblyData<'a> {
     base: &'a str,
     cwd: String,
     context_files: Vec<CtxFileData>,
+    /// The effective root group the template renders; the section appears
+    /// only when it holds more than one entry (primary first).
+    project_roots: Vec<ProjectRootData>,
     /// Kernel parity: harness skills are advertised only when the `Read`
     /// tool is active.
     skills_advertised: bool,
     skills: Vec<AdvSkillData>,
+}
+
+/// One root of the effective group in the fold; `primary` annotates the
+/// session cwd's entry, which always leads.
+#[derive(Serialize)]
+struct ProjectRootData {
+    path: String,
+    primary: bool,
+}
+
+/// The fold's root list is the effective group — session cwd first
+/// (primary), the declared grant set deduped behind it — mirroring the
+/// kernel fold, so both renderers teach the same primary regardless of the
+/// order a client declared or where a project-less create actually runs.
+fn project_roots_data(cwd: &std::path::Path, declared: &[PathBuf]) -> Vec<ProjectRootData> {
+    crate::core::system_prompt::effective_project_roots(cwd, declared)
+        .iter()
+        .enumerate()
+        .map(|(index, root)| ProjectRootData {
+            path: root.display().to_string(),
+            primary: index == 0,
+        })
+        .collect()
 }
 
 fn assembly_data<'a>(
@@ -129,6 +155,7 @@ fn assembly_data<'a>(
                 content: f.content.clone(),
             })
             .collect(),
+        project_roots: project_roots_data(cwd, &resources.project_roots),
         skills_advertised: active_tools.iter().any(|t| t == "Read") && !resources.skills.is_empty(),
         skills: resources
             .skills
@@ -241,6 +268,7 @@ pub fn render_golden_fixture() -> String {
                 content: "r1".into(),
             },
         ],
+        project_roots: vec![],
     };
     let active_tools = vec![
         "Read".to_string(),
@@ -283,6 +311,59 @@ mod tests {
                 std::path::Path::new("/private/tmp/golden-proj")
             ),
             include_str!("../../../testdata/fold_prompt.golden.txt"),
+        );
+    }
+
+    /// A multi-root session folds the project-root section after the cwd
+    /// line, first root annotated primary; the byte-pin golden above (no
+    /// roots) proves the single-root/empty renders stay byte-identical.
+    #[test]
+    fn the_fold_lists_project_roots_when_more_than_one_is_declared() {
+        let build = |roots: &[PathBuf]| {
+            let resources = crate::core::harness::HarnessResources {
+                project_roots: roots.to_vec(),
+                ..Default::default()
+            };
+            let builder = base_prompt_builder("Base.".to_string(), PathBuf::from("/proj"));
+            builder(&[], &resources, std::path::Path::new("/proj"))
+        };
+        let prompt = build(&[
+            PathBuf::from("/proj"),
+            PathBuf::from("/other-repo"),
+            PathBuf::from("/third"),
+        ]);
+        assert!(
+            prompt.ends_with(
+                "Current working directory: /proj\n\
+                 \n\
+                 Project roots (all accessible; the first is primary):\n\
+                 - /proj (primary)\n\
+                 - /other-repo\n\
+                 - /third\n"
+            ),
+            "the section rides the fold tail: {prompt}"
+        );
+        // One declared root keeps the baseline shape.
+        let single = build(&[PathBuf::from("/proj")]);
+        assert!(
+            !single.contains("Project roots"),
+            "single-root stays baseline: {single}"
+        );
+        assert!(
+            single.ends_with("Current working directory: /proj\n"),
+            "{single}"
+        );
+        // The fold normalizes like the kernel: the session cwd's entry
+        // leads with the primary annotation whatever order the roots
+        // arrived in.
+        let shuffled = build(&[PathBuf::from("/third"), PathBuf::from("/proj")]);
+        assert!(
+            shuffled.contains(
+                "Project roots (all accessible; the first is primary):\n\
+                 - /proj (primary)\n\
+                 - /third\n"
+            ),
+            "the session cwd's entry is primary: {shuffled}"
         );
     }
 }

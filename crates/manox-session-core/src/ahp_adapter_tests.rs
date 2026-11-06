@@ -5409,6 +5409,162 @@ mod create_intent {
         uninstall();
     }
 
+    /// The desktop's multi-root create: the conversation row names the
+    /// primary as its project, the create intent carries the FULL grant
+    /// group — primary first — and the fold plus the live engine's
+    /// granted-root fence both hold every root, with the declared primary
+    /// as the effective cwd.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_multi_root_create_grants_every_root_with_the_primary_first() {
+        let _guards = install();
+        let _registry = manox_agent::provider_glue::install_for_test_scoped(two_model_registry());
+        let scratch = std::env::temp_dir().join(format!(
+            "manox-multi-root-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        manox_agent::object_store::set_path_for_test(Some(scratch.join("objects.db")));
+        manox_agent::object_store::init();
+        let primary = scratch.join("primary");
+        let secondary = scratch.join("secondary");
+        std::fs::create_dir_all(&primary).expect("primary dir");
+        std::fs::create_dir_all(&secondary).expect("secondary dir");
+        let primary_string = primary.to_string_lossy().into_owned();
+        let secondary_string = secondary.to_string_lossy().into_owned();
+
+        let id = format!("s-multi-root-{}", uuid::Uuid::new_v4().simple());
+        manox_agent::object_store::ObjectStore.create_conversation(&id, Some(&primary_string));
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd.clone());
+        let params = CreateSessionParams {
+            channel: session::uri(&id),
+            meta: None,
+            provider: None,
+            working_directories: Some(vec![
+                format!("file://{primary_string}"),
+                format!("file://{secondary_string}"),
+            ]),
+            config: None,
+            active_client: None,
+            progress_token: None,
+        };
+        backend
+            .create_session(&id, &params)
+            .expect("the create lands");
+
+        // The channel state carries the full grant group, insertion order
+        // preserved (the declared primary seats first, as the effective cwd).
+        let state = backend
+            .session_state(&id)
+            .expect("the create seeds the session");
+        let dirs = state.working_directories.expect("granted dirs");
+        let primary_uri = format!("file://{primary_string}");
+        let secondary_uri = format!("file://{secondary_string}");
+        assert_eq!(
+            dirs.first().map(String::as_str),
+            Some(primary_uri.as_str()),
+            "the declared primary seats first: {dirs:?}"
+        );
+        assert!(
+            dirs.contains(&secondary_uri),
+            "the secondary is granted: {dirs:?}"
+        );
+        assert_eq!(
+            state
+                .config
+                .expect("config seat")
+                .values
+                .get("workingDirectory"),
+            Some(&serde_json::Value::String(primary_string.clone())),
+            "the effective cwd is the declared primary"
+        );
+
+        // The live engine's fence holds the whole root set the moment the
+        // thread exists — construction-time grants, no spawn race.
+        let thread = server
+            .ahp_inner()
+            .session_thread(&id)
+            .expect("the create seats the thread");
+        let granted = thread.with_mut(|t| t.granted_working_directories());
+        let canon_primary = manox_harness::sandbox::canonicalize_best_effort(&primary);
+        let canon_secondary = manox_harness::sandbox::canonicalize_best_effort(&secondary);
+        assert!(
+            granted.contains(&canon_primary) && granted.contains(&canon_secondary),
+            "every declared root is granted on the engine: {granted:?}"
+        );
+
+        manox_agent::object_store::set_path_for_test(None);
+        uninstall();
+    }
+
+    /// The seeded create (hidden context blocks) opens through the
+    /// cold-restore path, and its sidecar write is asynchronous — the
+    /// declared grant group must ride the open itself, or the fence spawns
+    /// without the roots and stays blind to them for the session's whole
+    /// life (the sidecar never re-reads into a live engine).
+    ///
+    /// The AHP `CreateSessionParams` carry no `seed`, so only a direct
+    /// `create_session_request` reaches this branch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_seeded_multi_root_create_grants_every_root_on_the_cold_open() {
+        let _guards = install();
+        let _registry = manox_agent::provider_glue::install_for_test_scoped(two_model_registry());
+        let scratch = std::env::temp_dir().join(format!(
+            "manox-seeded-multi-root-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        manox_agent::object_store::set_path_for_test(None);
+        let primary = scratch.join("primary");
+        let secondary = scratch.join("secondary");
+        std::fs::create_dir_all(&primary).expect("primary dir");
+        std::fs::create_dir_all(&secondary).expect("secondary dir");
+        let primary_string = primary.to_string_lossy().into_owned();
+        let secondary_string = secondary.to_string_lossy().into_owned();
+
+        let id = format!("s-seeded-multi-root-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let intent = crate::agent_server::SessionIntent {
+            session_id: Some(id.clone()),
+            cwd: Some(primary_string.clone()),
+            project: None,
+            initial_model: None,
+            access_mode: None,
+            reasoning_effort: None,
+            seed: Some(vec![serde_json::json!({
+                "type": "text",
+                "text": "hidden context the client dropped before the first turn"
+            })]),
+            working_directories: vec![primary_string.clone(), secondary_string.clone()],
+        };
+        let inner = Arc::clone(server.ahp_inner());
+        crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
+            .await
+            .expect("the seeded create lands");
+
+        // The live engine's fence holds the whole root set the moment the
+        // thread exists — the declared group rode the cold open, not the
+        // sidecar write that is still in flight.
+        let thread = server
+            .ahp_inner()
+            .session_thread(&id)
+            .expect("the seeded create seats the thread");
+        let granted = thread.with_mut(|t| t.granted_working_directories());
+        let canon_primary = manox_harness::sandbox::canonicalize_best_effort(&primary);
+        let canon_secondary = manox_harness::sandbox::canonicalize_best_effort(&secondary);
+        assert!(
+            granted.contains(&canon_primary) && granted.contains(&canon_secondary),
+            "every declared root is granted on the engine: {granted:?}"
+        );
+
+        uninstall();
+    }
+
     /// A seed that arrives after a deferred session's rows were appended
     /// still folds them.
     ///

@@ -31,10 +31,32 @@ const TOOL_SNIPPETS: &[(&str, &str)] = &[
     ("Ls", "List directory contents"),
 ];
 
+/// The root list a prompt renders from a session cwd and the declared
+/// grant set: the cwd leads (tools resolve there by default, so it is the
+/// primary), declared roots follow in declaration order, duplicates
+/// collapse to the first occurrence. Plain path equality — the renderer
+/// never touches the filesystem. This keeps the adjacent "Current working
+/// directory" line and the root section truthful when a client ordered the
+/// group differently or a project-less create runs in its unfiled
+/// workspace: the primary always names the directory the session actually
+/// resolves in.
+pub(crate) fn effective_project_roots(
+    cwd: &std::path::Path,
+    declared: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::with_capacity(declared.len() + 1);
+    roots.push(cwd.to_path_buf());
+    roots.extend(declared.iter().cloned());
+    let mut seen = std::collections::HashSet::new();
+    roots.retain(|root| seen.insert(root.clone()));
+    roots
+}
+
 pub fn build_harness_prompt(
     base: &str,
     cwd: &std::path::Path,
     active_tools: &[String],
+    project_roots: &[std::path::PathBuf],
     context_files: &[crate::harness::ContextFile],
     skills: &[crate::harness::Skill],
     custom: bool,
@@ -109,6 +131,21 @@ pub fn build_harness_prompt(
         }
     }
     prompt.push_str(&format!("\nCurrent working directory: {}\n", cwd.display()));
+    // The project-root section only exists for a multi-root session; a
+    // single root (and an empty set) keeps the prompt byte-identical to the
+    // cwd-only baseline. The rendered group is the effective set — the
+    // session cwd first (primary), the declared roots deduped behind it.
+    let effective_roots = effective_project_roots(cwd, project_roots);
+    if effective_roots.len() > 1 {
+        prompt.push_str("\nProject roots (all accessible; the first is primary):\n");
+        for (index, root) in effective_roots.iter().enumerate() {
+            if index == 0 {
+                prompt.push_str(&format!("- {} (primary)\n", root.display()));
+            } else {
+                prompt.push_str(&format!("- {}\n", root.display()));
+            }
+        }
+    }
     prompt
 }
 
@@ -146,6 +183,7 @@ mod tests {
             DEFAULT_BASE_PROMPT,
             std::path::Path::new("/proj"),
             &tools,
+            &[],
             &context,
             &skills,
             false,
@@ -183,9 +221,90 @@ mod tests {
             std::path::Path::new("/proj"),
             &[],
             &[],
+            &[],
             &skills,
             false,
         );
         assert!(!prompt.contains("<skill"), "{prompt}");
+    }
+
+    #[test]
+    fn multi_root_sessions_list_the_project_roots() {
+        let roots = [
+            std::path::PathBuf::from("/proj"),
+            std::path::PathBuf::from("/other-repo"),
+        ];
+        let prompt = build_harness_prompt(
+            "Base.",
+            std::path::Path::new("/proj"),
+            &[],
+            &roots,
+            &[],
+            &[],
+            false,
+        );
+        assert!(
+            prompt.contains(
+                "\nProject roots (all accessible; the first is primary):\n\
+                 - /proj (primary)\n\
+                 - /other-repo\n"
+            ),
+            "both roots render, primary first: {prompt}"
+        );
+    }
+
+    /// The rendered group is the effective set: the session cwd leads (and
+    /// takes the primary annotation) whatever order the client declared or
+    /// where the create actually runs (a project-less session's unfiled
+    /// workspace), and a repeated root renders once.
+    #[test]
+    fn the_root_section_rides_the_effective_group_cwd_first_deduped() {
+        let roots = [
+            std::path::PathBuf::from("/second"),
+            std::path::PathBuf::from("/proj"),
+            std::path::PathBuf::from("/second"),
+        ];
+        let prompt = build_harness_prompt(
+            "Base.",
+            std::path::Path::new("/proj"),
+            &[],
+            &roots,
+            &[],
+            &[],
+            false,
+        );
+        assert!(
+            prompt.contains(
+                "\nProject roots (all accessible; the first is primary):\n\
+                 - /proj (primary)\n\
+                 - /second\n"
+            ),
+            "cwd leads as primary, duplicates collapse: {prompt}"
+        );
+        assert!(
+            !prompt.contains("- /second\n- /second"),
+            "a repeated root renders once: {prompt}"
+        );
+    }
+
+    /// The compat judgment: a single-root session renders byte-identically
+    /// to a no-roots one — the cwd line stays the only directory prose.
+    #[test]
+    fn single_root_keeps_the_baseline_prompt_byte_identical() {
+        let build = |roots: &[std::path::PathBuf]| {
+            build_harness_prompt(
+                "Base.",
+                std::path::Path::new("/proj"),
+                &[],
+                roots,
+                &[],
+                &[],
+                false,
+            )
+        };
+        let baseline = build(&[]);
+        let single = build(&[std::path::PathBuf::from("/proj")]);
+        assert_eq!(single, baseline);
+        assert!(!baseline.contains("Project roots"), "{baseline}");
     }
 }

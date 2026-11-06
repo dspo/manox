@@ -575,6 +575,10 @@ pub fn spawn_engine(
         },
         last_cwd_note: Mutex::new(None),
     });
+    // The actor's own copy of the declared roots: the prompt's project-root
+    // section is seeded from this construction-time snapshot, never from a
+    // store read that could race the spawn.
+    let project_roots = extra_granted_roots.to_vec();
     // The registry entry lives exactly as long as the actor: its exit
     // unregisters under a channel-identity guard (K3), so a store-level
     // decision after this point takes the cold-append path instead of
@@ -608,6 +612,7 @@ pub fn spawn_engine(
             parent_session,
             actor_bus,
             actor_restore_tx,
+            project_roots,
         )
         .await;
         unregister_engine_route(&registry_thread_id, &actor_cmd_tx);
@@ -1008,6 +1013,7 @@ async fn run_actor(
     parent_session: Option<String>,
     bus: Arc<crate::steer_bus::AgentBus>,
     restore_ready: tokio::sync::watch::Sender<bool>,
+    project_roots: Vec<PathBuf>,
 ) {
     // Session assembly preflights the model against the registry, so resolve
     // only after the one-shot background registration (parallelized per
@@ -1121,6 +1127,7 @@ async fn run_actor(
             &notice_tx,
             state.goal_bridge.as_ref(),
             &state.granted_roots,
+            &project_roots,
             &thread_id,
             None,
             &bus,
@@ -1158,6 +1165,7 @@ async fn run_actor(
                 &notice_tx,
                 state.goal_bridge.as_ref(),
                 &state.granted_roots,
+                &project_roots,
                 &thread_id,
                 parent_session.as_deref(),
                 &bus,
@@ -1858,6 +1866,7 @@ async fn run_actor(
                     &state.gate,
                     state.goal_bridge.as_ref(),
                     &state.granted_roots,
+                    &project_roots,
                     &thread_id,
                     &bus,
                 )

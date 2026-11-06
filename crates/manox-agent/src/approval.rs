@@ -35,13 +35,13 @@ use crate::thread::{AccessMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, send_notice};
 
 /// A refused fs mutation: the sandbox-mode marker (the one vocabulary both
-/// enforcing families teach) plus the same-turn escalation hint. Only the
-/// sandbox mode denies — full access runs unfenced, so there is exactly one
-/// denial word.
-fn fs_denial() -> ToolError {
+/// enforcing families teach) carrying the authorized root set the verdict
+/// judged against, plus the same-turn escalation hint. Only the sandbox mode
+/// denies — full access runs unfenced, so there is exactly one denial word.
+fn fs_denial(authorized_roots: &[std::path::PathBuf]) -> ToolError {
     ToolError::Other(format!(
         "{}\n{}",
-        manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox),
+        manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox, authorized_roots),
         manox_harness::sandbox::escalation_hint_marker("operation")
     ))
 }
@@ -656,10 +656,34 @@ impl ApprovalGatedTool {
     }
 }
 
+/// The root set one sandbox-mode fs call is judged against: the shared
+/// writable roots for the call's directory (workspace + manox home + temp
+/// areas) plus the session's granted roots, canonical, deduplicated,
+/// order-stable. Denial texts list it so a refusal names where access IS
+/// allowed instead of the model learning the fence's shape by trial.
+pub(super) fn fence_roots(
+    cwd: &std::path::Path,
+    granted_roots: Option<&crate::granted_roots::GrantedRoots>,
+) -> Vec<std::path::PathBuf> {
+    let mut candidates = manox_harness::sandbox::writable_roots(AccessMode::Sandbox, cwd);
+    if let Some(granted) = granted_roots {
+        candidates.extend(granted.roots_for(cwd));
+    }
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for candidate in candidates {
+        if !roots.contains(&candidate) {
+            roots.push(candidate);
+        }
+    }
+    roots
+}
+
 /// The one fs containment verdict every enforcing surface shares: the host
 /// gate's `Write`/`Edit`/`Py` check and the subagent snapshot's fence. `deny`
 /// is the caller's refusal text — the host gate teaches the escalation retry,
-/// the subagent fence reports a blocker instead (it has no channel).
+/// the subagent fence reports a blocker instead (it has no channel). Either
+/// way the refusal carries the authorized root set the verdict judged
+/// against, so a denial names where access IS allowed.
 ///
 /// The call's effective cwd is the same `cwd` `[anchor, ...route]` resolution
 /// the tool itself will perform, peeked read-only so the fence does not
@@ -672,9 +696,8 @@ pub(super) fn fs_write_verdict(
     params: &serde_json::Value,
     ctx: &dyn ToolContext,
     granted_roots: Option<&crate::granted_roots::GrantedRoots>,
-    deny: &dyn Fn() -> ToolError,
+    deny: &dyn Fn(&[std::path::PathBuf]) -> ToolError,
 ) -> Result<(), ToolError> {
-    let refuse = || Err(deny());
     let cwd = match manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd")) {
         Ok(cwd) => cwd,
         Err(e) => return Err(ToolError::InvalidArguments(e)),
@@ -685,10 +708,8 @@ pub(super) fn fs_write_verdict(
     // escalation-approved directory stays for the session — no `.git` or
     // plans-dir special-casing: the plans dir is admitted transitively under
     // the manox home.
-    let mut roots = manox_harness::sandbox::writable_roots(AccessMode::Sandbox, &cwd);
-    if let Some(granted) = granted_roots {
-        roots.extend(granted.roots_for(&cwd));
-    }
+    let roots = fence_roots(&cwd, granted_roots);
+    let refuse = || Err(deny(&roots));
     let contained = |target: &Path| {
         let canon = manox_harness::sandbox::canonicalize_best_effort(target);
         roots.iter().any(|r| canon.starts_with(r))
@@ -885,7 +906,7 @@ mod tests {
     /// The one denial word under two tiers: only sandbox mode denies, so the
     /// model-facing marker is a constant fact.
     fn sandbox_denial() -> String {
-        manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox)
+        manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox, &[])
     }
 
     fn gate() -> Arc<ApprovalGate> {
@@ -1186,6 +1207,99 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains(&sandbox_denial()));
         assert_eq!(ran2.load(Ordering::SeqCst), 0);
+    }
+
+    /// The create's multi-root grant group fences exactly like the session
+    /// cwd: writes under the SECONDARY granted root pass the verdict while
+    /// the sticky cwd stays in the primary, and an out-of-roots target is
+    /// refused with a denial that lists the authorized roots — the refusal
+    /// names where access IS allowed.
+    #[tokio::test]
+    async fn sandbox_admits_the_secondary_granted_root_and_lists_roots_on_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        let secondary = dir.path().join("secondary");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&secondary).unwrap();
+        let (gate, _rx) = gate_with_events();
+        gate.set_mode(AccessMode::Sandbox);
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let granted = crate::granted_roots::GrantedRoots::new(&primary);
+        granted.approve(&secondary);
+        let tool = ApprovalGatedTool::new(
+            Arc::new(MockTool {
+                name: "Write",
+                approval: false,
+                read_only: false,
+                fs_paths: true,
+                ran: Arc::clone(&ran),
+            }),
+            Arc::clone(&gate),
+        )
+        .with_granted_roots(granted);
+        let ctx = LocalToolContext::new(
+            Arc::new(TokioExecutionEnv::new(&primary)),
+            primary.clone(),
+            Arc::new(ToolState::new()),
+        );
+        // The secondary root admits itself for writes resolved under it.
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({
+                    "path": secondary.join("probe.txt"),
+                    "cwd": [""],
+                    "content": "x"
+                }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "the secondary root writes like the cwd");
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+        // Outside every root: denied, and the refusal lists the authorized
+        // roots (primary + secondary + the shared writable set). The probe
+        // rides the fenced tool itself: the granted secondary must be named,
+        // or the denial does not actually teach where access IS allowed
+        // (the primary alone would pass even a fence that dropped the
+        // granted set, since the cwd's writable roots cover it).
+        let err = tool
+            .execute(
+                "c2",
+                serde_json::json!({
+                    "path": "/usr/local/manox-secondary-fence-probe.txt",
+                    "cwd": [""],
+                    "content": "x"
+                }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        let denial = err.to_string();
+        assert!(denial.contains(&sandbox_denial()), "{denial}");
+        assert!(
+            denial.contains("Authorized write roots"),
+            "the refusal lists the authorized roots: {denial}"
+        );
+        let canon_primary = manox_harness::sandbox::canonicalize_best_effort(&primary)
+            .display()
+            .to_string();
+        let canon_secondary = manox_harness::sandbox::canonicalize_best_effort(&secondary)
+            .display()
+            .to_string();
+        assert!(
+            denial.contains(&format!("- {canon_primary}")),
+            "the primary root is listed: {denial}"
+        );
+        assert!(
+            denial.contains(&format!("- {canon_secondary}")),
+            "the granted secondary is listed: {denial}"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the denied call never runs");
     }
 
     /// A linked worktree of the session workspace admits itself through the
