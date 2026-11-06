@@ -147,8 +147,21 @@ pub fn validate_escalation_args(
 /// (bash and fs) teach and report, so the model recognizes a policy denial
 /// identically whether the seatbelt refused a bash file effect or the fs fence
 /// refused a mutation. Only the sandbox mode denies; full access runs unfenced.
-pub fn sandbox_denial_marker(mode: AccessMode) -> String {
-    format!("[sandbox: file access denied under {} mode]", mode.wire())
+///
+/// `authorized_roots` appends the root set the denial was judged against, so
+/// a refusal names where access IS allowed instead of leaving the fence's
+/// shape for the model to guess. Empty renders the marker line alone — the
+/// byte-identical legacy text (the bash output classifier has no root set to
+/// report).
+pub fn sandbox_denial_marker(mode: AccessMode, authorized_roots: &[PathBuf]) -> String {
+    let mut text = format!("[sandbox: file access denied under {} mode]", mode.wire());
+    if !authorized_roots.is_empty() {
+        text.push_str("\nAuthorized write roots (access must stay inside these):");
+        for root in authorized_roots {
+            text.push_str(&format!("\n- {}", root.display()));
+        }
+    }
+    text
 }
 
 /// Substrings a sandboxed file-write denial leaves in the process output
@@ -236,7 +249,9 @@ pub fn seatbelt_denial_note(
         .iter()
         .any(|sig| lower.contains(sig))
     {
-        Some(note(sandbox_denial_marker(mode)))
+        // No root list here: the classifier sees command output only and has
+        // no root set to report — the fs fence's denials carry it instead.
+        Some(note(sandbox_denial_marker(mode, &[])))
     } else {
         None
     }
@@ -551,8 +566,9 @@ mod tests {
 
     #[test]
     fn marker_and_hint_vocabulary() {
+        // No roots: the byte-identical legacy marker line.
         assert_eq!(
-            sandbox_denial_marker(AccessMode::Sandbox),
+            sandbox_denial_marker(AccessMode::Sandbox, &[]),
             "[sandbox: file access denied under sandbox mode]"
         );
         assert_eq!(
@@ -561,6 +577,21 @@ mod tests {
         );
         assert!(escalation_hint_marker("command").contains("retry this exact command once"));
         assert!(escalation_hint_marker("command").contains("`require_escalated: true`"));
+    }
+
+    #[test]
+    fn denial_marker_lists_the_authorized_roots() {
+        let text = sandbox_denial_marker(
+            AccessMode::Sandbox,
+            &[PathBuf::from("/proj"), PathBuf::from("/other")],
+        );
+        assert!(
+            text.starts_with("[sandbox: file access denied under sandbox mode]\n"),
+            "the marker line stays first: {text}"
+        );
+        assert!(text.contains("Authorized write roots"), "{text}");
+        assert!(text.contains("\n- /proj"), "{text}");
+        assert!(text.contains("\n- /other"), "{text}");
     }
 
     #[test]

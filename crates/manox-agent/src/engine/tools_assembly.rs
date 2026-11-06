@@ -213,21 +213,26 @@ pub(super) struct SubagentWriteFence {
 }
 
 /// The unarmed fence's refusal: the shared sandbox marker (the one
-/// vocabulary both enforcing families speak) and the honest fact of a
-/// session with no escalation channel.
-fn subagent_fence_denial() -> manox_harness::tool::ToolError {
+/// vocabulary both enforcing families speak) carrying the authorized root
+/// set, and the honest fact of a session with no escalation channel.
+fn subagent_fence_denial(
+    authorized_roots: &[std::path::PathBuf],
+) -> manox_harness::tool::ToolError {
     manox_harness::tool::ToolError::Other(format!(
         "{}\n[sandbox: no escalation channel in this session]",
-        manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox)
+        manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox, authorized_roots)
     ))
 }
 
-/// The armed fence's refusal for a plain out-of-roots call: the marker plus
-/// the sanctioned retry — the one widening road this session has.
-fn armed_fence_plain_denial() -> manox_harness::tool::ToolError {
+/// The armed fence's refusal for a plain out-of-roots call: the marker (with
+/// the authorized root set) plus the sanctioned retry — the one widening
+/// road this session has.
+fn armed_fence_plain_denial(
+    authorized_roots: &[std::path::PathBuf],
+) -> manox_harness::tool::ToolError {
     manox_harness::tool::ToolError::Other(format!(
         "{}\n{}",
-        manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox),
+        manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox, authorized_roots),
         manox_harness::sandbox::escalation_hint_marker("operation")
     ))
 }
@@ -331,11 +336,12 @@ impl SubagentWriteFence {
             Err(err @ manox_harness::tool::ToolError::InvalidArguments(_)) => return Err(err),
             Err(_) => {}
         }
+        let roots = crate::approval::fence_roots(ctx.cwd(), Some(&self.granted_roots));
         let Some(escalation) = &self.escalation else {
-            return Err(subagent_fence_denial());
+            return Err(subagent_fence_denial(&roots));
         };
         if !is_escalation_request(params) {
-            return Err(armed_fence_plain_denial());
+            return Err(armed_fence_plain_denial(&roots));
         }
         let justification = params
             .get("justification")
@@ -361,7 +367,10 @@ impl SubagentWriteFence {
             }
             Err(msg) => Err(manox_harness::tool::ToolError::Other(format!(
                 "{}\n{msg}",
-                manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox)
+                manox_harness::sandbox::sandbox_denial_marker(
+                    AccessMode::Sandbox,
+                    &crate::approval::fence_roots(ctx.cwd(), Some(&self.granted_roots))
+                )
             ))),
         }
     }

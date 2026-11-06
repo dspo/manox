@@ -320,6 +320,7 @@ pub(super) fn session_builder(
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     granted_roots: &crate::granted_roots::GrantedRoots,
+    project_roots: &[PathBuf],
     thread_id: &str,
     parent_session: Option<&str>,
     bus: &Arc<crate::steer_bus::AgentBus>,
@@ -387,7 +388,7 @@ pub(super) fn session_builder(
                 },
             },
         ))
-        .with_resources(instruction_resources(cwd))
+        .with_resources(instruction_resources(cwd, project_roots))
         .with_tools(tools)
         .with_initial_active_tools(default_active);
     // Persist hashline snapshots under the manox config dir so an edit tag
@@ -429,9 +430,14 @@ pub(super) async fn adopt_session_model(
 /// memory hierarchy (managed policy, `~/.claude/CLAUDE.md` + rules, the
 /// per-directory chain down to the session cwd) loaded through
 /// [`crate::claude_md`] and folded into the system prompt by the kernel
-/// every turn. Skills/templates stay
+/// every turn, plus the session's declared project roots (the multi-root
+/// create grant set, primary first) for the prompt's root section. Skills
+/// and templates stay
 /// empty here — manox skills ride the `manox_agent::skill` registry instead.
-pub(super) fn instruction_resources(cwd: &Path) -> manox_harness::harness::HarnessResources {
+pub(super) fn instruction_resources(
+    cwd: &Path,
+    project_roots: &[PathBuf],
+) -> manox_harness::harness::HarnessResources {
     let set = crate::claude_md::load(cwd, &crate::settings::claude_md_load_context());
     let context_files = set
         .eager
@@ -450,6 +456,7 @@ pub(super) fn instruction_resources(cwd: &Path) -> manox_harness::harness::Harne
         skills: Vec::new(),
         prompt_templates: Vec::new(),
         context_files,
+        project_roots: project_roots.to_vec(),
     }
 }
 
@@ -496,6 +503,7 @@ pub(super) async fn rebuild_session(
     gate: &Arc<ApprovalGate>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     granted_roots: &crate::granted_roots::GrantedRoots,
+    project_roots: &[PathBuf],
     thread_id: &str,
     bus: &Arc<crate::steer_bus::AgentBus>,
 ) {
@@ -531,6 +539,7 @@ pub(super) async fn rebuild_session(
         notice_tx,
         goal_bridge,
         granted_roots,
+        project_roots,
         thread_id,
         None,
         bus,

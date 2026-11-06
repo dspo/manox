@@ -106,10 +106,32 @@ struct AssemblyData<'a> {
     base: &'a str,
     cwd: String,
     context_files: Vec<CtxFileData>,
+    /// The session's declared project roots; the template renders the
+    /// section only when more than one is declared (primary first).
+    project_roots: Vec<ProjectRootData>,
     /// Kernel parity: harness skills are advertised only when the `Read`
     /// tool is active.
     skills_advertised: bool,
     skills: Vec<AdvSkillData>,
+}
+
+/// One declared project root in the fold; `primary` annotates the first.
+#[derive(Serialize)]
+struct ProjectRootData {
+    path: String,
+    primary: bool,
+}
+
+fn project_roots_data(resources: &crate::core::harness::HarnessResources) -> Vec<ProjectRootData> {
+    resources
+        .project_roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| ProjectRootData {
+            path: root.display().to_string(),
+            primary: index == 0,
+        })
+        .collect()
 }
 
 fn assembly_data<'a>(
@@ -129,6 +151,7 @@ fn assembly_data<'a>(
                 content: f.content.clone(),
             })
             .collect(),
+        project_roots: project_roots_data(resources),
         skills_advertised: active_tools.iter().any(|t| t == "Read") && !resources.skills.is_empty(),
         skills: resources
             .skills
@@ -241,6 +264,7 @@ pub fn render_golden_fixture() -> String {
                 content: "r1".into(),
             },
         ],
+        project_roots: vec![],
     };
     let active_tools = vec![
         "Read".to_string(),
@@ -283,6 +307,47 @@ mod tests {
                 std::path::Path::new("/private/tmp/golden-proj")
             ),
             include_str!("../../../testdata/fold_prompt.golden.txt"),
+        );
+    }
+
+    /// A multi-root session folds the project-root section after the cwd
+    /// line, first root annotated primary; the byte-pin golden above (no
+    /// roots) proves the single-root/empty renders stay byte-identical.
+    #[test]
+    fn the_fold_lists_project_roots_when_more_than_one_is_declared() {
+        let build = |roots: &[PathBuf]| {
+            let resources = crate::core::harness::HarnessResources {
+                project_roots: roots.to_vec(),
+                ..Default::default()
+            };
+            let builder = base_prompt_builder("Base.".to_string(), PathBuf::from("/proj"));
+            builder(&[], &resources, std::path::Path::new("/proj"))
+        };
+        let prompt = build(&[
+            PathBuf::from("/proj"),
+            PathBuf::from("/other-repo"),
+            PathBuf::from("/third"),
+        ]);
+        assert!(
+            prompt.ends_with(
+                "Current working directory: /proj\n\
+                 \n\
+                 Project roots (all accessible; the first is primary):\n\
+                 - /proj (primary)\n\
+                 - /other-repo\n\
+                 - /third\n"
+            ),
+            "the section rides the fold tail: {prompt}"
+        );
+        // One declared root keeps the baseline shape.
+        let single = build(&[PathBuf::from("/proj")]);
+        assert!(
+            !single.contains("Project roots"),
+            "single-root stays baseline: {single}"
+        );
+        assert!(
+            single.ends_with("Current working directory: /proj\n"),
+            "{single}"
         );
     }
 }

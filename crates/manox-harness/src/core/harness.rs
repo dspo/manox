@@ -1177,6 +1177,12 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self
     }
 
+    /// The directory a tool call resolves in when it names no `cwd` — the
+    /// session cwd the builder seeded (`with_tool_cwd`).
+    pub fn tool_cwd(&self) -> &std::path::Path {
+        self.agent.tool_context().cwd()
+    }
+
     /// Point the session's hashline snapshot store at a persistent directory,
     /// so a rebuilt store (app restart, session fork, worktree re-entry) can
     /// rehydrate tags it never minted in memory.
@@ -3592,6 +3598,11 @@ pub struct HarnessResources {
     /// prompt automatically, so every turn sees
     /// them without an explicit invocation.
     pub context_files: Vec<ContextFile>,
+    /// The session's declared project roots (the multi-working-directory
+    /// grant set, primary first). The prompt fold renders them as a section
+    /// only when more than one root is declared; a single root (and an
+    /// empty set) keeps the prompt byte-identical to the cwd-only baseline.
+    pub project_roots: Vec<std::path::PathBuf>,
 }
 
 /// A project-instruction file (AGENTS.md / CLAUDE.md) from the agentDir or

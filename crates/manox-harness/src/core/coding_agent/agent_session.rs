@@ -1080,6 +1080,7 @@ impl AgentSessionBuilder {
                 &base_prompt,
                 &cwd,
                 &active_tools,
+                &resources.project_roots,
                 &resources.context_files,
                 &resources.skills,
                 custom_prompt,
@@ -1194,6 +1195,7 @@ impl AgentSessionBuilder {
                             &base_prompt_for_builder,
                             cwd,
                             active_tools,
+                            &resources.project_roots,
                             &resources.context_files,
                             &resources.skills,
                             custom_for_builder,
@@ -1989,6 +1991,49 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error, "sticky cwd follows the switch");
+    }
+
+    /// A multi-root create renders the project-root section into the live
+    /// system prompt (declared order, first root annotated primary), and a
+    /// tool call that names no `cwd` resolves in the declared primary — the
+    /// session cwd the create seeded.
+    #[tokio::test]
+    async fn multi_root_create_lists_the_roots_and_resolves_the_primary_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        let secondary = dir.path().join("secondary");
+        tokio::fs::create_dir_all(&primary).await.unwrap();
+        tokio::fs::create_dir_all(&secondary).await.unwrap();
+
+        let resources = HarnessResources {
+            project_roots: vec![primary.clone(), secondary.clone()],
+            ..Default::default()
+        };
+        let session = create_agent_session()
+            .with_cwd(&primary)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .with_resources(resources)
+            .build()
+            .await
+            .unwrap();
+        let prompt = session.system_prompt();
+        assert!(
+            prompt.contains("Project roots (all accessible; the first is primary):"),
+            "the section renders: {prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("- {} (primary)", primary.display())),
+            "the declared primary is annotated: {prompt}"
+        );
+        assert!(
+            prompt.contains(&format!("- {}", secondary.display())),
+            "the secondary root is listed: {prompt}"
+        );
+        // A cwd-less tool call resolves against the session cwd — the
+        // create's declared primary, not the secondary.
+        assert_eq!(session.harness.tool_cwd(), primary.as_path());
     }
 
     /// The system prompt's working-directory line follows a host-driven

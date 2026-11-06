@@ -1362,20 +1362,26 @@ impl ThreadStore {
             .summary_by_id(id)
             .map(|s| PathBuf::from(s.project.clone()))
             .unwrap_or_else(|| PathBuf::from("."));
-        let handle = Thread::open_existing(ThreadId(id.to_string()), cwd, path.clone(), lease);
+        // Multi-root restore (multi-working-dirs): the pending grants flush
+        // into the sidecar the moment the journal exists, then the sidecar's
+        // set rides the open — the cold-open fence starts cwd-only, and the
+        // actor's session build reads THIS snapshot deterministically (no
+        // post-spawn grant race).
+        self.flush_working_dirs_if_materialized(id);
+        let persisted = self.persisted_working_directories(&path);
+        let handle = Thread::open_existing(
+            ThreadId(id.to_string()),
+            cwd,
+            path.clone(),
+            lease,
+            &persisted,
+        );
         // Re-surface the bound project from the sidecar so the chip shows it.
         if let Some(sum) = self.summary_by_id(id)
             && !sum.project.is_empty()
         {
             let dir = PathBuf::from(&sum.project);
             handle.with_mut(|t| t.restore_project(dir));
-        }
-        // Multi-root restore (multi-working-dirs): the sidecar's granted
-        // directories re-widen the restored engine's fence — `open`
-        // spawned it cwd-only.
-        self.flush_working_dirs_if_materialized(id);
-        for dir in self.persisted_working_directories(&path) {
-            handle.with_mut(|t| t.grant_working_directory(dir));
         }
         self.live_threads.insert(id.to_string(), handle.downgrade());
         Ok(Some(handle))

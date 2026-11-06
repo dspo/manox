@@ -827,29 +827,56 @@ impl Thread {
     }
 
     /// A genuinely empty thread (sidebar new-conversation): never restores
-    /// the previous session.
-    pub fn new_fresh(id: ThreadId, cwd: PathBuf) -> ThreadHandle {
-        Self::open(id, cwd, None, None, true, None)
+    /// the previous session. A multi-root create with no project rides its
+    /// grant group in here too (construction-time, race-free).
+    pub fn new_fresh(id: ThreadId, cwd: PathBuf, extra_granted_roots: &[PathBuf]) -> ThreadHandle {
+        Self::open(id, cwd, None, None, true, None, extra_granted_roots)
     }
 
     /// Construct a thread bound to a project directory: a fresh session with
     /// the project as its cwd in one step (no recreate, no restore), so the
-    /// sidebar never sees an orphaned pre-project session file.
-    pub fn new_in_project(id: ThreadId, project: PathBuf) -> ThreadHandle {
-        Self::open(id, project.clone(), None, Some(project), true, None)
+    /// sidebar never sees an orphaned pre-project session file. The create's
+    /// full `working_directories` grant group rides in with the thread —
+    /// primary first — so the engine's fence admits every root from spawn
+    /// and the prompt's project section is seeded deterministically (no
+    /// post-spawn grant race with the actor's session build).
+    pub fn new_in_project(
+        id: ThreadId,
+        project: PathBuf,
+        extra_granted_roots: &[PathBuf],
+    ) -> ThreadHandle {
+        Self::open(
+            id,
+            project.clone(),
+            None,
+            Some(project),
+            true,
+            None,
+            extra_granted_roots,
+        )
     }
 
     /// Construct a thread backed by a specific session file (sidebar open).
     /// `lease` is the session's write lease, acquired by the caller so a
     /// cross-process contention surfaces at the store's synchronous
-    /// boundary instead of inside the spawned actor.
+    /// boundary instead of inside the spawned actor. The sidecar's granted
+    /// root set rides in (cold restores spawn cwd-only).
     pub fn open_existing(
         id: ThreadId,
         cwd: PathBuf,
         path: PathBuf,
         lease: std::sync::Arc<crate::session_lease::LeaseEntry>,
+        extra_granted_roots: &[PathBuf],
     ) -> ThreadHandle {
-        Self::open(id, cwd, Some(path), None, false, Some(lease))
+        Self::open(
+            id,
+            cwd,
+            Some(path),
+            None,
+            false,
+            Some(lease),
+            extra_granted_roots,
+        )
     }
 
     /// The working directory a conversation with no project runs in: its own
@@ -875,6 +902,7 @@ impl Thread {
         project: Option<PathBuf>,
         fresh: bool,
         lease: Option<std::sync::Arc<crate::session_lease::LeaseEntry>>,
+        extra_granted_roots: &[PathBuf],
     ) -> ThreadHandle {
         // A genuinely new conversation with no project is the special
         // project: it runs in its own temporary workspace rather than in
@@ -919,7 +947,7 @@ impl Thread {
             id.0.clone(),
             goal_bridge.clone(),
             None,
-            &[],
+            extra_granted_roots,
             lease,
         );
 
@@ -964,7 +992,7 @@ impl Thread {
             pending_events: Vec::new(),
             pending_engine_events: None,
             engine_generation: 0,
-            extra_working_dirs: Vec::new(),
+            extra_working_dirs: extra_granted_roots.to_vec(),
         });
         handle.set_restore_ready(restore_ready);
         drain_engine_notices(handle.clone(), events, 0);

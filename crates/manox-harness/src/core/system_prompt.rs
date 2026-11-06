@@ -35,6 +35,7 @@ pub fn build_harness_prompt(
     base: &str,
     cwd: &std::path::Path,
     active_tools: &[String],
+    project_roots: &[std::path::PathBuf],
     context_files: &[crate::harness::ContextFile],
     skills: &[crate::harness::Skill],
     custom: bool,
@@ -109,6 +110,19 @@ pub fn build_harness_prompt(
         }
     }
     prompt.push_str(&format!("\nCurrent working directory: {}\n", cwd.display()));
+    // The project-root section only exists for a multi-root session; a
+    // single root (and an empty set) keeps the prompt byte-identical to the
+    // cwd-only baseline.
+    if project_roots.len() > 1 {
+        prompt.push_str("\nProject roots (all accessible; the first is primary):\n");
+        for (index, root) in project_roots.iter().enumerate() {
+            if index == 0 {
+                prompt.push_str(&format!("- {} (primary)\n", root.display()));
+            } else {
+                prompt.push_str(&format!("- {}\n", root.display()));
+            }
+        }
+    }
     prompt
 }
 
@@ -146,6 +160,7 @@ mod tests {
             DEFAULT_BASE_PROMPT,
             std::path::Path::new("/proj"),
             &tools,
+            &[],
             &context,
             &skills,
             false,
@@ -183,9 +198,56 @@ mod tests {
             std::path::Path::new("/proj"),
             &[],
             &[],
+            &[],
             &skills,
             false,
         );
         assert!(!prompt.contains("<skill"), "{prompt}");
+    }
+
+    #[test]
+    fn multi_root_sessions_list_the_project_roots() {
+        let roots = [
+            std::path::PathBuf::from("/proj"),
+            std::path::PathBuf::from("/other-repo"),
+        ];
+        let prompt = build_harness_prompt(
+            "Base.",
+            std::path::Path::new("/proj"),
+            &[],
+            &roots,
+            &[],
+            &[],
+            false,
+        );
+        assert!(
+            prompt.contains(
+                "\nProject roots (all accessible; the first is primary):\n\
+                 - /proj (primary)\n\
+                 - /other-repo\n"
+            ),
+            "both roots render, primary first: {prompt}"
+        );
+    }
+
+    /// The compat judgment: a single-root session renders byte-identically
+    /// to a no-roots one — the cwd line stays the only directory prose.
+    #[test]
+    fn single_root_keeps_the_baseline_prompt_byte_identical() {
+        let build = |roots: &[std::path::PathBuf]| {
+            build_harness_prompt(
+                "Base.",
+                std::path::Path::new("/proj"),
+                &[],
+                roots,
+                &[],
+                &[],
+                false,
+            )
+        };
+        let baseline = build(&[]);
+        let single = build(&[std::path::PathBuf::from("/proj")]);
+        assert_eq!(single, baseline);
+        assert!(!baseline.contains("Project roots"), "{baseline}");
     }
 }

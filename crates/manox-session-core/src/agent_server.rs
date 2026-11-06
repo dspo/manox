@@ -1268,6 +1268,16 @@ impl AgentServerInner {
             // identity claim here, matching the deferred-fresh path.
             manox_agent::thread_store::global()
                 .with_mut(|store| store.note_session_path(&session_id, &path));
+            // The multi-root grant sidecar lands BEFORE the cold-open: the
+            // journal is materialized (seeded create), so the write is
+            // immediate, and `load_thread` rides the set into the engine
+            // spawn — fence admits every root and the prompt's project
+            // section is seeded deterministically.
+            if !intent.working_directories.is_empty() {
+                let dirs = intent.working_directories.clone();
+                manox_agent::thread_store::global()
+                    .with_mut(|s| s.set_working_directories(&session_id, dirs));
+            }
             open_session(inner, owner, &session_id).await?;
             // Explicit intent overrides on the opened thread (durable change
             // rows); absent fields keep what the seeded journal restores.
@@ -1277,11 +1287,6 @@ impl AgentServerInner {
                 .get(&session_id)
                 .map(|entry| entry.thread.clone());
             if let Some(thread) = thread {
-                // Multi-root grants on the restored engine (the cold-open
-                // fence started cwd-only; multi-working-dirs).
-                for dir in &intent.working_directories {
-                    thread.with_mut(|t| t.grant_working_directory(PathBuf::from(dir)));
-                }
                 thread.with_mut(|t| {
                     if let Some(model) = model {
                         t.set_model(model);
@@ -1296,11 +1301,6 @@ impl AgentServerInner {
                         t.bind_at_creation(project.clone());
                     }
                 });
-            }
-            if !intent.working_directories.is_empty() {
-                let dirs = intent.working_directories.clone();
-                manox_agent::thread_store::global()
-                    .with_mut(|s| s.set_working_directories(&session_id, dirs));
             }
             return Ok(json!({ "session_id": session_id }));
         }
@@ -1323,20 +1323,27 @@ impl AgentServerInner {
             .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| project.clone().unwrap_or_else(|| inner.cwd.clone()));
-        let thread = match &project {
-            Some(p) => Thread::new_in_project(ThreadId(session_id.clone()), p.clone()),
-            None => Thread::new_fresh(ThreadId(session_id.clone()), cwd.clone()),
+        let thread = {
+            // Multi-root: the create's full `working_directories` grant
+            // group rides the construction — primary first — so the engine's
+            // granted-root set admits every root from spawn and the prompt's
+            // project section is seeded deterministically (no post-spawn
+            // grant race with the actor's session build).
+            let roots: Vec<PathBuf> = intent
+                .working_directories
+                .iter()
+                .map(PathBuf::from)
+                .collect();
+            match &project {
+                Some(p) => Thread::new_in_project(ThreadId(session_id.clone()), p.clone(), &roots),
+                None => Thread::new_fresh(ThreadId(session_id.clone()), cwd.clone(), &roots),
+            }
         };
-        // Multi-root: grant the extra working directories before the engine
-        // materializes, so the gate's granted-root set admits them from the
-        // first tool call (multi-working-dirs).
-        for dir in &intent.working_directories {
-            thread.with_mut(|t| t.grant_working_directory(PathBuf::from(dir)));
-        }
         // Persist the grants (multi-working-dirs): the sidecar keeps them
-        // for a cold restore. The path note seeds the id→path map first
-        // (the journal materializes lazily at the first turn) so the
-        // sidecar write is addressable.
+        // for a cold restore. The path note seeds the store's id→path map
+        // first (the journal materializes lazily at the first turn) so the
+        // sidecar write is addressable. The engine's in-memory grant already
+        // happened at spawn; this is the durable leg.
         if !intent.working_directories.is_empty()
             && let Some(path) =
                 manox_ahp_runtime::paths::session_file_under(&session_id, project.as_deref())

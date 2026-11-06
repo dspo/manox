@@ -5711,7 +5711,8 @@ async fn a_sandbox_pinned_child_stays_confined_under_a_full_access_captain() {
     let denied = text_of(&bash, &ctx, "touch /usr/local/manox-pin-bash-probe.txt").await;
     assert!(
         denied.contains(&manox_harness::sandbox::sandbox_denial_marker(
-            AccessMode::Sandbox
+            AccessMode::Sandbox,
+            &[]
         )),
         "the pinned child's Bash stays confined under a full-access Captain: {denied}"
     );
