@@ -860,7 +860,8 @@ impl Thread {
     /// `lease` is the session's write lease, acquired by the caller so a
     /// cross-process contention surfaces at the store's synchronous
     /// boundary instead of inside the spawned actor. The sidecar's granted
-    /// root set rides in (cold restores spawn cwd-only).
+    /// root set rides in, so a cold restore's spawn admits every declared
+    /// root.
     pub fn open_existing(
         id: ThreadId,
         cwd: PathBuf,

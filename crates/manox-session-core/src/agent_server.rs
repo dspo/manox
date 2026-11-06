@@ -600,6 +600,21 @@ pub(crate) async fn open_session(
     owner: &str,
     session_id: &str,
 ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
+    open_session_with_roots(inner, owner, session_id, &[]).await
+}
+
+/// `open_session` with a create's declared grant group riding the cold
+/// open. A seeded create queues its sidecar write with the asynchronous
+/// meta-write batch, so the synchronous load behind the create cannot read
+/// the grants back from disk — they pass through here into
+/// `load_thread_with_roots` instead, and the fence and the prompt's
+/// project section are correct from spawn.
+pub(crate) async fn open_session_with_roots(
+    inner: &Arc<AgentServerInner>,
+    owner: &str,
+    session_id: &str,
+    declared_roots: &[String],
+) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
     // Phase 1 (fast path): a live session is re-owned without any IO.
     if inner.sessions.lock().contains_key(session_id) {
         inner.add_owner(session_id, owner);
@@ -610,7 +625,7 @@ pub(crate) async fn open_session(
     // load the SAME `ThreadHandle` (the store's weak upgrade), and only phase
     // 3 decides who inserts.
     let thread = manox_agent::thread_store::global()
-        .with_mut(|s| s.load_thread(session_id))
+        .with_mut(|s| s.load_thread_with_roots(session_id, declared_roots))
         .map_err(|error| {
             // Another process drives this session: its engine actor holds
             // the per-session write lease. Fail fast — the client surfaces
@@ -1268,17 +1283,20 @@ impl AgentServerInner {
             // identity claim here, matching the deferred-fresh path.
             manox_agent::thread_store::global()
                 .with_mut(|store| store.note_session_path(&session_id, &path));
-            // The multi-root grant sidecar lands BEFORE the cold-open: the
-            // journal is materialized (seeded create), so the write is
-            // immediate, and `load_thread` rides the set into the engine
-            // spawn — fence admits every root and the prompt's project
-            // section is seeded deterministically.
+            // The multi-root grant has two legs. The sidecar write is the
+            // durable leg: it lands with the next meta-write flush and keeps
+            // later cold restores (a fresh process) honest. The open itself
+            // is synchronous and cannot read that write back yet, so the
+            // declared roots also ride the open (`open_session_with_roots`
+            // → `load_thread_with_roots`) — the fence admits every root and
+            // the prompt's project section is seeded from spawn, with no
+            // post-spawn grant pass.
             if !intent.working_directories.is_empty() {
                 let dirs = intent.working_directories.clone();
                 manox_agent::thread_store::global()
                     .with_mut(|s| s.set_working_directories(&session_id, dirs));
             }
-            open_session(inner, owner, &session_id).await?;
+            open_session_with_roots(inner, owner, &session_id, &intent.working_directories).await?;
             // Explicit intent overrides on the opened thread (durable change
             // rows); absent fields keep what the seeded journal restores.
             let thread = inner
