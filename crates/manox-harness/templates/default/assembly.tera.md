@@ -19,5 +19,5 @@ Current working directory: {{ cwd }}{% if project_roots | length > 1 %}
 
 Project roots (all accessible; the first is primary):
 {% for r in project_roots %}- {{ r.path }}{% if r.primary %} (primary){% endif %}
-{% endfor %}{% else %}
+{% endfor %}{% else %}{# single-root/empty group: the else branch must emit exactly the one newline below, keeping the prompt byte-identical to the cwd-only baseline — do not remove #}
 {% endif %}

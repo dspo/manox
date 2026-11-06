@@ -431,9 +431,10 @@ pub(super) async fn adopt_session_model(
 /// per-directory chain down to the session cwd) loaded through
 /// [`crate::claude_md`] and folded into the system prompt by the kernel
 /// every turn, plus the session's declared project roots (the multi-root
-/// create grant set, primary first) for the prompt's root section. Skills
-/// and templates stay
-/// empty here — manox skills ride the `manox_agent::skill` registry instead.
+/// create grant set) for the prompt's root section — the renderer seats
+/// the session cwd first and dedups, so the raw set needs no own
+/// normalization. Skills and templates stay empty here — manox skills ride
+/// the `manox_agent::skill` registry instead.
 pub(super) fn instruction_resources(
     cwd: &Path,
     project_roots: &[PathBuf],

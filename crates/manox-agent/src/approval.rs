@@ -1261,9 +1261,12 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 1);
 
         // Outside every root: denied, and the refusal lists the authorized
-        // roots (primary + secondary + the shared writable set).
-        let (tool2, _ran2) = gated_named("Write", false, false, Arc::clone(&gate));
-        let err = tool2
+        // roots (primary + secondary + the shared writable set). The probe
+        // rides the fenced tool itself: the granted secondary must be named,
+        // or the denial does not actually teach where access IS allowed
+        // (the primary alone would pass even a fence that dropped the
+        // granted set, since the cwd's writable roots cover it).
+        let err = tool
             .execute(
                 "c2",
                 serde_json::json!({
@@ -1285,10 +1288,18 @@ mod tests {
         let canon_primary = manox_harness::sandbox::canonicalize_best_effort(&primary)
             .display()
             .to_string();
+        let canon_secondary = manox_harness::sandbox::canonicalize_best_effort(&secondary)
+            .display()
+            .to_string();
         assert!(
             denial.contains(&format!("- {canon_primary}")),
             "the primary root is listed: {denial}"
         );
+        assert!(
+            denial.contains(&format!("- {canon_secondary}")),
+            "the granted secondary is listed: {denial}"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the denied call never runs");
     }
 
     /// A linked worktree of the session workspace admits itself through the

@@ -1178,7 +1178,10 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     }
 
     /// The directory a tool call resolves in when it names no `cwd` — the
-    /// session cwd the builder seeded (`with_tool_cwd`).
+    /// session cwd the builder seeded (`with_tool_cwd`). Test-only for now:
+    /// the kernel's public surface stays minimal, and a host that needs the
+    /// read point adds it with its first real consumer.
+    #[cfg(test)]
     pub fn tool_cwd(&self) -> &std::path::Path {
         self.agent.tool_context().cwd()
     }
@@ -3599,9 +3602,10 @@ pub struct HarnessResources {
     /// them without an explicit invocation.
     pub context_files: Vec<ContextFile>,
     /// The session's declared project roots (the multi-working-directory
-    /// grant set, primary first). The prompt fold renders them as a section
-    /// only when more than one root is declared; a single root (and an
-    /// empty set) keeps the prompt byte-identical to the cwd-only baseline.
+    /// grant set). The prompt renders the effective group — session cwd
+    /// first (primary), these deduped behind it — as a section only when
+    /// the group holds more than one entry; a single root (and an empty
+    /// set) keeps the prompt byte-identical to the cwd-only baseline.
     pub project_roots: Vec<std::path::PathBuf>,
 }
 

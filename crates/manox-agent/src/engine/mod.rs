@@ -576,8 +576,8 @@ pub fn spawn_engine(
         last_cwd_note: Mutex::new(None),
     });
     // The actor's own copy of the declared roots: the prompt's project-root
-    // section is seeded from this snapshot, deterministically — not from a
-    // store read that could race the facade's post-spawn grant loop.
+    // section is seeded from this construction-time snapshot, never from a
+    // store read that could race the spawn.
     let project_roots = extra_granted_roots.to_vec();
     // The registry entry lives exactly as long as the actor: its exit
     // unregisters under a channel-identity guard (K3), so a store-level

@@ -106,8 +106,8 @@ struct AssemblyData<'a> {
     base: &'a str,
     cwd: String,
     context_files: Vec<CtxFileData>,
-    /// The session's declared project roots; the template renders the
-    /// section only when more than one is declared (primary first).
+    /// The effective root group the template renders; the section appears
+    /// only when it holds more than one entry (primary first).
     project_roots: Vec<ProjectRootData>,
     /// Kernel parity: harness skills are advertised only when the `Read`
     /// tool is active.
@@ -115,16 +115,20 @@ struct AssemblyData<'a> {
     skills: Vec<AdvSkillData>,
 }
 
-/// One declared project root in the fold; `primary` annotates the first.
+/// One root of the effective group in the fold; `primary` annotates the
+/// session cwd's entry, which always leads.
 #[derive(Serialize)]
 struct ProjectRootData {
     path: String,
     primary: bool,
 }
 
-fn project_roots_data(resources: &crate::core::harness::HarnessResources) -> Vec<ProjectRootData> {
-    resources
-        .project_roots
+/// The fold's root list is the effective group — session cwd first
+/// (primary), the declared grant set deduped behind it — mirroring the
+/// kernel fold, so both renderers teach the same primary regardless of the
+/// order a client declared or where a project-less create actually runs.
+fn project_roots_data(cwd: &std::path::Path, declared: &[PathBuf]) -> Vec<ProjectRootData> {
+    crate::core::system_prompt::effective_project_roots(cwd, declared)
         .iter()
         .enumerate()
         .map(|(index, root)| ProjectRootData {
@@ -151,7 +155,7 @@ fn assembly_data<'a>(
                 content: f.content.clone(),
             })
             .collect(),
-        project_roots: project_roots_data(resources),
+        project_roots: project_roots_data(cwd, &resources.project_roots),
         skills_advertised: active_tools.iter().any(|t| t == "Read") && !resources.skills.is_empty(),
         skills: resources
             .skills
@@ -348,6 +352,18 @@ mod tests {
         assert!(
             single.ends_with("Current working directory: /proj\n"),
             "{single}"
+        );
+        // The fold normalizes like the kernel: the session cwd's entry
+        // leads with the primary annotation whatever order the roots
+        // arrived in.
+        let shuffled = build(&[PathBuf::from("/third"), PathBuf::from("/proj")]);
+        assert!(
+            shuffled.contains(
+                "Project roots (all accessible; the first is primary):\n\
+                 - /proj (primary)\n\
+                 - /third\n"
+            ),
+            "the session cwd's entry is primary: {shuffled}"
         );
     }
 }

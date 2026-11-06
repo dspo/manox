@@ -365,12 +365,11 @@ impl SubagentWriteFence {
                 self.granted_roots.approve(root);
                 Ok(())
             }
+            // Refused: the grant set cannot have moved (only an approval
+            // widens it), so the roots computed at the verdict still hold.
             Err(msg) => Err(manox_harness::tool::ToolError::Other(format!(
                 "{}\n{msg}",
-                manox_harness::sandbox::sandbox_denial_marker(
-                    AccessMode::Sandbox,
-                    &crate::approval::fence_roots(ctx.cwd(), Some(&self.granted_roots))
-                )
+                manox_harness::sandbox::sandbox_denial_marker(AccessMode::Sandbox, &roots)
             ))),
         }
     }
