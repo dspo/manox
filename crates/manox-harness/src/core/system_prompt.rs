@@ -40,7 +40,7 @@ const TOOL_SNIPPETS: &[(&str, &str)] = &[
 /// group differently or a project-less create runs in its unfiled
 /// workspace: the primary always names the directory the session actually
 /// resolves in.
-pub fn effective_project_roots(
+pub(crate) fn effective_project_roots(
     cwd: &std::path::Path,
     declared: &[std::path::PathBuf],
 ) -> Vec<std::path::PathBuf> {
