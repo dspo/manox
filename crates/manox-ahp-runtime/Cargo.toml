@@ -24,7 +24,7 @@ tracing.workspace = true
 uuid.workspace = true
 tokio-util.workspace = true
 async-channel.workspace = true
-async-trait = "0.1"
+async-trait.workspace = true
 axum = { workspace = true, optional = true }
 libc.workspace = true
 

@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use manox_ahp_runtime::error::RuntimeError;
 use manox_ahp_runtime::runtime_trait::{
     ForkIntent, RenameOutcome, SessionIntent, SessionRuntime, TerminalSnapshot,
@@ -21,16 +22,6 @@ use manox_ahp_runtime::runtime_trait::{
 use serde_json::Value;
 
 use crate::agent_server::AgentServer;
-
-/// Run an async runtime seam from the host's synchronous `Backend` methods.
-///
-/// The host calls these from an async context, so the block has to yield the
-/// worker rather than park it (`block_in_place`) — the same discipline the
-/// adapter's own helper follows, and the reason a bare `handle().block_on`
-/// panics here.
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::task::block_in_place(|| manox_agent::runtime::handle().block_on(future))
-}
 
 /// The gateway as the AHP runtime.
 pub struct GatewayRuntime {
@@ -54,6 +45,7 @@ impl GatewayRuntime {
     }
 }
 
+#[async_trait]
 impl SessionRuntime for GatewayRuntime {
     fn terminal_state(&self, terminal_id: &str) -> Option<TerminalSnapshot> {
         {
@@ -76,7 +68,7 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
-    fn create_terminal(
+    async fn create_terminal(
         &self,
         session_id: &str,
         terminal_id: &str,
@@ -91,7 +83,7 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
-    fn dispose_terminal(&self, terminal_id: &str) -> Result<(), RuntimeError> {
+    async fn dispose_terminal(&self, terminal_id: &str) -> Result<(), RuntimeError> {
         {
             let _ = terminal_id;
             Err(RuntimeError::new(
@@ -100,7 +92,7 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
-    fn terminal_input(&self, terminal_id: &str, data: &str) -> Result<(), RuntimeError> {
+    async fn terminal_input(&self, terminal_id: &str, data: &str) -> Result<(), RuntimeError> {
         {
             let _ = (terminal_id, data);
             Err(RuntimeError::new(
@@ -109,7 +101,12 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
-    fn terminal_resize(&self, terminal_id: &str, cols: u16, rows: u16) -> Result<(), RuntimeError> {
+    async fn terminal_resize(
+        &self,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), RuntimeError> {
         {
             let _ = (terminal_id, cols, rows);
             Err(RuntimeError::new(
@@ -118,26 +115,24 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
-    fn create_session(&self, owner: &str, intent: SessionIntent) -> Result<(), RuntimeError> {
+    async fn create_session(&self, owner: &str, intent: SessionIntent) -> Result<(), RuntimeError> {
         use crate::agent_server::AgentServerInner;
         let server = Arc::clone(&self.server);
         let inner = Arc::clone(server.ahp_inner());
         let owner = owner.to_string();
-        block_on(
-            async move { AgentServerInner::create_session_request(&inner, &owner, intent).await },
-        )
-        .map(|_| ())
+        let _ = AgentServerInner::create_session_request(&inner, &owner, intent).await?;
+        Ok(())
     }
 
-    fn fork_session(&self, owner: &str, intent: ForkIntent) -> Result<(), RuntimeError> {
+    async fn fork_session(&self, owner: &str, intent: ForkIntent) -> Result<(), RuntimeError> {
         let server = Arc::clone(&self.server);
         let inner = Arc::clone(server.ahp_inner());
         let owner = owner.to_string();
-        block_on(async move { crate::agent_server::fork_session(&inner, &owner, intent).await })
-            .map(|_| ())
+        let _ = crate::agent_server::fork_session(&inner, &owner, intent).await?;
+        Ok(())
     }
 
-    fn dispose_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError> {
+    async fn dispose_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError> {
         self.server.ahp_inner().dispose_session(owner, session_id);
         Ok(())
     }
@@ -146,26 +141,29 @@ impl SessionRuntime for GatewayRuntime {
         self.server.ahp_inner().session_thread(session_id).is_some()
     }
 
-    fn open_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError> {
+    async fn open_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError> {
         let inner = Arc::clone(self.server.ahp_inner());
         let owner = owner.to_string();
         let id = session_id.to_string();
-        block_on(crate::agent_server::open_session(&inner, &owner, &id))
+        crate::agent_server::open_session(&inner, &owner, &id).await
     }
 
-    fn submit(&self, owner: &str, session_id: &str, text: String) -> Result<Value, RuntimeError> {
+    async fn submit(
+        &self,
+        owner: &str,
+        session_id: &str,
+        text: String,
+    ) -> Result<Value, RuntimeError> {
         let server = Arc::clone(&self.server);
         let inner = Arc::clone(server.ahp_inner());
         let owner = owner.to_string();
         let session_id = session_id.to_string();
-        block_on(async move {
-            inner
-                .submit(&owner, &session_id, text, Vec::new(), None, None)
-                .await
-        })
+        inner
+            .submit(&owner, &session_id, text, Vec::new(), None, None)
+            .await
     }
 
-    fn steer(
+    async fn steer(
         &self,
         session_id: &str,
         message_id: &str,
@@ -182,7 +180,7 @@ impl SessionRuntime for GatewayRuntime {
             .drop_queued(session_id, message_id.to_string());
     }
 
-    fn cancel_turn(&self, session_id: &str) -> Result<(), RuntimeError> {
+    async fn cancel_turn(&self, session_id: &str) -> Result<(), RuntimeError> {
         tracing::info!(session = %session_id, "gateway: cancelling the turn");
         // A cold session (restored journal, no live engine in THIS process)
         // still owes the cancel an answer: open it first, so the cancel
@@ -190,7 +188,7 @@ impl SessionRuntime for GatewayRuntime {
         // engine that owed the turn died elsewhere) or reports the foreign
         // write lease honestly. Refusing "unknown session" left a restored
         // dead turn unstoppable (real-device round, 2026-10-20).
-        self.ensure_live("ahp", session_id)?;
+        self.ensure_live("ahp", session_id).await?;
         match self.server.ahp_inner().session_thread(session_id) {
             Some(thread) => {
                 thread.with_mut(|t| t.cancel());
@@ -201,12 +199,12 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
-    fn set_model(&self, session_id: &str, model: &str) -> Result<(), RuntimeError> {
-        self.ensure_live("ahp", session_id)?;
+    async fn set_model(&self, session_id: &str, model: &str) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id).await?;
         self.server.ahp_inner().set_model(session_id, model)
     }
 
-    fn preflight_config(
+    async fn preflight_config(
         &self,
         session_id: &str,
         model: Option<&str>,
@@ -214,38 +212,42 @@ impl SessionRuntime for GatewayRuntime {
         mode: Option<&str>,
         network: Option<&str>,
     ) -> Result<(), RuntimeError> {
-        self.ensure_live("ahp", session_id)?;
+        self.ensure_live("ahp", session_id).await?;
         self.server
             .ahp_inner()
             .preflight_config(session_id, model, effort, mode, network)
     }
 
-    fn set_reasoning_effort(&self, session_id: &str, effort: &str) -> Result<(), RuntimeError> {
-        self.ensure_live("ahp", session_id)?;
+    async fn set_reasoning_effort(
+        &self,
+        session_id: &str,
+        effort: &str,
+    ) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id).await?;
         self.server
             .ahp_inner()
             .set_reasoning_effort(session_id, effort)
     }
 
-    fn set_access_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError> {
-        self.ensure_live("ahp", session_id)?;
+    async fn set_access_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id).await?;
         self.server.ahp_inner().set_access_mode(session_id, mode)
     }
 
-    fn set_network_access(&self, session_id: &str, access: &str) -> Result<(), RuntimeError> {
-        self.ensure_live("ahp", session_id)?;
+    async fn set_network_access(&self, session_id: &str, access: &str) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id).await?;
         self.server
             .ahp_inner()
             .set_network_access(session_id, access)
     }
 
-    fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError> {
-        self.ensure_live("ahp", session_id)?;
+    async fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id).await?;
         let server = Arc::clone(&self.server);
         let inner = Arc::clone(server.ahp_inner());
         let session_id = session_id.to_string();
         let cwd = cwd.to_string();
-        block_on(async move { inner.set_cwd(&session_id, &cwd).await })
+        inner.set_cwd(&session_id, &cwd).await
     }
 
     fn archive_session(&self, owner: &str, session_id: &str, archived: bool) {
@@ -289,12 +291,16 @@ impl SessionRuntime for GatewayRuntime {
         self.server.ahp_inner().set_project_alias(path, alias)
     }
 
-    fn compact(&self, session_id: &str, instructions: Option<String>) -> Result<(), RuntimeError> {
-        self.ensure_live("ahp", session_id)?;
+    async fn compact(
+        &self,
+        session_id: &str,
+        instructions: Option<String>,
+    ) -> Result<(), RuntimeError> {
+        self.ensure_live("ahp", session_id).await?;
         self.server.ahp_inner().compact(session_id, instructions)
     }
 
-    fn goal(
+    async fn goal(
         &self,
         session_id: &str,
         action: &str,
@@ -302,7 +308,7 @@ impl SessionRuntime for GatewayRuntime {
         budget: Option<u64>,
         max_rounds: Option<u64>,
     ) -> Result<(), RuntimeError> {
-        self.ensure_live("ahp", session_id)?;
+        self.ensure_live("ahp", session_id).await?;
         self.server
             .ahp_inner()
             .goal(session_id, action, objective, budget, max_rounds)
@@ -312,43 +318,27 @@ impl SessionRuntime for GatewayRuntime {
         self.server.ahp_inner().session_thread(session_id)
     }
 
-    fn teardown_container(
+    async fn teardown_container(
         &self,
         owner: &str,
         session_id: &str,
         mode: &str,
     ) -> Result<Value, RuntimeError> {
-        // The waterfall awaits a store refresh in archive mode (the cascade
-        // set must read fresh parent edges); the trait seam is synchronous,
-        // so the await rides the same block_in_place discipline as `set_cwd`.
-        let owner = owner.to_string();
-        let session_id = session_id.to_string();
-        block_on(async move {
-            self.server
-                .ahp_inner()
-                .teardown_container(&owner, &session_id, mode)
-                .await
-        })
+        self.server
+            .ahp_inner()
+            .teardown_container(owner, session_id, mode)
+            .await
     }
 
-    fn conversation_metrics(&self, session_id: &str) -> Option<Value> {
+    async fn conversation_metrics(&self, session_id: &str) -> Option<Value> {
         let thread = self.server.ahp_inner().session_thread(session_id)?;
-        // `conversation_info` awaits the journal snapshot; the trait method is
-        // sync (the backend calls it from bridge and baseline paths), so ride
-        // the runtime handle the same way `accept` does on the napi edge.
         let cache = Arc::clone(&self.metrics_cache);
-        let fold = manox_ahp_runtime::journal_query::conversation_info(&cache, &thread, session_id);
-        // Callers live on both sides of the runtime: the router's async tasks
-        // and the bridge run on it, cold callers don't. `block_in_place` is
-        // the only wait that is legal on a worker thread.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| manox_agent::runtime::handle().block_on(fold)).ok()
-        } else {
-            manox_agent::runtime::handle().block_on(fold).ok()
-        }
+        manox_ahp_runtime::journal_query::conversation_info(&cache, &thread, session_id)
+            .await
+            .ok()
     }
 
-    fn set_embedder_tools(
+    async fn set_embedder_tools(
         &self,
         session_id: &str,
         client_id: &str,
@@ -359,7 +349,7 @@ impl SessionRuntime for GatewayRuntime {
             .set_embedder_tools(session_id, client_id, tools);
     }
 
-    fn confirm_tool_call(
+    async fn confirm_tool_call(
         &self,
         session_id: &str,
         auth_id: &str,
@@ -387,14 +377,12 @@ impl SessionRuntime for GatewayRuntime {
         // forever. Cold-open the thread first; its restore re-arms the
         // gates the chain still carries.
         let inner = Arc::clone(self.server.ahp_inner());
-        let thread = block_on(crate::agent_server::ensure_opened_for_settle(
-            &inner, session_id,
-        ))?;
+        let thread = crate::agent_server::ensure_opened_for_settle(&inner, session_id).await?;
         thread.with_mut(|t| t.respond_authorization(auth_id, response));
         Ok(())
     }
 
-    fn answer_question(
+    async fn answer_question(
         &self,
         session_id: &str,
         request_id: &str,
@@ -411,9 +399,7 @@ impl SessionRuntime for GatewayRuntime {
         // Same settle path as `confirm_tool_call`: cold-open before the
         // bare lookup can refuse the verdict.
         let inner = Arc::clone(self.server.ahp_inner());
-        let thread = block_on(crate::agent_server::ensure_opened_for_settle(
-            &inner, session_id,
-        ))?;
+        let thread = crate::agent_server::ensure_opened_for_settle(&inner, session_id).await?;
         use manox_ahp_runtime::runtime_trait::QuestionResponse;
         let outcome = match response {
             QuestionResponse::Answer => manox_agent::questions::AskOutcome::Answered(answers),
@@ -426,10 +412,11 @@ impl SessionRuntime for GatewayRuntime {
 
     // MCP servers are process-global; the session id rides the trait for
     // symmetry with every other seam but carries no per-session scoping.
-    // Both calls are synchronous intents: the registry settles the lifecycle
-    // detached and the AHP face learns the outcome from the event stream.
+    // Both calls are detachable intents that await nothing: the registry
+    // settles the lifecycle detached and the AHP face learns the outcome
+    // from the event stream.
 
-    fn mcp_start(&self, _session_id: &str, id: &str) -> Result<(), RuntimeError> {
+    async fn mcp_start(&self, _session_id: &str, id: &str) -> Result<(), RuntimeError> {
         #[cfg(feature = "mcp")]
         {
             manox_agent::mcp::start(id).map_err(RuntimeError::new)
@@ -441,7 +428,7 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
-    fn mcp_stop(&self, _session_id: &str, id: &str) -> Result<(), RuntimeError> {
+    async fn mcp_stop(&self, _session_id: &str, id: &str) -> Result<(), RuntimeError> {
         #[cfg(feature = "mcp")]
         {
             manox_agent::mcp::stop(id).map_err(RuntimeError::new)
@@ -453,7 +440,7 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
-    fn mcp_set_enabled(
+    async fn mcp_set_enabled(
         &self,
         _session_id: &str,
         id: &str,

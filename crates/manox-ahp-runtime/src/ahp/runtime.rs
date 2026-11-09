@@ -214,11 +214,14 @@ impl AhpRuntime {
     /// reactor on the calling thread. The napi edge calls this from the Node
     /// main thread (no runtime), so enter the global runtime there; callers
     /// already on a runtime (axum, in-process hosts) pass straight through.
+    /// `accept` only spawns, so entering the context is enough — no future is
+    /// driven, and the calling thread keeps its own call stack.
     pub fn accept(&self, transport: HostTransport) {
         if tokio::runtime::Handle::try_current().is_ok() {
             self.host.accept(transport);
         } else {
-            manox_agent::runtime::handle().block_on(async { self.host.accept(transport) });
+            let _entered = manox_agent::runtime::handle().enter();
+            self.host.accept(transport);
         }
     }
 
@@ -290,7 +293,7 @@ mod accept_without_a_reactor_tests {
         ) -> Option<tokio::sync::broadcast::Receiver<std::sync::Arc<Vec<u8>>>> {
             None
         }
-        fn create_terminal(
+        async fn create_terminal(
             &self,
             _: &str,
             _: &str,
@@ -299,13 +302,13 @@ mod accept_without_a_reactor_tests {
         ) -> Result<(), crate::error::RuntimeError> {
             unreachable!("unused")
         }
-        fn dispose_terminal(&self, _: &str) -> Result<(), crate::error::RuntimeError> {
+        async fn dispose_terminal(&self, _: &str) -> Result<(), crate::error::RuntimeError> {
             unreachable!("unused")
         }
-        fn terminal_input(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+        async fn terminal_input(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
             unreachable!("unused")
         }
-        fn terminal_resize(
+        async fn terminal_resize(
             &self,
             _: &str,
             _: u16,
@@ -313,30 +316,34 @@ mod accept_without_a_reactor_tests {
         ) -> Result<(), crate::error::RuntimeError> {
             unreachable!("unused")
         }
-        fn create_session(
+        async fn create_session(
             &self,
             _: &str,
             _: crate::runtime_trait::SessionIntent,
         ) -> Result<(), crate::error::RuntimeError> {
             unreachable!("unused")
         }
-        fn fork_session(
+        async fn fork_session(
             &self,
             _: &str,
             _: crate::runtime_trait::ForkIntent,
         ) -> Result<(), crate::error::RuntimeError> {
             unreachable!("unused")
         }
-        fn dispose_session(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+        async fn dispose_session(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
         fn has_session(&self, _: &str) -> bool {
             false
         }
-        fn open_session(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+        async fn open_session(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
             unreachable!("unused")
         }
-        fn submit(
+        async fn submit(
             &self,
             _: &str,
             _: &str,
@@ -344,7 +351,7 @@ mod accept_without_a_reactor_tests {
         ) -> Result<serde_json::Value, crate::error::RuntimeError> {
             unreachable!("unused")
         }
-        fn steer(
+        async fn steer(
             &self,
             _: &str,
             _: &str,
@@ -353,13 +360,13 @@ mod accept_without_a_reactor_tests {
             unreachable!("unused")
         }
         fn drop_queued(&self, _: &str, _: &str) {}
-        fn cancel_turn(&self, _: &str) -> Result<(), crate::error::RuntimeError> {
+        async fn cancel_turn(&self, _: &str) -> Result<(), crate::error::RuntimeError> {
             unreachable!("unused")
         }
-        fn set_model(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+        async fn set_model(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
-        fn preflight_config(
+        async fn preflight_config(
             &self,
             _: &str,
             _: Option<&str>,
@@ -369,16 +376,28 @@ mod accept_without_a_reactor_tests {
         ) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
-        fn set_reasoning_effort(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+        async fn set_reasoning_effort(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
-        fn set_access_mode(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+        async fn set_access_mode(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
-        fn set_network_access(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+        async fn set_network_access(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
-        fn set_cwd(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+        async fn set_cwd(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
         fn archive_session(&self, _: &str, _: &str, _: bool) {}
@@ -400,10 +419,14 @@ mod accept_without_a_reactor_tests {
         fn set_project_alias(&self, _: &str, _: Option<&str>) -> bool {
             false
         }
-        fn compact(&self, _: &str, _: Option<String>) -> Result<(), crate::error::RuntimeError> {
+        async fn compact(
+            &self,
+            _: &str,
+            _: Option<String>,
+        ) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
-        fn goal(
+        async fn goal(
             &self,
             _: &str,
             _: &str,
@@ -413,7 +436,7 @@ mod accept_without_a_reactor_tests {
         ) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
-        fn confirm_tool_call(
+        async fn confirm_tool_call(
             &self,
             _: &str,
             _: &str,
@@ -422,7 +445,7 @@ mod accept_without_a_reactor_tests {
         ) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
-        fn answer_question(
+        async fn answer_question(
             &self,
             _: &str,
             _: &str,
@@ -434,7 +457,7 @@ mod accept_without_a_reactor_tests {
         fn journal_feed(&self, _: &str) -> Option<manox_agent::thread::ThreadHandle> {
             None
         }
-        fn set_embedder_tools(
+        async fn set_embedder_tools(
             &self,
             _: &str,
             _: &str,
