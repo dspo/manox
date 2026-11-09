@@ -923,9 +923,8 @@ impl Thread {
             crate::paths::core_session_parts(project.as_deref(), &id.0)
                 .unwrap_or_else(|_| crate::paths::unresolved_session_parts(&id.0));
         // The goal bridge is shared with the engine's goal tools; its
-        // restore seed rides the Ready chain (seed_from_journal — the
-        // journal is the goal authority; stage ③ retired the db leg and
-        // with it the "goal features disabled" degrade).
+        // restore seed rides the Ready chain (seed_from_journal): the last
+        // `goal` row on the journal chain is the only goal authority.
         let goal_bridge = Some(GoalBridge::for_thread(&id.0));
         let SpawnedEngine {
             engine,
@@ -1155,11 +1154,10 @@ impl Thread {
                 if let Some(dir) = project {
                     self.project = Some(dir);
                 }
-                // Goal stage ②: the restore authority is the journal — the
-                // K2 rebuild's replayed snapshot seeds the bridge's fold
-                // (the db event log is the migration-window fallback when
-                // the chain never saw a goal). The seed re-applies the
-                // restart-paused demotion: activation is never inherited.
+                // The restore authority is the journal: the rebuild's
+                // replayed last `goal` row seeds the bridge's fold, and a
+                // chain that never saw one has no goal. The seed re-applies
+                // the restart-paused demotion: activation is never inherited.
                 if let Some(bridge) = self.goal_bridge.as_ref() {
                     bridge.seed_from_journal(goal);
                 }
@@ -2445,7 +2443,8 @@ impl Thread {
     }
 
     /// Run a markdown prompt-macro turn (`/plugin:command args`): render the
-    /// command body with `$ARGUMENTS` substituted and send it as a user turn.
+    /// command body with `{{ arguments }}` substituted and send it as a user
+    /// turn.
     /// The retired manox harness additionally applies the macro's
     /// `allowed-tools` filter for the turn; the harness runs its full
     /// toolset.

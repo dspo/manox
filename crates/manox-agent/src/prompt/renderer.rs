@@ -174,26 +174,23 @@ pub fn render_static(template: PromptTemplate) -> anyhow::Result<String> {
 /// — they are rendered via Tera's one-off path against the live body string,
 /// and intentionally not routed through the registry: a command body is
 /// untrusted prose authored in whatever language its author chose, not a
-/// manox-maintained asset. For backwards compatibility the legacy
-/// `$ARGUMENTS` placeholder is rewritten to `{{ arguments }}` first, so old
-/// command files keep working without a rewrite. If the body contains
+/// manox-maintained asset. A command body substitutes its arguments through
+/// the `{{ arguments }}` placeholder; every other byte — a literal
+/// `$ARGUMENTS` included — renders as written. If the body contains
 /// Tera-incompatible literal syntax (an unmatched `{%` / `{{`, or an unknown
 /// variable), the one-off render fails and the function falls back to a plain
 /// string substitution — command bodies are untrusted prose, and a literal
 /// `{{` must never break a command.
 ///
-/// This is the single site that substitutes command arguments; no `replace`
-/// of `$ARGUMENTS` lives in `command.rs`.
+/// This is the single site that substitutes command arguments.
 pub fn render_command_body(body: &str, arguments: &str) -> String {
-    let tpl = body.replace("$ARGUMENTS", "{{ arguments }}");
     let mut ctx = tera::Context::new();
     ctx.insert("arguments", arguments);
-    match tera::Tera::one_off(&tpl, &ctx, false) {
+    match tera::Tera::one_off(body, &ctx, false) {
         Ok(rendered) => rendered,
         // Fall back to plain substitution so a literal `{{` in the body never
-        // breaks command rendering. Both the new `{{ arguments }}` and any
-        // remaining edge form resolve to the raw args here.
-        Err(_) => tpl.replace("{{ arguments }}", arguments),
+        // breaks command rendering.
+        Err(_) => body.replace("{{ arguments }}", arguments),
     }
 }
 
@@ -435,15 +432,16 @@ mod tests {
         }
     }
 
-    /// Command bodies are untrusted prose rendered via the one-off path. A
-    /// legacy `$ARGUMENTS` placeholder is rewritten; a literal `{{` in the body
-    /// must fall back to plain substitution rather than erroring. Command
-    /// bodies are intentionally not routed through the per-language registries.
+    /// Command bodies are untrusted prose rendered via the one-off path. Only
+    /// `{{ arguments }}` substitutes — a literal `$ARGUMENTS` stays literal —
+    /// and a literal `{{` in the body must fall back to plain substitution
+    /// rather than erroring. Command bodies are intentionally not routed
+    /// through the per-language registries.
     #[test]
     fn command_body_renders_arguments_and_falls_back_on_tera_syntax() {
         assert_eq!(
             render_command_body("Review $ARGUMENTS now", "HEAD~1"),
-            "Review HEAD~1 now"
+            "Review $ARGUMENTS now"
         );
         assert_eq!(
             render_command_body("See {{ arguments }} end", "x"),

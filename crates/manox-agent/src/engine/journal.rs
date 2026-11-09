@@ -423,7 +423,7 @@ pub(super) async fn append_row_fail_loud(
 /// `session_path` is the store's cached journal-file path, needed for the
 /// cold path; `None` with no live route logs and drops the row (a thread
 /// that never materialized has no journal — its sidecar carries the flag
-/// until the journal exists, the K2 fallback).
+/// until the journal exists).
 /// Returns whether the row was handed to a path that can still land it: a live
 /// actor's queue, or a cold append against a file that exists. `false` means
 /// there is nowhere for the row to go — no actor and no file — which the caller
@@ -564,16 +564,15 @@ pub(super) fn cold_append_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
 /// face a live actor uses (`append_typed`: writer-ordered parent selection +
 /// seq stamp + journal broadcast). Safe because the registry protocol
 /// guarantees no live storage writes this file while the route is absent.
-/// A thread whose journal never materialized has no file: the row is
-/// skipped loudly at debug — the sidecar carries the flag until the journal
-/// exists (the K2 fallback).
+/// A thread whose journal never materialized has no file: the row is skipped
+/// loudly at debug — the sidecar carries the flag until the journal exists.
 ///
 /// Cross-process, the file may still have a live writer: another process's
 /// actor holding the write lease. The lease is taken here too (short-held:
 /// released with this function's return — the row-level serialization is
-/// the storage's own `WriteFence`), and contention degrades exactly like
-/// the K2 fallback: the row is skipped loudly and the sidecar keeps the
-/// flag until this process or the other re-lands it.
+/// the storage's own `WriteFence`), and contention degrades exactly like the
+/// no-file case: the row is skipped loudly and the sidecar keeps the flag
+/// until this process or the other re-lands it.
 pub(super) async fn cold_journal_append(
     session_path: Option<PathBuf>,
     kind: String,

@@ -1,9 +1,9 @@
 //! Journal replay (L10, §C.3): the deterministic fold from one session's
 //! active entry chain to the thread's journal-backed observable state.
 //!
-//! This fold is the authority behind the engine's restore path (K2): every
-//! field a §C.2 state-change entry carries rebuilds from the chain, and the
-//! chain is the only source — replay reads the journal and nothing else. The
+//! This fold is the authority behind the engine's restore path: every field a
+//! §C.2 state-change entry carries rebuilds from the chain, and the chain is
+//! the only source — replay reads the journal and nothing else. The
 //! match below is exhaustive — a new kernel entry variant must classify
 //! here (state-bearing or ignored) before it compiles, mirroring the
 //! projection fold's coverage gate.
@@ -146,7 +146,7 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
     let mut state = ReplayedThreadState::default();
     for record in records {
         match &record.entry {
-            // ── journal-backed state (K2 authority) ─────────────────────
+            // ── journal-backed state ────────────────────────────────────
             Event::Title { title, .. } => {
                 state.title = Some(title.clone());
             }
