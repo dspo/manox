@@ -25,7 +25,6 @@ use reqwest::Client as HttpClient;
 use url::Url;
 
 pub const PROVIDER_CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
-pub const LEGACY_PROVIDER_CONFIG_FILE_NAME: &str = "config.yaml";
 
 // ═══════════════════════════════════════════════════
 // Wire protocol + auth strategy
@@ -848,7 +847,7 @@ pub fn strip_context_suffix(id: &str) -> String {
 }
 
 impl CxConfig {
-    /// Load from `~/.manox/cx.providers.config.yaml` (with legacy `config.yaml` migration).
+    /// Load from `~/.manox/cx.providers.config.yaml`.
     pub fn load_default() -> Result<Self> {
         let path = active_provider_config_path()?;
         read_config_file(&path)
@@ -881,7 +880,7 @@ impl FromStr for CxConfig {
 }
 
 // ═══════════════════════════════════════════════════
-// Path resolution + legacy migration
+// Path resolution
 // ═══════════════════════════════════════════════════
 
 /// `$HOME/.manox` — the single root for all cx-family persistent state
@@ -902,82 +901,9 @@ pub fn default_config_path() -> Result<PathBuf> {
     Ok(cx_state_dir()?.join(PROVIDER_CONFIG_FILE_NAME))
 }
 
-fn legacy_provider_config_path() -> Result<PathBuf> {
-    Ok(cx_state_dir()?.join(LEGACY_PROVIDER_CONFIG_FILE_NAME))
-}
-
-/// Previous cx state root (`$HOME/.config/cx`), retired when all persistent
-/// content moved under `~/.manox/`. Kept only as a one-time migration source.
-fn legacy_cx_state_dir() -> PathBuf {
-    dirs::home_dir()
-        .map(|home| home.join(".config/cx"))
-        .unwrap_or_default()
-}
-
-/// Rename a legacy `config.yaml` to the current name if the current file is absent.
-pub fn migrate_legacy_provider_config(current_path: &Path, legacy_path: &Path) -> Result<bool> {
-    if current_path.exists() || !legacy_path.exists() {
-        return Ok(false);
-    }
-
-    if let Some(parent) = current_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
-    }
-
-    std::fs::rename(legacy_path, current_path).with_context(|| {
-        format!(
-            "迁移旧配置失败: {} -> {}",
-            legacy_path.display(),
-            current_path.display()
-        )
-    })?;
-    eprintln!("已将旧 Provider 配置迁移到 {}", current_path.display());
-    Ok(true)
-}
-
-/// Copy the provider config from the retired `~/.config/cx` root when the new
-/// `~/.manox` root has no config yet (first run after the root move). The old
-/// file is left in place — pruning the old root is the manual migration step.
-///
-/// `old_root` is the retired state dir supplied by the caller rather than read
-/// from the process-global `HOME`, so the function carries no ambient state.
-fn migrate_legacy_root_provider_config(current_path: &Path, old_root: &Path) -> Result<bool> {
-    if current_path.exists() {
-        return Ok(false);
-    }
-    if old_root.as_os_str().is_empty() {
-        return Ok(false);
-    }
-    let candidates = [
-        old_root.join(PROVIDER_CONFIG_FILE_NAME),
-        old_root.join(LEGACY_PROVIDER_CONFIG_FILE_NAME),
-    ];
-    let Some(source) = candidates.iter().find(|p| p.exists()) else {
-        return Ok(false);
-    };
-    if let Some(parent) = current_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
-    }
-    std::fs::copy(source, current_path).with_context(|| {
-        format!(
-            "迁移旧 Provider 配置失败: {} -> {}",
-            source.display(),
-            current_path.display()
-        )
-    })?;
-    eprintln!("已将旧 Provider 配置迁移到 {}", current_path.display());
-    Ok(true)
-}
-
-/// Active config path, migrating a legacy file first if needed.
+/// The provider config path: `$HOME/.manox/cx.providers.config.yaml`.
 pub fn active_provider_config_path() -> Result<PathBuf> {
-    let current_path = default_config_path()?;
-    let legacy_path = legacy_provider_config_path()?;
-    migrate_legacy_provider_config(&current_path, &legacy_path)?;
-    migrate_legacy_root_provider_config(&current_path, &legacy_cx_state_dir())?;
-    Ok(current_path)
+    default_config_path()
 }
 
 /// Read and parse a config file.
@@ -1627,73 +1553,6 @@ providers:
         assert_eq!(strip_context_suffix("m[1g]"), "m[1g]"); // unknown unit
         assert_eq!(strip_context_suffix("a[1m][2m]"), "a[1m][2m]"); // multi-group
         assert_eq!(strip_context_suffix("glm[1m]5.2"), "glm[1m]5.2"); // non-trailing
-    }
-
-    #[test]
-    fn migrate_legacy_provider_config_moves_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let current_path = dir.path().join(PROVIDER_CONFIG_FILE_NAME);
-        let legacy_path = dir.path().join(LEGACY_PROVIDER_CONFIG_FILE_NAME);
-        let content = "providers: []\nagents: []\n";
-        std::fs::write(&legacy_path, content).unwrap();
-
-        let migrated = migrate_legacy_provider_config(&current_path, &legacy_path).unwrap();
-        assert!(migrated);
-        assert!(!legacy_path.exists());
-        assert_eq!(std::fs::read_to_string(&current_path).unwrap(), content);
-    }
-
-    #[test]
-    fn migrate_legacy_provider_config_noop_when_current_exists() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let current_path = dir.path().join(PROVIDER_CONFIG_FILE_NAME);
-        let legacy_path = dir.path().join(LEGACY_PROVIDER_CONFIG_FILE_NAME);
-        std::fs::write(&current_path, "providers: []\n").unwrap();
-        std::fs::write(&legacy_path, "providers: []\n").unwrap();
-
-        let migrated = migrate_legacy_provider_config(&current_path, &legacy_path).unwrap();
-        assert!(!migrated);
-        assert!(legacy_path.exists());
-    }
-
-    #[test]
-    fn migrate_legacy_root_provider_config_copies_from_old_root() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let old_root = dir.path().join(".config/cx");
-        let new_root = dir.path().join(".manox");
-        std::fs::create_dir_all(&old_root).unwrap();
-        let content = "providers: []\nagents: []\n";
-        std::fs::write(old_root.join(PROVIDER_CONFIG_FILE_NAME), content).unwrap();
-
-        let current_path = new_root.join(PROVIDER_CONFIG_FILE_NAME);
-        let migrated = migrate_legacy_root_provider_config(&current_path, &old_root).unwrap();
-        assert!(migrated);
-        // The old root keeps its file — pruning it is the manual migration step.
-        assert!(old_root.join(PROVIDER_CONFIG_FILE_NAME).exists());
-        assert_eq!(std::fs::read_to_string(&current_path).unwrap(), content);
-
-        // A second run is a no-op once the new root has a config.
-        let again = migrate_legacy_root_provider_config(&current_path, &old_root).unwrap();
-        assert!(!again);
-    }
-
-    #[test]
-    fn migrate_legacy_root_provider_config_noop_with_empty_old_root() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let current_path = dir.path().join(PROVIDER_CONFIG_FILE_NAME);
-        let migrated = migrate_legacy_root_provider_config(&current_path, Path::new("")).unwrap();
-        assert!(!migrated);
-        assert!(!current_path.exists());
-    }
-
-    #[test]
-    fn migrate_legacy_root_provider_config_noop_without_old_root() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let old_root = dir.path().join(".config/cx");
-        let current_path = dir.path().join(".manox").join(PROVIDER_CONFIG_FILE_NAME);
-        let migrated = migrate_legacy_root_provider_config(&current_path, &old_root).unwrap();
-        assert!(!migrated);
-        assert!(!current_path.exists());
     }
 
     /// Endpoint headers override provider-level ones, case-insensitively;
