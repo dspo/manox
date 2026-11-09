@@ -255,8 +255,23 @@ pub fn entries_to_display(
                 retract_note(&mut folded, annotation_id, &mut display, &mut notes);
             }
             _ => {
+                // A user row's authorship is an entry fact (`Event::Message::ui`),
+                // so the rebuilt bubble carries the same send-time header live
+                // and after a restart — no sidecar read.
+                let attribution = match entry {
+                    manox_harness::session::Event::Message { ui: Some(ui), .. } => {
+                        Some(user_entry_ui_to_message_ui(ui))
+                    }
+                    _ => None,
+                };
                 for message in manox_harness::session::session_entry_to_context_messages(entry) {
-                    let mapped = harness_messages_to_messages(std::slice::from_ref(&message));
+                    let mut mapped = harness_messages_to_messages(std::slice::from_ref(&message));
+                    if let (Some(ui), Some(first)) = (attribution.as_ref(), mapped.first_mut())
+                        && first.role == crate::language_model::Role::User
+                        && first.provenance == crate::message::MessageProvenance::User
+                    {
+                        first.ui = Some(ui.clone());
+                    }
                     message_count += mapped.len();
                     display.extend(mapped.into_iter().map(HistoryEntry::Message));
                 }
@@ -264,6 +279,18 @@ pub fn entries_to_display(
         }
     }
     (display, notes)
+}
+
+/// Translate the entry-level authorship fact into the host's UI metadata.
+fn user_entry_ui_to_message_ui(
+    ui: &manox_harness::session::UserEntryUi,
+) -> crate::message::MessageUiMetadata {
+    crate::message::MessageUiMetadata {
+        author: Some(crate::message::MessageAuthor::from_routing(&ui.author)),
+        peer: ui.peer,
+        display_text: ui.display_text.clone(),
+        ..Default::default()
+    }
 }
 
 /// Drop a folded annotation card from both output lists, closing the gap so
@@ -627,6 +654,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user(text),
             origin: None,
+            ui: None,
         }
     }
 

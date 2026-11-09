@@ -109,6 +109,10 @@ pub(crate) enum SessionCmd {
         /// actor pins the middleware skip from it instead of appending its
         /// own entry; `None` persists the entry at drain, before the run.
         accepted_entry: Option<String>,
+        /// The entry-level authorship of this prompt's user row
+        /// (`None` = the human typed it). The actor pins it on the session
+        /// so whichever append lands the row carries it.
+        ui: Option<manox_harness::session::UserEntryUi>,
     },
     /// Inject a steer into the running turn.
     Steer {
@@ -781,12 +785,14 @@ impl ThreadEngine for Engine {
         images: Vec<manox_harness::types::ContentBlock>,
         origin: Option<String>,
         accepted_entry: Option<String>,
+        ui: Option<manox_harness::session::UserEntryUi>,
     ) {
         let _ = self.cmd_tx.send(SessionCmd::Prompt {
             text: prompt,
             images,
             origin_rpc: origin,
             accepted_entry,
+            ui,
         });
     }
     fn persist_user_submission(
@@ -821,6 +827,8 @@ impl ThreadEngine for Engine {
             // Durable: a still-deferred session (no file yet) materializes
             // here — the accepted text is on disk before the caller's
             // receipt returns.
+            // Accept-time persistence precedes the host insert that knows
+            // the authorship, so this row is always human input.
             let id = appender.append_message_durable(message, origin).await?;
             Ok(Some(id))
         })
@@ -888,6 +896,7 @@ impl ThreadEngine for Engine {
             images,
             origin_rpc: None,
             accepted_entry: None,
+            ui: None,
         });
     }
 
@@ -1543,6 +1552,7 @@ async fn run_actor(
                 images,
                 origin_rpc,
                 accepted_entry,
+                ui,
             } => {
                 // Ownership honesty, not a retry: after a supervisor failure
                 // the harness may be mid-state, so a submit is refused with a
@@ -1598,6 +1608,10 @@ async fn run_actor(
                 // awaited the append before its receipt and passes the
                 // entry id) or here, at drain, for a queued Submit. The
                 // middleware skips its own append through the pinned id.
+                // The row's author rides the session pin so the append that
+                // lands the row (drain-time here, or the persistence
+                // middleware on the run's MessageEnd) attaches it.
+                session.set_pending_user_ui(ui);
                 if let Err(err) =
                     persist_prompt_user_entry(&session, &text, &images, origin_rpc, accepted_entry)
                         .await
@@ -2773,10 +2787,10 @@ async fn rebuild_restored_state(
 
 /// Map the journal's active chain into the display sequence plus the
 /// positioned UI notes: the display interleaves the note entries at their
-/// persisted position, then re-attaches the sidecar's per-ordinal user-turn
-/// chrome (registry slash display forms + agent attributions) — the transcript
-/// stores only wire content, so the attach is what keeps a reloaded thread's
-/// bubbles send-time accurate.
+/// persisted position, then re-attaches the sidecar's per-ordinal registry
+/// slash display forms — the transcript stores only wire content, so the
+/// attach is what keeps a reloaded thread's bubbles send-time accurate.
+/// Authorship needs no attach: it rides the user row (`Event::Message::ui`).
 ///
 /// Reads go through the journal handle, never a session borrow: the turn's
 /// projection runs detached from the run that produced the chain.
@@ -2789,10 +2803,6 @@ async fn display_from_entries(
     attach_registry_displays(
         &mut display,
         &load_registry_displays(sessions_dir, session_path).await,
-    );
-    attach_user_attributions(
-        &mut display,
-        &load_user_attributions(sessions_dir, session_path).await,
     );
     (display, notes)
 }
@@ -2831,36 +2841,22 @@ async fn load_registry_displays(
         .unwrap_or_default()
 }
 
-/// The agent attributions persisted per user-message ordinal by
-/// `Thread::persist_user_attribution`. Missing sidecar or field reads as
-/// empty (human-only transcript).
-async fn load_user_attributions(
-    sessions_dir: &Path,
-    session_path: &Path,
-) -> std::collections::HashMap<usize, manox_harness::session_meta::UserAttributionMeta> {
-    manox_harness::session_meta::load(sessions_dir, session_path)
-        .await
-        .map(|meta| meta.user_attributions)
-        .unwrap_or_default()
-}
-
-/// Drop the per-ordinal user-turn chrome (registry display forms + agent
-/// attributions). A compaction rebuilds the transcript as a summary user
-/// message plus the retained tail, which shifts every persisted ordinal;
-/// the stale records would otherwise attach to the wrong user prompt on
-/// the next `sync_history`. New turns after the compaction persist fresh
-/// ordinals over the rebuilt sequence.
+/// Drop the per-ordinal registry display forms. A compaction rebuilds the
+/// transcript as a summary user message plus the retained tail, which shifts
+/// every persisted ordinal; the stale records would otherwise attach to the
+/// wrong user prompt on the next `sync_history`. New turns after the
+/// compaction persist fresh ordinals over the rebuilt sequence. Attribution
+/// needs no clearing — it rides the row and is retained with it.
 async fn clear_user_chrome(sessions_dir: &Path, session_path: &Path) {
-    // Probe first: clearing empty maps would only churn the sidecar.
+    // Probe first: clearing an empty map would only churn the sidecar.
     let meta = manox_harness::session_meta::load(sessions_dir, session_path)
         .await
         .unwrap_or_default();
-    if meta.registry_displays.is_empty() && meta.user_attributions.is_empty() {
+    if meta.registry_displays.is_empty() {
         return;
     }
     if let Err(err) = manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
         meta.registry_displays.clear();
-        meta.user_attributions.clear();
     })
     .await
     {
@@ -2898,39 +2894,6 @@ fn attach_registry_displays(
         {
             if let Some(text) = displays.get(&ordinal) {
                 message.ui.get_or_insert_with(Default::default).display_text = Some(text.clone());
-            }
-            ordinal += 1;
-        }
-    }
-}
-
-/// Re-attach `author`/`peer` to the user prompt message at each persisted
-/// ordinal. The ordinal counts `Role::User` messages with a `User`
-/// provenance — the same set `Thread` counts when persisting — so steers
-/// (user prompts too) and tool results (excluded) align between the two.
-fn attach_user_attributions(
-    history: &mut [HistoryEntry],
-    attributions: &std::collections::HashMap<
-        usize,
-        manox_harness::session_meta::UserAttributionMeta,
-    >,
-) {
-    if attributions.is_empty() {
-        return;
-    }
-    let mut ordinal = 0usize;
-    for entry in history {
-        let HistoryEntry::Message(message) = entry else {
-            continue;
-        };
-        if message.role == crate::language_model::Role::User
-            && message.provenance == crate::message::MessageProvenance::User
-        {
-            if let Some(record) = attributions.get(&ordinal) {
-                let ui = message.ui.get_or_insert_with(Default::default);
-                ui.author = Some(crate::message::MessageAuthor::from_routing(&record.author));
-                ui.peer = record.peer;
-                ui.display_text = record.display_text.clone();
             }
             ordinal += 1;
         }

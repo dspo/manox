@@ -232,10 +232,16 @@ pub(super) async fn persist_prompt_user_entry(
     let entry_id = match accepted_entry {
         Some(id) => id,
         None => {
+            // The drain-time append is the row's one append, so it consumes
+            // the authorship pin exactly like the persistence middleware
+            // would on the run's announcement.
+            let ui = appender.take_pending_user_ui();
             // Durable: a still-deferred session (no file yet) puts the
             // accepted text on disk here, not at the first assistant
             // message.
-            appender.append_message_durable(message, origin_rpc).await?
+            appender
+                .append_message_durable_with_ui(message, origin_rpc, ui)
+                .await?
         }
     };
     appender.pin_accepted_user_entry(entry_id.clone(), content);
