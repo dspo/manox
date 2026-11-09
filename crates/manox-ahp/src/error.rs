@@ -1,7 +1,7 @@
 //! Host errors and the single declaration table of codes leaving the gateway.
 //!
-//! The v2 rule survives: every production error carries a stable code (no bare
-//! messages). AHP's standard codes come from `ahp-types`; the x-manox band
+//! Every production error carries a stable code (no bare messages). AHP's
+//! standard codes come from `ahp-types`; the x-manox band
 //! `-32080..-32099` carries the extensions this host needs and refuses to
 //! silently degrade.
 
@@ -23,6 +23,11 @@ pub mod codes {
     pub const X_MANOX_RESOURCE_DENIED: i32 = -32082;
     /// The runtime backend failed while serving a command.
     pub const X_MANOX_BACKEND: i32 = -32083;
+    /// A handler exceeded [`crate::lanes::DISPATCH_DEADLINE`]; the transport
+    /// answered the request itself.
+    pub const X_MANOX_TIMEOUT: i32 = -32084;
+    /// A connection's channel lane was full; the message was not dispatched.
+    pub const X_MANOX_OVERLOAD: i32 = -32085;
 
     /// Name → code, for the declaration surface and its drift gate.
     pub const DECLARED: &[(&str, i32)] = &[
@@ -48,6 +53,8 @@ pub mod codes {
         ("xManox/actionRejected", X_MANOX_ACTION_REJECTED),
         ("xManox/resourceDenied", X_MANOX_RESOURCE_DENIED),
         ("xManox/backend", X_MANOX_BACKEND),
+        ("xManox/timeout", X_MANOX_TIMEOUT),
+        ("xManox/overload", X_MANOX_OVERLOAD),
     ];
 }
 

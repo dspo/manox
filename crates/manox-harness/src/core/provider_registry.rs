@@ -151,7 +151,7 @@ pub struct ProviderConfig {
 
 /// Registered provider descriptions plus the global model index. The
 /// stream resolution order is: registered provider → optional fallback
-/// resolver (the host's legacy bridge) → error.
+/// resolver (the host's alias catalog) → error.
 pub struct ProviderRegistry {
     providers: Mutex<HashMap<String, ProviderConfig>>,
     /// Two-level model index: provider name → model id → expanded `Model`.
@@ -466,9 +466,8 @@ struct RegistryCatalog {
 
 impl ModelCatalog for RegistryCatalog {
     fn resolve(&self, provider: &str, model_id: &str) -> Option<Model> {
-        // Host-side compatibility layers (e.g. legacy provider-id aliases)
-        // wrap this catalog from the outside; the kernel only knows its own
-        // registration names.
+        // Host-side wrappers (e.g. provider-id aliases) wrap this catalog
+        // from the outside; the kernel only knows its own registration names.
         self.registry
             .resolve_model(provider, model_id)
             .or_else(|| DefaultModelCatalog.resolve(provider, model_id))

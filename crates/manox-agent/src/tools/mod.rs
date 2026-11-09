@@ -40,6 +40,5 @@ pub const LS: &str = "Ls";
 
 pub const WRITE: &str = "Write";
 
-// The manox harness tool implementations were removed with the retired
-// manox harness; the constants above remain the shared wire-name source of
-// truth.
+// The constants above are the shared wire-name source of truth for the
+// built-in tool set.

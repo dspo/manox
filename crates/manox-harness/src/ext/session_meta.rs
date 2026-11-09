@@ -30,11 +30,10 @@ pub struct SessionMeta {
     /// fence keeps admitting them. Empty (the default) = single-cwd.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub working_directories: Vec<String>,
-    /// Note: pre-W4 sidecars may still carry `plan_mode` / `plan_file`
-    /// keys, and retired copies of the access mode / reasoning effort
-    /// picks. All those fields are gone and `SessionMeta` ignores unknown
-    /// keys, so the stale values are inert — never read them as state (the
-    /// session-mutable config picks live in the journal's own rows).
+    /// Note: a sidecar may still carry `plan_mode` / `plan_file` keys and
+    /// older access-mode / reasoning-effort picks. `SessionMeta` ignores
+    /// unknown keys, so those values are inert — never read them as state
+    /// (the session-mutable config picks live in the journal's own rows).
     /// Last execution plan the model published via `UpdatePlan`, persisted so
     /// it survives compaction (the transcript's tool calls are summarized
     /// away) and restarts. Serialized `manox_agent::plan::PlanSnapshot`; `None`
@@ -72,54 +71,38 @@ pub struct SessionMeta {
     /// reload.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub registry_displays: HashMap<usize, String>,
-    /// Agent attribution for user-role messages the human did not type
-    /// (plan seeds, peer deliveries, member opening tasks), keyed by the
-    /// same user-prompt ordinal as `registry_displays`. The host resolves
-    /// `author` (a routing identity) to a display name at render time.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub user_attributions: HashMap<usize, UserAttributionMeta>,
-}
-
-/// One persisted attribution record (see `SessionMeta::user_attributions`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct UserAttributionMeta {
-    /// Routing identity of the originating agent: `"lead"` for the main
-    /// agent, the manifest / member name otherwise.
-    pub author: String,
-    /// The message entered via team peer delivery; the reload path
-    /// rebuilds it as a team bubble.
-    #[serde(default)]
-    pub peer: bool,
-    /// The send-time display form of the message (e.g. the unwrapped body of
-    /// a peer delivery whose model-facing text is a wrapped `[from …]` form).
-    /// The reload path re-attaches it so restored bubbles match the live view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_text: Option<String>,
 }
 
 /// The sidecar path for a session file.
+///
+/// The canonical journal (`<bucket>/<id>/session.jsonl`) holds the session
+/// directory (and its lease) alone — dsh's shape — so its sidecar is a cache
+/// row beside the bucket: `<bucket>/cache/<id>.json`. Any other path (a
+/// caller outside the store, a test fixture) resolves to the same cache shape
+/// under `session_dir`, keyed by its file stem; the cache never sits beside
+/// the journal.
 pub fn meta_path(session_dir: &Path, session_path: &Path) -> PathBuf {
-    // Core layout: the session directory holds the journal (and its lease)
-    // alone — dsh's shape — so the sidecar lives one level up as a cache
-    // row under `<core>/cache/<id>.json`. A legacy flat `<id>.jsonl` keeps
-    // the old beside-the-file derivation.
-    if session_path.file_name().and_then(|n| n.to_str())
-        == Some(crate::session::identity::JOURNAL_FILE)
-        && let Some(dir) = session_path.parent()
-        && let Some(core_root) = dir.parent()
-        && let Some(id) = dir.file_name().and_then(|n| n.to_str())
-    {
-        return core_root.join("cache").join(format!("{id}.json"));
-    }
-    let _ = session_dir;
-    let id = session_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    session_path
-        .parent()
-        .unwrap_or(session_dir)
-        .join(format!("{id}.meta.json"))
+    let is_journal = session_path.file_name().and_then(|name| name.to_str())
+        == Some(crate::session::identity::JOURNAL_FILE);
+    let parent = session_path.parent().unwrap_or(session_dir);
+    let (root, id) = if is_journal {
+        (
+            parent.parent().unwrap_or(session_dir),
+            parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+        )
+    } else {
+        (
+            session_dir,
+            session_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default(),
+        )
+    };
+    root.join("cache").join(format!("{id}.json"))
 }
 
 /// Read the sidecar; a missing file yields the default (fresh session).
@@ -165,8 +148,9 @@ pub async fn save(
 /// its sidecar is already addressable.
 async fn save_unlocked(path: &Path, meta: &SessionMeta) -> Result<(), anyhow::Error> {
     let bytes = serde_json::to_vec_pretty(meta)?;
-    // `<id>.meta.json.tmp`: `with_extension` would only replace the last
-    // extension (`json`), yielding a surprising `<id>.meta.meta.json.tmp`.
+    // `<cache>/<id>.json.tmp`: `with_extension` would only replace the last
+    // extension (`json`), yielding a surprising `<cache>/<id>.json.tmp` path
+    // that collides with the cache row of the same name.
     let tmp = path.with_file_name(format!(
         "{}.tmp",
         path.file_name()
@@ -375,13 +359,22 @@ mod tests {
         assert!(cleared.plan_snapshot.is_none());
     }
 
+    /// Write raw bytes at the sidecar's cache path, creating the directory
+    /// the cache row lives in (the canonical layout keeps sidecars out of the
+    /// session directory).
+    async fn write_raw_sidecar(dir: &std::path::Path, session: &std::path::Path, raw: &str) {
+        let path = meta_path(dir, session);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(path, raw).await.unwrap();
+    }
+
     #[tokio::test]
     async fn corrupt_sidecar_surfaces_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("abc.jsonl");
-        tokio::fs::write(meta_path(dir.path(), &session), "{not json")
-            .await
-            .unwrap();
+        write_raw_sidecar(dir.path(), &session, "{not json").await;
         assert!(load(dir.path(), &session).await.is_err());
     }
 
@@ -443,9 +436,7 @@ mod tests {
     async fn update_self_heals_corrupt_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("abc.jsonl");
-        tokio::fs::write(meta_path(dir.path(), &session), "{\"broken\":")
-            .await
-            .unwrap();
+        write_raw_sidecar(dir.path(), &session, "{\"broken\":").await;
         update(dir.path(), &session, |meta| meta.archived = true)
             .await
             .unwrap();

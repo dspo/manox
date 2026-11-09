@@ -11,9 +11,9 @@
 //! and `manox-agent` must not depend on either (the kernel does not know AHP
 //! exists — capabilities reach it through its own hooks).
 //!
-//! [`runtime_trait::SessionRuntime`] is the seam the adapter holds. The gateway
-//! in `manox-session-core` implements it for as long as v2 lives, which is what
-//! lets the adapter name no gateway type.
+//! [`runtime_trait::SessionRuntime`] is the seam the adapter holds. The session
+//! runtime in `manox-session-core` implements it, which is what lets the adapter
+//! name no gateway type.
 
 pub mod ahp;
 pub mod base64_bytes;

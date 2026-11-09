@@ -1,5 +1,5 @@
 //! `WebExplore*` tool set — the agent's outbound surface for driving the
-//! built-in browser (ported from the retired manox harness).
+//! built-in browser.
 //!
 //! The browser capability (`manox_agent::capability::CapabilityClient`) is a
 //! frontend-provided seam; harness tools run on tokio. Each call therefore rides the

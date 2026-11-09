@@ -17,6 +17,7 @@ ahp-types.workspace = true
 # lives. Client-facing SDK pieces of that crate are not used here.
 ahp.workspace = true
 async-channel.workspace = true
+async-trait.workspace = true
 axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 parking_lot.workspace = true
@@ -29,7 +30,7 @@ chrono.workspace = true
 
 [dev-dependencies]
 ahp-ws.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [lints]
 workspace = true

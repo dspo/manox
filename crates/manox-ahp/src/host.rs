@@ -125,11 +125,20 @@ impl Host {
 
         let inner = self.inner.clone();
         tokio::spawn(async move {
+            // Teardown is a guard, not the last statement of a happy path: a
+            // panicking reader must still retire its waiters and leave the
+            // host's registry, or the connection reads as alive while every
+            // host → client request to it waits out its whole deadline.
+            let teardown = ConnectionGuard {
+                inner: inner.clone(),
+                conn: conn.clone(),
+            };
+            let lanes = crate::lanes::Lanes::new(inner.clone(), conn.clone());
             loop {
                 match source.recv().await {
                     Ok(Some(msg)) => {
                         let msg = conn.interpret(msg);
-                        crate::router::handle(&inner, &conn, msg).await
+                        dispatch_inbound(&inner, &conn, &lanes, msg).await;
                     }
                     Ok(None) => break,
                     Err(err) => {
@@ -138,13 +147,10 @@ impl Host {
                     }
                 }
             }
-            conn.cancel_waiters(JsonRpcError {
-                code: crate::codes::X_MANOX_BACKEND,
-                message: "client connection closed".to_string(),
-                data: None,
-            });
-            conn.kill();
-            inner.conns.write().retain(|live| live.id() != conn.id());
+            // Drop the lanes first so no lane keeps dispatching into a
+            // connection that is being torn down.
+            drop(lanes);
+            drop(teardown);
         });
     }
 
@@ -372,6 +378,60 @@ impl Host {
                 )))
             }
         }
+    }
+}
+
+/// The reader's teardown, run on every exit including unwind.
+///
+/// A panicking reader must not leave the connection "alive" in [`Inner::conns`]
+/// with waiters that never resolve: every later host → client request to it
+/// would wait out its whole deadline. A panic unwinds the reader's future and
+/// drops its locals, so a drop guard is the one place teardown cannot be skipped.
+struct ConnectionGuard {
+    inner: Arc<Inner>,
+    conn: Arc<Conn>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.conn.cancel_waiters(JsonRpcError {
+            code: crate::codes::X_MANOX_BACKEND,
+            message: "client connection closed".to_string(),
+            data: None,
+        });
+        self.conn.kill();
+        self.inner
+            .conns
+            .write()
+            .retain(|live| live.id() != self.conn.id());
+    }
+}
+
+/// Classify one inbound message: correlation and the handshake run inline, and
+/// everything else is demultiplexed onto its channel's lane.
+async fn dispatch_inbound(
+    inner: &Arc<Inner>,
+    conn: &Arc<Conn>,
+    lanes: &crate::lanes::Lanes,
+    msg: JsonRpcMessage,
+) {
+    match &msg {
+        // Completing a waiter is bookkeeping, not application work: queueing it
+        // behind a lane would let a busy channel starve the reply the host
+        // itself is waiting for.
+        JsonRpcMessage::SuccessResponse(_) | JsonRpcMessage::ErrorResponse(_) => {
+            crate::router::handle(inner, conn, msg).await;
+        }
+        // The handshake sets the connection's identity and subscription set, and
+        // `Inner::reseat` must land before any lane work that depends on it.
+        JsonRpcMessage::Request(request)
+            if matches!(request.method.as_str(), "initialize" | "reconnect") =>
+        {
+            if crate::lanes::claim(conn, request.id) {
+                crate::router::handle(inner, conn, msg).await;
+            }
+        }
+        _ => lanes.dispatch(crate::lanes::target_channel(&msg), msg),
     }
 }
 
@@ -623,13 +683,14 @@ impl Inner {
     }
 
     /// Make sure a session's state is loaded, seeding from the backend.
-    pub(crate) fn ensure_session(&self, session_id: &str) -> Result<(), HostError> {
+    pub(crate) async fn ensure_session(&self, session_id: &str) -> Result<(), HostError> {
         if self.store.read().session(session_id).is_some() {
             return Ok(());
         }
         let state = self
             .backend
             .session_state(session_id)
+            .await
             .ok_or_else(|| HostError::SessionNotFound(session_id.to_string()))?;
         let chats: Vec<Uri> = state
             .chats
@@ -639,7 +700,7 @@ impl Inner {
         self.store.write().insert_session(session_id, state);
         for uri in chats {
             if let Some(chat_id) = crate::channels::chat::id(&uri)
-                && let Some(chat) = self.backend.chat_state(chat_id)
+                && let Some(chat) = self.backend.chat_state(chat_id).await
             {
                 self.store.write().insert_chat(session_id, chat_id, chat);
             }
@@ -648,19 +709,21 @@ impl Inner {
     }
 
     /// Make sure a chat's state and its session link are loaded.
-    pub(crate) fn ensure_chat(&self, chat_id: &str) -> Result<String, HostError> {
+    pub(crate) async fn ensure_chat(&self, chat_id: &str) -> Result<String, HostError> {
         if let Some(owner) = self.store.read().chat_session(chat_id).map(str::to_string) {
             return Ok(owner);
         }
         let session_id = self
             .backend
             .session_state_for_chat(chat_id)
+            .await
             .ok_or_else(|| HostError::NotFound(crate::channels::chat::uri(chat_id)))?;
-        self.ensure_session(&session_id)?;
+        self.ensure_session(&session_id).await?;
         if self.store.read().chat(chat_id).is_none() {
             let state = self
                 .backend
                 .chat_state(chat_id)
+                .await
                 .ok_or_else(|| HostError::NotFound(crate::channels::chat::uri(chat_id)))?;
             self.store.write().insert_chat(&session_id, chat_id, state);
         }
@@ -682,26 +745,28 @@ impl Inner {
 
     /// Make sure an annotations channel is loaded, computing it on first
     /// sight from the backend's journal fold.
-    pub(crate) fn ensure_annotations(&self, id: &str) -> Result<(), HostError> {
+    pub(crate) async fn ensure_annotations(&self, id: &str) -> Result<(), HostError> {
         if self.store.read().annotations(id).is_some() {
             return Ok(());
         }
         let state = self
             .backend
             .annotations_state(id)
+            .await
             .ok_or_else(|| HostError::NotFound(crate::channels::annotations::uri(id)))?;
         self.store.write().insert_annotations(id, state);
         Ok(())
     }
 
     /// Make sure a changeset view is loaded, computing it on first sight.
-    pub(crate) fn ensure_changeset(&self, uri: &str) -> Result<(), HostError> {
+    pub(crate) async fn ensure_changeset(&self, uri: &str) -> Result<(), HostError> {
         if self.store.read().changeset(uri).is_some() {
             return Ok(());
         }
         let state = self
             .backend
             .changeset_state(uri)
+            .await
             .ok_or_else(|| HostError::NotFound(uri.to_string()))?;
         self.store.write().insert_changeset(uri, state);
         Ok(())

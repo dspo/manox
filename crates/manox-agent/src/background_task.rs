@@ -1491,7 +1491,7 @@ mod tests {
     }
 
     /// The 8KB tail cut must land on a UTF-8 char boundary: CJK output past
-    /// the cap used to panic split_off's is_char_boundary assertion.
+    /// the cap must not split a character (split_off asserts on a boundary).
     #[test]
     fn snapshot_tail_truncates_multibyte_output_on_char_boundary() {
         let id = TaskId("utf8_tail".into());

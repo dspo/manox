@@ -39,15 +39,23 @@ pub(crate) async fn handle(inner: &Arc<Inner>, conn: &Arc<Conn>, msg: JsonRpcMes
     match msg {
         JsonRpcMessage::Request(request) => {
             let id = request.id;
-            match dispatch_request(inner, conn, &request).await {
-                Ok(result) => conn.send(wire::success(id, result)),
+            let reply = match dispatch_request(inner, conn, &request).await {
+                Ok(result) => wire::success(id, result),
                 Err(err) => {
                     tracing::debug!(method = %request.method, "request failed: {err}");
-                    conn.send(wire::error(
-                        id,
-                        ahp_types::messages::JsonRpcError::from(err),
-                    ));
+                    wire::error(id, ahp_types::messages::JsonRpcError::from(err))
                 }
+            };
+            // The caller claimed this id before dispatching; a claim that is
+            // already gone means the dispatch deadline answered first, so the
+            // handler's late reply is discarded rather than sent twice.
+            if !conn.reply_once(id, reply) {
+                tracing::debug!(
+                    connection = conn.id(),
+                    id = id,
+                    method = %request.method,
+                    "late reply discarded: the request was already answered"
+                );
             }
         }
         JsonRpcMessage::Notification(note) => dispatch_notification(inner, conn, &note).await,
@@ -117,19 +125,19 @@ async fn dispatch_request(
         "resolveSessionConfig" => resolve_session_config(params),
         "completions" => completions(params),
         "createSession" => create_session(inner, conn, params).await,
-        "disposeSession" => dispose_session(inner, params),
+        "disposeSession" => dispose_session(inner, params).await,
         "createTerminal" => create_terminal(inner, params).await,
-        "disposeTerminal" => dispose_terminal(inner, params),
+        "disposeTerminal" => dispose_terminal(inner, params).await,
         "createChat" => create_chat(inner, conn, params).await,
         "moveChat" => move_chat(inner, conn, params).await,
-        "disposeChat" => dispose_chat(inner, params),
-        "fetchTurns" => fetch_turns(inner, params),
+        "disposeChat" => dispose_chat(inner, params).await,
+        "fetchTurns" => fetch_turns(inner, params).await,
         "invokeChangesetOperation" => invoke_changeset_operation(inner, params).await,
         "resourceRead" => resource_read(inner, params),
         "resourceWrite" => resource_write(inner, params),
         "resourceList" => resource_list(inner, params),
         "resourceDelete" => resource_delete(inner, params),
-        other if other.starts_with("x-manox/") => inner.backend.extension(other, &params),
+        other if other.starts_with("x-manox/") => inner.backend.extension(other, &params).await,
         // The table and this match must agree: a name that resolves to a command
         // but reaches here is our own bug, so it surfaces as such instead of
         // masquerading as an unknown method.
@@ -151,7 +159,7 @@ async fn dispatch_notification(inner: &Arc<Inner>, conn: &Arc<Conn>, note: &Json
         wire::DISPATCH_ACTION_METHOD => {
             let params = note.params.clone().unwrap_or(Value::Null);
             match parse_params::<DispatchActionParams>(params) {
-                Ok(params) => dispatch_action(inner, conn, params),
+                Ok(params) => dispatch_action(inner, conn, params).await,
                 Err(err) => tracing::debug!("malformed dispatchAction: {err}"),
             }
         }
@@ -165,7 +173,7 @@ async fn dispatch_notification(inner: &Arc<Inner>, conn: &Arc<Conn>, note: &Json
 ///
 /// AHP has no write receipt: the client learns the outcome from the echoed
 /// action envelope (with its `serverSeq`) or from `rejectionReason`.
-fn dispatch_action(inner: &Arc<Inner>, conn: &Arc<Conn>, params: DispatchActionParams) {
+async fn dispatch_action(inner: &Arc<Inner>, conn: &Arc<Conn>, params: DispatchActionParams) {
     let origin = ActionOrigin {
         client_id: conn.client_id().unwrap_or_default(),
         client_seq: params.client_seq,
@@ -202,19 +210,19 @@ fn dispatch_action(inner: &Arc<Inner>, conn: &Arc<Conn>, params: DispatchActionP
     };
     match &channel {
         Channel::Session(id) => {
-            if let Err(err) = inner.ensure_session(id) {
+            if let Err(err) = inner.ensure_session(id).await {
                 inner.reject(uri, params.action, Some(origin), err.message());
                 return;
             }
         }
         Channel::Chat(id) => {
-            if let Err(err) = inner.ensure_chat(id) {
+            if let Err(err) = inner.ensure_chat(id).await {
                 inner.reject(uri, params.action, Some(origin), err.message());
                 return;
             }
         }
         Channel::Annotations(id) => {
-            if let Err(err) = inner.ensure_annotations(id) {
+            if let Err(err) = inner.ensure_annotations(id).await {
                 inner.reject(uri, params.action, Some(origin), err.message());
                 return;
             }
@@ -226,7 +234,7 @@ fn dispatch_action(inner: &Arc<Inner>, conn: &Arc<Conn>, params: DispatchActionP
             }
         }
         Channel::Changeset(_) => {
-            if let Err(err) = inner.ensure_changeset(uri) {
+            if let Err(err) = inner.ensure_changeset(uri).await {
                 inner.reject(uri, params.action, Some(origin), err.message());
                 return;
             }
@@ -245,7 +253,7 @@ fn dispatch_action(inner: &Arc<Inner>, conn: &Arc<Conn>, params: DispatchActionP
         Channel::Root | Channel::Extension(_) => {}
     }
 
-    match inner.backend.dispatch(uri, &params.action, &origin) {
+    match inner.backend.dispatch(uri, &params.action, &origin).await {
         crate::backend::DispatchOutcome::Rejected(reason) => {
             inner.reject(uri, params.action, Some(origin), reason);
         }
@@ -290,7 +298,7 @@ async fn initialize(
 
     let mut snapshots = Vec::new();
     for uri in params.initial_subscriptions.clone().unwrap_or_default() {
-        if let Some(snapshot) = subscribe_uri(inner, conn, &uri)? {
+        if let Some(snapshot) = subscribe_uri(inner, conn, &uri).await? {
             snapshots.push(shape_snapshot(snapshot, None));
         }
     }
@@ -321,7 +329,8 @@ async fn subscribe(
 ) -> Result<Value, HostError> {
     let params: SubscribeParams = parse_params(params)?;
     let view_turns = params.view.as_ref().and_then(|view| view.turns);
-    let snapshot = subscribe_uri(inner, conn, &params.channel)?
+    let snapshot = subscribe_uri(inner, conn, &params.channel)
+        .await?
         .map(|snapshot| shape_snapshot(snapshot, view_turns));
     to_value(SubscribeResult { snapshot })
 }
@@ -347,7 +356,7 @@ fn shape_snapshot(snapshot: Snapshot, view_turns: Option<i64>) -> Snapshot {
 
 /// Subscribe one channel and answer its snapshot (or `None` for stateless
 /// channels, whose baseline is pushed as an extension action instead).
-fn subscribe_uri(
+async fn subscribe_uri(
     inner: &Arc<Inner>,
     conn: &Arc<Conn>,
     uri: &str,
@@ -356,13 +365,13 @@ fn subscribe_uri(
         .ok_or_else(|| HostError::InvalidParams(format!("unknown channel scheme: {uri}")))?;
     match &channel {
         Channel::Root => {}
-        Channel::Session(id) => inner.ensure_session(id)?,
+        Channel::Session(id) => inner.ensure_session(id).await?,
         Channel::Chat(id) => {
-            inner.ensure_chat(id)?;
+            inner.ensure_chat(id).await?;
         }
         Channel::Terminal(id) => inner.ensure_terminal(id)?,
-        Channel::Annotations(id) => inner.ensure_annotations(id)?,
-        Channel::Changeset(_) => inner.ensure_changeset(uri)?,
+        Channel::Annotations(id) => inner.ensure_annotations(id).await?,
+        Channel::Changeset(_) => inner.ensure_changeset(uri).await?,
         // The side-channel is not subscribable — a client's MCP surface is
         // the customization's `channel` field, and its traffic is
         // request/response. A subscribe lands as `NotFound`, the same answer
@@ -374,7 +383,7 @@ fn subscribe_uri(
     let snapshot = inner.snapshot(&channel);
     if snapshot.is_none()
         && !channel.is_state_bearing()
-        && let Some(state) = inner.backend.extension_baseline(uri)
+        && let Some(state) = inner.backend.extension_baseline(uri).await
     {
         // The baseline rides an `action` envelope, not a bare notification:
         // the Rust SDK client drops unknown notification methods, so a
@@ -433,7 +442,7 @@ async fn reconnect(
 
     let mut snapshots = Vec::new();
     for uri in &subscriptions {
-        if let Ok(Some(snapshot)) = subscribe_uri(inner, conn, uri) {
+        if let Ok(Some(snapshot)) = subscribe_uri(inner, conn, uri).await {
             snapshots.push(shape_snapshot(snapshot, None));
         }
     }
@@ -520,11 +529,14 @@ async fn invoke_changeset_operation(inner: &Arc<Inner>, params: Value) -> Result
             "the target kind is not in the operation's declared scopes".to_string(),
         ));
     }
-    inner.backend.invoke_changeset_operation(
-        params.channel.as_str(),
-        &params.operation_id,
-        params.target.as_ref(),
-    )
+    inner
+        .backend
+        .invoke_changeset_operation(
+            params.channel.as_str(),
+            &params.operation_id,
+            params.target.as_ref(),
+        )
+        .await
 }
 
 /// The `mcp://` side-channel: forward one MCP request to the runtime's
@@ -543,7 +555,10 @@ async fn mcp_channel_request(
         )));
     }
     crate::channels::mcp::upstream_params(&mut params);
-    inner.backend.mcp_channel_request(channel, method, &params)
+    inner
+        .backend
+        .mcp_channel_request(channel, method, &params)
+        .await
 }
 
 async fn create_session(
@@ -558,8 +573,8 @@ async fn create_session(
     if inner.store.read().session(&session_id).is_some() {
         return Err(HostError::SessionAlreadyExists(session_id));
     }
-    inner.backend.create_session(&session_id, &params)?;
-    inner.ensure_session(&session_id)?;
+    inner.backend.create_session(&session_id, &params).await?;
+    inner.ensure_session(&session_id).await?;
     if let Some(summary) = inner.backend.session_summary(&session_id) {
         inner.session_added(summary);
     }
@@ -621,12 +636,12 @@ pub fn tolerated_upstream_gaps() -> usize {
     1
 }
 
-fn dispose_session(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
+async fn dispose_session(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
     let params: DisposeSessionParams = parse_params(params)?;
     let session_id = session::id(&params.channel)
         .ok_or_else(|| HostError::InvalidParams("disposeSession channel".to_string()))?
         .to_string();
-    inner.backend.dispose_session(&session_id)?;
+    inner.backend.dispose_session(&session_id).await?;
     inner.store.write().remove_session(&session_id);
     inner.session_removed(&session_id);
     Ok(Value::Null)
@@ -660,17 +675,18 @@ async fn create_terminal(inner: &Arc<Inner>, params: Value) -> Result<Value, Hos
     }
     inner
         .backend
-        .create_terminal(&session_id, &terminal_id, cols, rows)?;
+        .create_terminal(&session_id, &terminal_id, cols, rows)
+        .await?;
     inner.ensure_terminal(&terminal_id)?;
     Ok(Value::Null)
 }
 
-fn dispose_terminal(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
+async fn dispose_terminal(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
     let params: DisposeTerminalParams = parse_params(params)?;
     let terminal_id = terminal::id(&params.channel)
         .ok_or_else(|| HostError::InvalidParams("disposeTerminal channel".to_string()))?
         .to_string();
-    inner.backend.dispose_terminal(&terminal_id)?;
+    inner.backend.dispose_terminal(&terminal_id).await?;
     inner.store.write().remove_terminal(&terminal_id);
     Ok(Value::Null)
 }
@@ -691,7 +707,7 @@ async fn move_chat(
         .read()
         .chat_session(&source_chat_id)
         .map(str::to_string);
-    let result = inner.backend.move_chat(&params)?;
+    let result = inner.backend.move_chat(&params).await?;
     // The catalog edges: the source session loses the chat, the destination
     // session's catalog gains it (the re-home seeds the destination's state,
     // so its summary reads from there). Sessions the store has not surfaced
@@ -708,7 +724,7 @@ async fn move_chat(
     }
     if let Some(new_session_id) = session::id(&result.session) {
         let new_chat_id = new_session_id.to_string();
-        let state = inner.backend.chat_state(&new_chat_id);
+        let state = inner.backend.chat_state(&new_chat_id).await;
         if let Some(state) = state {
             let summary = chat::summary(&state);
             inner
@@ -737,14 +753,18 @@ async fn create_chat(
     let chat_id = chat::id(&params.chat)
         .ok_or_else(|| HostError::InvalidParams("createChat chat".to_string()))?
         .to_string();
-    inner.ensure_session(&session_id)?;
+    inner.ensure_session(&session_id).await?;
     if inner.store.read().chat(&chat_id).is_some() {
         return Err(HostError::AlreadyExists(chat::uri(&chat_id)));
     }
-    inner.backend.create_chat(&session_id, &chat_id, &params)?;
+    inner
+        .backend
+        .create_chat(&session_id, &chat_id, &params)
+        .await?;
     let state = inner
         .backend
         .chat_state(&chat_id)
+        .await
         .ok_or_else(|| HostError::NotFound(chat::uri(&chat_id)))?;
     let summary = chat::summary(&state);
     inner
@@ -761,7 +781,7 @@ async fn create_chat(
     Ok(Value::Null)
 }
 
-fn dispose_chat(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
+async fn dispose_chat(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
     let params: DisposeChatParams = parse_params(params)?;
     let chat_id = chat::id(&params.channel)
         .ok_or_else(|| HostError::InvalidParams("disposeChat channel".to_string()))?
@@ -771,7 +791,7 @@ fn dispose_chat(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
         .read()
         .chat_session(&chat_id)
         .map(str::to_string);
-    inner.backend.dispose_chat(&chat_id)?;
+    inner.backend.dispose_chat(&chat_id).await?;
     if let Some(session_id) = session_id {
         inner.publish(
             &session::uri(&session_id),
@@ -785,16 +805,16 @@ fn dispose_chat(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
     Ok(Value::Null)
 }
 
-fn fetch_turns(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
+async fn fetch_turns(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
     let params: FetchTurnsParams = parse_params(params)?;
     let chat_id = chat::id(&params.channel)
         .ok_or_else(|| HostError::InvalidParams("fetchTurns channel".to_string()))?
         .to_string();
-    inner.ensure_chat(&chat_id)?;
-    let (turns, turns_next_cursor) =
-        inner
-            .backend
-            .fetch_turns_page(&chat_id, params.cursor.as_deref(), None)?;
+    inner.ensure_chat(&chat_id).await?;
+    let (turns, turns_next_cursor) = inner
+        .backend
+        .fetch_turns_page(&chat_id, params.cursor.as_deref(), None)
+        .await?;
     inner.publish(
         &params.channel,
         StateAction::ChatTurnsLoaded(ahp_types::actions::ChatTurnsLoadedAction {

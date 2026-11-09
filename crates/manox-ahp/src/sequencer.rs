@@ -3,8 +3,8 @@
 //! AHP sequences the whole server, not each channel: every accepted action gets
 //! the next number from one counter, snapshots carry the watermark they were
 //! taken at, and `reconnect` compares a single `lastSeenServerSeq`. The counter
-//! is the analogue of the v2 journal's single append-point stamp (L4) at the
-//! gateway layer; the journal keeps its own dense per-chain `seq`.
+//! is the gateway-layer counterpart of the journal's single append-point stamp
+//! (L4); the journal keeps its own dense per-chain `seq`.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 

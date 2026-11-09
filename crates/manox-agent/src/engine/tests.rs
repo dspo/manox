@@ -163,76 +163,54 @@ async fn attach_registry_displays_restores_sidecar_compact_forms() {
     assert_eq!(ui(4).as_deref(), Some("/healthz"));
 }
 
+/// A user row's authorship is an entry fact: the display rebuild reads it
+/// off `Event::Message::ui` — no sidecar, no ordinal count.
 #[tokio::test]
-async fn attach_user_attributions_restores_sidecar_authorship() {
-    let dir = tempfile::tempdir().unwrap();
-    let session = dir.path().join("sess-author.jsonl");
-    let meta = manox_harness::session_meta::SessionMeta {
-        user_attributions: [
-            (
-                0usize,
-                manox_harness::session_meta::UserAttributionMeta {
-                    author: "lead".into(),
-                    peer: false,
-                    display_text: None,
-                },
-            ),
-            (
-                1usize,
-                manox_harness::session_meta::UserAttributionMeta {
-                    author: "Sailor".into(),
-                    peer: true,
-                    display_text: Some("unwrapped body".into()),
-                },
-            ),
-            // Beyond the transcript's ordinals: tolerated, attaches nowhere.
-            (
-                5usize,
-                manox_harness::session_meta::UserAttributionMeta {
-                    author: "lead".into(),
-                    peer: false,
-                    display_text: None,
-                },
-            ),
-        ]
-        .into_iter()
-        .collect(),
-        ..Default::default()
+async fn the_display_rebuild_carries_the_rows_authorship() {
+    let user_row = |id: &str, text: &str, ui: Option<manox_harness::session::UserEntryUi>| {
+        manox_harness::session::Event::Message {
+            id: id.to_string(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            message: manox_harness::types::AgentMessage::user(text),
+            origin: None,
+            ui,
+        }
     };
-    manox_harness::session_meta::save(dir.path(), &session, &meta)
-        .await
-        .unwrap();
-
-    let attributions = load_user_attributions(dir.path(), &session).await;
-    // Same ordinal convention as the display forms: tool results and
-    // assistant turns never consume one.
-    let mut history: Vec<HistoryEntry> = vec![
-        Message::user("plan seed".to_string()), // ordinal 0
-        Message::assistant(vec![MessageContent::Text("ok".into())]),
-        Message::user_with_content(vec![MessageContent::ToolResult(
-            crate::language_model::LanguageModelToolResult {
-                tool_use_id: "tu_1".into(),
-                tool_name: "Read".into(),
-                is_error: false,
-                content: "ok".into(),
-            },
-        )]),
-        Message::user("[from Sailor]: wrapped".to_string()), // ordinal 1
-    ]
-    .into_iter()
-    .map(HistoryEntry::Message)
-    .collect();
-    attach_user_attributions(&mut history, &attributions);
-
-    let ui_at = |ix: usize| match &history[ix] {
+    let entries = vec![
+        user_row(
+            "m-0",
+            "plan seed",
+            Some(manox_harness::session::UserEntryUi {
+                author: "lead".into(),
+                peer: false,
+                display_text: None,
+            }),
+        ),
+        user_row("m-1", "a human prompt", None),
+        user_row(
+            "m-2",
+            "[from Sailor] wrapped",
+            Some(manox_harness::session::UserEntryUi {
+                author: "Sailor".into(),
+                peer: true,
+                display_text: Some("unwrapped body".into()),
+            }),
+        ),
+    ];
+    let (display, _notes) = adapt::entries_to_display(&entries);
+    let ui_at = |ix: usize| match &display[ix] {
         HistoryEntry::Message(m) => m.ui.clone(),
         _ => None,
     };
-    let seed = ui_at(0).expect("seed carries attribution");
+    let seed = ui_at(0).expect("the seed row carries attribution");
     assert_eq!(seed.author, Some(crate::message::MessageAuthor::Lead));
     assert!(!seed.peer);
-    assert!(ui_at(1).is_none(), "assistant turns stay unattributed");
-    let peer = ui_at(3).expect("peer delivery carries attribution");
+    assert!(
+        ui_at(1).is_none(),
+        "a human row stays human across the rebuild"
+    );
+    let peer = ui_at(2).expect("the peer row carries attribution");
     assert_eq!(
         peer.author,
         Some(crate::message::MessageAuthor::Agent("Sailor".into()))
@@ -241,11 +219,7 @@ async fn attach_user_attributions_restores_sidecar_authorship() {
     assert_eq!(
         peer.display_text.as_deref(),
         Some("unwrapped body"),
-        "the send-time display form survives the sidecar round-trip"
-    );
-    assert!(
-        ui_at(2).is_none(),
-        "tool results never consume an ordinal nor carry attribution"
+        "the send-time display form rides the row"
     );
 }
 
@@ -257,16 +231,6 @@ async fn clear_user_chrome_drops_sidecar_ordinals() {
         registry_displays: [(0usize, "/gitwork:deliver fast".to_string())]
             .into_iter()
             .collect(),
-        user_attributions: [(
-            0usize,
-            manox_harness::session_meta::UserAttributionMeta {
-                author: "lead".into(),
-                peer: false,
-                display_text: None,
-            },
-        )]
-        .into_iter()
-        .collect(),
         ..Default::default()
     };
     manox_harness::session_meta::save(dir.path(), &session, &meta)
@@ -279,11 +243,6 @@ async fn clear_user_chrome_drops_sidecar_ordinals() {
     assert!(
         displays.is_empty(),
         "a compaction clears the stale display ordinals"
-    );
-    let attributions = load_user_attributions(dir.path(), &session).await;
-    assert!(
-        attributions.is_empty(),
-        "a compaction clears the stale attributions"
     );
 }
 
@@ -329,7 +288,7 @@ async fn user_row_ids(session: &AgentSession) -> Vec<String> {
         .unwrap();
     rows.iter()
         .filter_map(|r| match &r.entry {
-            manox_harness::session::SessionTreeEntry::Message {
+            manox_harness::session::Event::Message {
                 id,
                 message: AgentMessage::User { .. },
                 ..
@@ -344,8 +303,8 @@ async fn user_row_ids(session: &AgentSession) -> Vec<String> {
 /// the injected `user` journal row is keyed by the client message id.
 #[tokio::test]
 async fn idle_steer_starts_its_own_run_and_lands_the_client_row_id() {
-    // settle_run fires the detached plugin `Stop` hook through the global
-    // runtime handle; init it hermetically like every settle-exercising test.
+    // The commit fires the detached plugin `Stop` hook through the global
+    // runtime handle; init it hermetically like every commit-exercising test.
     crate::runtime::init_hermetic_for_test();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().join("proj");
@@ -369,7 +328,7 @@ async fn idle_steer_starts_its_own_run_and_lands_the_client_row_id() {
     let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
     let state = test_engine_state();
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
-    let mut run_steers = Vec::new();
+    let mut run_steers: Vec<String> = Vec::new();
     let mut shutdown_after_run = false;
     let mut harness_model = test_model();
 
@@ -471,7 +430,7 @@ async fn settle_drains_a_steer_left_queued_at_run_end() {
     let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
     let state = test_engine_state();
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
-    let mut run_steers = Vec::new();
+    let mut run_steers: Vec<String> = Vec::new();
     let mut shutdown_after_run = false;
     let mut harness_model = test_model();
 
@@ -528,13 +487,13 @@ async fn settle_drains_a_steer_left_queued_at_run_end() {
 /// duplicate the message.
 #[tokio::test]
 async fn aborted_run_retracts_stranded_steers_from_the_kernel_queue() {
-    // settle_run fires the Stop hook; init the hermetic runtime handle.
+    // The commit fires the Stop hook; init the hermetic runtime handle.
     crate::runtime::init_hermetic_for_test();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().join("proj");
     std::fs::create_dir_all(&cwd).unwrap();
     let session = steer_test_session(&dir).await;
-    let sessions_dir = dir.path().join("sessions");
+    let _sessions_dir = dir.path().join("sessions");
     let state = test_engine_state();
     let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
 
@@ -555,17 +514,16 @@ async fn aborted_run_retracts_stranded_steers_from_the_kernel_queue() {
     );
     let mut run_steers = vec![stranded_id.clone()];
 
-    // Abort path: settle_run with abort_requested must retract every still-
-    // queued steer id and report the retracted ones as stranded.
-    settle_run(
-        &Ok(Vec::new()),
-        /* abort_requested */ true,
+    // Abort path: the commit with abort_requested must retract every
+    // still-queued steer id and report the retracted ones as stranded.
+    commit_for_test(
         &session,
+        &Ok(Vec::new()),
+        true,
+        std::mem::take(&mut run_steers),
         &state,
-        &sessions_dir,
         &cwd,
         &notice_tx,
-        &mut run_steers,
     )
     .await;
 
@@ -601,8 +559,26 @@ async fn aborted_run_retracts_stranded_steers_from_the_kernel_queue() {
     );
 }
 
-/// The last `turn_finish` journal row (settle delivery probe): the entry
-/// id, parent id, and the §C.2 flags, as `settle_run` appended them.
+/// Close one turn the way the actor does, without a drive loop: these
+/// settle-shape tests exercise the durable commit and its notices.
+#[allow(clippy::too_many_arguments)]
+async fn commit_for_test(
+    session: &AgentSession,
+    result: &anyhow::Result<Vec<AgentMessage>>,
+    abort_requested: bool,
+    steers: Vec<String>,
+    state: &Arc<EngineState>,
+    cwd: &Path,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) -> CommitFacts {
+    let mut turn = TurnCommit::open(session, state, notice_tx, cwd);
+    turn.adopt_steers(steers);
+    turn.commit_turn(derive_outcome(result, abort_requested), abort_requested)
+        .await
+}
+
+/// The last `turn_finish` journal row (close delivery probe): the entry
+/// id, parent id, and the §C.2 flags, as the turn's commit appended them.
 async fn turn_finish_row(
     session: &AgentSession,
 ) -> (String, Option<String>, bool, bool, Vec<String>) {
@@ -616,7 +592,7 @@ async fn turn_finish_row(
         .iter()
         .rev()
         .find_map(|r| match &r.entry {
-            manox_harness::session::SessionTreeEntry::TurnFinish {
+            manox_harness::session::Event::TurnFinish {
                 id,
                 parent_id,
                 cancelled,
@@ -643,7 +619,7 @@ async fn turn_finish_row(
         rows.iter()
             .rev()
             .find_map(|r| match r.entry {
-                manox_harness::session::SessionTreeEntry::TurnFinish { .. } => Some(r.seq),
+                manox_harness::session::Event::TurnFinish { .. } => Some(r.seq),
                 _ => None,
             })
             .expect("turn_finish row present"),
@@ -652,7 +628,7 @@ async fn turn_finish_row(
     entry
 }
 
-/// Settle delivery (v2 wire): a normal settle appends a durable
+/// Settle delivery: a normal settle appends a durable
 /// `turn_finish` row — clean exit, no stranded steers, a fresh entry id
 /// chained onto the session leaf.
 #[tokio::test]
@@ -662,21 +638,20 @@ async fn settle_appends_a_turn_finish_row_on_normal_completion() {
     let cwd = dir.path().join("proj");
     std::fs::create_dir_all(&cwd).unwrap();
     let session = steer_test_session(&dir).await;
-    let sessions_dir = dir.path().join("sessions");
+    let _sessions_dir = dir.path().join("sessions");
     let state = test_engine_state();
     let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
     // A steer drained by the run confirms as injected (not stranded).
     let mut run_steers = vec!["injected-steer".to_string()];
     let pre_leaf = session.journal_appender().leaf_id().await.unwrap();
-    settle_run(
-        &Ok(Vec::new()),
-        /* abort_requested */ false,
+    commit_for_test(
         &session,
+        &Ok(Vec::new()),
+        false,
+        std::mem::take(&mut run_steers),
         &state,
-        &sessions_dir,
         &cwd,
         &notice_tx,
-        &mut run_steers,
     )
     .await;
 
@@ -702,7 +677,7 @@ async fn settle_appends_a_turn_finish_row_on_normal_completion() {
 }
 
 /// Settle delivery, abort path: the retracted steers of the
-/// `Settled{stranded}` notice ride the same durable row, so a v2 client
+/// `Settled{stranded}` notice ride the same durable row, so a client
 /// retires its cards from the journal fold alone.
 #[tokio::test]
 async fn settle_appends_a_turn_finish_row_with_stranded_steers_on_abort() {
@@ -711,7 +686,7 @@ async fn settle_appends_a_turn_finish_row_with_stranded_steers_on_abort() {
     let cwd = dir.path().join("proj");
     std::fs::create_dir_all(&cwd).unwrap();
     let session = steer_test_session(&dir).await;
-    let sessions_dir = dir.path().join("sessions");
+    let _sessions_dir = dir.path().join("sessions");
     let state = test_engine_state();
     let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
 
@@ -725,15 +700,14 @@ async fn settle_appends_a_turn_finish_row_with_stranded_steers_on_abort() {
         stranded_id.clone(),
     );
     let mut run_steers = vec![stranded_id.clone()];
-    settle_run(
-        &Ok(Vec::new()),
-        /* abort_requested */ true,
+    commit_for_test(
         &session,
+        &Ok(Vec::new()),
+        true,
+        std::mem::take(&mut run_steers),
         &state,
-        &sessions_dir,
         &cwd,
         &notice_tx,
-        &mut run_steers,
     )
     .await;
 
@@ -741,6 +715,95 @@ async fn settle_appends_a_turn_finish_row_with_stranded_steers_on_abort() {
     assert!(cancelled, "the abort verdict rides the row");
     assert!(!failed);
     assert_eq!(stranded, vec![stranded_id], "retracted steers are listed");
+}
+
+/// A terminal assistant that carries `stop_reason: Error` is the turn's
+/// failure verdict even though the loop returned Ok: the partial assistant
+/// and its synthesized tool results stay on disk, so `Result::is_err` is the
+/// wrong source. Its `error_message` is the terminal text.
+fn terminal_error_assistant(message: &str) -> AgentMessage {
+    AgentMessage::Assistant {
+        content: vec![ContentBlock::Text {
+            text: "partial".to_string(),
+            signature: None,
+        }],
+        model: "test".into(),
+        provider: "test".into(),
+        api: "anthropic".into(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        stop_reason: Some(manox_harness::types::StopReason::Error),
+        raw_stop_reason: Some("error".into()),
+        usage: Box::new(manox_harness::types::Usage::default()),
+        error_message: Some(message.to_string()),
+        timestamp: chrono::Utc::now(),
+    }
+}
+
+#[test]
+fn a_terminal_error_assistant_fails_the_turn() {
+    let result = Ok(vec![
+        AgentMessage::user("hello"),
+        terminal_error_assistant("provider refused the request"),
+    ]);
+    assert_eq!(
+        terminal_error(&result).as_deref(),
+        Some("provider refused the request")
+    );
+    let outcome = derive_outcome(&result, false);
+    assert_eq!(
+        outcome,
+        RunOutcome::Failed {
+            terminal: Some("provider refused the request".into()),
+            cause: FailureCause::Terminal,
+        }
+    );
+    assert!(outcome.failed() && !outcome.cancelled());
+
+    // A clean Ok run completes, and an Err keeps the run error's text.
+    assert_eq!(
+        derive_outcome(&Ok(vec![partial_assistant("done")]), false),
+        RunOutcome::Completed
+    );
+    let err = derive_outcome(&Err(anyhow::anyhow!("transport died")), false);
+    assert_eq!(
+        err,
+        RunOutcome::Failed {
+            terminal: Some("transport died".into()),
+            cause: FailureCause::Terminal,
+        }
+    );
+    assert!(err.failed());
+}
+
+/// The durable row carries the derived verdict: an Ok run whose terminal
+/// assistant errored journals `failed: true`.
+#[tokio::test]
+async fn settle_journals_failed_from_the_terminal_error_not_the_result() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let session = steer_test_session(&dir).await;
+    let _sessions_dir = dir.path().join("sessions");
+    let state = test_engine_state();
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+    let result = Ok(vec![terminal_error_assistant("context window exceeded")]);
+    commit_for_test(
+        &session,
+        &result,
+        false,
+        Vec::new(),
+        &state,
+        &cwd,
+        &notice_tx,
+    )
+    .await;
+
+    let (_id, _parent, cancelled, failed, _stranded) = turn_finish_row(&session).await;
+    assert!(!cancelled, "a failed turn is not a cancelled one");
+    assert!(failed, "the terminal Error assistant fails the turn");
 }
 
 /// S4 continuation: the retraction is what stops the stranded text from
@@ -769,7 +832,7 @@ async fn retried_steer_injects_once_after_abort() {
     let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
     let state = test_engine_state();
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
-    let mut run_steers = Vec::new();
+    let mut run_steers: Vec<String> = Vec::new();
     let mut shutdown_after_run = false;
     let mut harness_model = test_model();
 
@@ -779,15 +842,14 @@ async fn retried_steer_injects_once_after_abort() {
         steer_message(aborted_id.clone(), "original text".into(), Vec::new()),
         aborted_id.clone(),
     );
-    settle_run(
-        &Ok(Vec::new()),
-        /* abort_requested */ true,
+    commit_for_test(
         &session,
+        &Ok(Vec::new()),
+        true,
+        vec![aborted_id.clone()],
         &state,
-        &sessions_dir,
         &cwd,
         &notice_tx,
-        &mut vec![aborted_id.clone()],
     )
     .await;
     // The retraction left the queue empty.
@@ -876,7 +938,9 @@ fn bash_output_update_still_maps_to_tool_output() {
 fn durable_journal_mapping_round_trips_every_journaled_event() {
     use crate::thread::{ThreadEvent, ToolCallStatus};
     let events: Vec<ThreadEvent> = vec![
-        ThreadEvent::TurnStarted,
+        // `TurnStarted` is deliberately absent: the open edge is appended by
+        // the engine at run open (it must be durable before the run), not by
+        // the async notice tap.
         ThreadEvent::TurnFinished {
             cancelled: false,
             failed: true,
@@ -945,7 +1009,7 @@ fn durable_journal_mapping_round_trips_every_journaled_event() {
     for event in &events {
         let (kind, payload) = durable_journal_payload(event)
             .unwrap_or_else(|| panic!("{event:?} must map to a journal kind"));
-        let entry = manox_harness::session::SessionTreeEntry::from_kind_payload(
+        let entry = manox_harness::session::Event::from_kind_payload(
             &kind,
             "e-test".into(),
             None,
@@ -979,9 +1043,14 @@ fn durable_journal_mapping_round_trips_every_journaled_event() {
 
 #[test]
 fn the_turn_start_payload_stamps_the_owning_process() {
-    let (kind, payload) =
-        durable_journal_payload(&ThreadEvent::TurnStarted).expect("turn start journals");
-    assert_eq!(kind, "turn_start");
+    // The open edge is not journaled by the notice tap (it must be durable
+    // before the run, so `run_turn` appends it synchronously) — the tap's
+    // mapping must refuse it or the turn would get two `turn_start` rows.
+    assert!(
+        durable_journal_payload(&ThreadEvent::TurnStarted).is_none(),
+        "the open edge is landed by the engine, not by the async notice tap"
+    );
+    let payload = turn_start_payload();
     assert_eq!(
         payload["owner"]["pid"],
         serde_json::json!(std::process::id()),
@@ -1008,11 +1077,13 @@ async fn journal_relay_feeds_storage_appends_in_seq_order() {
     )
     .await
     .unwrap();
+    let session = manox_harness::session::Session::new(storage);
+    let storage = session.storage();
     let state = test_engine_state();
     spawn_journal_relay_rx(storage.subscribe_journal(), state.journal_tx.clone());
     let mut feed = state.journal_tx.subscribe();
 
-    use manox_harness::session::{SessionStorage, SessionTreeEntry};
+    use manox_harness::session::Event;
     for i in 0..3 {
         let parent = if i == 0 {
             None
@@ -1020,8 +1091,8 @@ async fn journal_relay_feeds_storage_appends_in_seq_order() {
             Some(format!("e{}", i - 1))
         };
         let parent = parent.as_deref();
-        storage
-            .append_entry(&SessionTreeEntry::TurnStart {
+        session
+            .append_verbatim(Event::TurnStart {
                 id: format!("e{i}"),
                 parent_id: parent.map(str::to_string),
                 timestamp: chrono::Utc::now(),
@@ -1078,6 +1149,7 @@ fn test_engine_state() -> Arc<EngineState> {
         journal_tx: tokio::sync::broadcast::channel(JOURNAL_FEED_CAPACITY).0,
         request_usage: Mutex::new(HashMap::new()),
         per_model_last_usage: Mutex::new(HashMap::new()),
+        last_turn_usage: Mutex::new(None),
         cumulative: Mutex::new(TokenUsage::default()),
         per_model: Mutex::new(HashMap::new()),
         cumulative_cost: Mutex::new(0.0),
@@ -1103,6 +1175,10 @@ fn test_engine_state() -> Arc<EngineState> {
         journaled_access_mode: Mutex::new(AccessMode::default()),
         journaled_thinking_level: Mutex::new(None),
         subagent_observer: Mutex::new(None),
+        projection: Mutex::new(ProjectionFlight::default()),
+        abort_grace_ms: AtomicU64::new(0),
+        degraded: AtomicBool::new(false),
+        degraded_reason: Mutex::new(None),
     })
 }
 
@@ -1339,19 +1415,19 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
     let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
     let state = test_engine_state();
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
-    let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
     let mut harness_model = test_model();
 
     let handle = session.handle();
     let sessions_path = dir.path().join("sessions");
     let active_session_path = session.path().clone();
-    let journal_appender = session.journal_appender();
+    let _journal_appender = session.journal_appender();
+    let mut turn = TurnCommit::open(&session, &state, &notice_tx, &cwd);
     let run = drive_run(
         session.prompt("first turn"),
         &handle,
         &mut cmd_rx,
-        &mut run_steers,
+        &mut turn,
         &mut shutdown_after_run,
         live,
         &state,
@@ -1359,11 +1435,10 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
         &mut harness_model,
         &sessions_path,
         &active_session_path,
-        &journal_appender,
     );
     let new_model = test_model_switched();
 
-    let ((result, _aborted), ()) = tokio::join!(run, async {
+    let (drive, ()) = tokio::join!(run, async {
         // Turn 1 in flight; switch the model before it resumes. While
         // the run parks on the barrier, drive_run's select polls the
         // command channel, so the switch lands before turn 1 returns.
@@ -1392,7 +1467,7 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
         stream.turn2_started.notified().await;
         stream.release2.notify_waiters();
     });
-    result.unwrap();
+    drive.result.unwrap();
 
     assert_eq!(
         *stream.seen.lock().unwrap(),
@@ -1611,7 +1686,6 @@ async fn parallel_tool_rounds_land_every_result() {
 
     let state = test_engine_state();
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
-    let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
     let mut harness_model = test_model();
     let handle = session.handle();
@@ -1619,11 +1693,13 @@ async fn parallel_tool_rounds_land_every_result() {
     let active_session_path = session.path().clone();
     let journal_appender = session.journal_appender();
 
+    let mut turn = TurnCommit::open(&session, &state, &facade_tx, &cwd);
+
     let driven = drive_run(
         session.prompt("four rounds of parallel greps"),
         &handle,
         &mut cmd_rx,
-        &mut run_steers,
+        &mut turn,
         &mut shutdown_after_run,
         live,
         &state,
@@ -1631,7 +1707,6 @@ async fn parallel_tool_rounds_land_every_result() {
         &mut harness_model,
         &sessions_path,
         &active_session_path,
-        &journal_appender,
     );
     let appender_for_dump = std::sync::Arc::clone(&journal_appender);
     // Production pressure the basic flow lacks: the foreground leaf fires
@@ -1652,10 +1727,8 @@ async fn parallel_tool_rounds_land_every_result() {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     });
-    let (result, _aborted) = match tokio::time::timeout(std::time::Duration::from_secs(60), driven)
-        .await
-    {
-        Ok(pair) => pair,
+    let drive = match tokio::time::timeout(std::time::Duration::from_secs(60), driven).await {
+        Ok(drive) => drive,
         Err(_) => {
             let rows = appender_for_dump
                 .storage()
@@ -1665,20 +1738,18 @@ async fn parallel_tool_rounds_land_every_result() {
             let kinds: Vec<String> = rows
                 .iter()
                 .map(|r| match &r.entry {
-                    manox_harness::session::SessionTreeEntry::ToolCall { name, status, .. } => {
+                    manox_harness::session::Event::ToolCall { name, status, .. } => {
                         format!("tool_call:{name}:{status}")
                     }
-                    manox_harness::session::SessionTreeEntry::ToolResult { .. } => {
-                        "tool_result".into()
-                    }
-                    manox_harness::session::SessionTreeEntry::Message { .. } => "message".into(),
+                    manox_harness::session::Event::ToolResult { .. } => "tool_result".into(),
+                    manox_harness::session::Event::Message { .. } => "message".into(),
                     other => format!("{:?}", std::mem::discriminant(other)),
                 })
                 .collect();
             panic!("drive_run stalled mid-turn; journal tail: {kinds:?}");
         }
     };
-    result.unwrap();
+    drive.result.unwrap();
     snapshot_storm.abort();
 
     // Post-run: the idle arm of the actor loop services any AppendJournal
@@ -1702,19 +1773,14 @@ async fn parallel_tool_rounds_land_every_result() {
     // persisted ToolResult messages.
     let tool_results = rows
         .iter()
-        .filter(|r| {
-            matches!(
-                &r.entry,
-                manox_harness::session::SessionTreeEntry::ToolResult { .. }
-            )
-        })
+        .filter(|r| matches!(&r.entry, manox_harness::session::Event::ToolResult { .. }))
         .count();
     let result_messages = rows
         .iter()
         .filter(|r| {
             matches!(
                 &r.entry,
-                manox_harness::session::SessionTreeEntry::Message {
+                manox_harness::session::Event::Message {
                     message: AgentMessage::ToolResult { .. },
                     ..
                 }
@@ -1724,11 +1790,11 @@ async fn parallel_tool_rounds_land_every_result() {
     let kinds: Vec<String> = rows
         .iter()
         .map(|r| match &r.entry {
-            manox_harness::session::SessionTreeEntry::ToolCall { name, status, .. } => {
+            manox_harness::session::Event::ToolCall { name, status, .. } => {
                 format!("tool_call:{name}:{status:?}")
             }
-            manox_harness::session::SessionTreeEntry::ToolResult { .. } => "tool_result".into(),
-            manox_harness::session::SessionTreeEntry::Message { .. } => "message".to_string(),
+            manox_harness::session::Event::ToolResult { .. } => "tool_result".into(),
+            manox_harness::session::Event::Message { .. } => "message".to_string(),
             other => format!("{:?}", std::mem::discriminant(other)),
         })
         .collect();
@@ -1777,7 +1843,6 @@ async fn mid_run_journal_append_lands_immediately() {
     let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
     let state = test_engine_state();
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
-    let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
     let mut harness_model = test_model();
 
@@ -1785,11 +1850,12 @@ async fn mid_run_journal_append_lands_immediately() {
     let sessions_path = dir.path().join("sessions");
     let active_session_path = session.path().clone();
     let journal_appender = session.journal_appender();
+    let mut turn = TurnCommit::open(&session, &state, &notice_tx, &cwd);
     let run = drive_run(
         session.prompt("first turn"),
         &handle,
         &mut cmd_rx,
-        &mut run_steers,
+        &mut turn,
         &mut shutdown_after_run,
         live,
         &state,
@@ -1797,11 +1863,10 @@ async fn mid_run_journal_append_lands_immediately() {
         &mut harness_model,
         &sessions_path,
         &active_session_path,
-        &journal_appender,
     );
 
     let appender_for_probe = std::sync::Arc::clone(&journal_appender);
-    let ((result, _aborted), ()) = tokio::join!(run, async {
+    let (drive, ()) = tokio::join!(run, async {
         // The turn is parked in flight; append a facade-level row.
         stream.started.notified().await;
         cmd_tx
@@ -1828,7 +1893,7 @@ async fn mid_run_journal_append_lands_immediately() {
             let found = rows.iter().any(|r| {
                 matches!(
                     &r.entry,
-                    manox_harness::session::SessionTreeEntry::SubagentProgress {
+                    manox_harness::session::Event::SubagentProgress {
                         agent_id, status, ..
                     }
                         if agent_id == "review-kernel"
@@ -1846,7 +1911,7 @@ async fn mid_run_journal_append_lands_immediately() {
         }
         panic!("the mid-run AppendJournal must land in the journal before settle");
     });
-    result.unwrap();
+    drive.result.unwrap();
 
     // Post-settle: the chain stays linear — the foreign row is part of
     // the active chain and the run's own rows append after it.
@@ -1861,7 +1926,7 @@ async fn mid_run_journal_append_lands_immediately() {
         .position(|r| {
             matches!(
                 &r.entry,
-                manox_harness::session::SessionTreeEntry::SubagentProgress { agent_id, .. }
+                manox_harness::session::Event::SubagentProgress { agent_id, .. }
                     if agent_id == "review-kernel"
             )
         })
@@ -1871,12 +1936,7 @@ async fn mid_run_journal_append_lands_immediately() {
     // mid-run interleaving.
     let done_ix = rows
         .iter()
-        .rposition(|r| {
-            matches!(
-                &r.entry,
-                manox_harness::session::SessionTreeEntry::Message { .. }
-            )
-        })
+        .rposition(|r| matches!(&r.entry, manox_harness::session::Event::Message { .. }))
         .expect("the run's settled message rows present");
     assert!(
         foreign_ix < done_ix,
@@ -2004,7 +2064,7 @@ async fn ui_note_permanent_append_failure_fails_loud() {
     let state = test_engine_state();
     let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
     let landed = persist_ui_note(
-        &session,
+        &session.journal_appender(),
         &state,
         &notice_tx,
         &UiNoteRecord {
@@ -2051,7 +2111,7 @@ async fn ui_note_permanent_append_failure_fails_loud() {
 async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
     use std::os::unix::fs::PermissionsExt;
 
-    // settle_run fires the (detached) plugin `Stop` hook through the
+    // The commit fires the (detached) plugin `Stop` hook through the
     // global runtime handle.
     crate::runtime::init_hermetic_for_test();
     let dir = tempfile::tempdir().unwrap();
@@ -2109,7 +2169,6 @@ async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
 
     let state = test_engine_state();
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
-    let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
     let mut harness_model = test_model();
     let handle = session.handle();
@@ -2118,11 +2177,13 @@ async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
     let journal_appender = session.journal_appender();
     let journal_path = session.path().to_path_buf();
 
+    let mut turn = TurnCommit::open(&session, &state, &notice_tx, &cwd);
+
     let run = drive_run(
         session.prompt("k4 fail-loud probe"),
         &handle,
         &mut cmd_rx,
-        &mut run_steers,
+        &mut turn,
         &mut shutdown_after_run,
         live,
         &state,
@@ -2130,11 +2191,10 @@ async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
         &mut harness_model,
         &sessions_path,
         &active_session_path,
-        &journal_appender,
     );
 
     let skipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ((result, aborted), ()) = tokio::join!(run, async {
+    let (drive, ()) = tokio::join!(run, async {
         // Turn 2 is parked in the provider stream; turn 1's assistant
         // message materialized the journal file on disk.
         stream.parked.notified().await;
@@ -2237,22 +2297,21 @@ async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
     // (c) fail-closed convergence: the cancel reports through drive_run's
     // abort flag, so settle surfaces TurnFinished{cancelled}.
     assert!(
-        aborted,
+        drive.abort_requested,
         "a permanent journal loss must cancel the turn fail-closed (K4)"
     );
 
     // Post-run: settle drains the parked loss record (the storage is
     // healthy again) — the durable `error` entry lands now, the
     // "visible after recovery" half of the K4 contract.
-    settle_run(
-        &result,
-        aborted,
+    commit_for_test(
         &session,
+        &drive.result,
+        drive.abort_requested,
+        turn.take_steers(),
         &state,
-        &sessions_path,
         &cwd,
         &notice_tx,
-        &mut run_steers,
     )
     .await;
     // Idle-arm replication for cmds that raced past the run (the tap's
@@ -2282,7 +2341,7 @@ async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
     assert!(
         !rows.iter().any(|r| matches!(
             &r.entry,
-            manox_harness::session::SessionTreeEntry::SubagentProgress { agent_id, .. }
+            manox_harness::session::Event::SubagentProgress { agent_id, .. }
                 if agent_id == "k4-loss-probe"
         )),
         "the permanently lost row must not appear in the journal"
@@ -2315,7 +2374,7 @@ fn k5_user_entries(
 ) -> Vec<(String, Option<String>)> {
     rows.iter()
         .filter_map(|r| match &r.entry {
-            manox_harness::session::SessionTreeEntry::Message {
+            manox_harness::session::Event::Message {
                 message: AgentMessage::User { content, .. },
                 origin,
                 ..
@@ -2345,13 +2404,11 @@ struct K5Rig {
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
     live: Arc<Mutex<LiveTranscript>>,
-    run_steers: Vec<String>,
     shutdown_after_run: bool,
     harness_model: HarnessModel,
     handle: manox_harness::harness::HarnessHandle,
     sessions_path: PathBuf,
     active_session_path: PathBuf,
-    journal_appender: Arc<JournalAppender>,
 }
 
 impl K5Rig {
@@ -2364,13 +2421,11 @@ impl K5Rig {
             notice_tx,
             state: test_engine_state(),
             live: Arc::new(Mutex::new(LiveTranscript::default())),
-            run_steers: Vec::new(),
             shutdown_after_run: false,
             harness_model: test_model(),
             handle: session.handle(),
             sessions_path: dir.path().join("sessions"),
             active_session_path: session.path().clone(),
-            journal_appender: session.journal_appender(),
         }
     }
 }
@@ -2434,11 +2489,12 @@ async fn accepted_user_entry_persists_before_the_run_and_the_middleware_skips_th
     assert_eq!(pinned.as_deref(), Some(accepted_id.as_str()));
 
     let mut rig = K5Rig::new(&dir, &session);
-    let (result, _aborted) = drive_run(
+    let mut turn = TurnCommit::open(&session, &rig.state, &rig.notice_tx, &cwd);
+    let drive = drive_run(
         session.prompt("k5 accepted text"),
         &rig.handle,
         &mut rig.cmd_rx,
-        &mut rig.run_steers,
+        &mut turn,
         &mut rig.shutdown_after_run,
         Arc::clone(&rig.live),
         &rig.state,
@@ -2446,10 +2502,9 @@ async fn accepted_user_entry_persists_before_the_run_and_the_middleware_skips_th
         &mut rig.harness_model,
         &rig.sessions_path,
         &rig.active_session_path,
-        &rig.journal_appender,
     )
     .await;
-    result.unwrap();
+    drive.result.unwrap();
 
     let rows = appender.storage().journal_range(0, u64::MAX).await.unwrap();
     let users = k5_user_entries(&rows);
@@ -2468,7 +2523,7 @@ async fn accepted_user_entry_persists_before_the_run_and_the_middleware_skips_th
         rows.iter()
             .filter(|r| matches!(
                 &r.entry,
-                manox_harness::session::SessionTreeEntry::Message {
+                manox_harness::session::Event::Message {
                     message: AgentMessage::Assistant { .. },
                     ..
                 }
@@ -2527,6 +2582,7 @@ async fn kill_after_receipt_keeps_the_accepted_entry_and_origin() {
 
     let journal_path = session.path().clone();
     let mut rig = K5Rig::new(&dir, &session);
+    let mut turn = TurnCommit::open(&session, &rig.state, &rig.notice_tx, &cwd);
     // The probe wins the select and the drive_run future is dropped
     // WITHOUT releasing the park: everything after the receipt dies
     // mid-turn (the crash the receipt's window invited).
@@ -2535,7 +2591,7 @@ async fn kill_after_receipt_keeps_the_accepted_entry_and_origin() {
             session.prompt("k5b text"),
             &rig.handle,
             &mut rig.cmd_rx,
-            &mut rig.run_steers,
+            &mut turn,
             &mut rig.shutdown_after_run,
             Arc::clone(&rig.live),
             &rig.state,
@@ -2543,7 +2599,6 @@ async fn kill_after_receipt_keeps_the_accepted_entry_and_origin() {
             &mut rig.harness_model,
             &rig.sessions_path,
             &rig.active_session_path,
-            &rig.journal_appender,
         ) => panic!("the parked run must not finish before the probe"),
         _ = async {
             stream.started.notified().await;
@@ -2625,11 +2680,12 @@ async fn queued_submit_persists_at_drain_before_the_run() {
     );
 
     let mut rig = K5Rig::new(&dir, &session);
-    let (result, _aborted) = drive_run(
+    let mut turn = TurnCommit::open(&session, &rig.state, &rig.notice_tx, &cwd);
+    let drive = drive_run(
         session.prompt("drained text"),
         &rig.handle,
         &mut rig.cmd_rx,
-        &mut rig.run_steers,
+        &mut turn,
         &mut rig.shutdown_after_run,
         Arc::clone(&rig.live),
         &rig.state,
@@ -2637,10 +2693,9 @@ async fn queued_submit_persists_at_drain_before_the_run() {
         &mut rig.harness_model,
         &rig.sessions_path,
         &rig.active_session_path,
-        &rig.journal_appender,
     )
     .await;
-    result.unwrap();
+    drive.result.unwrap();
 
     let rows = appender.storage().journal_range(0, u64::MAX).await.unwrap();
     let users = k5_user_entries(&rows);
@@ -2651,7 +2706,7 @@ async fn queued_submit_persists_at_drain_before_the_run() {
         .filter(|r| {
             matches!(
                 &r.entry,
-                manox_harness::session::SessionTreeEntry::Message {
+                manox_harness::session::Event::Message {
                     message: AgentMessage::User { .. },
                     ..
                 }
@@ -2704,22 +2759,23 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
     };
     appender.pin_accepted_user_entry("stale-entry-id".into(), stale_content);
 
-    // A legacy (origin-less) prompt: the drain-time resolution declines
+    // An origin-less prompt: the drain-time resolution declines
     // to persist — and clears the stale pin on its way through.
     let pinned = persist_prompt_user_entry(&session, "fresh text", &[], None, None)
         .await
         .unwrap();
     assert!(
         pinned.is_none(),
-        "a legacy prompt keeps the middleware path"
+        "an origin-less prompt keeps the middleware path"
     );
 
     let mut rig = K5Rig::new(&dir, &session);
-    let (result, _aborted) = drive_run(
+    let mut turn = TurnCommit::open(&session, &rig.state, &rig.notice_tx, &cwd);
+    let drive = drive_run(
         session.prompt("fresh text"),
         &rig.handle,
         &mut rig.cmd_rx,
-        &mut rig.run_steers,
+        &mut turn,
         &mut rig.shutdown_after_run,
         Arc::clone(&rig.live),
         &rig.state,
@@ -2727,14 +2783,17 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
         &mut rig.harness_model,
         &rig.sessions_path,
         &rig.active_session_path,
-        &rig.journal_appender,
     )
     .await;
-    result.unwrap();
+    drive.result.unwrap();
 
     let rows = appender.storage().journal_range(0, u64::MAX).await.unwrap();
     let users = k5_user_entries(&rows);
-    assert_eq!(users.len(), 1, "the legacy turn appended its own user row");
+    assert_eq!(
+        users.len(),
+        1,
+        "the origin-less turn appended its own user row"
+    );
     assert_eq!(users[0].0, "fresh text");
     assert_eq!(users[0].1, None);
     let id = rows
@@ -2742,7 +2801,7 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
         .find(|r| {
             matches!(
                 &r.entry,
-                manox_harness::session::SessionTreeEntry::Message {
+                manox_harness::session::Event::Message {
                     message: AgentMessage::User { .. },
                     ..
                 }
@@ -2753,6 +2812,82 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
     assert_ne!(
         id, "stale-entry-id",
         "the surviving row is the middleware's fresh append, not the stale pin's id"
+    );
+}
+
+/// The authorship pin is consumed by the turn's own append: the journal row
+/// carries `ui` (the fact every fold reads), and no sidecar write records it.
+#[tokio::test]
+async fn an_attributed_turn_writes_its_author_on_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("proj");
+    tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+    let stream = Arc::new(ToolRoundsStream {
+        rounds: 0, // first call answers "done": the run completes
+        call: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let stream_for_resolver = Arc::clone(&stream);
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
+        Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+    });
+    let mut session = create_agent_session()
+        .with_cwd(&cwd)
+        .with_session_dir(dir.path().join("sessions"))
+        .with_model_runtime(ModelRuntime::new(resolver))
+        .with_model(test_model())
+        .with_system_prompt("You are a test assistant.")
+        .build()
+        .await
+        .unwrap();
+
+    // What the actor's Prompt-cmd handler does with an agent-authored
+    // prompt before the run announces its user message.
+    session.set_pending_user_ui(Some(manox_harness::session::UserEntryUi {
+        author: "harness".into(),
+        peer: false,
+        display_text: Some("[harness] the model switched".into()),
+    }));
+
+    let appender = session.journal_appender();
+    let mut rig = K5Rig::new(&dir, &session);
+    let mut turn = TurnCommit::open(&session, &rig.state, &rig.notice_tx, &cwd);
+    let drive = drive_run(
+        session.prompt("[harness] the model switched"),
+        &rig.handle,
+        &mut rig.cmd_rx,
+        &mut turn,
+        &mut rig.shutdown_after_run,
+        Arc::clone(&rig.live),
+        &rig.state,
+        &rig.notice_tx,
+        &mut rig.harness_model,
+        &rig.sessions_path,
+        &rig.active_session_path,
+    )
+    .await;
+    drive.result.unwrap();
+
+    let rows = appender.storage().journal_range(0, u64::MAX).await.unwrap();
+    let ui = rows
+        .iter()
+        .find_map(|record| match &record.entry {
+            manox_harness::session::Event::Message {
+                message: AgentMessage::User { .. },
+                ui,
+                ..
+            } => Some(ui.clone()),
+            _ => None,
+        })
+        .expect("the turn appended its user row");
+    assert_eq!(
+        ui,
+        Some(manox_harness::session::UserEntryUi {
+            author: "harness".into(),
+            peer: false,
+            display_text: Some("[harness] the model switched".into()),
+        }),
+        "the row itself carries the author"
     );
 }
 
@@ -2804,19 +2939,19 @@ async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
     let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
     let state = test_engine_state();
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
-    let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
     let mut harness_model = test_model();
 
     let handle = session.handle();
     let sessions_path = dir.path().join("sessions");
     let active_session_path = session.path().clone();
-    let journal_appender = session.journal_appender();
+    let _journal_appender = session.journal_appender();
+    let mut turn = TurnCommit::open(&session, &state, &notice_tx, &cwd);
     let run = drive_run(
         session.prompt("first turn"),
         &handle,
         &mut cmd_rx,
-        &mut run_steers,
+        &mut turn,
         &mut shutdown_after_run,
         live,
         &state,
@@ -2824,14 +2959,13 @@ async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
         &mut harness_model,
         &sessions_path,
         &active_session_path,
-        &journal_appender,
     );
     let record = UiNoteRecord {
         kind: crate::db::UiNoteKind::Notice,
         data: serde_json::json!({ "text": "mid-run card" }),
     };
 
-    let ((result, _aborted), ()) = tokio::join!(run, async {
+    let (drive, ()) = tokio::join!(run, async {
         stream.turn1_started.notified().await;
         cmd_tx.send(SessionCmd::AppendUiNote(record)).unwrap();
         // The mirror takes the card while the turn is still in flight.
@@ -2860,22 +2994,34 @@ async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
     // Settlement persists the parked note BEFORE the authoritative
     // sync, so the rebuilt mirror retains it — no loss window between
     // the mid-run mirror and the next reload.
-    settle_run(
-        &result,
-        false,
+    commit_for_test(
         &session,
+        &drive.result,
+        false,
+        turn.take_steers(),
         &state,
-        &sessions_path,
         &cwd,
         &notice_tx,
-        &mut run_steers,
     )
     .await;
-    result.unwrap();
+    drive.result.unwrap();
+
+    // The close lands the durable row; the derived work (persisting the parked
+    // note and rebuilding the mirror) is the detached projection's. Run one
+    // pass inline so the assertions are deterministic.
+    let projection = Projection {
+        appender: session.journal_appender(),
+        state: Arc::clone(&state),
+        sessions_dir: sessions_path.clone(),
+        session_path: session.path().clone(),
+        notice_tx: notice_tx.clone(),
+        fallback_cwd: cwd.clone(),
+    };
+    project_turn(&projection).await;
 
     assert!(
         state.pending_ui_notes.lock().unwrap().is_empty(),
-        "settlement drains the parked queue"
+        "the projection drains the parked queue"
     );
     assert!(
         matches!(
@@ -2892,7 +3038,612 @@ async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
     let jsonl = tokio::fs::read_to_string(session.path()).await.unwrap();
     assert!(
         jsonl.contains("\"customType\":\"manox_ui_note\"") && jsonl.contains("mid-run card"),
-        "settlement must persist the parked note"
+        "the projection must persist the parked note"
+    );
+}
+
+// ── turn ownership: open -> drive -> commit -> project ──────────────────────
+
+/// The same session shape as `steer_test_session`, with the test's own
+/// provider stream (panic / park / abort shapes live here).
+async fn session_with_stream(
+    dir: &tempfile::TempDir,
+    stream: Arc<dyn manox_harness::agent_loop::StreamFn>,
+) -> AgentSession {
+    let cwd = dir.path().join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let resolver: manox_harness::agent_loop::StreamResolver =
+        Arc::new(move |_m: &HarnessModel| Ok(Arc::clone(&stream)));
+    create_agent_session()
+        .with_cwd(&cwd)
+        .with_session_dir(dir.path().join("sessions"))
+        .with_model_runtime(ModelRuntime::new(resolver))
+        .with_model(test_model())
+        .with_system_prompt("You are a test assistant.")
+        .build()
+        .await
+        .unwrap()
+}
+
+/// A provider stream that panics on its first poll — the supervision case the
+/// `run_turn` open -> commit guarantee exists for.
+struct PanickingStream;
+
+#[async_trait::async_trait]
+impl manox_harness::agent_loop::StreamFn for PanickingStream {
+    async fn stream(
+        &self,
+        _context: &manox_harness::types::AgentContext,
+        _signal: tokio_util::sync::CancellationToken,
+        _event_tx: tokio::sync::mpsc::Sender<manox_harness::types::AgentEvent>,
+    ) -> Result<AgentMessage, anyhow::Error> {
+        panic!("provider stream exploded")
+    }
+}
+
+/// A provider stream that parks until its cancellation token fires, then
+/// answers with an aborted assistant — an abort the run absorbs within the
+/// grace.
+struct ParkedStream;
+
+#[async_trait::async_trait]
+impl manox_harness::agent_loop::StreamFn for ParkedStream {
+    async fn stream(
+        &self,
+        context: &manox_harness::types::AgentContext,
+        signal: tokio_util::sync::CancellationToken,
+        _event_tx: tokio::sync::mpsc::Sender<manox_harness::types::AgentEvent>,
+    ) -> Result<AgentMessage, anyhow::Error> {
+        signal.cancelled().await;
+        Ok(AgentMessage::Assistant {
+            content: Vec::new(),
+            model: context.model.id.clone(),
+            provider: context.model.provider.clone(),
+            api: context.model.api.clone(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(manox_harness::types::StopReason::Aborted),
+            raw_stop_reason: None,
+            usage: Box::new(manox_harness::types::Usage::default()),
+            error_message: Some("aborted".into()),
+            timestamp: chrono::Utc::now(),
+        })
+    }
+}
+
+/// A provider stream that never resolves and ignores the abort — the shape
+/// that must cost the future its life at the grace deadline.
+struct StuckStream;
+
+#[async_trait::async_trait]
+impl manox_harness::agent_loop::StreamFn for StuckStream {
+    async fn stream(
+        &self,
+        _context: &manox_harness::types::AgentContext,
+        _signal: tokio_util::sync::CancellationToken,
+        _event_tx: tokio::sync::mpsc::Sender<manox_harness::types::AgentEvent>,
+    ) -> Result<AgentMessage, anyhow::Error> {
+        std::future::pending::<()>().await;
+        unreachable!("the stuck stream never resolves")
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_stream_closes_the_turn_failed() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = session_with_stream(&dir, Arc::new(PanickingStream)).await;
+    session
+        .append_message(AgentMessage::user("seed"))
+        .await
+        .unwrap();
+    let cwd = dir.path().join("proj");
+    let sessions = dir.path().join("sessions");
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+    let state = test_engine_state();
+    let live = Arc::new(Mutex::new(LiveTranscript::default()));
+    let mut run_steers: Vec<String> = Vec::new();
+    let mut shutdown_after_run = false;
+    let mut harness_model = test_model();
+    let handle = session.handle();
+
+    let settlement = run_turn(
+        &mut session,
+        TurnInput::Continue,
+        &handle,
+        &mut cmd_rx,
+        &mut run_steers,
+        &mut shutdown_after_run,
+        Arc::clone(&live),
+        &state,
+        &notice_tx,
+        &mut harness_model,
+        &sessions,
+        &cwd,
+    )
+    .await;
+    let _ = cmd_tx;
+
+    match &settlement.outcome {
+        RunOutcome::Failed {
+            terminal: Some(terminal),
+            cause: FailureCause::Terminal,
+        } => assert!(
+            terminal.contains("provider stream exploded"),
+            "the terminal error names the panic: {terminal}"
+        ),
+        other => panic!("a panicking provider fails the turn: {other:?}"),
+    }
+    // Exactly one durable close, and it is the failed one.
+    let rows = session
+        .journal_appender()
+        .storage()
+        .journal_range(0, u64::MAX)
+        .await
+        .unwrap();
+    let finishes: Vec<_> = rows
+        .iter()
+        .filter_map(|record| match &record.entry {
+            manox_harness::session::Event::TurnFinish {
+                cancelled, failed, ..
+            } => Some((*cancelled, *failed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finishes, vec![(false, true)], "one failed close");
+    let starts = rows
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.entry,
+                manox_harness::session::Event::TurnStart { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        starts, 1,
+        "the turn's open edge lands exactly once, before the run"
+    );
+}
+
+/// The run future itself panicking: the supervisor's `catch_unwind` turns it
+/// into a normal failed close (with the panic payload as the terminal text),
+/// and the guard still lands exactly one durable row.
+#[tokio::test]
+async fn a_panicking_run_future_is_caught_and_closes_failed() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let session = steer_test_session(&dir).await;
+    let cwd = dir.path().join("proj");
+    let sessions = dir.path().join("sessions");
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+    let state = test_engine_state();
+    let live = Arc::new(Mutex::new(LiveTranscript::default()));
+    let mut shutdown_after_run = false;
+    let mut harness_model = test_model();
+    let handle = session.handle();
+    let session_path = session.path().clone();
+    let mut turn = TurnCommit::open(&session, &state, &notice_tx, &cwd);
+
+    let drive = drive_run(
+        async { panic!("run future exploded") },
+        &handle,
+        &mut cmd_rx,
+        &mut turn,
+        &mut shutdown_after_run,
+        Arc::clone(&live),
+        &state,
+        &notice_tx,
+        &mut harness_model,
+        &sessions,
+        &session_path,
+    )
+    .await;
+    let _ = cmd_tx;
+    assert_eq!(drive.panic.as_deref(), Some("run future exploded"));
+    let outcome = outcome_of_drive(&drive);
+    assert_eq!(
+        outcome,
+        RunOutcome::Failed {
+            terminal: Some("run future exploded".into()),
+            cause: FailureCause::Panic,
+        },
+        "the panic is the turn's own failure verdict"
+    );
+    turn.commit_turn(outcome, drive.abort_requested).await;
+
+    let rows = session
+        .journal_appender()
+        .storage()
+        .journal_range(0, u64::MAX)
+        .await
+        .unwrap();
+    let finishes: Vec<_> = rows
+        .iter()
+        .filter_map(|record| match &record.entry {
+            manox_harness::session::Event::TurnFinish {
+                cancelled, failed, ..
+            } => Some((*cancelled, *failed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finishes, vec![(false, true)], "exactly one failed close");
+}
+
+#[tokio::test]
+async fn an_abort_within_the_grace_closes_the_turn_cancelled() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = session_with_stream(&dir, Arc::new(ParkedStream)).await;
+    session
+        .append_message(AgentMessage::user("seed"))
+        .await
+        .unwrap();
+    let cwd = dir.path().join("proj");
+    let sessions = dir.path().join("sessions");
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+    let state = test_engine_state();
+    let live = Arc::new(Mutex::new(LiveTranscript::default()));
+    let mut run_steers: Vec<String> = Vec::new();
+    let mut shutdown_after_run = false;
+    let mut harness_model = test_model();
+    let handle = session.handle();
+
+    let abort_tx = cmd_tx.clone();
+    let abort = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = abort_tx.send(SessionCmd::Abort);
+    });
+    let settlement = run_turn(
+        &mut session,
+        TurnInput::Continue,
+        &handle,
+        &mut cmd_rx,
+        &mut run_steers,
+        &mut shutdown_after_run,
+        Arc::clone(&live),
+        &state,
+        &notice_tx,
+        &mut harness_model,
+        &sessions,
+        &cwd,
+    )
+    .await;
+    abort.abort();
+    let _ = cmd_tx;
+
+    assert_eq!(settlement.outcome, RunOutcome::Aborted);
+    assert!(settlement.abort_requested);
+    assert!(
+        !state.is_degraded(),
+        "an orderly abort keeps the session usable"
+    );
+    let (_id, _parent, cancelled, failed, _stranded) = turn_finish_row(&session).await;
+    assert!(cancelled, "the abort verdict rides the row");
+    assert!(!failed, "an abort is not a failure");
+}
+
+#[tokio::test]
+async fn an_abort_beyond_the_grace_drops_the_run_and_degrades() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = session_with_stream(&dir, Arc::new(StuckStream)).await;
+    session
+        .append_message(AgentMessage::user("seed"))
+        .await
+        .unwrap();
+    let cwd = dir.path().join("proj");
+    let sessions = dir.path().join("sessions");
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+    let state = test_engine_state();
+    state.abort_grace_ms.store(100, Ordering::Relaxed);
+    let live = Arc::new(Mutex::new(LiveTranscript::default()));
+    let mut run_steers: Vec<String> = Vec::new();
+    let mut shutdown_after_run = false;
+    let mut harness_model = test_model();
+    let handle = session.handle();
+
+    let abort_tx = cmd_tx.clone();
+    let abort = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = abort_tx.send(SessionCmd::Abort);
+    });
+    let settlement = run_turn(
+        &mut session,
+        TurnInput::Continue,
+        &handle,
+        &mut cmd_rx,
+        &mut run_steers,
+        &mut shutdown_after_run,
+        Arc::clone(&live),
+        &state,
+        &notice_tx,
+        &mut harness_model,
+        &sessions,
+        &cwd,
+    )
+    .await;
+    abort.abort();
+    let _ = cmd_tx;
+
+    assert_eq!(
+        settlement.outcome,
+        RunOutcome::Aborted,
+        "the grace expiry still closes the turn"
+    );
+    assert!(state.is_degraded(), "a dropped run degrades the session");
+    let (_id, _parent, cancelled, failed, _stranded) = turn_finish_row(&session).await;
+    assert!(cancelled && !failed, "the row records the cancelled close");
+}
+
+/// The close is the turn's only dependency: it lands before any derived work,
+/// and a projection that never runs (or fails) leaves the mirror stale without
+/// ever reopening the turn.
+#[tokio::test]
+async fn the_close_does_not_depend_on_the_projection() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = steer_test_session(&dir).await;
+    session
+        .append_message(AgentMessage::user("hello"))
+        .await
+        .unwrap();
+    session
+        .append_message(partial_assistant("hi"))
+        .await
+        .unwrap();
+    let cwd = dir.path().join("proj");
+    let sessions = dir.path().join("sessions");
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+    let state = test_engine_state();
+
+    commit_for_test(
+        &session,
+        &Ok(vec![AgentMessage::user("hello"), partial_assistant("hi")]),
+        false,
+        Vec::new(),
+        &state,
+        &cwd,
+        &notice_tx,
+    )
+    .await;
+
+    // The durable row is the journal tail and the mirror was never touched.
+    let (_id, _parent, cancelled, failed, _stranded) = turn_finish_row(&session).await;
+    assert!(!cancelled && !failed);
+    assert!(
+        state.history.lock().unwrap().is_empty(),
+        "the close runs no derived work"
+    );
+
+    // The projection rebuilds the mirror afterwards and appends no lifecycle
+    // row of its own.
+    let projection = Projection {
+        appender: session.journal_appender(),
+        state: Arc::clone(&state),
+        sessions_dir: sessions.clone(),
+        session_path: session.path().clone(),
+        notice_tx: notice_tx.clone(),
+        fallback_cwd: cwd.clone(),
+    };
+    project_turn(&projection).await;
+    assert!(
+        !state.history.lock().unwrap().is_empty(),
+        "the projection rebuilds the mirror"
+    );
+    let rows = session
+        .journal_appender()
+        .storage()
+        .journal_range(0, u64::MAX)
+        .await
+        .unwrap();
+    let finishes = rows
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.entry,
+                manox_harness::session::Event::TurnFinish { .. }
+            )
+        })
+        .count();
+    assert_eq!(finishes, 1, "the projection never appends a close");
+}
+
+// ── restore reconciliation ──────────────────────────────────────────────────
+
+/// The last durable close: `(cancelled, failed, reason)`.
+async fn last_turn_finish(session: &AgentSession) -> Option<(bool, bool, Option<String>)> {
+    let rows = session
+        .journal_appender()
+        .storage()
+        .journal_range(0, u64::MAX)
+        .await
+        .unwrap();
+    rows.iter().rev().find_map(|record| match &record.entry {
+        manox_harness::session::Event::TurnFinish {
+            cancelled,
+            failed,
+            reason,
+            ..
+        } => Some((*cancelled, *failed, reason.clone())),
+        _ => None,
+    })
+}
+
+async fn turn_finish_count(session: &AgentSession) -> usize {
+    session
+        .journal_appender()
+        .storage()
+        .journal_range(0, u64::MAX)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.entry,
+                manox_harness::session::Event::TurnFinish { .. }
+            )
+        })
+        .count()
+}
+
+/// A Submit while a turn is held commits the held turn and starts the new
+/// one: the ask cards are withdrawn with the turn, the durable close lands,
+/// and nothing is parked outside the engine (`dspo/manox#899`).
+#[tokio::test]
+async fn a_submit_while_held_commits_the_held_turn() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let session = steer_test_session(&dir).await;
+    let cwd = dir.path().join("proj");
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+    let state = test_engine_state();
+
+    // A clean run that ends on a delivered ask holds its turn.
+    state.question_gate.register_if_absent(
+        "ask-1",
+        crate::permission::PendingAuthMeta {
+            tool_name: crate::tools::ASK_USER_QUESTION.to_string(),
+            summary: "pick one".into(),
+            input: serde_json::json!({ "question": "which?" }),
+        },
+    );
+    let facts = commit_for_test(
+        &session,
+        &Ok(vec![
+            AgentMessage::user("hello"),
+            partial_assistant("let me ask"),
+        ]),
+        false,
+        Vec::new(),
+        &state,
+        &cwd,
+        &notice_tx,
+    )
+    .await;
+    assert!(facts.held, "a delivered ask holds the turn");
+    assert!(state.awaiting_answers.load(Ordering::Relaxed));
+    assert_eq!(
+        turn_finish_count(&session).await,
+        0,
+        "a held turn is not closed yet"
+    );
+
+    // The Submit path: the open cards dismiss, the held turn commits, and the
+    // new turn is free to open.
+    withdraw_open_asks(&session.journal_appender(), &state, &notice_tx, "dismissed").await;
+    let held = state
+        .held_settle
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the turn is held");
+    finish_held_settle(
+        held,
+        false,
+        &session.journal_appender(),
+        &state,
+        &cwd,
+        &notice_tx,
+    )
+    .await;
+
+    assert!(!state.awaiting_answers.load(Ordering::Relaxed));
+    assert!(!state.running.load(Ordering::Relaxed));
+    assert_eq!(
+        last_turn_finish(&session).await,
+        Some((false, false, None)),
+        "the held turn closes complete, through the same durable tail"
+    );
+    assert!(
+        state.question_gate.pending_entries().is_empty(),
+        "the cards died with their turn"
+    );
+}
+
+/// A restored chain that ends inside a turn gets the close its previous
+/// process never wrote — `cancelled: true`, `failed: false`, reason
+/// `"host exited"` — and the replayed fold sees it. This is the user-row
+/// shape: no `turn_start` row, only the user row that opened the turn.
+#[tokio::test]
+async fn restore_closes_an_interrupted_unstamped_turn_as_host_exited() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = steer_test_session(&dir).await;
+    let sessions = dir.path().join("sessions");
+    session
+        .append_message(AgentMessage::user("hello"))
+        .await
+        .unwrap();
+    session
+        .append_message(partial_assistant("partial"))
+        .await
+        .unwrap();
+    let before = session.journal_range(0, u64::MAX).await.unwrap();
+    assert!(
+        crate::replay::replay_thread_state(&before)
+            .open_turn
+            .is_some(),
+        "a chain whose tail is an open turn must be detected without turn_start"
+    );
+
+    let _ = rebuild_restored_state(&session, &sessions).await;
+
+    let after = session.journal_range(0, u64::MAX).await.unwrap();
+    assert_eq!(
+        crate::replay::replay_thread_state(&after).open_turn,
+        None,
+        "the reconciliation closes the chain"
+    );
+    assert_eq!(
+        last_turn_finish(&session).await,
+        Some((true, false, Some("host exited".to_string()))),
+        "the durable close is the cold seed's verdict"
+    );
+
+    // Idempotent: a second restore finds nothing to close.
+    let count = turn_finish_count(&session).await;
+    let _ = rebuild_restored_state(&session, &sessions).await;
+    assert_eq!(turn_finish_count(&session).await, count);
+}
+
+/// The same reconciliation on an engine-owned chain (`turn_start` row, no
+/// finish).
+#[tokio::test]
+async fn restore_closes_an_interrupted_turn_start_chain() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = steer_test_session(&dir).await;
+    let sessions = dir.path().join("sessions");
+    session
+        .append_message(AgentMessage::user("hello"))
+        .await
+        .unwrap();
+    session
+        .journal_appender()
+        .append_typed("turn_start", serde_json::json!({}))
+        .await
+        .unwrap();
+    session
+        .append_message(partial_assistant("partial"))
+        .await
+        .unwrap();
+
+    let before = session.journal_range(0, u64::MAX).await.unwrap();
+    assert!(
+        crate::replay::replay_thread_state(&before)
+            .open_turn
+            .is_some()
+    );
+    let _ = rebuild_restored_state(&session, &sessions).await;
+    assert_eq!(
+        last_turn_finish(&session).await,
+        Some((true, false, Some("host exited".to_string())))
     );
 }
 
@@ -3030,81 +3781,70 @@ fn request_attribution_keys_turns_and_keeps_only_latest_request_per_model() {
         assistant_usage(200),
         assistant_usage(300),
     );
+    let user = |id: Option<&str>| AgentMessage::User {
+        content: Vec::new(),
+        timestamp: chrono::Utc::now(),
+        id: id.map(str::to_string),
+    };
     let messages = vec![
-        AgentMessage::User {
-            content: Vec::new(),
-            timestamp: chrono::Utc::now(),
-            id: None,
-        },
+        user(Some("client-1")),
         assistant_request(u1.clone()),
         assistant_request(u2.clone()),
-        AgentMessage::User {
+        // A hidden Custom row (model context only) sits between the turns:
+        // the walk keys off the user messages themselves, so it cannot shift
+        // the attribution of either turn.
+        AgentMessage::Custom {
+            custom_type: "hidden".into(),
             content: Vec::new(),
+            display: false,
+            details: None,
             timestamp: chrono::Utc::now(),
-            id: None,
         },
+        user(None),
         assistant_request(u3.clone()),
     ];
-    let history: Vec<HistoryEntry> = adapt::harness_messages_to_messages(&messages)
-        .into_iter()
-        .map(HistoryEntry::Message)
-        .collect();
-    let (per_turn, per_model_last) = request_attribution(&history, &messages);
-    let id = |ix: usize| match &history[ix] {
-        HistoryEntry::Message(m) => m.id.clone(),
-        _ => String::new(),
-    };
+    let (per_turn, per_model_last, last_turn) = request_attribution(&messages);
 
-    // Each turn accumulates under its own triggering user message.
+    // Each turn accumulates under its own triggering user message: the
+    // client id when the message carries one (S3), the user-message ordinal
+    // otherwise.
     assert_eq!(per_turn.len(), 2);
-    assert_eq!(per_turn[&id(0)], to_token_usage(&u1) + to_token_usage(&u2));
-    assert_eq!(per_turn[&id(3)], to_token_usage(&u3));
+    assert_eq!(
+        per_turn["client-1"],
+        to_token_usage(&u1) + to_token_usage(&u2)
+    );
+    assert_eq!(per_turn["user-1"], to_token_usage(&u3));
 
     // The budget numerator is the single latest request, never a sum.
     let last = per_model_last
         .get("DeepSeek/deepseek-v4-flash")
         .expect("latest request keyed by provider/model");
     assert_eq!(last.cache_read_input_tokens, 300);
+
+    // The key-free footer stamp is the last turn's own total.
+    assert_eq!(last_turn, Some(to_token_usage(&u3)));
 }
 
+/// #920: the walk reads the kernel transcript alone. A chain whose derived
+/// display mirror diverges (a hidden `Custom` row, a note entry) must neither
+/// panic nor mis-key the turn's usage.
 #[test]
-#[should_panic(expected = "out of lockstep")]
-fn request_attribution_backstop_trips_on_leftover_mapped_rows() {
+fn request_attribution_ignores_the_derived_display_shape() {
     let messages = vec![
         AgentMessage::User {
             content: Vec::new(),
             timestamp: chrono::Utc::now(),
-            id: None,
+            id: Some("turn-a".into()),
         },
-        assistant_request(assistant_usage(100)),
+        assistant_request(assistant_usage(42)),
     ];
-    let mut history: Vec<HistoryEntry> = adapt::harness_messages_to_messages(&messages)
-        .into_iter()
-        .map(HistoryEntry::Message)
-        .collect();
-    // Simulate adapt drift: one mapped row the walk never consumes.
-    history.push(history[0].clone());
-    let _ = request_attribution(&history, &messages);
-}
-
-#[test]
-#[should_panic(expected = "out of lockstep")]
-fn request_attribution_backstop_trips_on_over_consumption() {
-    let messages = vec![
-        AgentMessage::User {
-            content: Vec::new(),
-            timestamp: chrono::Utc::now(),
-            id: None,
-        },
-        assistant_request(assistant_usage(100)),
-    ];
-    // Simulate adapt drift in the other direction: the walk consumes an
-    // id for a message the mapping would not emit.
-    let history: Vec<HistoryEntry> = adapt::harness_messages_to_messages(&messages[..1])
-        .into_iter()
-        .map(HistoryEntry::Message)
-        .collect();
-    let _ = request_attribution(&history, &messages);
+    let (per_turn, _, last_turn) = request_attribution(&messages);
+    assert_eq!(per_turn.len(), 1);
+    assert_eq!(per_turn["turn-a"].cache_read_input_tokens, 42);
+    assert_eq!(
+        last_turn.map(|usage| usage.cache_read_input_tokens),
+        Some(42)
+    );
 }
 
 /// The unified Steer surface's description teaches the whole loop: the
@@ -3382,13 +4122,21 @@ async fn subagent_session_persists_under_host_dir_with_metadata() {
         manox_harness::subagent::StopReason::Completed,
         "the child completes: {result:?}"
     );
+    // The canonical layout under the host-injected root: one directory per
+    // run, `session.jsonl` inside.
     let mut entries = tokio::fs::read_dir(&subagents).await.unwrap();
     let mut header = None;
     while let Some(entry) = entries.next_entry().await.unwrap() {
-        let content = tokio::fs::read_to_string(entry.path()).await.unwrap();
+        let path = entry
+            .path()
+            .join(manox_harness::session::identity::JOURNAL_FILE);
+        if !path.is_file() {
+            continue;
+        }
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
         header = Some(content.lines().next().unwrap().to_string());
     }
-    let header = header.expect("one transcript under the host dir");
+    let header = header.expect("one canonical transcript under the host root");
     assert!(
         header.contains("\"metadata\":{\"subagent\":{")
             && header.contains("\"type\":\"Explore\"")
@@ -3455,8 +4203,8 @@ fn scripted_state_rows() -> Vec<(&'static str, serde_json::Value)> {
         ),
         ("goal", json!({ "goal": { "objective": "replay" } })),
         ("title", json!({ "title": "replayed title" })),
-        // The retired `chromeuse` slug rides along: journal rows are
-        // string-typed, so pre-removal sessions replay without a compat read.
+        // An unknown suite slug rides along: journal rows are
+        // string-typed, so a stored session replays without a compat read.
         (
             "browser_suites",
             json!({ "suites": ["webexplore", "chromeuse"] }),
@@ -3594,7 +4342,7 @@ const REPLAY_COVERAGE_KINDS: &[&str] = &[
     "active_tools_change",
 ];
 
-fn entry_type_tag(entry: &manox_harness::session::SessionTreeEntry) -> String {
+fn entry_type_tag(entry: &manox_harness::session::Event) -> String {
     serde_json::to_value(entry)
         .ok()
         .and_then(|value| {
@@ -3875,7 +4623,7 @@ async fn journal_replay_is_consistent_across_disk_reload() {
 /// K2 authority: the journal rebuild WINS over a diverging sidecar, and
 /// the sidecar cache is repaired toward the journal. The session-mutable
 /// config keys answer from the chain alone — a chain with no mode row
-/// restores the bounded default, and a sidecar's retired config copy is
+/// restores the bounded default, and a sidecar's stale config copy is
 /// never read.
 #[tokio::test]
 async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
@@ -3948,8 +4696,8 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
          holds no config answer anymore"
     );
     assert_eq!(rebuilt.project, Some(PathBuf::from("/journal/project")));
-    // Goal stage ②: the rebuild passes the replayed journal snapshot
-    // through to the Ready chain (the bridge seed's authority).
+    // The rebuild passes the replayed journal snapshot through to the Ready
+    // chain (the bridge seed's authority).
     assert_eq!(
         rebuilt
             .goal
@@ -3975,8 +4723,8 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
 
 /// The sidecar fills only the fields the chain has never seen (title /
 /// plan / project). The session-mutable config keys are NOT among them:
-/// a chain without config rows restores the defaults — the retired
-/// sidecar copies are dead, no fallback read survives.
+/// a chain without config rows restores the defaults — stale sidecar
+/// copies are dead, no fallback read survives.
 #[test]
 fn restored_state_falls_back_to_the_sidecar_only_for_its_cache_fields() {
     let replayed = crate::replay::ReplayedThreadState::default();
@@ -4057,10 +4805,9 @@ async fn set_thinking_level_lands_one_row_and_a_restate_lands_none() {
             .unwrap()
             .into_iter()
             .filter_map(|record| match record.entry {
-                manox_harness::session::SessionTreeEntry::ThinkingLevelChange {
-                    thinking_level,
-                    ..
-                } => Some(thinking_level),
+                manox_harness::session::Event::ThinkingLevelChange { thinking_level, .. } => {
+                    Some(thinking_level)
+                }
                 _ => None,
             })
             .collect()
@@ -4073,8 +4820,8 @@ async fn set_thinking_level_lands_one_row_and_a_restate_lands_none() {
         "the pick lands exactly one durable row in the wire form"
     );
 
-    // Restating the level in force lands no duplicate (this is the shape
-    // the restore seed's re-apply of the replayed value used to take).
+    // Restating the level in force lands no duplicate (the restore seed
+    // re-applies the replayed value the same way).
     apply_thinking_level(&mut session, &state, &notice_tx, Some("max".to_string())).await;
     assert_eq!(effort_rows(&session).await.len(), 1);
     session.close().await.unwrap();
@@ -4149,13 +4896,13 @@ async fn store_journal_rows_route_to_the_actor_and_the_shutdown_claim_lands_them
     assert!(
         rows.iter().any(|record| matches!(
             &record.entry,
-            manox_harness::session::SessionTreeEntry::PinnedArchived { pinned, archived, .. }
+            manox_harness::session::Event::PinnedArchived { pinned, archived, .. }
                 if !*pinned && *archived
         )),
         "the claimed row must land in the journal"
     );
 
-    // A retired route never accepts new rows: the dispatch waits for
+    // An unregistered route never accepts new rows: the dispatch waits for
     // the route's removal, then takes the cold path (no file here —
     // the row is skipped, which the wait+removal must not hang on).
     unregister_engine_route(&thread_id, &cmd_tx);
@@ -4225,7 +4972,7 @@ async fn project_binding_journals_project_change_entry() {
     assert!(
         rows.iter().any(|record| matches!(
             &record.entry,
-            manox_harness::session::SessionTreeEntry::ProjectChange { path, .. }
+            manox_harness::session::Event::ProjectChange { path, .. }
                 if path.as_deref() == Some("/bound/project")
         )),
         "the binding must journal a project_change entry; chain kinds: {:?}",
@@ -4261,9 +5008,7 @@ async fn access_mode_decision_lands_one_row_and_restates_land_none() {
         let modes: Vec<_> = records
             .iter()
             .filter_map(|record| match &record.entry {
-                manox_harness::session::SessionTreeEntry::AccessModeChange { mode, .. } => {
-                    Some(mode.as_str())
-                }
+                manox_harness::session::Event::AccessModeChange { mode, .. } => Some(mode.as_str()),
                 _ => None,
             })
             .collect();
@@ -4301,7 +5046,7 @@ async fn access_mode_decision_lands_one_row_and_restates_land_none() {
         .filter(|record| {
             matches!(
                 &record.entry,
-                manox_harness::session::SessionTreeEntry::AccessModeChange { .. }
+                manox_harness::session::Event::AccessModeChange { .. }
             )
         })
         .count();
@@ -4329,7 +5074,7 @@ async fn establishment_journals_one_cwd_witness() {
         .filter(|record| {
             matches!(
                 &record.entry,
-                manox_harness::session::SessionTreeEntry::CwdChange { cwd, .. }
+                manox_harness::session::Event::CwdChange { cwd, .. }
                     if *cwd == projected_str
             )
         })
@@ -4377,7 +5122,7 @@ async fn bind_order_leaves_exactly_one_cwd_witness_on_the_new_chain() {
         .filter(|record| {
             matches!(
                 &record.entry,
-                manox_harness::session::SessionTreeEntry::CwdChange { .. }
+                manox_harness::session::Event::CwdChange { .. }
             )
         })
         .count();
@@ -4390,7 +5135,7 @@ async fn bind_order_leaves_exactly_one_cwd_witness_on_the_new_chain() {
     handle_set_cwd(&mut session, &state, &notice_tx, &other).await;
     let rows = session.journal_range(0, u64::MAX).await.unwrap();
     let tail = rows.iter().rev().find_map(|record| match &record.entry {
-        manox_harness::session::SessionTreeEntry::CwdChange { cwd, .. } => Some(cwd.clone()),
+        manox_harness::session::Event::CwdChange { cwd, .. } => Some(cwd.clone()),
         _ => None,
     });
     assert_eq!(
@@ -4494,7 +5239,7 @@ async fn initial_title_decision_journals_through_the_tap() {
     assert!(
         rows.iter().any(|record| matches!(
             &record.entry,
-            manox_harness::session::SessionTreeEntry::Title { title, .. }
+            manox_harness::session::Event::Title { title, .. }
                 if title == "initial title"
         )),
         "the decision must land a title entry"
@@ -4927,9 +5672,7 @@ async fn session_model_changes(session: &AgentSession) -> Vec<String> {
         .unwrap()
         .iter()
         .filter_map(|r| match &r.entry {
-            manox_harness::session::SessionTreeEntry::ModelChange { model_id, .. } => {
-                Some(model_id.clone())
-            }
+            manox_harness::session::Event::ModelChange { model_id, .. } => Some(model_id.clone()),
             _ => None,
         })
         .collect()
@@ -5422,7 +6165,7 @@ async fn parent_mode_rows(session: &manox_harness::coding_agent::AgentSession) -
         .expect("context entries read")
         .into_iter()
         .filter_map(|entry| match entry {
-            manox_harness::session::SessionTreeEntry::AccessModeChange { mode, .. } => Some(mode),
+            manox_harness::session::Event::AccessModeChange { mode, .. } => Some(mode),
             _ => None,
         })
         .collect()
@@ -5495,9 +6238,9 @@ async fn child_journal_opens_with_the_inherited_mode_and_follows_a_live_flip() {
         .await
         .expect("dispatch starts");
     let run_id = run.id.clone();
-    let journal = subagents.join(manox_harness::session::repository::session_file_name(
-        &run_id,
-    ));
+    let journal = subagents
+        .join(&run_id)
+        .join(manox_harness::session::identity::JOURNAL_FILE);
 
     // The registry entries (feed + writer) are live the moment the dispatch
     // returns — the guard rides the run task, not the dispatch return. The
@@ -5614,9 +6357,7 @@ async fn child_journal_opens_with_the_inherited_mode_and_follows_a_live_flip() {
     let replayed_modes: Vec<&str> = replayed
         .iter()
         .filter_map(|record| match &record.entry {
-            manox_harness::session::SessionTreeEntry::AccessModeChange { mode, .. } => {
-                Some(mode.as_str())
-            }
+            manox_harness::session::Event::AccessModeChange { mode, .. } => Some(mode.as_str()),
             _ => None,
         })
         .collect();

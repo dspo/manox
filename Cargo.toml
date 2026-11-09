@@ -65,6 +65,9 @@ hyperlinks = { path = "crates/hyperlinks" }
 
 anyhow = "1"
 async-channel = "2"
+# async-trait — the AHP seams (`Backend`, `SessionRuntime`) are async; both are
+# held as `dyn` trait objects, which is what the macro adds over native AFIT.
+async-trait = "0.1"
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 # ahp / ahp-types —— Agent Host Protocol 官方 Rust crate（wire 类型 + 客户端

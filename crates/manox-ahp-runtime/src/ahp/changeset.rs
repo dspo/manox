@@ -386,8 +386,9 @@ impl SessionChangeset {
 
 /// The engine: one changeset per session, computed on demand. All methods
 /// are synchronous — a scan is a handful of git invocations (milliseconds) —
-/// and callers decide the async wrapper (`block_in_place` on seed paths,
-/// `spawn_blocking` on the live recompute).
+/// and callers decide the async wrapper (`spawn_blocking` on the live
+/// recompute). The seed path calls them inline: the backend's async seam lets
+/// the read run where it is without parking a worker.
 pub struct Engine {
     sessions: Mutex<HashMap<String, SessionChangeset>>,
     git: Arc<dyn GitRunner>,

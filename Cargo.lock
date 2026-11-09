@@ -3054,6 +3054,7 @@ dependencies = [
  "ahp-types",
  "ahp-ws",
  "async-channel",
+ "async-trait",
  "axum",
  "chrono",
  "futures",

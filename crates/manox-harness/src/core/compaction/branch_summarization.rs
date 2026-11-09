@@ -19,7 +19,7 @@ use crate::compaction::{
     FileOperations, SUMMARIZATION_SYSTEM_PROMPT, compute_file_lists, estimate_tokens,
     extract_file_ops_from_message, format_file_operations, serialize_conversation,
 };
-use crate::session::SessionTreeEntry;
+use crate::session::Event;
 use crate::types::{
     AgentContext, AgentEvent, AgentMessage, ContentBlock, Model, StopReason, Usage,
 };
@@ -57,14 +57,14 @@ pub struct BranchPreparation {
 /// tool results are skipped (the assistant tool call carries their context),
 /// custom messages fold to their custom form, and branch/compaction summaries
 /// become their tagged user carriers.
-pub fn get_message_from_entry(entry: &SessionTreeEntry) -> Option<AgentMessage> {
+pub fn get_message_from_entry(entry: &Event) -> Option<AgentMessage> {
     match entry {
-        SessionTreeEntry::Message {
+        Event::Message {
             message: AgentMessage::ToolResult { .. },
             ..
         } => None,
-        SessionTreeEntry::Message { message, .. } => Some(message.clone()),
-        SessionTreeEntry::CustomMessage {
+        Event::Message { message, .. } => Some(message.clone()),
+        Event::CustomMessage {
             custom_type,
             content,
             details,
@@ -78,10 +78,10 @@ pub fn get_message_from_entry(entry: &SessionTreeEntry) -> Option<AgentMessage> 
             details: details.clone(),
             timestamp: *timestamp,
         }),
-        SessionTreeEntry::BranchSummary {
+        Event::BranchSummary {
             summary, timestamp, ..
         } => Some(crate::session::branch_summary_message(summary, *timestamp)),
-        SessionTreeEntry::Compaction {
+        Event::Compaction {
             summary, timestamp, ..
         } => Some(crate::session::compaction_summary_message(
             summary, *timestamp,
@@ -96,13 +96,10 @@ pub fn get_message_from_entry(entry: &SessionTreeEntry) -> Option<AgentMessage> 
 /// still fits while the accumulated total stays under 90% of it. Harness-
 /// authored branch summaries seed the read/modified file lists first so
 /// cumulative tracking survives nested navigation.
-pub fn prepare_branch_entries(
-    entries: &[SessionTreeEntry],
-    token_budget: u64,
-) -> BranchPreparation {
+pub fn prepare_branch_entries(entries: &[Event], token_budget: u64) -> BranchPreparation {
     let mut ops = FileOperations::default();
     for entry in entries {
-        if let SessionTreeEntry::BranchSummary {
+        if let Event::BranchSummary {
             details: Some(details),
             from_hook,
             ..
@@ -133,7 +130,7 @@ pub fn prepare_branch_entries(
         if token_budget > 0 && total_tokens + tokens > token_budget {
             if matches!(
                 entry,
-                SessionTreeEntry::Compaction { .. } | SessionTreeEntry::BranchSummary { .. }
+                Event::Compaction { .. } | Event::BranchSummary { .. }
             ) && (total_tokens as u128) < (token_budget as u128) * 9 / 10
             {
                 messages.insert(0, message);
@@ -185,7 +182,7 @@ pub fn build_branch_summary_prompt(
 // hide a caller's missing argument behind a struct literal.
 #[allow(clippy::too_many_arguments)]
 pub async fn summarize_branch(
-    entries: &[SessionTreeEntry],
+    entries: &[Event],
     model: &Model,
     stream_fn: Arc<dyn StreamFn>,
     token_budget: u64,
@@ -344,13 +341,14 @@ mod tests {
         }
     }
 
-    fn message_entry(id: &str, parent: Option<&str>, message: AgentMessage) -> SessionTreeEntry {
-        SessionTreeEntry::Message {
+    fn message_entry(id: &str, parent: Option<&str>, message: AgentMessage) -> Event {
+        Event::Message {
             id: id.into(),
             parent_id: parent.map(Into::into),
             timestamp: chrono::Utc::now(),
             message,
             origin: None,
+            ui: None,
         }
     }
 
@@ -383,7 +381,7 @@ mod tests {
             Some(AgentMessage::User { .. })
         ));
 
-        let custom = SessionTreeEntry::CustomMessage {
+        let custom = Event::CustomMessage {
             id: "c".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -400,7 +398,7 @@ mod tests {
             Some(AgentMessage::Custom { custom_type, .. }) if custom_type == "note"
         ));
 
-        let branch = SessionTreeEntry::BranchSummary {
+        let branch = Event::BranchSummary {
             id: "bs".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -420,7 +418,7 @@ mod tests {
         assert!(text.contains("prior branch"));
         assert!(text.starts_with(crate::session::BRANCH_SUMMARY_PREFIX));
 
-        let setting = SessionTreeEntry::ModelChange {
+        let setting = Event::ModelChange {
             id: "m".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -493,7 +491,7 @@ mod tests {
 
         // A prior branch summary seeds the file lists and folds into the
         // carrier under the 90% rule.
-        let branch_summary = SessionTreeEntry::BranchSummary {
+        let branch_summary = Event::BranchSummary {
             id: "bs".into(),
             parent_id: Some("u2".into()),
             timestamp: chrono::Utc::now(),

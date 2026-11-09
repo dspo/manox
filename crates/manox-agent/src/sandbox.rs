@@ -608,7 +608,8 @@ fn managed_transport_ready() -> bool {
     }
 }
 
-/// Non-interactive editor/pager defaults (see retired-harness rationale).
+/// Non-interactive editor/pager defaults: a tool subprocess must never block
+/// on an interactive editor or pager.
 pub const NONINTERACTIVE_ENV: &[(&str, &str)] = &[
     ("GIT_EDITOR", "true"),
     ("EDITOR", "true"),

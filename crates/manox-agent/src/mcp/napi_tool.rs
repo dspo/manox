@@ -3,7 +3,7 @@
 //! Each `McpTool` holds the server name, the rmcp `Tool` definition, and a
 //! clonable handle to the running rmcp client service. `execute` calls
 //! `tools/call` natively on the tokio runtime (harness tools already run there —
-//! no executor bridge needed, unlike the retired manox adapter).
+//! no executor bridge needed).
 
 use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use rmcp::model::CallToolRequestParams;

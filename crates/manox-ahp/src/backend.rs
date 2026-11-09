@@ -16,6 +16,7 @@
 use ahp_types::actions::{ActionOrigin, StateAction};
 use ahp_types::commands::{CreateChatParams, CreateSessionParams};
 use ahp_types::state::{ChatState, RootState, SessionState, SessionSummary, TerminalState, Turn};
+use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::error::HostError;
@@ -41,6 +42,11 @@ pub enum DispatchOutcome {
 }
 
 /// The runtime behind the host.
+///
+/// The effectful half is async: the host awaits runtime work on the runtime
+/// instead of parking a worker inside a nested executor. Pure reads stay sync —
+/// they answer from memory or a store lock and need no runtime turn.
+#[async_trait]
 pub trait Backend: Send + Sync + 'static {
     /// Root channel state: agent + model catalogue, terminal catalogue, config.
     fn root_state(&self) -> RootState;
@@ -53,14 +59,14 @@ pub trait Backend: Send + Sync + 'static {
     fn session_summary(&self, session_id: &str) -> Option<SessionSummary>;
 
     /// Full session state, folded from the durable journal.
-    fn session_state(&self, session_id: &str) -> Option<SessionState>;
+    async fn session_state(&self, session_id: &str) -> Option<SessionState>;
 
     /// Full chat state, folded from the durable journal.
-    fn chat_state(&self, chat_id: &str) -> Option<ChatState>;
+    async fn chat_state(&self, chat_id: &str) -> Option<ChatState>;
 
     /// Which session owns `chat_id` (the host needs it to seed a chat's parent
     /// catalog before it can serve either channel).
-    fn session_state_for_chat(&self, chat_id: &str) -> Option<String>;
+    async fn session_state_for_chat(&self, chat_id: &str) -> Option<String>;
 
     /// Terminal state, when the runtime owns the terminal.
     fn terminal_state(&self, terminal_id: &str) -> Option<TerminalState>;
@@ -69,7 +75,7 @@ pub trait Backend: Send + Sync + 'static {
     ///
     /// The id is the client's, from the channel URI, so a client that names a
     /// terminal can find it again by that name.
-    fn create_terminal(
+    async fn create_terminal(
         &self,
         _session_id: &str,
         _terminal_id: &str,
@@ -80,22 +86,22 @@ pub trait Backend: Send + Sync + 'static {
     }
 
     /// Dispose a terminal and release its PTY.
-    fn dispose_terminal(&self, _terminal_id: &str) -> Result<(), HostError> {
+    async fn dispose_terminal(&self, _terminal_id: &str) -> Result<(), HostError> {
         Err(HostError::Unimplemented("disposeTerminal".to_string()))
     }
 
     /// Create (or adopt) a session for a client-chosen URI.
-    fn create_session(
+    async fn create_session(
         &self,
         session_id: &str,
         params: &CreateSessionParams,
     ) -> Result<(), HostError>;
 
     /// Dispose a session and its journals' live resources.
-    fn dispose_session(&self, session_id: &str) -> Result<(), HostError>;
+    async fn dispose_session(&self, session_id: &str) -> Result<(), HostError>;
 
     /// Create a chat (journal) inside a session, optionally forking.
-    fn create_chat(
+    async fn create_chat(
         &self,
         session_id: &str,
         chat_id: &str,
@@ -103,10 +109,10 @@ pub trait Backend: Send + Sync + 'static {
     ) -> Result<(), HostError>;
 
     /// Dispose a chat.
-    fn dispose_chat(&self, chat_id: &str) -> Result<(), HostError>;
+    async fn dispose_chat(&self, chat_id: &str) -> Result<(), HostError>;
 
     /// Page older turns into the chat's state (`fetchTurns`).
-    fn fetch_turns(
+    async fn fetch_turns(
         &self,
         chat_id: &str,
         cursor: Option<&str>,
@@ -118,17 +124,17 @@ pub trait Backend: Send + Sync + 'static {
     /// Snapshots are tail-cut ([`crate::channels::chat::tail_view`]), so paging
     /// is what makes the cut lossless; a backend that cannot page more says so
     /// by answering `None`, which is also this default.
-    fn fetch_turns_page(
+    async fn fetch_turns_page(
         &self,
         chat_id: &str,
         cursor: Option<&str>,
         limit: Option<i64>,
     ) -> Result<(Vec<Turn>, Option<String>), HostError> {
-        Ok((self.fetch_turns(chat_id, cursor, limit)?, None))
+        Ok((self.fetch_turns(chat_id, cursor, limit).await?, None))
     }
 
     /// Side effects of an accepted, client-dispatched action.
-    fn dispatch(
+    async fn dispatch(
         &self,
         channel: &str,
         action: &StateAction,
@@ -142,20 +148,20 @@ pub trait Backend: Send + Sync + 'static {
 
     /// An `x-manox/*` command. The default refuses: the declaration surface
     /// only advertises what the build actually serves.
-    fn extension(&self, method: &str, _params: &Value) -> Result<Value, HostError> {
+    async fn extension(&self, method: &str, _params: &Value) -> Result<Value, HostError> {
         Err(HostError::Unimplemented(method.to_string()))
     }
 
     /// Baselines for the stateless extension channels (`x-manox-plan:/…`).
     /// `None` means the runtime has nothing to say for that channel yet.
-    fn extension_baseline(&self, _channel: &str) -> Option<Value> {
+    async fn extension_baseline(&self, _channel: &str) -> Option<Value> {
         None
     }
 
     /// Atomically move a host-authorized chat (AHP 1.0 `moveChat`). The
     /// default answers unimplemented; runtimes that own journals implement
     /// the re-home.
-    fn move_chat(
+    async fn move_chat(
         &self,
         _params: &ahp_types::commands::MoveChatParams,
     ) -> Result<ahp_types::commands::MoveChatResult, HostError> {
@@ -165,13 +171,16 @@ pub trait Backend: Send + Sync + 'static {
     /// The annotations channel state of one session (`ahp-session:/<id>/
     /// annotations`), folded on first sight from the journal's annotation
     /// rows. `None` = not found.
-    fn annotations_state(&self, _session_id: &str) -> Option<ahp_types::state::AnnotationsState> {
+    async fn annotations_state(
+        &self,
+        _session_id: &str,
+    ) -> Option<ahp_types::state::AnnotationsState> {
         None
     }
 
     /// The changeset view of one `ahp-changeset:/…` channel, computed on
     /// first sight by the runtime's changeset engine. `None` = not found.
-    fn changeset_state(&self, _channel: &str) -> Option<ahp_types::state::ChangesetState> {
+    async fn changeset_state(&self, _channel: &str) -> Option<ahp_types::state::ChangesetState> {
         None
     }
 
@@ -179,7 +188,7 @@ pub trait Backend: Send + Sync + 'static {
     /// router has validated the command shape; the runtime validates the
     /// operation id and target against the changeset's live list. The
     /// returned value is an `InvokeChangesetOperationResult`.
-    fn invoke_changeset_operation(
+    async fn invoke_changeset_operation(
         &self,
         channel: &str,
         operation_id: &str,
@@ -195,7 +204,7 @@ pub trait Backend: Send + Sync + 'static {
     /// already gated it to the advertised `tools/*` / `resources/*`
     /// families), `params` is the request minus the routing envelope. The
     /// default refuses — a backend without the MCP plane serves no channel.
-    fn mcp_channel_request(
+    async fn mcp_channel_request(
         &self,
         _channel: &str,
         method: &str,

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use manox_ahp_runtime::base64_bytes;
+use manox_ahp_runtime::error::RuntimeErrorKind;
 use manox_ahp_runtime::runtime_trait::{ClientToolSpec, ImageAttachment};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -35,10 +36,6 @@ use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 struct ServerSession {
     thread: ThreadHandle,
     turn_active: Arc<AtomicBool>,
-    // parking_lot (round 4 §3.2): a panic inside a lock holder must not
-    // poison the queue into a permanent cascade — the std .unwrap() locks
-    // turned one panic into every subsequent submit/steer/drain panicking.
-    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
     /// The settle watcher's cancellation token. The watcher owns an `Arc` of
     /// the entry's state, so dropping the entry alone would not end it.
     settle_cancel: tokio_util::sync::CancellationToken,
@@ -54,17 +51,16 @@ impl Drop for ServerSession {
     }
 }
 
-/// Drains one session's parked submissions when its turn settles.
+/// Tracks whether a session has a turn in flight.
 ///
-/// A submit that arrives mid-turn is parked rather than refused (the user
-/// typed it; refusing would lose it), and this is what turns the parked batch
-/// into the follow-up turn. It watches the thread's own event stream, so it
-/// sees the same settle edge the kernel emitted — there is no polling and no
-/// second source of truth about whether a turn is running.
+/// The engine owns turn ordering now: a submit is forwarded to the actor even
+/// while a turn is open (the actor commits a held turn before starting the new
+/// one, and queues a mid-run one as its follow-up), so the gateway only mirrors
+/// the edge — it parks nothing (`dspo/manox#899`: a held turn cleared this flag
+/// never, and every later submit was stranded in a queue nothing drained).
 fn spawn_settle_watcher(
     session_id: String,
     thread: ThreadHandle,
-    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
     turn_active: Arc<AtomicBool>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -83,50 +79,12 @@ fn spawn_settle_watcher(
             };
             match &*event {
                 ThreadEvent::TurnStarted => turn_active.store(true, Ordering::SeqCst),
-                ThreadEvent::TurnFinished { cancelled, .. } => {
-                    turn_active.store(false, Ordering::SeqCst);
-                    // A cancelled turn settles the queue too: its text was not
-                    // run, and leaving it parked would strand it forever.
-                    let _ = cancelled;
-                    let drained: Vec<QueuedSubmit> = pending_submits.lock().drain(..).collect();
-                    if drained.is_empty() {
-                        continue;
-                    }
-                    let mut batch_origin: Option<String> = None;
-                    thread.with_mut(|t| {
-                        for queued in drained {
-                            if queued.origin.is_some() {
-                                batch_origin = queued.origin.clone();
-                            }
-                            let content = to_message_content(queued.text, queued.images);
-                            t.insert_user_message_with_content_and_ui_metadata(
-                                content,
-                                Some(queued.ui),
-                            );
-                        }
-                    });
-                    thread.with_mut(|t| {
-                        t.set_pending_turn_origin(batch_origin);
-                        t.run_turn();
-                    });
-                }
+                ThreadEvent::TurnFinished { .. } => turn_active.store(false, Ordering::SeqCst),
                 _ => {}
             }
         }
         tracing::debug!(session = %session_id, "settle watcher stopped");
     })
-}
-
-/// A submission parked while a turn runs; drained into one follow-up turn when
-/// the turn settles, mirroring the legacy host's queued-follow-up behavior.
-struct QueuedSubmit {
-    client_id: String,
-    text: String,
-    images: Vec<(String, String)>,
-    ui: MessageUiMetadata,
-    /// The Submit's origin RPC id (echo retirement, §F.2). A drained batch
-    /// merges into one turn, so the last non-None origin wins.
-    origin: Option<String>,
 }
 
 /// How often the catalogue-serving process stat-sweeps the store for
@@ -311,8 +269,7 @@ impl AgentServer {
         // summary write (title auto-stamps, interacted_at bumps, pin/
         // archive/tag, rescans) reaches EVERY connection as the
         // ThreadsUpdated push, so no client needs an in-process store
-        // subscription to keep its list fresh (the desktop's store-event
-        // bridge retired against this). Weak like the reload listener: a
+        // subscription to keep its list fresh. Weak like the reload listener: a
         // dropped server leaves the watcher inert, and the store's channel
         // close (teardown) retires the task. A store-less construction
         // (foreign fixtures) skips the watcher — there is nothing to watch.
@@ -509,9 +466,9 @@ impl AgentServerInner {
 
     /// Full-replacement write of one client's embedder tool set for a session.
     ///
-    /// The AHP face (`session/activeClientSet`) lands here, exactly like the v2
-    /// `RegisterSessionTools` call: both are the same registration fact, and
-    /// the engine consults this one store when it assembles a session's tools.
+    /// The AHP face (`session/activeClientSet`) lands here: it is the same
+    /// registration fact, and the engine consults this one store when it
+    /// assembles a session's tools.
     pub(crate) fn set_embedder_tools(
         &self,
         session_id: &str,
@@ -628,11 +585,12 @@ pub(crate) async fn open_session_with_roots(
         .with_mut(|s| s.load_thread_with_roots(session_id, declared_roots))
         .map_err(|error| {
             // Another process drives this session: its engine actor holds
-            // the per-session write lease. Fail fast — the client surfaces
-            // the stable code and can retry after the holder exits.
+            // the per-session write lease. Fail fast — the refusal carries
+            // the AlreadyOwned kind so the client can retry after the holder
+            // exits.
             tracing::warn!(session_id, %error, "session open blocked by a foreign write lease");
             manox_ahp_runtime::error::RuntimeError::new(error.to_string())
-                .with_code(manox_ahp_runtime::error::codes::SESSION_ALREADY_OWNED)
+                .with_kind(RuntimeErrorKind::AlreadyOwned)
         })?
         .ok_or_else(|| unknown_session(session_id))?;
     // Phase 3: recheck–insert under ONE lock hold. The loser finds the
@@ -642,7 +600,6 @@ pub(crate) async fn open_session_with_roots(
         let mut sessions = inner.sessions.lock();
         if !sessions.contains_key(session_id) {
             let turn_active = Arc::new(AtomicBool::new(false));
-            let pending_submits = Arc::new(Mutex::new(Vec::new()));
             let settle_cancel = tokio_util::sync::CancellationToken::new();
             // The watcher's handle is deliberately dropped: the entry owns the
             // cancellation token, so the task ends when the entry does, and a
@@ -651,7 +608,6 @@ pub(crate) async fn open_session_with_roots(
             let _watcher = spawn_settle_watcher(
                 session_id.to_string(),
                 thread.clone(),
-                Arc::clone(&pending_submits),
                 Arc::clone(&turn_active),
                 settle_cancel.clone(),
             );
@@ -660,7 +616,6 @@ pub(crate) async fn open_session_with_roots(
                 ServerSession {
                     thread: thread.clone(),
                     turn_active,
-                    pending_submits,
                     settle_cancel,
                 },
             );
@@ -670,10 +625,6 @@ pub(crate) async fn open_session_with_roots(
     Ok(())
 }
 
-/// No such live session.
-///
-/// Shared by the runtime intents that refuse with `session/notFound`, so the
-/// code a client matches on does not depend on which intent refused.
 /// The project a conversation belongs to, as its path, resolved through the
 /// object store — the one place belonging lives. `None` covers both "no
 /// project" (the special project) and "no row yet"; both shard into the
@@ -684,9 +635,12 @@ fn object_project_of(session_id: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// No such live session.
+///
+/// Shared by the runtime intents that refuse a missing session, so the kind a
+/// caller sees does not depend on which intent refused.
 fn unknown_session(session_id: &str) -> manox_ahp_runtime::error::RuntimeError {
-    manox_ahp_runtime::error::RuntimeError::new(format!("unknown session: {session_id}"))
-        .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)
+    manox_ahp_runtime::error::RuntimeError::not_found(format!("unknown session: {session_id}"))
 }
 
 /// The synthetic owner [`AgentServer::ensure_opened_for_settle`] mints when
@@ -695,15 +649,15 @@ pub(crate) const SETTLE_OWNER: &str = "settle";
 
 /// No registered model answers to this id.
 fn unresolvable_model(id: &str) -> manox_ahp_runtime::error::RuntimeError {
-    manox_ahp_runtime::error::RuntimeError::new(format!("unknown model: {id}"))
-        .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE)
+    manox_ahp_runtime::error::RuntimeError::bad_request(format!("unknown model: {id}"))
 }
 
 /// A resolved model the session's own runtime cannot serve (missing
 /// endpoint, unresolvable credential reference, unwired api).
 fn unservable_model(id: &str, reason: &str) -> manox_ahp_runtime::error::RuntimeError {
-    manox_ahp_runtime::error::RuntimeError::new(format!("model {id} cannot be served: {reason}"))
-        .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE)
+    manox_ahp_runtime::error::RuntimeError::bad_request(format!(
+        "model {id} cannot be served: {reason}"
+    ))
 }
 
 /// Parse strictly: an unparseable mode must not settle on the default
@@ -717,7 +671,7 @@ pub(crate) fn parse_access_mode(
         manox_ahp_runtime::error::RuntimeError::new(format!(
             "unknown access mode: {mode} (expected sandbox or full-access)"
         ))
-        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
+        .with_kind(RuntimeErrorKind::BadRequest)
     })
 }
 
@@ -730,7 +684,7 @@ pub(crate) fn parse_network_access(
         manox_ahp_runtime::error::RuntimeError::new(format!(
             "unknown network access: {access} (expected off or on)"
         ))
-        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
+        .with_kind(RuntimeErrorKind::BadRequest)
     })
 }
 
@@ -745,7 +699,7 @@ pub(crate) fn parse_reasoning_effort(
         _ => Err(manox_ahp_runtime::error::RuntimeError::new(
             "set_reasoning_effort requires effort: high|max",
         )
-        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)),
+        .with_kind(RuntimeErrorKind::BadRequest)),
     }
 }
 
@@ -776,8 +730,7 @@ fn publish_root_agents(host: &Arc<manox_ahp::Host>, agents: Vec<ahp_types::state
 /// (threads.db is not on the session-creation path). The source is read
 /// straight off its persisted file (the cold path): appends are durable at
 /// write time, so this is correct for live and cold sources alike, and a
-/// deferred (never-materialized) source has no file and answers
-/// `session/not-found`.
+/// deferred (never-materialized) source has no file and answers `NotFound`.
 ///
 /// The intent fields override the inherited state ONLY when explicitly
 /// given — absent fields inherit from the copied journal (unlike
@@ -817,7 +770,7 @@ pub(crate) async fn fork_session(
                         "unknown model: {}",
                         m
                     ))
-                    .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
+                    .with_kind(RuntimeErrorKind::BadRequest));
                 }
             }
         }
@@ -830,7 +783,7 @@ pub(crate) async fn fork_session(
                 return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                     "unknown access mode: {s} (expected sandbox or full-access)"
                 ))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                .with_kind(RuntimeErrorKind::BadRequest));
             }
         },
     };
@@ -842,7 +795,7 @@ pub(crate) async fn fork_session(
             return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                 "unknown reasoning effort: {other}"
             ))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+            .with_kind(RuntimeErrorKind::BadRequest));
         }
     };
 
@@ -852,24 +805,22 @@ pub(crate) async fn fork_session(
     else {
         return Err(
             manox_ahp_runtime::error::RuntimeError::new("thread not found")
-                .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND),
+                .with_kind(RuntimeErrorKind::NotFound),
         );
     };
     if !source_path.exists() {
         return Err(
             manox_ahp_runtime::error::RuntimeError::new("thread not found")
-                .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND),
+                .with_kind(RuntimeErrorKind::NotFound),
         );
     }
     let source = JsonlSessionStorage::open(&source_path)
         .await
         .map_err(|err| {
             manox_ahp_runtime::error::RuntimeError::new(format!("journal corrupt: {err}"))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
         })?;
     let records = source.journal_range(0, u64::MAX).await.map_err(|err| {
         manox_ahp_runtime::error::RuntimeError::new(format!("journal corrupt: {err}"))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
     })?;
     let through = records
         .iter()
@@ -878,7 +829,7 @@ pub(crate) async fn fork_session(
             manox_ahp_runtime::error::RuntimeError::new(format!(
                 "entry {through_entry_id} is not on the source's active chain"
             ))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
+            .with_kind(RuntimeErrorKind::BadRequest)
         })?;
 
     // Materialize the fork file immediately (never deferred — a non-empty
@@ -892,8 +843,7 @@ pub(crate) async fn fork_session(
     else {
         return Err(manox_ahp_runtime::error::RuntimeError::new(
             "minted fork id failed the path gate",
-        )
-        .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+        ));
     };
     // A caller-chosen id must not silently overwrite an existing journal: the
     // fork file is created below, and `create` truncates. Refuse instead, so a
@@ -902,7 +852,7 @@ pub(crate) async fn fork_session(
         return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
             "session {session_id} already exists"
         ))
-        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+        .with_kind(RuntimeErrorKind::BadRequest));
     }
     let fork_cwd = cwd.clone().unwrap_or_else(|| source.metadata.cwd.clone());
     let target = JsonlSessionStorage::create(
@@ -925,15 +875,14 @@ pub(crate) async fn fork_session(
     .await
     .map_err(|err| {
         manox_ahp_runtime::error::RuntimeError::new(format!("fork file creation failed: {err}"))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
     })?;
-    let prefix: Vec<manox_harness::session::SessionTreeEntry> = records[..=through]
+    let prefix: Vec<manox_harness::session::Event> = records[..=through]
         .iter()
         .map(|r| r.entry.clone())
         .collect();
-    target.append_entries(&prefix).await.map_err(|err| {
+    let target = manox_harness::session::Session::new(target);
+    target.append_entries(prefix).await.map_err(|err| {
         manox_ahp_runtime::error::RuntimeError::new(format!("fork row copy failed: {err}"))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
     })?;
     drop(target);
 
@@ -984,7 +933,7 @@ impl AgentServerInner {
     /// no orphaned pre-project file), else `new_fresh`; `initial_model`
     /// resolves through the single convergence point
     /// `resolve_model_ref` (L8) *before* anything is created — an
-    /// unresolvable canonical ref answers `model/unresolvable` without a
+    /// unresolvable canonical ref answers `BadRequest` without a
     /// side effect.
     ///
     /// A session journal's header line: id, origin cwd, and the lineage
@@ -996,9 +945,7 @@ impl AgentServerInner {
     ) -> Option<manox_harness::session::jsonl::JsonlSessionMetadata> {
         let bytes = std::fs::read(path).ok()?;
         let line_end = bytes.iter().position(|b| *b == b'\n')?;
-        manox_harness::session::jsonl::parse_header_line(&bytes[..line_end])
-            .ok()
-            .map(|(meta, _)| meta)
+        manox_harness::session::jsonl::parse_header_line(path, &bytes[..line_end]).ok()
     }
 
     /// The durable facts one claim decision runs on: the live table, the
@@ -1068,8 +1015,7 @@ impl AgentServerInner {
         let Some(path) = manox_ahp_runtime::paths::persisted_session_file(id) else {
             return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                 "session {id} has no journal to restore"
-            ))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+            )));
         };
         manox_agent::thread_store::global().with_mut(|state| state.note_session_path(id, &path));
         open_session(inner, owner, id).await?;
@@ -1097,7 +1043,7 @@ impl AgentServerInner {
                             "unknown model: {}",
                             m
                         ))
-                        .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
+                        .with_kind(RuntimeErrorKind::BadRequest));
                     }
                 }
             }
@@ -1110,7 +1056,7 @@ impl AgentServerInner {
                     return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                         "unknown access mode: {s} (expected sandbox or full-access)"
                     ))
-                    .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                    .with_kind(RuntimeErrorKind::BadRequest));
                 }
             },
         };
@@ -1122,7 +1068,7 @@ impl AgentServerInner {
                 return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                     "unknown reasoning effort: {other}"
                 ))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                .with_kind(RuntimeErrorKind::BadRequest));
             }
         };
         // Seed blocks are kernel content blocks: validate the vocabulary
@@ -1141,7 +1087,7 @@ impl AgentServerInner {
                             return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                                 "seed block {i} is not a valid content block: {e}"
                             ))
-                            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                            .with_kind(RuntimeErrorKind::BadRequest));
                         }
                     }
                 }
@@ -1182,13 +1128,13 @@ impl AgentServerInner {
                         return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                             "session {id} lives in {existing_cwd}; the create named {requested_cwd}"
                         ))
-                        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                        .with_kind(RuntimeErrorKind::BadRequest));
                     }
                     ClaimOutcome::SubagentOwned { id } => {
                         return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                             "session {id} belongs to its parent's run and cannot be claimed"
                         ))
-                        .with_code(manox_ahp_runtime::error::codes::SESSION_ALREADY_OWNED));
+                        .with_kind(RuntimeErrorKind::AlreadyOwned));
                     }
                 }
             }
@@ -1227,8 +1173,7 @@ impl AgentServerInner {
             else {
                 return Err(manox_ahp_runtime::error::RuntimeError::new(
                     "minted session id failed the path gate",
-                )
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+                ));
             };
             let storage = JsonlSessionStorage::create(
                 &path,
@@ -1248,13 +1193,12 @@ impl AgentServerInner {
                 manox_ahp_runtime::error::RuntimeError::new(format!(
                     "seeded session file creation failed: {err}"
                 ))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
             })?;
-            let seed_rows: Vec<manox_harness::session::SessionTreeEntry> = seed_blocks
+            let seed_rows: Vec<manox_harness::session::Event> = seed_blocks
                 .into_iter()
                 .scan(None::<String>, |parent, block| {
                     let entry_id = uuid::Uuid::new_v4().to_string();
-                    let entry = manox_harness::session::SessionTreeEntry::CustomMessage {
+                    let entry = manox_harness::session::Event::CustomMessage {
                         id: entry_id.clone(),
                         parent_id: parent.clone(),
                         timestamp: chrono::Utc::now(),
@@ -1267,11 +1211,11 @@ impl AgentServerInner {
                     Some(entry)
                 })
                 .collect();
-            storage.append_entries(&seed_rows).await.map_err(|err| {
+            let storage = manox_harness::session::Session::new(storage);
+            storage.append_entries(seed_rows).await.map_err(|err| {
                 manox_ahp_runtime::error::RuntimeError::new(format!(
                     "seed row append failed: {err}"
                 ))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
             })?;
             drop(storage);
             // Path note + open are two steps, deliberately (review #778):
@@ -1387,7 +1331,6 @@ impl AgentServerInner {
             }
         });
         let turn_active = Arc::new(AtomicBool::new(false));
-        let pending_submits = Arc::new(Mutex::new(Vec::new()));
         // The insert is a single-lock recheck: a racing same-id create/open
         // that won the race since the live check above has its entry adopted
         // and ours dropped — never clobbered, so the loser's intent seeds
@@ -1396,7 +1339,6 @@ impl AgentServerInner {
         let _watcher = spawn_settle_watcher(
             session_id.clone(),
             thread.clone(),
-            Arc::clone(&pending_submits),
             Arc::clone(&turn_active),
             settle_cancel.clone(),
         );
@@ -1405,7 +1347,6 @@ impl AgentServerInner {
             ServerSession {
                 thread: thread.clone(),
                 turn_active,
-                pending_submits,
                 settle_cancel,
             },
         );
@@ -1459,7 +1400,7 @@ impl AgentServerInner {
         session_id: &str,
         text: String,
         images: Vec<ImageAttachment>,
-        client_id: Option<String>,
+        _client_id: Option<String>,
         origin_rpc: Option<String>,
     ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
         let receipt = |accepted: bool, message_id: Option<String>| {
@@ -1489,34 +1430,21 @@ impl AgentServerInner {
         if !self.sessions.lock().contains_key(session_id) {
             open_session(self, owner, session_id).await?;
         }
-        let Some(session) = self.sessions.lock().get(session_id).map(|s| {
-            (
-                s.thread.clone(),
-                s.turn_active.clone(),
-                s.pending_submits.clone(),
-            )
-        }) else {
+        let Some(thread) = self
+            .sessions
+            .lock()
+            .get(session_id)
+            .map(|s| s.thread.clone())
+        else {
             return Err(unknown_session(session_id));
         };
-        let (thread, turn_active, pending_submits) = session;
-        let client_id = client_id.unwrap_or_else(|| owner.to_string());
-        if turn_active.load(Ordering::SeqCst) && slash.is_none() {
-            let ui = thread.read(|t| MessageUiMetadata {
-                model_id: t.model().map(|m| m.id.clone()),
-                access_mode: Some(t.access_mode().as_i64()),
-                ..Default::default()
-            });
-            pending_submits.lock().push(QueuedSubmit {
-                client_id,
-                text,
-                images,
-                ui,
-                origin: origin_rpc,
-            });
-            return receipt(true, None);
-        }
+        // A submit lands even while a turn is open: the engine's actor owns
+        // the ordering (a held turn is committed first, a running one queues
+        // the submit as its follow-up). No client text is parked outside the
+        // engine — `dspo/manox#899` was exactly that parking outliving the
+        // turn it waited for.
         // Slash resolution first (its handlers mutate the facade): a slash
-        // hit keeps the legacy transcript semantics and never takes the
+        // hit keeps the slash transcript semantics and never takes the
         // accept-time persist path. The origin pin lands here, as before —
         // a run started by a slash builtin carries it.
         let slashed = thread.with_mut(|t| {
@@ -1588,8 +1516,7 @@ impl AgentServerInner {
                     // and tell the client why.
                     thread.with_mut(|t| t.set_pending_turn_origin(None));
                     let message = format!("submit persistence failed: {err}");
-                    return Err(manox_ahp_runtime::error::RuntimeError::new(message)
-                        .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+                    return Err(manox_ahp_runtime::error::RuntimeError::new(message));
                 }
             }
         }
@@ -1630,17 +1557,14 @@ impl AgentServerInner {
             .into_iter()
             .map(|i| (base64_bytes::encode(&i.data), i.mime_type))
             .collect();
-        let Some((thread, pending_submits)) = self
+        let Some(thread) = self
             .sessions
             .lock()
             .get(session_id)
-            .map(|s| (s.thread.clone(), s.pending_submits.clone()))
+            .map(|s| s.thread.clone())
         else {
             return Err(unknown_session(session_id));
         };
-        // A steer removes its own parked follow-up so the turn-end drain does
-        // not resend the same text as a plain follow-up.
-        pending_submits.lock().retain(|q| q.client_id != message_id);
         let injected = thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
@@ -1682,17 +1606,15 @@ impl AgentServerInner {
             // Whether the text went into the RUNNING turn or started one. The
             // caller needs the difference: an injected steer is consumed by the
             // turn it interrupted, so the pending message that announced it has
-            // to be retired, while a steer that started its own turn is carried
+            // to be cleared, while a steer that started its own turn is carried
             // by that turn like any other opening message.
             "injected": injected,
         }))
     }
 
-    pub(crate) fn drop_queued(&self, session_id: &str, client_id: String) {
-        if let Some(session) = self.sessions.lock().get(session_id) {
-            let pending = session.pending_submits.clone();
-            pending.lock().retain(|q| q.client_id != client_id);
-        }
+    pub(crate) fn drop_queued(&self, _session_id: &str, _client_id: String) {
+        // Nothing is parked outside the engine: a removed pending message is
+        // a client-side bookkeeping echo (`dspo/manox#899`).
     }
 
     /// Validate a model pick WITHOUT landing it: resolve the id, then check
@@ -1767,7 +1689,7 @@ impl AgentServerInner {
 
     /// Select the session's model.
     ///
-    /// The refusal is reported to the caller, not only noted to the v2 clients:
+    /// The refusal is reported to the caller, not only noted to the clients:
     /// the AHP dispatch path has already folded the change into the state its
     /// subscribers reduce, so a swallowed failure would let every client
     /// converge on a model the session is not running.
@@ -1789,8 +1711,8 @@ impl AgentServerInner {
                 if let Err(reason) = thread.read(|t| t.preflight_model(&model)) {
                     return Err(unservable_model(id, &reason));
                 }
-                // T10: the v1 `ThreadInfo` republish is gone — the engine
-                // journals the change and the P-face delta refreshes chips.
+                // The engine journals the change and the P-face delta
+                // refreshes chips.
                 thread.with_mut(|t| t.set_model(model));
                 Ok(())
             }
@@ -1893,7 +1815,7 @@ impl AgentServerInner {
             return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                 "unknown goal action: {action}"
             ))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+            .with_kind(RuntimeErrorKind::BadRequest));
         }
         let Some(thread) = self.session_thread(session_id) else {
             return Err(unknown_session(session_id));
@@ -1920,7 +1842,7 @@ impl AgentServerInner {
         });
         result.map_err(|error| {
             manox_ahp_runtime::error::RuntimeError::new(error.to_string())
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
+                .with_kind(RuntimeErrorKind::BadRequest)
         })
     }
 
@@ -1961,8 +1883,8 @@ impl AgentServerInner {
     ///   self-heal). The refresh is fingerprint-driven — a stat sweep in
     ///   steady state — so the await is cheap enough for a user gesture.
     /// - The live leg resolves the catalogue row id to its ACTIVE session
-    ///   id first: a legacy journal's row id (the thread key) is not the
-    ///   session id the engine assembled, and consulting the engine with
+    ///   id first: a thread-keyed journal's row id is not the session id the
+    ///   engine assembled, and consulting the engine with
     ///   the raw row id would archive without stopping anything.
     ///   Unresolvable (the store never scanned the row's path) skips the
     ///   live leg with a log line — the row exists (the batch validated
@@ -1982,7 +1904,7 @@ impl AgentServerInner {
             return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                 "teardown mode `{mode}` is not a known value; expected \"stop-all\" or \"archive\""
             ))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+            .with_kind(RuntimeErrorKind::BadRequest));
         }
         if mode == "archive" {
             // The cascade reads parent edges; the edges are only as fresh
@@ -2066,8 +1988,8 @@ impl AgentServerInner {
 
     /// Pin or unpin a session (the AHP extension surface: AHP has no pin bit).
     ///
-    /// The durable authority is the store row plus the session's sidecar, the
-    /// same path v2's `PinThread` takes — a pin the sidebar shows and a cold
+    /// The durable authority is the store row plus the session's sidecar — a
+    /// pin the sidebar shows and a cold
     /// restore forgets would be the worst of both.
     pub(crate) fn pin_session(&self, session_id: &str, pinned: bool) -> bool {
         let mut applied = false;
@@ -2118,8 +2040,8 @@ impl AgentServerInner {
     ///   to the **facade**, so the sidebar and any in-process observer show the
     ///   new name at once.
     /// - `thread_store::rename_thread` performs the **durable** half: it appends
-    ///   the journal `title` entry (the row the v2 projection folds and the AHP
-    ///   translator reads) and writes the sidecar.
+    ///   the journal `title` entry (the row the AHP translator reads) and
+    ///   writes the sidecar.
     ///
     /// The facade call deliberately does **not** stand in for persistence: it
     /// feeds the consumer end of the engine's notice chain, which is *past* its

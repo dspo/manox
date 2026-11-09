@@ -26,40 +26,13 @@ pub use reducer::{Outcome as ExtOutcome, XManoxState};
 /// `_meta` key carrying the declaration on both `initialize` params and result.
 pub const META_KEY: &str = "x-manox";
 
-/// Extension surface version. Bump when an extension is renamed or removed.
+/// Extension surface version: the shape of the `x-manox/*` declaration a
+/// client may cache.
 ///
-/// 2: the v2 gateway's deletion took `x-manox-modelchat:/` and the
-/// `fetchEntries`/`modelChat`/`modelChatCancel`/`cancelDelivery`/`shutdown`
-/// commands off the surface. A client that caches version 1's declaration would
-/// otherwise keep offering names this build answers `unsupported` to.
-///
-/// 4: the thread rows (`pinnedChanged` / `labelChanged` / `sessionInfoChanged`
-/// / `leafChanged`) moved from `ahp-session:/<id>` — where no fold ever ran
-/// and no baseline could carry them — to the dedicated [`channels::THREAD`]
-/// channel; the never-folded `compaction` bag field went with them. A client
-/// caching version 3 lost nothing it could read: those envelopes were
-/// unfollable there.
-///
-/// 5: `backgroundTaskStopped` left the declaration. It never had a dispatch
-/// arm (every client dispatch was rejected with "no runtime intent") and never
-/// had a host producer (the stop signal already reaches clients through
-/// `backgroundTasksChanged`'s `status: "Stopped"`), so a client caching
-/// version 4 kept only a name that was rejected either way.
-///
-/// 6: the sub-agent rows left this surface. `subagent_progress` is retired —
-/// the swarm's `run/started` + `run/settled` rows are the only durable
-/// background-work truth — and both halves of the sub-agent view are standard
-/// AHP state now: the roster rides the parent chat's `ChatBackgroundWorkSet` /
-/// `ChatBackgroundWorkRemoved` (each entry naming the child's channel) and the
-/// child's transcript is that channel, `ahp-chat:/<run-id>`, read-only with a
-/// `ChatOrigin::Tool` naming the spawning call. A client that keyed its
-/// sub-agent view off this channel's rows reads those instead.
-///
-/// The version advances only on a REMOVING or RE-SHAPING change — the
-/// changelog above is that history, and every entry is a removal. Additive
-/// evolution (a new action kind, a new optional field) bumps nothing: a
-/// caching client's baseline never loses a fact it could read. Keep that
-/// policy — no bump for additions alone.
+/// A change that removes or re-shapes a declared name bumps it, so a cached
+/// declaration never outlives the surface it describes. Additive evolution (a
+/// new action kind, a new optional field) never bumps: a caching client's
+/// baseline loses no fact it could read.
 pub const VERSION: u32 = 6;
 
 /// State-bearing extension channel prefixes, in declaration order.
@@ -72,7 +45,7 @@ pub mod channels {
     /// chat's background work; the *persistent* run account (settled runs
     /// keep their row) is this channel's `childRunsChanged` registry.
     pub const WORK: &str = "x-manox-work:/";
-    /// Aggregated conversation metrics — the v2 Q face (per chat).
+    /// Aggregated conversation metrics for one chat (usage, cost, context).
     pub const METRICS: &str = "x-manox-metrics:/";
     /// Thread rows: pin, label, session info, leaf cursor (per session).
     pub const THREAD: &str = "x-manox-thread:/";
@@ -84,11 +57,11 @@ pub mod channels {
     /// Every declared channel prefix — and, like [`super::commands::ALL`], only
     /// the ones this build actually serves.
     ///
-    /// The v2 surface also carried a bare-model completion side stream
-    /// (`x-manox-modelchat:/`). It is **not** declared: the module that produced
-    /// it was deleted with the v2 gateway, so a subscriber would wait forever on
-    /// a channel that can only ever answer `null`. Re-declaring it is the right
-    /// move the moment a model-completion implementation exists to back it.
+    /// The bare-model completion side stream (`x-manox-modelchat:/`) is
+    /// **not** declared: no module produces it, so a subscriber would wait
+    /// forever on a channel that can only ever answer `null`. Declaring it is
+    /// the right move the moment a model-completion implementation exists to
+    /// back it.
     pub const ALL: &[&str] = &[PLAN, WORK, METRICS, THREAD, WORKSPACES, COMMANDS];
 }
 
@@ -201,17 +174,16 @@ pub mod commands {
     /// So a capability is listed here only once something answers for it.
     ///
     /// Client-contributed tools are **not** here: AHP models them natively (see
-    /// [`CLIENT_TOOLS_VIA_ACTION`]), so the v2 `RegisterSessionTools` capability
-    /// has no `x-manox` command.
+    /// [`CLIENT_TOOLS_VIA_ACTION`]), so they take no `x-manox` command.
     ///
-    /// Capabilities the v2 surface had and this face does **not** serve, none of
-    /// which is declared above:
+    /// Capabilities this face does **not** serve, none of which is declared
+    /// above:
     ///
     /// - history paging — AHP's own `fetchTurns` covers it, cursor and all;
-    /// - bare-model completions (`modelChat` / `modelChatCancel`) — the channel
-    ///   they fed was deleted with the v2 gateway, so there is nothing to call;
-    /// - adjudication retraction (`cancelDelivery`) — deliveries are the deleted
-    ///   v2 waterfall's concept; AHP settles through channel actions;
+    /// - bare-model completions (`modelChat` / `modelChatCancel`) — no channel
+    ///   backs them, so there is nothing to call;
+    /// - adjudication retraction (`cancelDelivery`) — AHP settles through
+    ///   channel actions, not a separate delivery;
     /// - process shutdown — a host-lifecycle concern, not a session one.
     pub const ALL: &[&str] = &[COMPACT, GOAL, OPEN_TURN, TEARDOWN];
 }

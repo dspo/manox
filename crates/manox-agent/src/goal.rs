@@ -12,9 +12,7 @@
 //! `Updated`), tombstones (`Cleared`), and `Round` token accounting — via
 //! `apply_goal_event`/`fold_goal_events`; the fold is fail-loud: a corrupt,
 //! malformed, or out-of-order event is an error, never a silent fallback.
-//! The db `thread_events` goal stream retired with the goal authority's
-//! stage ③ (a pre-release clean cut: the journal is the only durable
-//! plane).
+//! The journal is the only durable plane.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};

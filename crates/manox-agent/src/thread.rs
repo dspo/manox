@@ -7,8 +7,7 @@
 //! broadcast to the handle's subscribers. History is exposed as a display
 //! sequence (messages interleaved with persisted UI annotation cards) so the
 //! rebuild path (`ConversationState::rebuild_from_display`) replays it in
-//! order. The retired manox harness implementation was removed; see git
-//! history (or the `origin/Manox` backup branch) for it.
+//! order.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -256,8 +255,8 @@ pub enum ThreadEvent {
     /// `message_id` is that row's entry id. Synthesized by the CLIENT fold
     /// at row-arrival time so an injected steer card retires the instant
     /// its durable row appears (before the turn settles); the SERVER never
-    /// emits it. Shared vocabulary only: v2 never carries it on the wire
-    /// (`translate` skips it), and it joins no journal payload.
+    /// emits it. Shared vocabulary only: `translate` skips it, and it joins
+    /// no journal payload.
     UserRowLanded {
         message_id: String,
     },
@@ -321,6 +320,11 @@ pub struct Thread {
     /// batch carries no accepted entry — the engine persists the merged
     /// prompt at drain instead.
     pending_turn_accepted_entry: Option<String>,
+    /// The entry-level authorship of THIS turn's first user message, set by
+    /// the insert that produced it and consumed by `run_turn`: the engine
+    /// pins it on the session so the journal row — and with it every fold of
+    /// that row — carries the author. `None` = the human typed the message.
+    pending_turn_ui: Option<manox_harness::session::UserEntryUi>,
     /// Image blocks attached to the pending prompts, drained by `run_turn`
     /// onto the engine (kernel `ContentBlock::Image`).
     pending_images: Vec<manox_harness::types::ContentBlock>,
@@ -803,6 +807,7 @@ impl Thread {
             pending_prompts: Vec::new(),
             pending_turn_origin: None,
             pending_turn_accepted_entry: None,
+            pending_turn_ui: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -920,18 +925,11 @@ impl Thread {
         let loading = initial_path.is_some();
         let model = crate::provider_glue::default_model();
         let (sessions_dir, session_file) =
-            crate::paths::core_session_parts(project.as_deref(), &id.0).unwrap_or_else(|_| {
-                (
-                    crate::paths::manox_config_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join("sessions"),
-                    None,
-                )
-            });
+            crate::paths::core_session_parts(project.as_deref(), &id.0)
+                .unwrap_or_else(|_| crate::paths::unresolved_session_parts(&id.0));
         // The goal bridge is shared with the engine's goal tools; its
-        // restore seed rides the Ready chain (seed_from_journal — the
-        // journal is the goal authority; stage ③ retired the db leg and
-        // with it the "goal features disabled" degrade).
+        // restore seed rides the Ready chain (seed_from_journal): the last
+        // `goal` row on the journal chain is the only goal authority.
         let goal_bridge = Some(GoalBridge::for_thread(&id.0));
         let SpawnedEngine {
             engine,
@@ -970,6 +968,7 @@ impl Thread {
             pending_prompts: Vec::new(),
             pending_turn_origin: None,
             pending_turn_accepted_entry: None,
+            pending_turn_ui: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -1019,18 +1018,12 @@ impl Thread {
             None => Self::unfiled_cwd(&self.id),
         };
         let model = self.model.clone();
-        // The v1.0.0 core layout: one directory per session under its
-        // project bucket, the journal (`log.v1.jsonl`) inside. The legacy
-        // flat `sessions/` tree is never written again.
+        // The core layout: one directory per session under its
+        // project bucket, the journal (`session.jsonl`) inside. A flat
+        // `sessions/` tree is never written.
         let (sessions_dir, session_file) =
-            crate::paths::core_session_parts(project.as_deref(), &self.id.0).unwrap_or_else(|_| {
-                (
-                    crate::paths::manox_config_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join("sessions"),
-                    None,
-                )
-            });
+            crate::paths::core_session_parts(project.as_deref(), &self.id.0)
+                .unwrap_or_else(|_| crate::paths::unresolved_session_parts(&self.id.0));
         // A fresh spawn has nothing to restore: the default (already
         // ready) watch is the honest value, so the receiver is dropped.
         let SpawnedEngine {
@@ -1167,11 +1160,10 @@ impl Thread {
                 if let Some(dir) = project {
                     self.project = Some(dir);
                 }
-                // Goal stage ②: the restore authority is the journal — the
-                // K2 rebuild's replayed snapshot seeds the bridge's fold
-                // (the db event log is the migration-window fallback when
-                // the chain never saw a goal). The seed re-applies the
-                // restart-paused demotion: activation is never inherited.
+                // The restore authority is the journal: the rebuild's
+                // replayed last `goal` row seeds the bridge's fold, and a
+                // chain that never saw one has no goal. The seed re-applies
+                // the restart-paused demotion: activation is never inherited.
                 if let Some(bridge) = self.goal_bridge.as_ref() {
                     bridge.seed_from_journal(goal);
                 }
@@ -1243,8 +1235,9 @@ impl Thread {
                     stranded_steer_ids: stranded,
                 });
                 // Re-fire: if peer messages arrived during the run
-                // (pending_prompts non-empty), start a follow-up turn.
-                // Mirrors manox-actor pending_submits drain.
+                // (pending_prompts non-empty), start a follow-up turn. Client
+                // submits need no drain here — they reach the engine directly
+                // and the actor orders them behind the open turn.
                 if !self.pending_prompts.is_empty() {
                     self.run_turn();
                 }
@@ -1342,9 +1335,10 @@ impl Thread {
         };
         let mut display = engine.history();
         // The send-time chrome of the last inserted user turn rides the
-        // mirrored transcript itself: its sidecar write is asynchronous, so a
-        // rebuild driven off `display_history` before that write lands would
-        // otherwise show an agent-authored turn as human input.
+        // mirrored transcript itself: the journal row carrying it lands when
+        // the run announces the message, so a refresh before that row is
+        // visible would otherwise show an agent-authored turn as human
+        // input.
         if let Some(ui) = self.last_user_ui.clone()
             && let Some(HistoryEntry::Message(last_user)) = display.iter_mut().rev().find(|entry| {
                 matches!(entry, HistoryEntry::Message(m)
@@ -1373,12 +1367,11 @@ impl Thread {
         ui: Option<MessageUiMetadata>,
     ) {
         self.sync_object_config();
-        let ordinal = self.user_prompt_ordinal();
         let human = ui.as_ref().and_then(|u| u.author.as_ref()).is_none();
         let mut message = Message::user(text.clone());
         message.ui = ui.clone();
         self.messages.push(message);
-        self.persist_user_attribution(ordinal, &ui);
+        self.pin_user_ui(&ui);
         self.stamp_interaction(human);
         self.pending_prompts.push(text);
         self.last_user_ui = ui;
@@ -1392,7 +1385,6 @@ impl Thread {
         self.sync_object_config();
         // Text blocks join the prompt text; image blocks ride the next
         // prompt as kernel `ContentBlock::Image`.
-        let ordinal = self.user_prompt_ordinal();
         let human = ui.as_ref().and_then(|u| u.author.as_ref()).is_none();
         let mut images = Vec::new();
         let text: String = content
@@ -1413,7 +1405,7 @@ impl Thread {
         let mut message = Message::user_with_content(content);
         message.ui = ui.clone();
         self.messages.push(message);
-        self.persist_user_attribution(ordinal, &ui);
+        self.pin_user_ui(&ui);
         self.stamp_interaction(human);
         if !text.trim().is_empty() {
             self.pending_prompts.push(text);
@@ -1493,7 +1485,7 @@ impl Thread {
     }
 
     pub fn run_turn(&mut self) {
-        if self.running || (self.pending_prompts.is_empty() && self.pending_images.is_empty()) {
+        if self.pending_prompts.is_empty() && self.pending_images.is_empty() {
             return;
         }
         self.ensure_engine(self.project.clone());
@@ -1501,13 +1493,18 @@ impl Thread {
         let images = std::mem::take(&mut self.pending_images);
         let origin = self.pending_turn_origin.take();
         let accepted_entry = self.pending_turn_accepted_entry.take();
+        let ui = self.pending_turn_ui.take();
         self.running = true;
         self.note_store_running(true);
-        self.pending_events.push(ThreadEvent::TurnStarted);
+        // The engine owns the open edge: it emits `TurnStarted` when the run
+        // actually opens (`engine::run_turn`), which is also what journals the
+        // `turn_start` row. A submit that lands on an open turn is forwarded
+        // all the same — the actor orders it (a held turn is committed first,
+        // a running one queues it as its follow-up).
         self.engine
             .as_ref()
             .expect("ensure_engine materialized the engine")
-            .run_with_origin(prompt, images, origin, accepted_entry);
+            .run_with_origin(prompt, images, origin, accepted_entry, ui);
     }
 
     /// Explicit user cancel (Go-style cancel context): aborts the active
@@ -1663,20 +1660,14 @@ impl Thread {
         &self.request_usage
     }
 
-    /// The current turn's total, keyed off the triggering user message; the
-    /// conversation footer stamps it onto the just-finished reply at `Stop`.
+    /// The current turn's total; the conversation footer stamps it onto the
+    /// just-finished reply at `Stop`. Asked of the engine key-free: the
+    /// per-turn map is keyed by the kernel's stable message ids (#920), which
+    /// the facade's display mirror does not carry.
     pub fn last_request_token_usage(&self) -> Option<TokenUsage> {
-        let id = self
-            .messages
-            .iter()
-            .rev()
-            .find(|m| {
-                matches!(m.role, crate::language_model::Role::User)
-                    && m.provenance == crate::message::MessageProvenance::User
-            })?
-            .id
-            .clone();
-        self.request_usage.get(&id).copied()
+        self.engine
+            .as_ref()
+            .and_then(|engine| engine.last_turn_token_usage())
     }
 
     pub fn per_model_last_request_usage(&self) -> HashMap<String, TokenUsage> {
@@ -1936,14 +1927,8 @@ impl Thread {
         let reasoning_effort = self.reasoning_effort;
         // A member works in its leader's project, so it shards there.
         let (sessions_dir, session_file) =
-            crate::paths::core_session_parts(self.project.as_deref(), &id.0).unwrap_or_else(|_| {
-                (
-                    crate::paths::manox_config_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join("sessions"),
-                    None,
-                )
-            });
+            crate::paths::core_session_parts(self.project.as_deref(), &id.0)
+                .unwrap_or_else(|_| crate::paths::unresolved_session_parts(&id.0));
         let SpawnedEngine {
             engine,
             events,
@@ -1986,6 +1971,7 @@ impl Thread {
             pending_prompts: Vec::new(),
             pending_turn_origin: None,
             pending_turn_accepted_entry: None,
+            pending_turn_ui: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -2181,7 +2167,7 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.respond_tool_authorization(id, response);
         }
-        // The verdict retired the card: drop the sidebar attention bit once
+        // The verdict clears the card: drop the sidebar attention bit once
         // nothing is parked. The gate entry is removed by the response, so
         // this reads the post-verdict set.
         if self.pending_auth_entries().is_empty() {
@@ -2361,12 +2347,11 @@ impl Thread {
         text: String,
         ui: Option<MessageUiMetadata>,
     ) {
-        let ordinal = self.user_prompt_ordinal();
         let human = ui.as_ref().and_then(|u| u.author.as_ref()).is_none();
         let mut message = crate::message::Message::user(text.clone());
         message.ui = ui.clone();
         self.messages.push(message);
-        self.persist_user_attribution(ordinal, &ui);
+        self.pin_user_ui(&ui);
         self.stamp_interaction(human);
         self.pending_prompts.push(text);
         self.last_user_ui = ui;
@@ -2464,10 +2449,9 @@ impl Thread {
     }
 
     /// Run a markdown prompt-macro turn (`/plugin:command args`): render the
-    /// command body with `$ARGUMENTS` substituted and send it as a user turn.
-    /// The retired manox harness additionally applies the macro's
-    /// `allowed-tools` filter for the turn; the harness runs its full
-    /// toolset.
+    /// command body with `{{ arguments }}` substituted and send it as a user
+    /// turn. The turn runs with the harness's full toolset (no per-command
+    /// tool filter).
     pub fn submit_command(
         &mut self,
         name: &str,
@@ -2489,11 +2473,10 @@ impl Thread {
     }
 
     /// Run a skill turn: inject the named skill's body (description + body,
-    /// the user's args appended) as the user message, mirroring the retired
-    /// manox harness's `submit_skill`. The project layer under the thread's
-    /// cwd resolves on a registry miss; `disable-model-invocation` skills
-    /// stay reachable here — the flag hides them from the model, not from
-    /// the user's slash.
+    /// the user's args appended) as the user message. The project layer under
+    /// the thread's cwd resolves on a registry miss; `disable-model-invocation`
+    /// skills stay reachable here — the flag hides them from the model, not
+    /// from the user's slash.
     pub fn submit_skill(&mut self, key: &str, args: &str, ui: Option<MessageUiMetadata>) -> bool {
         let skill = crate::skill::global()
             .get(key)
@@ -2742,31 +2725,20 @@ impl Thread {
         persist_registry_display_spawn(sessions_dir, session_path, ordinal, display);
     }
 
-    /// Persist the attribution of an injected user turn in the session
-    /// sidecar so a reload restores the send-time header. Same ordinal
-    /// convention as `persist_registry_display`; a compaction clears both.
-    fn persist_user_attribution(&self, ordinal: usize, ui: &Option<MessageUiMetadata>) {
-        let Some(ui) = ui else {
-            return;
-        };
-        let Some(author) = &ui.author else {
-            return;
-        };
-        let Some(sessions_dir) = crate::paths::manox_config_dir()
-            .ok()
-            .map(|dir| dir.join("sessions"))
-        else {
-            return;
-        };
-        let Some(session_path) = self.active_session_path() else {
-            return;
-        };
-        let record = manox_harness::session_meta::UserAttributionMeta {
-            author: author.routing().to_string(),
-            peer: ui.peer,
-            display_text: ui.display_text.clone(),
-        };
-        persist_user_attribution_spawn(sessions_dir, session_path, ordinal, record);
+    /// Pin the authorship of the user turn just inserted so `run_turn`
+    /// hands it to the engine and the journal row carries it. Only a
+    /// message an agent authored needs the pin; a human row clears any stale
+    /// one, and so does an unattributed insert.
+    fn pin_user_ui(&mut self, ui: &Option<MessageUiMetadata>) {
+        self.pending_turn_ui = ui.as_ref().and_then(|ui| {
+            ui.author
+                .as_ref()
+                .map(|author| manox_harness::session::UserEntryUi {
+                    author: author.routing().to_string(),
+                    peer: ui.peer,
+                    display_text: ui.display_text.clone(),
+                })
+        });
     }
 
     /// Advance the session's interaction stamp — the sidebar's only recency
@@ -2884,27 +2856,9 @@ fn persist_registry_display_spawn(
     })
 }
 
-fn persist_user_attribution_spawn(
-    sessions_dir: PathBuf,
-    session_path: PathBuf,
-    ordinal: usize,
-    record: manox_harness::session_meta::UserAttributionMeta,
-) -> tokio::task::JoinHandle<()> {
-    crate::runtime::handle().spawn(async move {
-        if let Err(err) =
-            manox_harness::session_meta::update(&sessions_dir, &session_path, |meta| {
-                meta.user_attributions.insert(ordinal, record);
-            })
-            .await
-        {
-            tracing::warn!(error = %err, "failed to persist user message attribution");
-        }
-    })
-}
-
 /// Stamp the session's last human interaction in the sidecar. The per-session
 /// write lock in `session_meta::update` keeps it race-free against the sibling
-/// sidecar writers (attribution, displays, flags).
+/// sidecar writers (displays, flags).
 fn persist_interaction_spawn(
     sessions_dir: PathBuf,
     session_path: PathBuf,
@@ -2973,6 +2927,8 @@ pub(crate) mod tests {
         plan_persists: Mutex<Vec<Option<serde_json::Value>>>,
         /// Recorded `steer` calls (the mid-run injection texts).
         steers: Mutex<Vec<String>>,
+        /// Recorded `run_with_origin` authorship pins.
+        uis: Mutex<Vec<Option<manox_harness::session::UserEntryUi>>>,
         /// The session file the facade reports as active — the stamp writes
         /// need a real path to target.
         session_path: Mutex<Option<PathBuf>>,
@@ -2990,6 +2946,7 @@ pub(crate) mod tests {
                 runs: Mutex::new(Vec::new()),
                 plan_persists: Mutex::new(Vec::new()),
                 steers: Mutex::new(Vec::new()),
+                uis: Mutex::new(Vec::new()),
                 session_path: Mutex::new(None),
             }
         }
@@ -3025,6 +2982,18 @@ pub(crate) mod tests {
 
         fn run(&self, prompt: String, images: Vec<manox_harness::types::ContentBlock>) {
             self.runs.lock().unwrap().push((prompt, images));
+        }
+
+        fn run_with_origin(
+            &self,
+            prompt: String,
+            images: Vec<manox_harness::types::ContentBlock>,
+            _origin: Option<String>,
+            _accepted_entry: Option<String>,
+            ui: Option<manox_harness::session::UserEntryUi>,
+        ) {
+            self.uis.lock().unwrap().push(ui);
+            self.run(prompt, images);
         }
 
         fn steer(
@@ -3110,6 +3079,7 @@ pub(crate) mod tests {
             pending_prompts: Vec::new(),
             pending_turn_origin: None,
             pending_turn_accepted_entry: None,
+            pending_turn_ui: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -3135,8 +3105,8 @@ pub(crate) mod tests {
 
     #[test]
     fn access_mode_maps_i64_roundtrip() {
-        // 1 = sandbox, 2 = full access; every other value (including the
-        // retired read-only 0) lands on the bounded default.
+        // 1 = sandbox, 2 = full access; every other value (including 0)
+        // lands on the bounded default.
         assert_eq!(AccessMode::from_i64(1), AccessMode::Sandbox);
         assert_eq!(AccessMode::from_i64(2), AccessMode::FullAccess);
         assert_eq!(AccessMode::Sandbox.as_i64(), 1);
@@ -3204,6 +3174,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
@@ -3246,6 +3217,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
@@ -3258,8 +3230,8 @@ pub(crate) mod tests {
         assert!(thread.with_mut(|t| t.run_slash_builtin("compact", "focus", None)));
         assert!(thread.with_mut(|t| t.run_slash_builtin("goal", "clear", None)));
 
-        // Session-level commands, the retired plan builtin, and unknowns are
-        // not owned here.
+        // Session-level commands, `/plan` (a skill, not a builtin), and
+        // unknowns are not owned here.
         assert!(!thread.with_mut(|t| t.run_slash_builtin("exit", "", None)));
         assert!(!thread.with_mut(|t| t.run_slash_builtin("quit", "", None)));
         assert!(!thread.with_mut(|t| t.run_slash_builtin("new", "", None)));
@@ -3282,6 +3254,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
@@ -3327,6 +3300,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
@@ -3402,7 +3376,9 @@ pub(crate) mod tests {
         .expect("a human prompt never stamped the interaction key");
         assert!(stamped > 0, "the stamp must be a real timestamp");
 
-        // An agent-authored user turn: attributed, but never an interaction.
+        // An agent-authored user turn: the authorship is pinned for the next
+        // run (a journal fact), never written to the sidecar, and never an
+        // interaction.
         let engine = Arc::new(FakeEngine::new());
         engine.set_session_path(agent_session.clone());
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
@@ -3412,32 +3388,51 @@ pub(crate) mod tests {
                 Some(MessageUiMetadata {
                     author: Some(crate::message::MessageAuthor::Lead),
                     peer: true,
+                    display_text: Some("report".into()),
                     ..Default::default()
                 }),
-            )
+            );
+            t.run_turn();
         });
-        // The attribution write proves the seam ran; the stamp must not have.
-        let attributed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let pinned = engine.uis.lock().unwrap().last().cloned();
+        assert_eq!(
+            pinned,
+            Some(Some(manox_harness::session::UserEntryUi {
+                author: "lead".into(),
+                peer: true,
+                display_text: Some("report".into()),
+            })),
+            "the turn hands the row's authorship to the engine"
+        );
+        // The sidecar keeps only the remaining chrome (registry display
+        // forms); attribution has no field left to land in.
+        thread.with_mut(|t| t.persist_registry_display(0, Some("/healthz".into())));
+        let sidecar = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let meta = manox_harness::session_meta::load(&sessions, &agent_session)
                     .await
                     .unwrap();
-                if !meta.user_attributions.is_empty() {
+                if !meta.registry_displays.is_empty() {
                     return meta;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("an agent turn never recorded its attribution");
+        .expect("the registry display never landed");
+        assert!(
+            sidecar.interacted_at.is_none(),
+            "an agent-authored turn must not move the recency key"
+        );
+        let wire = serde_json::to_value(&sidecar).unwrap();
         assert_eq!(
-            attributed.user_attributions.len(),
-            1,
-            "the peer turn must be attributed"
+            wire["registry_displays"]["0"],
+            serde_json::json!("/healthz"),
+            "the sidecar still carries the registry display form: {wire}"
         );
         assert!(
-            attributed.interacted_at.is_none(),
-            "an agent-authored turn must not move the recency key"
+            wire.get("user_attributions").is_none(),
+            "the sidecar carries no attribution: {wire}"
         );
     }
 
@@ -3477,6 +3472,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine_id(HistoryPhase::Ready, engine.clone(), "cfg-handshake");
@@ -3558,6 +3554,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine_id(HistoryPhase::Ready, engine.clone(), "restated");
@@ -3598,6 +3595,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
@@ -3708,6 +3706,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
@@ -3734,6 +3733,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
@@ -3756,6 +3756,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
@@ -3810,6 +3811,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
@@ -3836,6 +3838,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
@@ -3871,6 +3874,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let engine_ref = Arc::clone(&engine);
@@ -3928,6 +3932,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
@@ -3970,6 +3975,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
@@ -4005,6 +4011,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
@@ -4113,6 +4120,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
@@ -4280,8 +4288,14 @@ pub(crate) mod tests {
         let store = crate::thread_store::global();
         let dir = crate::thread_store::global_sessions_dir();
         std::fs::create_dir_all(&dir).unwrap();
+        // The canonical layout is the only shape the scan admits.
+        let journal = dir
+            .join("--thread-test--")
+            .join("dirty-scan")
+            .join(manox_harness::session::identity::JOURNAL_FILE);
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
         std::fs::write(
-            dir.join("dirty-scan.jsonl"),
+            &journal,
             "{\"type\":\"session\",\"version\":4,\"id\":\"dirty-scan\",\"timestamp\":\"\
              2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{\"host\":\"manox\",\
              \"thread\":\"dirty-scan\"}}\n{\"type\":\"message\",\"id\":\"m1\",\"parentId\"\
@@ -4334,10 +4348,16 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("t-settle-stamp.jsonl");
+        let session = dir
+            .path()
+            .join("--thread-test--")
+            .join("t-settle-stamp")
+            .join(manox_harness::session::identity::JOURNAL_FILE);
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
         std::fs::write(&session, b"{}\n").unwrap();
         engine.set_session_path(session.clone());
         let thread = thread_with_engine_id(HistoryPhase::Ready, engine, "t-settle-stamp");
@@ -4406,6 +4426,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            uis: Mutex::new(Vec::new()),
             session_path: Mutex::new(None),
         });
         let thread = thread_with_engine_id(HistoryPhase::Ready, engine, "t-bits");

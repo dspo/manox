@@ -1,36 +1,13 @@
-# manox ↔ manox-app 交互协议 v3 —— AHP（Agent Host Protocol, channel 化）
+# manox ↔ manox-app 的 Agent Host Protocol（AHP）架构
 
-> **W0 规格冻结文档，normative**。本文冻结 v3 的目标终态、身份映射、不变式处置、x-manox 扩展声明面、依赖选型、删除清单与分期门禁；实施偏离一律记入 §H as-built，不回改上文冻结文本。
-> 取代关系：协议 v2（`manox-protocol`）已被本文取代，其规格文档已删除；全部协议面到 v3 的映射以本文为唯一事实源。
-> 权威优先级（对 AHP 侧）：**`types/` 与 `ahp`/`ahp-types` crate 为准**，AHP 文档仅作语义参考（其示例仍写 0.3.0、`annotations` 行缺失、`disposeChat` 矛盾，差异记 as-built）。
+> **权威优先级**：AHP wire 类型与 reducer 以 `ahp` / `ahp-types` crate（pin `=1.0.0`）为准，
+> 本文只描述 manox 宿主半边的架构、通道面与不变式；上游文档仅作语义参考（其示例仍写 0.3.0、
+> `annotations` 行缺失、`disposeChat` 有矛盾）。
+>
+> **依赖方向**：`manox-ahp` → `manox-ahp-runtime` → `manox-session-core`。`manox-agent`
+> 永不认识 AHP；协议适配一律在其上层。
 
-## Context：现状事实（已核实，两仓当时 main）
-
-- 两仓**已经是**「一进程内、typed 的状态同步协议」：`dspo/manox` 的 `manox-protocol` v2（`crates/manox-protocol`，约 4.4k LOC）+ `manox-session-core` 的 `AgentServer` 单例（`agent_server.rs` 5588 行）经 `transport::RpcConnection` 的 `in_process_pair`（async_channel，进程内对象）与 GPUI 前端通信；`cx web` 另起 loopback WS（`ws/{mod,listener,connection}.rs`，`/ws` 单路由、`?token=`、`~/.manox/gateway-ws.json`、`~/.manox/gateway.lock` 单例），**同一套帧直挂 socket 上**，无翻译层。
-- 协议 v2 已自带的协议级机制（与 AHP 高度重叠）：`Initialize{protocol_epoch}` 握手、`FollowSession` 流（`Snapshot`→`Entry`→`Projections`）、seq 单点盖章（L4）、投影 `key→{value,asOfSeq}` higher-seq-wins（L6）、溢出即 `StreamEnd{Resync}` 的重同步（L5）、客户端缺口修复引擎 `journal_stream.rs`（497 行）、六车道信封（`FromClient`/`FromServer`）、31 个 `ClientNote` + 18 个 `ClientCall` + 6 个 `ServerCall`（waterfall 审批/询问/计划评审）+ `HostEvent` 总线 + `wire_surface!` 声明面（`surface.rs` 1032 行）。
-- 客户端侧（`dspo/manox-app`）已自行实现 AHP 意义上的 state store：`client_store.rs`+`client_store_handle.rs`（1153+2143 行）持 journal 窗口 + 投影面 + echo 表 + 传输状态，`journal_fold.rs`/`journal_translate.rs`（437+888）折叠与翻译，`multiplexer.rs`（1970）做 MsgId/StreamId 路由；`source_gates.rs`（432）用 grep 计数冻结「绕过网关的直读」，`views/*` 仍 import runtime Rust 类型（`ThreadEvent`/`Message`/`HistoryEntry`/`AccessMode`…）并持 `ThreadHandle`「渲染镜像」。
-- AHP 侧（`~/projects/github/agent-host-protocol`，spec **1.0.0**）：JSON-RPC 2.0 + URI channel（`ahp-root://`、`ahp-session:/<uuid>`、`ahp-chat:/<cid>`、`ahp-terminal:/<id>`、`ahp-changeset:/<id>`、`ahp-automations://`、`ahp-session:/<uuid>/annotations`、`ahp-resource-watch:/<id>`、`ahp-otlp:`、`mcp://`）；"每帧 params 顶层带 `channel`" 使 `(method, params.channel)` 即可路由；宿主权威状态 + 客户端乐观写前（`dispatchAction{clientSeq}` → 宿主回 `action` 信封带 `origin{clientId,clientSeq}`/`rejectionReason`）；全局单调 `serverSeq` 与 `reconnect{lastSeenServerSeq}` 的「重放或快照」二选一；能力协商；`_meta` 与 **`x-` 前缀**为合法私有扩展位。
-- **必须自建（AHP 无宿主 SDK）**：`ahp`/`ahp-types`/`ahp-ws` 三个 crate 全是客户端（`ahp-ws` 只会 dial），没有任何 server/listener/session-manager/dispatcher/replay 设施。宿主半边——JSON-RPC 路由、全局 `serverSeq` 序号、快照与重连、动作校验/接受表、副作用派发（动作 → 真正跑 agent）、`resource*` 文件面——**是我们的新增维护面**。参考实现只有 VS Code（TS，`src/vs/platform/agentHost/node/`）与一个 157 行的 dotnet 一致性 fixture。
-
-### 用户裁决（2026-09-23）
-
-- **范围：全量替换**——manox-app 与 manox 之间的交互协议改为 AHP（channel 模型 + JSON-RPC + 双方同码 reducer）；不做「只加适配面」，也不做「只内部 channel 化」。
-- **四个诉求全部是验收面**：外部客户端互操作（VS Code Agents window / AHPX）、两仓解耦（UI 不再吃 runtime Rust 类型）、远程与多客户端、少维护自有协议。
-
-### 一句话方案
-
-**journal 仍是唯一 durable 权威（L3/L4/L10 存续），AHP host 把 journal 的追加翻译成 AHP 动作并广播，AHP 通道状态是 journal 的确定 fold；app 变成用 `ahp` crate（client + reducers）的纯 AHP 客户端。** 旧协议面（`manox-protocol` 全套 + session-core 的流/投影/waterfall 面 + app 的 client_store/journal_fold 一套）在 W4 整体删除，不做兼容层。
-
-### 技术支点（决定本方案可行的四点）
-
-1. AHP 明示传输由双方带外选定，**in-process message channel 合法**（`transport.md`）。
-2. 9 个纯 reducer 已随 `ahp` crate 发布（`apply_action_to_{root,session,chat,terminal,changeset,annotations,resource_watch,automation,automation_run}` + `ReduceOutcome`，`ahp/src/reducers.rs`），规范的意图就是**宿主与客户端跑同一份 reducer 代码** ⇒ 收敛性由构造保证。
-3. `ahp-types` 1.0.0 已含全部 state/action/command/notification 类型，**唯一前端叙事（TypeScript `types/` 为源、六语言生成）**。
-4. 重连允许以**快照代替重放** ⇒ 首版不必自建重放缓冲。
-
----
-
-## §A 目标终态
+## §A 分层与终态
 
 ```
 ┌ app 进程（单二进制）────────────────────────────────────────────┐
@@ -46,120 +23,165 @@ manox-ahp host
    ├─ 全局 serverSeq 单点盖章 · subscribe 快照 · reconnect
    ├─ 动作校验表（只接受我们声明的 client-dispatchable 子集）
    ├─ 副作用派发（chat/turnStarted → 内核 turn；toolCallConfirmed → 审批 settle）
-   ├─ x-manox 扩展面（plan / work / metrics / workspaces / commands / modelchat）
+   ├─ x-manox 扩展面（plan / work / metrics / thread / workspaces / commands）
    └─ resource* 最小面（工作目录围栏内）
-           ▲ journal 条目（38 变体）全射翻译
+           ▲ journal 条目全射翻译
 manox 内核 ThreadCore + Journal v4（磁盘 .jsonl，生态工具仍可直读）
 ```
 
-一句话：**journal（磁盘 .jsonl）仍是唯一 durable 权威；`manox-ahp` host 把 journal 追加全射翻译成 AHP 动作并广播，AHP 通道状态是该 journal 的确定 fold；manox-app 退化为 `ahp` crate（client + reducers）的纯 AHP 客户端，另经同一 in-proc `Transport` 抽象走进程内腿。** L1–L12 不变式的逐条存续/改写见 §C（唯一一份，不在本节重复）。
+一句话：**journal（磁盘 .jsonl）是唯一 durable 权威；`manox-ahp` host 把 journal 追加全射翻译成
+AHP 动作并广播，AHP 通道状态是该 journal 的确定 fold；manox-app 是用 `ahp` crate
+（client + reducers）的纯 AHP 客户端，另经同一 in-proc `Transport` 抽象走进程内腿。**
+L3–L12 不变式的逐条现状见 §C。
 
----
+三条结构性规则：
 
-## §B 身份与映射（核心决策，W0 定稿）
+- `manox-ahp` 不认识 manox 运行时：它的 `Backend` trait 是唯一窗口，测试可用脚本 backend 驱动。
+- `manox-ahp-runtime` 是 `Backend` 的真实实现侧缝；它不命名具体的会话运行时（builder 由拥有
+  会话存储的一方安装），也不反向依赖会话核心。
+- `manox-session-core` 实现 `SessionRuntime` 缝；写操作 fail-closed —— AHP 的 action 已被 reducer
+  折叠进订阅者状态，运行时拒绝必须回报为 refusal，静默 no-op 会让每个客户端收敛到从未发生的状态。
+
+## §B 通道与动作面
 
 ### B.1 通道 / URI
 
 | AHP channel | 映射到 manox | 说明 |
 |---|---|---|
-| `ahp-root://` | 全局 | `agents[].models`（=`ListModels`/`HostEvent::Models`）、terminals 目录、host config |
-| `ahp-session:/<uuid>` | **thread**（侧栏一行） | 承载 title / project / `workingDirectories` / status 位集 / `chats[]` 目录 / `defaultChat` = thread 的 active-session 指针；pin、分组、手工排序落 x-manox |
+| `ahp-root://` | 全局 | `agents[].models`、terminals 目录、host config |
+| `ahp-session:/<uuid>` | **thread**（侧栏一行） | title / project / `workingDirectories` / status 位集 / `chats[]` 目录 / `defaultChat` = thread 的 active-session 指针；pin、分组、手工排序落 x-manox |
 | `ahp-chat:/<cid>` | **session**（一份 `.jsonl` journal） | turns / activeTurn / responseParts / toolCalls / pending / draft；`createChat{source:{kind:'fork'|'sideChat'}}` ↔ 分支/fork/leaf 重定向 |
-| `ahp-terminal:/<id>` | terminal | `data`/`input`/`resized`/`claimed`/`exited`；多客户端同权（AHP 原生，优于现状 follow-only） |
-| `x-manox-plan:/<chat-id>` | plan 模式 + plan 文件 + 评审 | 缺口补齐 |
-| `x-manox-work:/<session-id>` | goal / 后台任务 / browser suites / 子代理树（depth/branch/agent_label） | 缺口补齐 |
-| `x-manox-metrics:/<chat-id>` | 原 Q 面（`GetConversationInfo`） | turns/messages/per-model usage/成本/context%/git stats，按 cursor 变更推送 |
-| `x-manox-workspaces://` | `manox-workspace` 域（目录行 + 有序会话账 + 全局 archive 集） | 缺口补齐（原 `ClientCall::Workspace`） |
-| `x-manox-commands://` | 命令/skill 目录（原 `ListCommands`/`HostEvent::Commands`） | stateless 快照 + 变更通知 |
-| `x-manox-modelchat:/<req-id>` | `ModelChat` 侧流（VS Code LM provider 的裸模型补全） | stateless 通道 |
+| `ahp-terminal:/<id>` | terminal | `data`/`input`/`resized`/`claimed`/`exited`；多客户端同权 |
+| `x-manox-plan:/<chat-id>` | 执行计划文档 | `plan_update` 的投影 |
+| `x-manox-work:/<session-id>` | goal / 后台任务 / browser suites / 子代理树（depth/branch/agent_label）与常驻 child-run 名册 | AHP 缺口补齐 |
+| `x-manox-metrics:/<chat-id>` | 会话聚合 | turns/messages/per-model usage/成本/context%/git stats，按 cursor 变更推送 |
+| `x-manox-thread:/<session-id>` | thread 行 | pin、label、session info、leaf 游标 |
+| `x-manox-workspaces://` | `manox-workspace` 域 | 目录行 + 有序会话账 + 全局 archive 集 |
+| `x-manox-commands://` | 命令/skill 目录 | stateless 快照 + 变更通知 |
 
 ### B.2 帧与传输
 
-| v2 | v3 |
+| AHP 机制 | manox 宿主侧落点 |
 |---|---|
-| `FromClient`/`FromServer` 六车道 | JSON-RPC 2.0：request/response、宿主→客户端 `action` 通知、客户端→宿主 `dispatchAction` 通知、per-channel 协议通知、宿主→客户端 request（`resource*` 与 `x-manox/*`） |
-| `MsgId` 关联 | JSON-RPC `id`；写路径改为 `clientSeq` 乐观对账 |
-| `StreamOpen/StreamItem(Entry/Projections)/StreamEnd{Resync}` | `subscribe`/`unsubscribe` + `action` 信封（`serverSeq`）；溢出 = 断连 → `reconnect`（快照腿） |
-| `Snapshot{records,has_more,projections}` | `subscribe` 结果 `{resource,state,fromSeq}` + `view.turns` + `fetchTurns{cursor}` 分页 |
-| `Initialize{protocol_epoch = 7}` | `initialize{protocolVersions:["1.0.0","0.9.0"],clientId,clientInfo,initialSubscriptions,locale}` → `{protocolVersion,serverSeq,snapshots,_meta:{"x-manox":{…}}}` |
-| `RpcError{code,message,data.code}`（稳定串码） | AHP 标准码（`-32001…-32011`）+ x-manox 码区间，声明表单一事实源（C2 纪律保留：生产零无码） |
-| `ServerCall` waterfall（Approve/AskUserQuestion/PlanVerdict） | **状态化**：`chat/toolCallReady`(+`options[]`)/`chat/toolCallConfirmed`；elicitation `chat/inputRequested`/`inputAnswerChanged`/`inputCompleted`；plan 走 `x-manox-plan/*`。多 owner 汇聚策略留在宿主侧，线下只暴露单一裁决结果与 `_meta.x-manox.deliveryId` 对账面 |
-| 进程内 `in_process_pair` | `ahp::Transport` 的进程内 impl（typed 帧，不序列化）；WS 由宿主侧 `WebSocketUpgrade` 提供 |
+| JSON-RPC 2.0 | request/response；宿主→客户端 `action` 通知；客户端→宿主 `dispatchAction` 通知；per-channel 协议通知；宿主→客户端 request（`x-manox/*` 客户端能力） |
+| JSON-RPC `id` | 请求关联；写路径以 `clientSeq` 乐观对账，回执 = 动作回声 + `serverSeq` + `origin{clientId,clientSeq}` |
+| `subscribe`/`unsubscribe` + `action` 信封（`serverSeq`） | 溢出 = 断连 → `reconnect`（快照腿）；高频 delta 用 `subscribe.delivery.maxLatencyMs` 合并 |
+| `subscribe` 结果 `{resource,state,fromSeq}` + `view.turns` + `fetchTurns{cursor}` | 会话快照与 turn 级分页；没有 entry 级翻页通道 |
+| `initialize{protocolVersions,clientId,clientInfo,initialSubscriptions,locale}` → `{protocolVersion,serverSeq,snapshots,_meta:{"x-manox":{…}}}` | 版本协商 + 扩展声明 |
+| AHP 标准错误码 + x-manox 码区间 | 声明表单一事实源：生产零无码 |
+| 进程内 `ahp::Transport` impl | typed 帧，不序列化；in-proc 无界，绝不阻塞发布方 |
+| axum `WebSocketUpgrade` | loopback `/ahp`，`?token=` + Origin 门 + 单例 `gateway.lock`；端点文件 `~/.manox/gateway-ws.json` |
 
-### B.3 命令 / 动作全量映射（实施对照表，W0 逐条定稿）
+### B.3 命令与动作面
 
-**`ClientCall`（18）**
+**客户端命令（host 服务）**：`initialize`、`subscribe`、`unsubscribe`、`ping`、`reconnect`、
+`listSessions`、`createSession`、`disposeSession`、`createChat`、`disposeChat`、`fetchTurns`、
+`x-manox/compact`、`x-manox/goal`、`x-manox/openTurn`、`x-manox/teardown`，以及
+`resourceRead`/`resourceWrite`/`resourceList`/`resourceDelete`（只落在会话工作目录子树 +
+granted-root 围栏内）。
 
-| v2 | v3 |
+**客户端可派发动作（`dispatchAction`，只接受声明的子集）**：
+
+- `chat/turnStarted`、`chat/pendingMessageSet{kind:'queued'|'steering'}`、
+  `chat/pendingMessageRemoved`、`chat/turnCancelled`、`chat/toolCallConfirmed`、
+  `chat/inputCompleted`、`chat/inputAnswerChanged`；
+- `session/configChanged`（canonical model 串、ConfigSchema 枚举 effort/accessMode；
+  durable 权威 = journal `model_change` / `thinking_level_change` / `access_mode_change` 行，见 §F.3）、
+  `session/isArchivedChanged`、`session/workingDirectorySet|Removed|Replaced`、
+  `session/activeClientSet`（客户端工具腿，见 §D.4）；
+- `x-manox/pinnedChanged`、`x-manox/orderChanged`、`x-manox/archivedChanged`、
+  `x-manox/aliasChanged`。
+
+**宿主发射动作**：
+
+- root：`root/agentsChanged`、`root/sessionAdded|Removed|SummaryChanged`；
+- session：`session/ready`、`session/configChanged`、`session/workingDirectory*`、
+  `session/isArchivedChanged`、`session/activeClientSet` 回声；
+- chat：`chat/turnStarted`、`chat/turnCompleted`、`chat/toolCallReady`（`options[]` +
+  `_meta.x-manox.{authId,summary,deliveryId}`）、`chat/toolCallConfirmed`、`chat/error`、
+  `chat/responsePart`、`chat/inputRequested`、`chat/inputAnswerChanged`、`chat/inputCompleted`、
+  `chat/inputNeededRemoved`、`chat/pendingMessageSet|Removed`；
+- terminal：`terminal/data`、`terminal/claimed`、`terminal/exited`；
+- x-manox：`x-manox-plan/planChanged`；`x-manox-work/goalChanged`、`backgroundTasksChanged`、
+  `childRunsChanged`、`browserSuitesChanged`、`activeToolsChanged`；`x-manox-metrics/changed`；
+  `x-manox-workspaces/baseline|changed|removed`；`x-manox/baseline`；
+  `x-manox/pinnedChanged`、`orderChanged`、`archivedChanged`、`aliasChanged`、`labelChanged`、
+  `sessionInfoChanged`、`leafChanged`。
+
+**宿主→客户端请求（server requests）**：`x-manox/browserOp`、`x-manox/clipboardRead`、
+`x-manox/openExternal`、`x-manox/invokeTool`，按客户端 `capabilities` 路由，fail-closed。
+
+**审批与询问是状态，不是 waterfall**：`Approve` → `chat/toolCallReady` + `chat/toolCallConfirmed`；
+`AskUserQuestion` → elicitation 三动作；plan 评审走通用 ask（§F.6）。多 owner 汇聚策略留在宿主侧，
+线下只暴露单一裁决结果与 `_meta.x-manox.deliveryId` 对账面。
+
+### B.4 AHP 原生覆盖的面
+
+以下能力由 AHP 自身承载，不另设自有协议面：初始化与能力声明（`initialize` 协商 +
+AHP registry）、客户端缺口修复（`reconnect` 快照腿）、状态推送（channel state + `action`
+信封）、审批/询问（状态化动作）、列表增量（`root/session*` 增量而非全量快照）、
+能力协商（`clientCapabilities`）、流溢出（断连重连）。
+
+### B.5 AHP 无对应 → `x-manox` 扩展面
+
+plan 执行计划文档；goal；compaction（journal 重写，AHP 无）；子代理层级（AHP 是扁平 worker chat，
+无 depth/父子树）；thread pin + 手工排序 + 分组 + alias/label；workspace 行域；后台任务；
+browser suites；命令/skill 目录；会话聚合（Q 面）；thread 游标信息。以上全部落 `x-manox/*`
+（合法 `x-` 前缀 + `_meta`），第三方 host 下优雅降级。
+
+## §C 不变式
+
+| 不变式 | 现状 |
 |---|---|
-| `Initialize` | `initialize` |
-| `OpenSession` | `subscribe(ahp-session:/<thread>)` |
-| `ListThreads` | `listSessions` + `root/sessionAdded\|Removed\|SummaryChanged` 增量维持 |
-| `ListModels` | root 快照 `agents[].models`（`SessionModelInfo{id,name,maxContextWindow,supportsVision,configSchema}`）+ `root/agentsChanged` |
-| `ListCommands` | `x-manox-commands://` 快照 |
-| `TerminalAttach` / `TerminalSnapshot` | `subscribe(ahp-terminal:/<id>)` + `terminal/claimed` |
-| `ModelChat` | `x-manox/modelChat` 命令 + 流式通知（stateless 通道） |
-| `RegisterSessionTools` | AHP 客户端工具腿（`activeClients`/`session.server_tools` + 归属客户端的 `chat/toolCallComplete`）；形状不足时兜底 `x-manox/invokeTool` |
-| `CreateSession{cwd,project,initial_model,access_mode,reasoning_effort}` | `createSession{channel:ahp-session:/<客户端铸 uuid>,provider,workingDirectories,config}`；`lifecycle:'creating'`→`session/ready`；幂等键 = 客户端铸 URI |
-| `Submit{session_id,text,images,origin_rpc}` | `dispatchAction{channel:ahp-chat:/<sid>,clientSeq,action:{type:'chat/turnStarted',turnId,message:{text,origin:{kind:'user'},attachments:[embeddedResource]}}}`（`origin_rpc` 角色由 `clientSeq` 取代） |
-| `Steer` | `chat/pendingMessageSet{kind:'steering'}` |
-| `PageHistory` | `fetchTurns{cursor}`（翻页语义）；journal 条目级翻页由 `x-manox/fetchEntries` 兜底 |
-| `Workspace{call}` | `x-manox-workspaces://` 上的命令/动作 |
-| `GetConversationInfo` | `x-manox-metrics:/<chat-id>` 快照 |
-| `CancelDelivery` | 无落点（`x-manox/cancelDelivery` 是设计期提案，`not-on-wire`；撤回经 `session/inputNeededRemoved` 表达） |
-| `ForkSession` | `createChat{source:{kind:'fork'|'sideChat',turnId,selection?}}` + `x-manox/branchFork`（leaf 重定向/`BranchSummary` 语义） |
+| **L3 一切状态变更皆 journal 条目** | 原样：AHP 动作面是 journal 的投影，不是新权威；「字段变了但无事件」仍结构不可能 |
+| **L4 seq 单点盖章** | 双层：journal 内每条链的 `seq` 仍由单一 append 点盖章（磁盘/回放契约）；网关另有全局 `serverSeq` 在动作派发点单点盖章 |
+| **L5 快照不丢、溢出即重同步** | snapshot 永不丢（subscribe / reconnect 快照）；高频 delta 用 `delivery.maxLatencyMs` 合并；网络载体溢出 = 断连 → 客户端 `reconnect` 取快照；进程内载体无界 |
+| **L6 客户端零领域 fold** | AHP reducer 是客户端唯一 fold，视图不得解析 provider/工具词汇 |
+| **L7 写只回回声** | 写是 `dispatchAction` 通知；回执 = 动作回声 + `serverSeq` + `origin{clientId,clientSeq}` 乐观对账；运行时拒绝是显式 refusal |
+| **L8 wire 身份 canonical** | `AgentInfo.provider` + `SessionModelInfo.id` = canonical `provider/model` 串 |
+| **L9 UI 值经协议面表达** | AHP 通道状态 + x-manox 扩展状态 + 宿主→客户端请求；组件层禁私开同步通道 |
+| **L10 重放等于内存** | 原样，并加门禁：`快照 == fold(重放)`，config 座位同样覆盖 |
+| **L11 单网关** | 一进程一个 AHP host，单 `serverSeq` 域 |
+| **L12 声明面即公开契约** | AHP 自身 registry + 唯一一张 x-manox 扩展声明表 + journal 词汇表（磁盘面） |
 
-**`ClientNote`（27 + 3 compat）**
+宿主侧内部约束（不属 AHP 面）：thread 句柄锁不可重入；前端能力调用一律以 future 表达，不在锁内
+做异步 UI 往返。
 
-`DetachSession`→`unsubscribe`；`DisposeSession`→`disposeChat`/`disposeSession`；`DropQueued`→`chat/pendingMessageRemoved{kind:'queued'}`；`CancelTurn`→`chat/turnCancelled`；`SetModel`→`session/configChanged`（canonical 串；durable 权威 = journal `model_change` 行，见 §H.8）；`SetReasoningEffort`/`SetAccessMode`/`SetBrowserSuite`→`session/configChanged`（ConfigSchema 枚举；effort/accessMode 的 durable 权威 = journal `thinking_level_change`/`access_mode_change` 行，见 §H.8；browser suite 仍由 `x-manox-work` 记状态）；`SetCwd`→`session/workingDirectorySet|Removed|Replaced`；`SetPlanMode`→`x-manox-plan/planModeChanged`；`PlanSeedExecution`→`x-manox/planExecute`（命令）；`Compact`→`x-manox/compact`（命令）；`Goal`→`x-manox/goal`（命令；状态落 `x-manox-work/goalChanged`）；`StopBackgroundTask`→无落点（`backgroundTaskStopped` 声明随声明面 v5 删除——它从未接派发臂，宿主也从不发）；`ArchiveThread`→`session/isArchivedChanged`；`PinThread`→`x-manox/pinnedChanged`（AHP 无 pin 位）；`InsertThreadBefore`/`InsertGroupBefore`→`x-manox/orderChanged`；`TerminalInput`/`TerminalResize`→`terminal/input`/`terminal/resized`；`CancelModelChat`→无落点（`x-manox/modelChatCancel` 随 v2 网关删除，`not-on-wire`）；`Shutdown`→无落点（连接关闭即断开，`not-on-wire`）；`AppendUserMessage`→`chat/pendingMessageSet{kind:'queued'}`；`AppendUiNote`→`chat/responsePart{kind:'systemNotification'}`；compat `CreateSession`/`Submit`/`Steer` 随 v2 一并删除（无兼容期）。
+### C.1 事件与 seq
 
-**`ServerCall`（6）**
+journal 的每一行都是持久事实：消息、工具、turn 边界、配置与状态变更。envelope 键
+（`seq`/`id`/`parentId`/`timestamp`/`type`）独占，payload 不复用，所以工具句柄是 `callId`、
+子代理句柄是 `agentId`。`seq` 是链深（dense 0-based），由单一 append 点盖章；行序可以因并发
+写者交叠而偏离链序，内存一律按链排序，读回不依赖行序。网关的全局 `serverSeq` 是另一个域，
+只盖 AHP 动作。
 
-`Approve`→`chat/toolCallReady{pending-confirmation, options[], _meta:{x-manox:{authId,summary,deliveryId}}}` + `chat/toolCallConfirmed{approved,selectedOptionId?,reason?}`；`AskUserQuestion`→elicitation 三动作（多客户端草稿同步白拿）；`PlanVerdict`→`x-manox-plan/verdictRequested`+`/reviewSettled`；`BrowserOp`/`ClipboardRead`/`OpenExternal`/`InvokeClientTool`→宿主→客户端 request `x-manox/browserOp|clipboardRead|openExternal|invokeTool`（按 `capabilities` 路由，fail-closed 不变）。
+### C.2 journal 词汇
 
-**`HostEvent`（8 变体 + 死亡清单）**
+- 唯一词汇是 `session::event::Event`（serde tag = 行名）；没有别名、没有第二套 schema。
+- 用户可见且需重启后存续的事实必须是事件；身份字段永不出现在事件 payload（事件只带 id 引用）。
+- 本 build 不写的行名按未知行拒收（`unknown_event_types_are_refused_not_guessed`），没有兼容读。
+- 身份只在 journal 首行 header 出现一次，此后永不改写；血缘（parent/toolCallId/runId/depth）是
+  header 字段，不是可变旁册指针。
 
-`Ready`→`initialize` 结果；`Models`→root `agentsChanged`；`Commands`→`x-manox-commands://`；`ThreadsUpdated`→`listSessions` + `root/sessionSummaryChanged`（删全量快照腿）；`SessionStatus`→由 session/chat 的 `status` 位集派生（删独立事件）；`SessionCreated/Disposed`→`session/chatAdded` + `root/sessionAdded` / `disposeSession` + `root/sessionRemoved`；`Error`→JSON-RPC error + `chat/error` 响应部件。
+### C.3 v4 读面
 
-### B.4 AHP 原生吃掉的自研物（直接删）
-
-epoch 握手与 `wire_surface!` 四张表、客户端缺口修复引擎 `journal_stream.rs`、投影的**线上面**（`projection_hub`/`projection_cache` 的推送职责）、`ServerNote` 双发窗口与死亡清单、过渡列表通道（`threadsUpdated`/`models`/`commands` 全量快照）、`answer_kind` 能力协商、`StreamEnd{Resync}` 语义（由 reconnect 承担）。
-
-### B.5 AHP 无对应（必须扩展或降级）
-
-plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无）；子代理层级（AHP 是扁平的 worker chat，无 depth/父子树）；thread pin + 手工排序 + 分组；workspace 行域；后台任务；browser suites；命令/skill/插件目录；Q 面聚合；客户端工具（`RegisterSessionTools` 方向相反）。以上全部落 `x-manox/*`（合法 `x-` 前缀 + `_meta`），第三方 host 下优雅降级。
-
----
-
-## §C 不变式（L1–L12 的存续与改写；本节为唯一一份）
-
-| 旧 | v3 处置 |
-|---|---|
-| L1 句柄锁不可重入 | 原样 |
-| L2 前端能力 `BoxFuture` | 原样 |
-| L3 一切状态变更皆 journal 条目 | **原样**（AHP 动作面是 journal 的投影，不是新权威；「字段变了但无事件」仍结构不可能） |
-| L4 seq 单点盖章 | 双层：journal 内 seq 仍单点盖章（磁盘/回放契约不变）；网关新增 **全局 `serverSeq` 在动作派发点单点盖章** |
-| L5 快照不丢、溢出即重同步 | 改写为：snapshot 永不丢（subscribe 快照 / reconnect 快照）；高频 delta 用 `subscribe.delivery.maxLatencyMs` 合并；网络载体溢出 = 断连 → 客户端自动 `reconnect` 取快照；进程内载体仍无界 |
-| L6 客户端零领域 fold | **强化**：AHP reducer 是客户端唯一 fold，视图不得解析 provider/工具词汇 |
-| L7 写只回 receipt | AHP 无 receipt：写是 `dispatchAction` 通知，回执 = 动作回声 + `serverSeq` + `origin{clientId,clientSeq}` 对账（乐观写前，比 receipt 更严格） |
-| L8 wire 身份 canonical | 原样：`AgentInfo.provider` + `SessionModelInfo.id` = canonical `provider/model` 串 |
-| L9 五面表达 UI 值 | 改写为：**AHP 通道状态 + x-manox 扩展状态 + 宿主→客户端请求**；组件层仍禁私开同步通道 |
-| L10 重放等于内存 | **原样**，并加一条门禁：`快照 == fold(重放)` |
-| L11 单网关 | 原样（一进程一个 AHP host，单 `serverSeq` 域） |
-| L12 声明面即公开契约 | 语义保留、载体更换：AHP 自身 registry + 我们**唯一一张** x-manox 扩展声明表 + journal 词汇表（磁盘面） |
-
----
+- 磁盘只有一个格式版本（`FORMAT_VERSION = 4`）；别的版本在 open 时以可操作的错误拒绝，
+  文件原样不动（转换是一次性 operator migration，运行时从不重写）。
+- 打开校验：header 必须合法；每条链的 parent 必须存在、无环、`seq` 等于链深；坏文件报错而不是
+  猜一种修复。
+- 读接口：`journal_range` 以链序返回记录，最后一条即活动 leaf；header-only 文件可被列表扫描
+  有界读取（不加载 transcript）。
 
 ## §D x-manox 扩展面（单一事实源，随 `initialize` 协商）
 
 ### D.1 声明块
 
 ```jsonc
-"_meta": { "x-manox": { "version": 1,
+"_meta": { "x-manox": { "version": 6,
   "channels": ["x-manox-plan:/", "x-manox-work:/", "x-manox-metrics:/",
-               "x-manox-workspaces://", "x-manox-commands://", "x-manox-modelchat:/"],
-  "clientDispatchableActions": ["x-manox-plan/planModeChanged", "x-manox/pinnedChanged", "..."],
-  "commands": ["x-manox/compact", "x-manox/modelChat", "x-manox/fetchEntries", "..."],
+               "x-manox-thread:/", "x-manox-workspaces://", "x-manox-commands://"],
+  "clientDispatchableActions": ["x-manox/pinnedChanged", "x-manox/orderChanged", "..."],
+  "commands": ["x-manox/compact", "x-manox/goal", "x-manox/openTurn", "x-manox/teardown"],
   "serverRequests": ["x-manox/browserOp", "x-manox/clipboardRead", "x-manox/openExternal", "x-manox/invokeTool"],
   "capabilities": { "multipleChats": {"fork": true, "sideChat": true},
                     "multipleWorkingDirectories": { "immutablePrimary": false } } } }
@@ -167,997 +189,187 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 ### D.2 扩展通道与其承载的领域状态
 
-| 扩展通道 | 承载的领域状态 | AHP 缺口来源 |
-|---|---|---|
-| `x-manox-plan:/<chat-id>` | plan 模式开关、plan 文件/制品内容、评审请求与裁决（`verdictRequested`/`reviewSettled`/`execute`/`planModeChanged`） | AHP 无 plan 模式与 plan 制品/评审 |
-| `x-manox-work:/<session-id>` | goal、后台任务、browser suites 运行态、子代理树（depth/branch/agent_label） | AHP 是扁平 worker chat，无 depth/父子树；goal/后台任务/browser suites 无对应 |
-| `x-manox-metrics:/<chat-id>` | 原 Q 面聚合：turns/messages、per-model usage、成本、context%、git stats，按 cursor 变更推送 | AHP 无按需聚合（Q）面 |
-| `x-manox-workspaces://` | `manox-workspace` 域：目录行 + 有序会话账 + 全局 archive 集（原 `ClientCall::Workspace`） | AHP 无 workspace 行域 |
-| `x-manox-commands://` | 命令/skill/插件目录（原 `ListCommands`/`HostEvent::Commands`）：stateless 快照 + 变更通知 | AHP 无命令/skill 目录 |
-| `x-manox-modelchat:/<req-id>` | `ModelChat` 侧流（VS Code LM provider 的裸模型补全）：stateless 通道 + `modelChatCancel` | AHP 无裸模型侧流 |
+| 扩展通道 | 承载的领域状态 |
+|---|---|
+| `x-manox-plan:/<chat-id>` | 执行计划文档（`planChanged` ← journal `plan_update`）；plan 开关与 plan 评审不存在 |
+| `x-manox-work:/<session-id>` | goal、后台任务、browser suites 运行态、子代理树（depth/branch/agent_label）、常驻 child-run 名册 |
+| `x-manox-metrics:/<chat-id>` | 会话聚合：turns/messages、per-model usage、成本、context%、git stats，按 cursor 变更推送 |
+| `x-manox-thread:/<session-id>` | thread 行：pin、label、session info、leaf 游标 |
+| `x-manox-workspaces://` | `manox-workspace` 域：目录行 + 有序会话账 + 全局 archive 集 |
+| `x-manox-commands://` | 命令/skill 目录：stateless 快照 + 变更通知 |
 
 ### D.3 命名与共存规则（normative）
 
-- **单一事实源**：一切 `x-manox` 命名（通道、动作、命令、serverRequest、`_meta` 键、错误码区间）必须声明在本文这一张表（及其 D.1 声明块）里；代码中不得出现未声明的 `x-manox` 名。新增 = 先改本文，再改代码。
-- **未知容忍**：对端收到未知扩展通道/动作/`_meta` 键时忽略不断连、不报错（与 §附.3 Assumption 4 一致）。
-- **第三方 host 优雅降级**：manox-app 连非 manox host 时，`_meta["x-manox"]` 缺失即隐藏对应 UI 能力面，绝不因扩展缺失而报错或降格核心流程。
+- **单一事实源**：一切 `x-manox` 命名（通道、动作、命令、serverRequest、`_meta` 键、错误码区间）
+  必须声明在本文这一张表（及其 D.1 声明块）里；代码中不得出现未声明的 `x-manox` 名。新增 = 先改本文，再改代码。
+- **未知容忍**：对端收到未知扩展通道/动作/`_meta` 键时忽略、不断连、不报错。
+- **第三方 host 优雅降级**：manox-app 连非 manox host 时，`_meta["x-manox"]` 缺失即隐藏对应 UI
+  能力面，绝不因扩展缺失而报错或降格核心流程。
 - `x-` 前缀与 `_meta` 是 AHP 1.0.0 明示的合法私有扩展位；`x-manox` 不承诺第三方 host 支持。
+- **声明即承诺**：只有真正有实现的动作/命令/通道才列入声明表；未实现的一律拒绝（不是静默 no-op）。
 
----
+### D.4 客户端工具
 
-## §E 依赖与选型决策（不再留待实施者决定）
+AHP 原生 `session/activeClientSet` 携带 `activeClients[].tools`：注册即动作，宿主 reducer 把它
+折叠进订阅者状态，同时落到引擎的 `embedder_tools` 注册表——一条注册路径，不是两张表。完整替换
+按 `clientId` 幂等；没有活引擎的会话拒绝注册（否则模型会拿到一个无法运行的工具）。
 
-1. **依赖**：`ahp-types`（wire 类型）+ `ahp`（client + **reducers**）**精确 pin（现 `=1.0.0`）**；`ahp-ws` 进 manox-app 侧测试与外部客户端 e2e（宿主侧 WS **不用** `ahp-ws`，它只能 dial；宿主用 axum `WebSocketUpgrade` + 自写 `ahp::Transport` impl——架构参考，禁止复制其代码，遵项目「禁抄袭第三方 crate」纪律）。
-2. **crate 布局**：新增 `crates/manox-ahp/`，承载 **AHP 协议的宿主半边 + journal→AHP 翻译 + x-manox 扩展声明面**，初始模块面为 `wire.rs`/`router.rs`/`sequencer.rs`/`channels/{root,session,chat,terminal}.rs`/`translate/`/`ext/`/`resource.rs`/`transport/{inproc,ws}.rs`/`error.rs` + `tests/`；**其 `Backend` trait 缝由 `manox-session-core` 实现**（宿主语义动作最终落到 session-core 的网关与内核调用）。`manox-protocol` 删除（见 §F），不保留 `manox-protocol` 空壳。
-3. **单网关单端口**：同一 axum listener 只留 `/ahp`（v2 的 `/ws` 直接删除，激进纪律）；token 与 `gateway.lock` 单例纪律不变，端点文件更名 `~/.manox/ahp-ws.json`。
-4. **协商与版本**：`protocolVersions:["1.0.0","0.9.0"]`（caret 语义，选择逻辑委托 `ahp_types::version::negotiate_protocol_version`）；扩展经 `_meta["x-manox"]`（未知键方忽略不断连）；我们**只 advertise 并实现真正用到的动作子集**（约 35 个宿主发射动作 + 必须接受的 client-dispatchable 子集），未实现的动作一律拒（`rejectionReason` 或 x-manox 稳定码）。
-5. **错误码**：AHP 标准码 + `x-manox/*` 码表（单一声明表；C2「生产零无码」结构门禁保留）。
-6. **能力**：advertise `multipleChats{fork,sideChat}`（= 已有分支/fork）；`multipleWorkingDirectories`（= 已有 `workingDirectories` 围栏，先不开 `immutablePrimary`）。
-7. **durability**：AHP 无持久化要求，**journal 仍是唯一 durable**；宿主启动时由 journal fold 得到通道状态，AHP 快照 = 该 fold 的输出。
+### D.5 宿主事件推送
 
----
+- `Models`：provider reload 时立即推 `root/agentsChanged`（不是等下一次列表）。
+- `ThreadsUpdated`：任何 summary 写（title auto-stamp、interacted_at、pin/archive/tag、rescan）
+  都推给每个连接，客户端无需 in-process store 订阅。
+- `SessionStatus`：由 session/chat 的 `status` 位集派生，不设独立事件。
+- `SessionCreated` / `SessionDisposed`：`root/sessionAdded|Removed` + `session/chatAdded`。
 
-## §F 删除清单（W4 收口；LOC 为当时实测）
+### D.6 生命周期与恢复
 
-> **已执行，见 §H.5。** 本节保留为计划的原始账；实际拆法与它有两处出入
-> （`manox-session-core` 未整体删除，新增 `manox-ahp-runtime`），
-> 原因记在 H.2j 与 H.5①。
+- **dispose 不写 durable 标记**：未物化会话 = 内存删行 + `root/sessionRemoved`；已物化会话仍在
+  列表里，日志里没有「已处置」行。
+- **订阅但从未提交的会话**：settle 可以冷开它（verdict 到来时引擎才物化），journal 行落在
+  seed 的 watermark 之上，客户端 fold 因此看到卡片关闭。
+- **restore 对账**：链尾是未闭合 turn（`turn_start`，或无 `turn_start` 的 user 行）时，
+  restore 追加 `cancelled: true, failed: false, reason: "host exited"` 的 `turn_finish`，让
+  `快照 == fold(重放)` 成立。
+- **共享 journal 的 turn owner**：`turn_start` 行携带进程 pid；owner 死掉时读者可以安全结算，
+  活着的 owner 的 turn 永不被自动取消。
 
-### F.1 manox
+## §E 依赖与选型
 
-- 删 `crates/manox-protocol/`：`msg.rs` 634 / `client.rs` 469 / `server.rs` 319 / `stream.rs` 479 / `surface.rs` 1032 / `transport.rs` 494 / `handshake.rs` 113 / `journal_stream.rs` 497 / `workspace.rs` 86 / `answer_kind.rs` 47 / `wire.rs` 95 + `tests/{surface_coverage,journal_proptest,journal_vectors}.rs`。
-- 保留并搬迁：journal 词汇表 `journal.rs`(377) + `base64_bytes.rs`(53) → **新增叶子 crate `crates/manox-journal/`**（纯磁盘格式，与 AHP 无关，也不属于任何协议面）。之所以是独立叶子 crate 而非并入 `manox-session-core`：它要打断 `manox-ahp → manox-session-core → manox-ahp` 的成环——`Backend` 缝由 `manox-session-core` 实现（§E.2），而 journal→AHP 翻译住在 `manox-ahp`，两侧都只能依赖这个叶子。**迁移窗口内 `manox-protocol` 以 `pub use manox_journal as journal;` 重导出它**，使 v2 继续编译到 §G W4 为止。
-- `crates/manox-ahp/` 承载：AHP 协议宿主半边 + journal→AHP 翻译 + x-manox 扩展面（§E.2）；`Backend` trait 缝由 `manox-session-core` 实现。
-- `crates/manox-session-core/`：删 `follow.rs` 614、`projection_hub.rs` 249、`projection_cache.rs` 192、`waterfall.rs` 444、`agent_client.rs` 227、`ws/connection.rs` 的 v2 帧路径；`projections.rs` 854 与 `translate.rs` 952 重写为内部的 `journal → AHP 动作 / 通道状态` 折叠（不再有独立「投影线上面」）；`agent_server.rs` 5588 瘦身（六车道/RpcPeer/StreamId/owner 表 → AHP host 的通道注册与副作用派发，即 `Backend` 实现侧）；`journal_query.rs` 360 的 `PageHistory` 改喂 `fetchTurns`、`ConversationInfoCache` 改喂 `x-manox-metrics`；`workspace_serve.rs` 205 改喂 `x-manox-workspaces://`；`model_chat.rs` 578 改喂 `x-manox-modelchat`；`ws/{mod,listener}.rs` 保留网关骨架（token/Origin/单例），路由 `/ws` → `/ahp`；`~/.manox/gateway-ws.json` → `ahp-ws.json`；`cx web` → `cx ahp`。
-- `crates/manox-napi`（休眠）：会话接线改为进程内 AHP 客户端（小改）。
+### E.1 依赖
 
-### F.2 manox-app
+AHP 只发客户端 SDK（`ahp` / `ahp-types` / `ahp-ws`），宿主半边（JSON-RPC 路由、
+`serverSeq`、快照/重连、动作校验与派发、`resource*` 文件面）是 manox 自建的面。
+`ahp-types`（wire 类型）+ `ahp`（client + reducers）**精确 pin（`=1.0.0`）**；`ahp-ws` 进
+manox-app 侧测试与外部客户端 e2e（宿主侧 WS **不用** `ahp-ws`，它只能 dial；宿主用 axum
+`WebSocketUpgrade` + 自写 `ahp::Transport` impl——架构参考，禁止复制其代码）。
 
-- 删 `client_store.rs` 1153、`client_store_handle.rs` 2143、`journal_fold.rs` 437、`journal_translate.rs` 888、`server_note_translate.rs` 164；`multiplexer.rs` 1970 → 单 `AhpClient` + 多订阅（大幅缩水）；`source_gates.rs` 432 重写为「视图只许读 AhpStore」的 grep 门禁；`workspace.rs` 去 `ThreadHandle`「渲染镜像」与 `provider_glue` 直读（模型面改读 root `agents`）；`views/message.rs` 的工具/审批卡改由 AHP tool-call 状态机渲染；`UI-MAP.md` 同 PR 更新。
+### E.2 crate 布局与单网关
 
----
+`crates/manox-ahp/` 承载 **AHP 协议的宿主半边 + journal→AHP 翻译 + x-manox 扩展声明面**；
+`Backend` trait 缝由 `manox-session-core` 实现。`manox-ahp-runtime` 是运行时半边
+（`SessionRuntime` 缝 + 适配器）。同一 axum listener 只留 `/ahp`；token 与 `gateway.lock`
+单例纪律不变，端点文件 `~/.manox/gateway-ws.json`。
 
-## §G 分期与门禁
+### E.3 会话聚合（Q 面）
 
-### W0 规格冻结（manox）
+`ConversationInfoCache` 按 `(thread_id, cursor)` 缓存 journal fold：turns/messages、per-model
+usage、累计 token 与成本、context%、git stats（host lookup，缺失为 `null`）。它是
+`x-manox-metrics` 通道的读模型，不是独立权威。
 
-- 交付：`docs/ahp-v3-architecture.md`（本文：映射表终稿 + x-manox 声明面 + 删除清单 + as-built 位）；v2 规格文档加「v2 已由 v3 取代」指针（该文档现已删除）；本地拉起 VS Code Agents window 与 AHPX 作为外部验收客户端（记录 `settings.json` 与连接方式）。
-- 门禁：映射表与扩展面经用户确认；v2 进入冻结（只收 blocker 修复）。
+### E.4 协商与版本
 
-### W1 宿主骨架（manox，纯新增）
+`protocolVersions:["1.0.0","0.9.0"]`（caret 语义，选择逻辑委托
+`ahp_types::version::negotiate_protocol_version`）；扩展经 `_meta["x-manox"]`；只 advertise
+并实现真正用到的动作子集，未实现的动作一律拒（`rejectionReason` 或 x-manox 稳定码）。
 
-- `crates/manox-ahp/`：JSON-RPC 编解码（`ahp-types::messages`）、`(method, channel)` 路由、全局 `serverSeq` 单点盖章、通道注册与订阅管理、`initialize`/`subscribe`/`unsubscribe`/`ping`/`reconnect`（**快照腿**）/`listSessions`/`createSession`/`disposeSession`/`createChat`/`disposeChat`、进程内 `Transport` impl、`/ahp` WS 路由、`cx ahp` headless 宿主。
-- 门禁：dev-dep `ahp` + `ahp-ws` 客户端经**进程内与 WS 两路**跑通 root/session/chat 的 init/subscribe/reconnect/unsubscribe；`cargo clippy --all-targets -- -D warnings`；`script/gates.sh`。
-- 中间绿：v2 面零改动（新增，不修改）。
+### E.5 错误码
 
-### W2 域翻译与状态收敛（manox）
+AHP 标准码 + `x-manox/*` 码表（单一声明表；生产零无码的结构门禁）。
 
-- `projection.rs`（manox-ahp-runtime）：kernel 会话记录 **全射** → AHP 动作（消息、流式 delta 的 create-then-append、tool-call 生命周期、usage、lifecycle、title/activity、workingDirectories、config 承载 model/effort/accessMode/browserSuite（行源 `model_change`/`thinking_level_change`/`access_mode_change`，见 §H.8）、compaction、分支/摘要）；projection 值 → 通道状态字段。**2026-10-09 起无中间 wire 词汇**：`manox-journal`（§C.2 v2 遗产词汇 crate）已删除，投影输入即 kernel `SessionTreeEntry` 记录（#878）。
-- 审批面：`Approve` → `toolCallReady`(+`options[]`)/`toolCallConfirmed`（含 mid-execution 再确认、可编辑参数、result confirmation 三态的映射取舍）；`AskUserQuestion` → elicitation；`PlanVerdict` → x-manox-plan。
-- 副作用派发：`chat/turnStarted|pendingMessageSet|turnCancelled|toolCallConfirmed|inputCompleted|isArchivedChanged|workingDirectory*` 等 → 现有内核调用（原 27 个 note 的落点）。
-- x-manox 全线 + `resource*` 最小面（`resourceRead/Write/List/Delete` + ContentRef，落在会话工作目录围栏内，fail-closed）。
-- 门禁：①**收敛性证明**——对任一 journal，`宿主状态 == reduce(快照, 已发信封序列)`（用 `ahp` crate 的 reducers 跑同一批信封）；②全射/覆盖门（38 条目 ⇒ 动作 ⇒ 声明表行，编译期 + 测试期联动，沿用 v2 文档 §J.4 口径）；③`快照 == fold(重放)`（L10 新面）；④真客户端 smoke，**实施期拆为两条**：**④a** 官方 TS client over WS（`script/ahp-client-smoke/smoke.mjs`，已绿，见 §H.2e）；**④b** 真 VS Code Agents window 发 prompt、看到工具卡与审批、看 plan，AHPX 列会话并收流（需先在 hcode fork 里加一条可插拔的 connection 来源，独立立项）；⑤错误码纪律。
-- 中间绿：v2 继续服务桌面；AHP 面可独立跑。
+### E.6 能力
 
-### W3 客户端切换（manox-app）
+advertise `multipleChats{fork,sideChat}`；`multipleWorkingDirectories`（不开 `immutablePrimary`）。
 
-- 新增 `ahp_store.rs`（`ahp::Client` + reducers + x-manox 通道状态）、`transport_inproc.rs`（typed `ahp::Transport`）；`ConversationState` 由 `ChatState.responseParts` 派生；`multiplexer.rs` 收敛；删 `client_store*`/`journal_fold`/`journal_translate`/`server_note_translate`；`source_gates.rs` 重写；`UI-MAP.md` 更新。
-- 门禁：manox-app 全量门禁（clippy `-D warnings`、`cargo test`、`fmt`）+ **逐能力手工 e2e 清单**（submit/steer/queued/cancel/审批/询问/plan/分支与恢复/终端/模型与 effort 切换/后台任务/工作区排序/多客户端同权/长会话翻页）；`script/local-manox.sh on` 联调。
-- 中间绿：切换后 app 与 v2 面零耦合。
+### E.7 durability
 
-### W4 v2 拆除（manox）
+AHP 无持久化要求，journal 仍是唯一 durable；宿主启动时由 journal fold 得到通道状态，
+AHP 快照 = 该 fold 的输出。
 
-- **实施期修订（crate 形状）**：计划把 `adapter/` 放在 `crates/manox-ahp` 内，实施拆成了
-  `manox-ahp`（transport-agnostic host + translate，不依赖 `manox-agent`，可用假 backend 单测）
-  + `manox-session-core/src/ahp/`（`Backend` 实现，认识运行时）。这个解耦更好——`manox-ahp` 因此
-  不依赖 `manox-agent`，`Backend` trait + `DispatchOutcome` 三值就是它的收益，单向依赖规则真的成立。
-  **但它改变了 W4 的形状**：`manox-session-core` **不能**再按 §F 整体删除，因为
-  `src/ahp/`（约 2.8k 行）住在里面。W4 需要给 `manox-session-core/src/ahp/` 一个新家——
-  候选是新 crate `manox-ahp-runtime`，或搬进 `manox-agent`。**倾向前者**（保持
-  `manox-agent` 不认识 AHP）。
-- **实施期修订（新增 crate）**：`crates/manox-journal`（`journal.rs` + `base64_bytes.rs`）是计划里
-  没有的落点——把**磁盘**词汇从 `manox-protocol` 里救出来成为叶子 crate，避免打断依赖拓扑
-  （`manox-ahp` 需要词汇做翻译，`manox-session-core` 需要 `manox-ahp` 做宿主）。§F 删除清单需同步。
-- **W4 前置核查（已做，2026-09-23）**：`manox-journal` 里有没有残留 v2 词汇——否则删
-  `manox-protocol` 会把 v2 的一部分以新名字留下来。**结论：代码面零残留**。该 crate
-  `use` 只有 `serde`（无 `FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|
-  PROTOCOL_EPOCH|StreamFrame`），453 行里没有任何帧类型或网关词汇；它承载的是 `.jsonl` 的行形状，
-  而 v3 切换**不改磁盘格式**（这正是 R1 里「锁旧 rev 的 client 仍能工作」的前提）。
-  **但文档面有漂移且已修**：`journal.rs` 的头注释自称 "Journal wire vocabulary" 并把
-  `StreamFrame::Entry`/`Snapshot`（v2 帧类型）写成自己的声明面——那是**传输**的关切，不是这个
-  crate 的。已改写为「disk vocabulary」，并删掉三处会随 W4 变成悬空引用的 `StreamFrame::*`。
-  唯一保留的 v2 味道是 `running` / `pending_auth` 两个词——实测它们**两边都在用**
-  （`manox-ahp/translate/actions.rs:146` 也读 `"running"`），是共享词汇而非残留。
-- 按 §F 删除清单执行；`manox-napi` 改 AHP；文档补 §H as-built 章。
-- 门禁：全仓 `script/gates.sh`；**grep 门禁**（生产区零 `FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）；双路径一致性（in-proc typed ≡ WS serde）；`journal_replay_is_consistent_across_disk_reload` 仍绿。
-- 中间绿：删除面已零消费者。
-- **已执行（2026-09-24），结果见 §H.5**：六腿全绿、grep 门禁零命中、`manox-protocol` 已删。
-  遗留覆盖缺口记在 H.3。
+## §F 实现事实（durable 行为）
 
-### W5 硬化与生态
+### F.1 journal 追加与 leaf
 
-- 有界重放缓冲（按 `serverSeq` 重放替换快照腿）、`delivery.maxLatencyMs` 合并调优、`resource*` 完整面（大输出 ContentRef、图片引用、客户端 `virtual://` URI、工作目录围栏）、远程与鉴权（token 已有；AHP `protectedResources`/`authenticate` 接入 provider 凭据后续议）、多客户端并发与 owner 语义、长会话快照成本度量。
-- 门禁：`ahp-*` minor 升级演练 checklist（升级即以收敛性门禁为护栏）；上游 `types/test-cases/reducers/*.json` 与我们信封的一致性抽样。
+- 单一 append 点在链上分配 dense `seq`；并发写者由文件 fence（flock + stale-view reload）
+  线性化。行序可以与链序不同，读回按链排序，`journal_range` 的最后一条就是活动 leaf。
+- 新格式只加行类型，不改 envelope；旧格式文件在 open 时拒绝（§C.3），不做运行时转换。
+- 追加失败不改变内存链；durable 行先于对外广播（客户端看到的动作都以已落盘行为前提）。
 
-### 跨仓协同与 PR 顺序（每步 main 常绿）
+### F.2 echo retirement
 
-1. **PR-A（manox）**：W0+W1+W2（纯新增 `manox-ahp` + 文档；v2 不动）。分支 `codex/ahp-host`，worktree 实施。
-2. **PR-B（manox-app）**：W3（切到 AHP；`Cargo.lock` bump 到 PR-A 的 rev）。分支 `codex/ahp-client`；`script/local-manox.sh on` 联调，off 形态验证。
-3. **PR-C（manox）**：W4（删 v2；`manox-protocol` 整体消失）。分支 `codex/ahp-remove-v2`，基于 PR-A 之后 main。
-4. **PR-D/E**：W5 各自仓，单独 PR（不并入 A/B/C）。
+`Submit` 携带的 `origin_rpc` 在 accept 时钉到用户行；宿主的 durable 行以客户端消息 id 落盘，
+客户端据此 retire 乐观 echo（`user_entry_id`）。steer 行没有 origin pin（origin 只属 submit
+路径），其身份是 journal 行 id 本身——见 §F.5。
 
-- **Cargo.lock rev 锁定即顺序容错**：manox-app 以 git 依赖 + `Cargo.lock` 锁定 manox 的 rev，PR-A/PR-C 的 main 移动都不会波及尚未切换的 app 锁定版本 ⇒ 不存在「双协议并存」窗口，也不需要并存。
-- 依赖 bump 纪律照 manox-app AGENTS.md：合并前 `cargo update -p manox-agent` 抬升同一 git source 的全部依赖。
-- 门禁权威：manox 以 `script/gates.sh` 完整四腿为准；app 以 clippy `-D warnings` + 全量 `cargo test` + `fmt` 为准。
-- **合并必须等用户明确指示（含 squash）**；提交信息不带 Co-Authored-By。
+### F.3 session config 三键的 durable 权威是 journal
 
----
+- 行类型：`model_change`、`thinking_level_change`（wire 字符串）、`access_mode_change`
+  （kebab wire 词汇 `sandbox`/`full-access`）。`replay.rs` 的宿主 fold 与 `projection.rs` 的
+  `target_of` 全射门同步登记。
+- 生产者：`model` 在 `AgentSession::set_model` 的单一 choke point 落行；`reasoningEffort` 的两个
+  `SetThinkingLevel` 臂收敛到同一落行词汇（中段臂经 live serializer task 落行，绝不在 select 臂内
+  await append 锁）；`accessMode` 在 `SetAccessMode` 臂落行。三处都带「仅真实变化」守卫，守卫读
+  最后 journaled 值而不是活镜像。
+- 消费：`projection.rs` 把三行折成 `session/configChanged`；restore 从链上恢复，无行即默认值
+  （不迁移、不做兼容读，用户重选一次即落行）。
+- sidecar 不存 config 副本；conversation 对象行只是新建线程的 draft 意图，`sync_object_config`
+  经正常 setter 派发落行。`networkAccess` 仍是 session-memory。
 
-## §附 显式不做 / 风险 / Assumptions / 验收标准（非架构轴，随规格一并冻结）
+### F.4 create 的项目与 config
 
-### 附.1 显式不做（本期范围外）
+- `createSession` 的 project 解析顺序：`intent.project`（显式覆盖）→ 对象行的 belonging。belonging
+  的权威是对象行，`workingDirectories` 只是授权集。deferred 与 seeded 两条路径都走
+  `Thread::new_in_project`；无对象行的 create 保持 unfiled。claim 的 Reuse 早退在解析之前，
+  已物化会话绝不因解析重铸或迁移。
+- `CreateSessionParams.config` 的三键（`model`/`reasoningEffort`/`accessMode`）先整单校验
+  （未知键、非字符串值拒绝整个 create；model 串经注册表解析，失败以 `model/unresolvable`
+  拒绝），全部发生在任何状态创建之前；通过后由既有 choke point 为真实变化落行，deferred
+  会话的行随首条 assistant 消息物化。
+- 中段排队的 `SetModel` 同时入队 `PendingMutation::Model`，由 turn 边界或 settle 的
+  `flush_pending_mutations_inner` 落 `model_change` 行，行先于同一 `TurnUpdate` 写入下一请求；
+  写失败即中止该 run。idle 路径仍走 `set_model` 的 choke point，不产生第二行。
 
-- AHP 的 annotations / comments（上游仍是空文件）/ automations / OTLP telemetry / customizations(Open Plugins) / `MultiHostClient` / `protectedResources`+OAuth：不实现、不 advertise。
-- 已实现（本表原列"不做"，随实现更新）：`mcp://` channel（tools/*、resources/* 代理，见 `manox-ahp/src/channels/mcp.rs`）；changeset 频道的 `uncommitted` 静态视图 + revert + review（见 `manox-ahp-runtime/src/ahp/changeset.rs`）；customization 的 enablement toggle（写入 settings，其余 customization 变更仍 refusal）。changeset 的 turn/branch 切片仍不做（需 journal 文件写埋点）。
-- 除 VS Code / AHPX 之外客户端兼容性承诺；x-manox 扩展不承诺第三方 host 支持。
-- 多窗口（保持当前单窗口约束）。
-- **不做 v2→v3 兼容层、不写 `legacy_*`/双协议窗口、不做 fallback 兼容读**（激进开发纪律；剪切靠 rev 锁定完成）。
+### F.5 mid-run steer 折成 turn 分区
 
-### 附.2 风险与对策
+`projection.rs::on_message` 的 user 行按 turn 状态分三路：
 
-| 风险 | 影响 | 对策 |
-|---|---|---|
-| AHP minor 间仍可能破坏（1.0.0 起官方仅承诺 1.0.0/0.9.0 两条协商基线） | 适配面反复返工 | 精确 pin + 升级任务化 + 收敛性门禁当护栏 + 扩展面自有声明表隔离；把「升级」写成独立清单 |
-| 无宿主 SDK，自建面大 | 工期与维护面上升（短期） | W1/W2 即交付主体；只实现用到的动作子集；重放腿延后到 W5（spec 允许快照代替）；长期净删 v2 全家 |
-| AHP 文档漂移（示例仍写 0.3.0、`annotations` 行缺失、`disposeChat` 矛盾） | 实现依据错位 | **以 `types/` 与 `ahp`/`ahp-types` crate 为准**，文档仅作语义参考；差异记 as-built |
-| 特性缺口（plan/compaction/子代理层级/pin+排序/workspace/命令目录/Q 面） | UI 功能退化 | 全部落 x-manox 扩展并在 W0 定稿；第三方 host 下优雅降级（`_meta` 缺失即隐藏） |
-| 迁移期两仓不同步 | 断裂/带病 main | 三 PR 顺序 + rev 锁定 + `local-manox.sh` 联调 + 逐能力 e2e 清单 |
-| 背压语义变化（原 Resync 帧 → 断连重连） | 长流体验 | 进程内无界（沿 v2 C6 决断）；WS 用 `delivery.maxLatencyMs` 合并 + 断连自动 reconnect；W5 补 replay buffer |
-| `resource*` 面越权读写 | 安全 | 只暴露会话工作目录子树 + granted-root 围栏；loopback+token 不变；fail-closed |
-| 快照体积（长会话全量 state） | 卡顿 | `view.turns` 尾部裁量 + `fetchTurns` 分页 + `x-manox-metrics` 让 Q 面不占推送；W5 度量 |
-| 生产侧依赖客户端 crate（reducers 在 `ahp` 内） | 概念错位/依赖偏重 | 生产侧只经 `ahp-types` + `ahp::reducers`；记录为 Assumption，上游若加 feature 开关则切换 |
-| 性能/渲染回归（视图改由 AHP 状态派生） | 体验退化 | W3 以「逐能力 e2e 清单 + 视觉零回归」为验收；`agent-ui` 以 selector-only 约束重构 |
+1. **无 turn 打开** → `chat/pendingMessageSet{kind:'queued'}`，进 `pending_user`，由下一个
+   `turnStart` 作为开场消息携带。
+2. **turn 已开、尚无开场消息**（deferred create 的形状）→ 该行是该 turn 的开场消息，以同
+   `turnId` 重发 `chat/turnStarted`。
+3. **turn 已开、已有开场消息** → 先按 turn 边界结清当前 turn（`chat/turnCompleted`，
+   Outcome=Complete），再以该 journal 行开新 turn：
+   `chat/turnStarted{turnId:'t-<entry.id>', message: 行文本, queuedMessageId: <entry.id>}`。
+   该行不再发 `pendingMessageSet`，也不进 `pending_user`。
 
-### 附.3 Assumptions
+- 身份就是 journal 行 id：客户端 steer 行以客户端 id 落盘，与它
+  `pendingMessageSet{Steering}` 用的 id 相同；reducer 在 `chat/turnStarted` 上按 id 清槽。
+- 边界 `chat/turnCompleted` 携带 `_meta.x-manox.steerBoundary = true`；客户端按「完成」触发的
+  run 级动作必须跳过该边界。一个 run 可以产出多个 turn。
+- parked steer 在下一个 run 的 turn 1 被消费时同样走第 3 路（`OpenTurn.message_text` 记录
+  `turn_start` 携带的开场文本，steer 行不会覆盖 prompt）。
+- run 在同一条 journal 行上继续；steer 行只落在内核回合边界，边界 `finish_turn` 对未结算
+  tool call / 未回答 ask 的 settle 是防御性规则，不是取消活工作。
+
+### F.6 plan 是内置 skill，不是模式
+
+- 没有 plan mode：harness 不持有 plan 开关，审批门没有 plan 文件豁免，`~/.manox/plans` 不是约定。
+- journal 只有 `plan_update`（`UpdatePlan` 的执行计划快照）；`plan_mode_change` / `plan_request` /
+  `plan_review` 不是词汇，出现即按未知行拒载。
+- `/plan` 是内嵌技能（`skills/plan/SKILL.md`，`disable-model-invocation: true`，仅用户斜杠入口；
+  磁盘同名 skill 遮蔽内置）。`/plan <task>` 走 `submit_skill`：渲染契约正文 + 追加 task，
+  display 文本保留 `/plan <task>`。
+- 契约要求以单问题 `AskUserQuestion` 卡提案（header `Plan review`，`detail` = 完整计划 markdown，
+  `intent.kind` = `plan-review`，选项 Approve / Approve with changes / Revise），答案经既有
+  turn-final 播种进入下一回合。
+- 通用载体：`on_question` 投影把问题级 `detail` markdown 写进 `ChatInputRequest.message`
+  （单问题原样；多问题按 `header` 分节拼接；全无 detail → `None`）。任何 AHP 客户端从 `message`
+  读 ask 的支撑文本。
+
+### F.7 硬化路线
+
+有界重放缓冲（按 `serverSeq` 重放替换快照腿）、`delivery.maxLatencyMs` 合并调优、`resource*`
+完整面（大输出 ContentRef、图片引用、客户端 `virtual://` URI、工作目录围栏）、远程与鉴权
+（AHP `protectedResources`/`authenticate` 接 provider 凭据）、多客户端并发与 owner 语义、
+长会话快照成本度量。门禁：`ahp-*` minor 升级演练以收敛性门禁为护栏；上游
+`types/test-cases/reducers/*.json` 与我们信封的一致性抽样。
+
+## §G Assumptions
 
 1. `ahp`/`ahp-types` 的 reducers 可作宿主侧权威 fold（规范明示双端同码），我们**只依赖不复制**。
-2. 进程内 channel 作为 AHP 传输合法（`transport.md` 明示 in-process message channel 之一），且 typed 帧（不序列化）满足一致性要求（双路径一致性测试守护）。
-3. 我们只 advertise 并实现自己真正用到的动作子集；未实现动作拒绝（不是静默 no-op）。
-4. AHP 客户端对未知 `_meta` 键与未知 `x-` 方法必须忽略而不致断（VS Code 客户端实测确认）。
-5. `gateway-ws.json`→`ahp-ws.json`、`cx web`→`cx ahp`、`/ws`→`/ahp` 无外部消费者（webui 前端已随仓库边界裁决删除）。
-6. i18n 与 UI 文案完全留在 manox-app，协议改造不动语言轴。
-
-### 附.4 验收标准（用户视角）
-
-1. VS Code Agents window 与本机 manox host（`cx ahp`）连接后：列会话、发 prompt、看流式回复与工具卡、做一次审批、看一次 plan 评审、切模型，全流程可用。
-2. AHPX CLI 能 `listSessions` 并收发一轮。
-3. manox-app 桌面功能与改造前逐条对齐（W3 的 e2e 清单全绿），且 `agent-ui` 不再 import 任何 manox runtime 类型（除 `manox-ahp` 的 AHP 类型）。
-4. `manox-protocol` 从 manox 仓消失；两仓生产区搜不到 v2 帧词汇；`script/gates.sh` 与 app 全量门禁绿。
-
-### 附.5 实施方式
-
-按 **`/gitwork:deliver`** 实施：两仓各自 worktree（`/private/tmp/<repo>--<branch>`）+ `codex/` 分支 + 正交 PR（PR-A → PR-B → PR-C）；每 PR 写清 Test Plan 与 Assumptions；门禁以 `script/gates.sh`（manox）/ clippy+test+fmt（manox-app）为唯一权威，不做手挑测试的假绿声明；已知沙箱环境性失败与整机并发 flake 记录在案、不计回归；**PR 创建后停手，合并等用户明确指示**。
-
----
-
-## §H as-built
-
-<!-- 本节随各期落地逐段追加，记录与上文冻结规格的偏离（含 AHP 上游文档漂移的具体差异、
-     映射表的实施期修订、W1 实际模块面与 §E.2/§F 的出入）。规格正文不回改，偏离只进本节。 -->
-
-### H.1 W0/W1/W2（宿主侧 + 运行时只读面）已落地，2026-09-23
-
-分支 `codex/ahp-host`（5 个提交，未 push、未开 PR）。已落地面与门禁：
-
-- **W0 规格冻结**：本文档（v2 规格文档已由本文取代并删除）。
-- **journal 词汇叶子化**：新增 `crates/manox-journal/`（`journal.rs` 377 + `base64_bytes.rs` 53），
-  偏离 §F/§E 的「迁入 manox-session-core」——叶子 crate 才不打断依赖拓扑
-  （`manox-ahp` 需要词汇做翻译，`manox-session-core` 需要 `manox-ahp` 做宿主）。
-  迁移窗口内 `manox-protocol` 以 `pub use manox_journal as journal;` 重导出，v2 面零改动。
-- **W1 宿主骨架**：`crates/manox-ahp/`（wire/router/sequencer/channels/backend/ext/error/
-  translate/transport{inproc,axum_ws}）。与 §E.2 的实施期修订：`Backend` 缝的实现方是
-  `manox-session-core`（见下），`Host` 自带 `chat_state`/`session_state` 读面供收敛性门禁使用。
-- **W2 宿主侧翻译**：`translate/actions.rs` 的状态机（`Translator::on_entry`）覆盖全部
-  journal 变体；`translate/mod.rs` 的 `target_of` 穷举即「新内核变体不落 wire 就编译失败」的门。
-  实施期修订：扩展动作的 `x-manox/*` 清单在 W2 增补了 `x-manox-work/activeToolsChanged`、
-  `x-manox/labelChanged`、`x-manox/sessionInfoChanged`、`x-manox/leafChanged`（AHP 无对应位）。
-- **W2 运行时只读面**：`crates/manox-session-core/src/ahp/` 的 `chat_state`/`session_state`
-  折叠（journal → AHP 通道状态），落定「宿主/客户端/冷启动折同一函数」的 L10 承诺；
-  诚实留空项见该模块文档头（live 连接事实、pin/label、会话级 token 汇总）。
-- **门禁**：`script/gates.sh` 六腿全 PASS（fmt/prod-libs/lean-libs/clippy/test-real/test-clean）；
-  `cargo test -p manox-ahp --features axum-ws` = 26 绿（14 单测 + 9 进程内 + 2 收敛性 + 1 WS）；
-  `cargo test -p manox-session-core` = 172 绿。
-
-### H.2 收敛性门禁抓到并修掉的缺陷（留档）
-
-首次运行 `crates/manox-ahp/tests/translation_convergence.rs` 即失败：翻译把
-`Approval{kind:"request"}` 也走了一遍 `chat/toolCallConfirmed`（此时 `verdict` 为空 ⇒ 读作拒绝），
-于是**正在等用户裁决的 tool call 被提前取消并 settle**，其后的 `ToolResult` 再也无法 complete，
-终态为 `Cancelled(Skipped)`。修法：request 只发 `chat/toolCallReady` + `session/inputNeededSet`；
-confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
-`Run → Ready → Confirmed → Complete(Completed{success:true})`，收敛与结构断言双绿。
-
-### H.2b 两条传输腿落地（本轮新增，2026-09-23）
-
-- **宿主可服务真实运行时**：`crates/manox-session-core/src/ahp/backend.rs` 实现 `manox_ahp::Backend`——
-  播种=journal 折叠（与客户端同码），并为每个会话起 bridge：**先订阅 kernel journal feed、再折叠播种**，
-  只转发 `seq > 播种 tail` 的事件（lagged 则重折重播），因此「快照 + 增量」严格不相交；
-  写入映射到既有 intent（`chat/turnStarted` → `AgentServerInner::submit`，`createSession` →
-  `create_session_request`，`disposeSession` → `dispose_session`），未接线的一律**响亮拒绝**。
-- **两条传输腿同一宿主（L11）**：`ahp/runtime.rs` 提供进程单例；`inproc()` 是 **over channel**（进程内 typed 帧，
-  桌面腿），`router("/ahp")` 是 **over websocket**（网关腿）。`ws/listener.rs` 在同一 listener、同一 per-boot token、
-  同一机器锁下把 `/ahp` 与 v2 的 `/ws` 并挂（v2 路由留到 W4 摘除）。根通道按 L8 列活 provider 目录（canonical
-  `provider/model`）。
-- **门禁证据**：`cargo test -p manox-session-core` = **173 绿**，含新增的**传输平价测试**
-  （`ahp::runtime::tests::in_process_and_websocket_legs_share_one_host`：一次 publish 同时到达进程内与
-  WebSocket 订阅者，且 `serverSeq` 相同）；`clippy -D warnings` 与 `fmt --check` 干净；
-  全 workspace 测试在**真实 HOME 与 hermetic clean HOME** 两种形态下均绿（clean 腿本轮因 /private/tmp 被系统清空、
-  临时 HOME 需重新物化工具链而在 rustup shim 处挂起，故改为「预置工具链的 clean HOME」等价跑法：隔离属性不变）。
-- **仍未落地**：终端通道、`createChat`/`disposeChat`（分支/fork）、`fetchTurns` 分页、x-manox 命令面、
-  `resource*` 文件面、`Backend::dispatch` 的其余动作映射（当前除 turn 起点外全部 `Rejected`）。
-
-### H.2c W2 写面与文件面落地（本轮新增，2026-09-23）
-
-`Backend::dispatch` 从此不再只有一个 turn 起点：accepted action 落到**既有**运行时 intent
-（不是第二份实现），未接线的仍响亮 `Rejected`。
-
-- **dispatch 映射**（`ahp/backend.rs`）：`chat/turnStarted`→`submit`；`chat/pendingMessageSet`→`steer`；
-  `chat/pendingMessageRemoved`→`drop_queued`；`chat/turnCancelled`→线程 `cancel`；
-  `chat/toolCallConfirmed`→`respond_authorization`；`chat/inputCompleted`→`respond_question`；
-  `session/configChanged`→`set_model`/`set_reasoning_effort`/`set_access_mode` 扇出；
-  `session/workingDirectorySet`→`set_cwd`；`session/isArchivedChanged`→`archive_thread`。
-  实施期修订：`ChatDraftChanged`/`ChatTurnResume`/
-  `ChatToolCallResultConfirmed`/`ChatInputAnswerChanged`/`ChatQueuedMessagesReordered`/
-  `SessionActiveClientRemoved`（及 chat 级 `ChatIsReadChanged`）归 **`Ignored`**
-  （reducer 已折叠、运行时无对应 intent），回显而非拒绝——拒绝会告诉订阅者「你看得见的
-  状态不是真的」。
-  **`SessionTitleChanged` 不在此列**：重命名实现为真动作（见 §H.2d）。
-  **`SessionIsReadChanged` 亦不在此列（2026-10-27 起为派生 read 的 view 输入）**：read 是
-  宿主的派生事实——`IsRead` 由 sidecar 的两个单调时间戳比较得出（`last_settled_at` 与
-  `last_viewed_at`，规则唯一一份在 `manox_agent::db::derive_unread`：**有 turn 在上次查看
-  之后落定 = 未读**）。`isReadChanged(true)` 腿 = 记一次查看（`mark_viewed`，单调 max）；
-  `false` 腿（显式标未读）**无派生语义、保持 reducer-only 回显**——纯派生模型下显式未读
-  对无 settled 事实的会话无物可标，物化它会造出第二个 read 真相源。落定戳由宿主在
-  `BackendNotice::Settled`（每次 run 唯一通用落定点，取消/失败同臂）写入，与是否有 AHP
-  客户端在场无关；跨进程靠宿主 peer sweep（5s，新鲜度不是正确性——时间戳已在盘上）。
-  停靠行（本进程未 fold 的会话）与 live 行共用同一张位表（`row_status_bits`），read 位从
-  派生来，从未订阅过的会话不再一律读成未读。catalogue 传播为 published-map diff：
-  `sessionAdded` 每宿主一次（生命周期）、已知行走 `sessionSummaryChanged` delta（read 翻转
-  随行）、离开 active 目录（对端归档/dispose）发 `sessionRemoved`——**removed 表达「离开
-  目录」而非严格 dispose**（拍板见 §H.2c 备注：与下游行处理吻合；带 IsArchived 的 delta
-  要下游先合并 delta 才有意义）。安静 pass 零通知——这是 sweep 的轮询许可。
-  2026-10-28 补 session 摘要的 status 来源（第二处 review 收尾）：摘要的
-  `InProgress`/`InputNeeded` 不再从**订阅快照**里取。`InProgress` 来自 store 的
-  running 集（由宿主的 turn 边维护；只覆盖**本进程驱动**的会话，对端驱动的 turn
-  在本进程不亮——进程内事实，已知边界）；`InputNeeded` 来自 store 的 pending-auth
-  集（tool authorization 卡进入/裁决时维护）**并**叠加宿主 fold 里 journalled 的
-  `InputNeeded`（审批行折出的位，`row_status_bits` 只从 fold 取
-  `InputNeeded`/`IsArchived` 两位，`InProgress` 绝不从 fold 取以免把陈旧的订阅快照
-  复活成运行中）；seeded 摘要的 `activity`/`working_directories` 取宿主**当前**
-  fold（`session_summary_live`），订阅快照只作为宿主状态缺失时的兜底。
-  2026-10-28 补三句（review/addendum 定稿）：**① 读位翻转由宿主 publish 到 session 通道**
-  （`catalogue_changed` 在 IsRead 相对 published 翻转且宿主持有该会话状态时发
-  `session/isReadChanged`；host publish 不经 dispatch，不回环）——fold-first 的 attached
-  客户端靠它变红，客户端只声明「我在看」，永远不发起 rise。**② settle 是未读的唯一升起
-  来源**：`BackendNotice::Settled` 的覆盖面是正确性前提（盖章先于 TurnFinished 推送）；不
-  经 Settled 的收尾（进程崩溃的 turn，恢复期在 fold 层结清、无 notice）不亮角标——已知
-  且接受的边界。**③ focused = viewed 是 app 的定义**（窗口可见性不参与）；
-  `sessionRemoved` 下游必须按 `params.session` 处理（`channel` 是 root）。
-- **审批身份单源**：settle key 走 action 的 `_meta["x-manox"]["authId"]`——即 translator 生成
-  `toolCallReady` 时盖的同一个 key。**没有 authId 的确认不 settle**（`Ignored`）：猜一个身份会去
-  回答**另一个** pending call。
-- **`createChat`/`disposeChat` 落地**：`createChat{source:fork}` 映射到 `fork_session`，并把客户端
-  选的 chat id 作为 fork 目标 id。为此 `ForkIntent` 增 `target_session_id: Option<String>`
-  （`None` 仍为 v2 的随机铸造），并新增**已存在即拒绝**的守卫——`JsonlSessionStorage::create` 会截断，
-  客户端选重 id 若不拦就是**毁掉一个已有会话**。`source:sideChat` 响亮 `Unimplemented`：
-  「源不进可见历史」是 journal 没有行的上下文策略，伪造成 fork 会展示它不该展示的 turns。
-  `disposeChat` 一并从 `CommandIntent::Declined` 转 `Implemented`（`command.rs` 的
-  `declined_commands_are_known_but_not_served` 改为 `every_declared_command_is_served`）。
-- **`resource*` 最小文件面**（`ahp/resources.rs`）：围栏即内核工具文件效果的同一围栏——路径**先
-  canonicalize 再判**，判据是组件级 `starts_with`（故 `/work/grants-evil` 不匹配 `/work/grants`），
-  `..`/符号链接/尚不存在的叶子都逃不出去（不存在的叶子经最近存在祖先解析后再判）。
-  读允许落在 `~/.manox`（宿主自己的 journal/plan 制品是客户端正当渲染的内容）；**写只许授权根**
-  ——状态根是宿主的记账，不是客户端可写面。denied 一律 `-32082`（`xManox/resourceDenied`）。
-- **`x-manox/*` 命令面**：`x-manox/compact`→`compact`、`x-manox/planExecute`→`plan_seed` 落到既有
-  intent；其余已声明命令答 `-32080`（`xManox/unsupported`）——「我声明了但不做」与「你请求写错了」
-  必须可区分。
-- **门禁证据**：`script/gates.sh` 六腿全 PASS（fmt/prod-libs/lean-libs/clippy/test-real/test-clean）；
-  `cargo test -p manox-session-core` = **200 绿**；`cargo test -p manox-ahp --features axum-ws` = 39 绿；
-  `cargo test -p manox-agent` = 533 绿。
-  新测试全部用**类型化 action**（不经 JSON 往返）：`StateAction` 末尾的 untagged `Unknown(Value)`
-  会让一个写错的字面量「成功」反序列化成无人匹配的 action，测试就会去断言兜底臂而非映射。
-- **网关 `/ahp` 路由补测**：此前 `ws_conformance` 自绑 listener，绕过了网关自己的 token/origin 闸，
-  于是「唯一没覆盖的路径恰好是安全边界」（token 是本地页面与宿主之间唯一的墙）。新测试
-  `ws::tests::ahp_route_rides_the_gateway_token_gate` 走真实网关腿：无 token → 401；
-  带 token 但 `Origin: http://evil.example` → 403；带 token + 非浏览器 origin
-  （`vscode-file://vscode-app`，参考客户端的真实形状）→ 升级成功**并跑通 `initialize`**
-  （证明路由真的挂了宿主，而不只是「一个会拒绝一切的 404 handler 也回 401」）。
-
-### H.2d 重命名实现为真动作（本轮新增，2026-09-23）
-
-`session/titleChanged` 曾被归入 `Ignored`（「运行时没有重命名 intent」）。**该前提只对了一半**，
-复核后修正：持久化槽位、读取优先级、回归测试三样早就都在，缺的只是写它的那一跳。
-
-- `ThreadSummary::title_override` 是 DB 列 + 结构体字段，`upsert` 语句里有它（`db/threads.rs:24,79,140,252`）。
-- `display_title()` 的优先级是 **user rename > LLM title > summary**（`db/threads.rs:64-69`）——
-  这个槽位就是为用户重命名建的。
-- `db/mod.rs:396-400` 早有一个通过的 round-trip 测试，写 `Some("renamed")` 再断言读回。
-- v2 没暴露重命名**不是**「运行时没有这个能力」，是 v2 没接。
-
-实施按 `archive_thread` 的同一形状（`条目即权威`，K2/L3），**三条腿，缺一不可**：
-
-1. **journal**：`thread_store.journal_title` 经 `dispatch_store_journal_row` 追加 `title` 行。
-   kind 与 payload 与 `engine.rs:513` 为 `TitleChanged` 产的完全一致，所以用户重命名与模型生成标题
-   落**同一种行**。这一行是 v2 与 AHP **两边唯一的路线**：v2 `projections.rs:203` 折
-   `SessionTreeEntry::Title`，AHP `translate/actions.rs:595` 读 journal；而实时
-   `ThreadEvent::TitleChanged` 恰在 `translate.rs:104` 的 `Skip` 表里——它本就不该被折叠，只该被 journal。
-2. **内存行**：`rename_thread` 更新 `title_override` 槽（`display_title()` 第一优先级），
-   facade 另经 `handle_notice` 拿到实时事件，侧栏立刻改名。
-3. **sidecar**：`write_meta` 让名字免重启、免重扫存活。
-
-**实施期纠错（重要，留档）**：本节初版把第 1 条写成「复用 `ThreadEvent::TitleChanged` 经
-`handle_notice` 发出，因此与生成标题走同一条路」——**那句话是假的**。`handle_notice` 是
-notice 链的**消费端**，在 engine 的 journal tap（`engine.rs:904-921`：发射点 → `notice_tx` →
-tap 写 journal → `tap_tx` → `notice_rx` → facade）**之后**，所以注入进去的事件只到 facade、
-**不产生 journal 行**。后果是真空洞：v2 客户端在重新 seed 前看不见重命名（`projections.rs:203`
-折的就是那行），而 W1–W3 期间两套协议并存——正是要避免的跨协议静默分歧。
-
-修法用既有先例 `journal_pinned_archived`（`thread_store.rs:1095`，store 级决定显式 journal）。
-**注意那个模板恰好包含我漏掉的那一步**——`archive_thread` 有显式的
-`journal_pinned_archived` 调用，正因为它是 store 级决定、也在 tap 之外。
-
-**通用陷阱**（已同时写进 `engine.rs:908` 与 `thread_store.rs` 的注释）：tap 的
-「no future emission site can forget to persist」保证**只对发射点成立**，对**注入点不成立**。
-任何未来从 store 侧注入 `ThreadEvent` 的代码都会踩同一个坑。
-
-**回归测试**：`rename_thread_appends_the_durable_title_row`（store 层）与
-`title_changed_appends_the_journal_row`（AHP 层）都断言 **journal 行**而非只断言 summary。
-两者都验证过「去掉 journal 那条腿即红」——在**全量 suite** 下复验过，只断言 summary 的
-`title_changed_renames_the_session` 在同样条件下**照样绿**，这正是这个洞此前没被发现的原因。
-
-**测试期第二个坑（留档）**：AHP 层那条测试初版复用共享 fixture 的 `s-dispatch`，
-于是**单独跑绿、全量跑红**——因为 `engine::engine_routes` 是**进程级、按 thread id 索引**的 map，
-先前某个测试的 `attach_engine` 为同一 id 注册了 route，本次 append 就被投递给那个已死的 actor，
-既不落盘也不走 cold-append 回退（且不报错）。修法是给该测试一个 uuid 后缀的 session id。
-教训：凡是直接断言 journal 落盘的测试，**session id 必须唯一**，否则会被引擎路由表串台。
-
-4. **dispatch**：`Accepted`（非 `Ignored`），空白标题 `Rejected`。
-
-为什么这不是「两种都不选」而是第三种：`Ignored` 在撒谎（reducer 折了、运行时没做），`Rejected`
-让标准客户端一个正常操作报错。让重命名**真的生效**既不撒谎也不报错，还顺手激活了一个一直没接线的
-既有能力。
-
-### H.2e W2 门禁 ④a：官方 TS client over WS 已绿（本轮新增，2026-09-23）
-
-计划把「真客户端 smoke」当一条门禁。它应当拆成两条——④a 现在就能做，④b 需要单独立项：
-
-- **④a（已执行）**：用上游**官方 TypeScript client**（`@microsoft/agent-host-protocol@0.9.0`，
-  执行时与本仓当时的 pin `ahp-types = "=0.9.0"` 同版本；pin 现为 `=1.0.0`）经 WS 打真实网关。
-  工具：`script/ahp-client-smoke/smoke.mjs`（13 项断言全 PASS）。
-- **④b（未做，独立立项）**：真 VS Code Agents window 的方言税（R5 那五处）。hcode 的连接来源
-  只有 ambient/ssh/wsl 三条，全是起 VS Code 自己的 agent host，端点不可插拔；指向 manox 的 `/ahp`
-  需要在 fork 里加一条 connection 来源。有价值，但不该继续挡着 W2 收口。
-
-**为什么 ④a 是独立一层**：Rust 套件（`ws_conformance.rs`、进程内 e2e）用的都是 `ahp::Client`，
-与宿主共享同一份 Rust `serde` 形状假设——我们把某个字段拼得与规范不同，在自己两半之间照样
-round-trip、照样绿。TS client 由规范的 TS 源码生成，正是对这一类分歧敏感。
-
-**执行记录**（`cargo run -p manox-session-core --example ahp_serve -- --port 0` 起网关，
-读 `~/.manox/gateway-ws.json` 取 port+token，再跑 smoke）：13 项断言全 PASS——initialize 版本协商、
-root 快照、`_meta["x-manox"]` 三查（version / channels 前缀）、ping、listSessions、
-resolveSessionConfig 的 schema+values 对、completions 的 items、subscribe 快照、
-reconnect 快照腿、dispatch 句柄。
-
-**smoke 过程中实测到的两件事**（都不是宿主缺陷，但都值得留档）：
-
-1. **`AhpClient` 的读泵不在构造函数里启动**——必须显式调 `client.connect()`。不调的话 socket
-   收得到帧、但没有任何东西分发它们，于是每一个请求都在一个完全健康的宿主上超时。这条已写进
-   smoke 脚本的注释，免得下一个人再花一小时。
-2. **`completions` 的 params 形状**：规范要求 `kind`（`"userMessage"`）+ `text` + `offset`（数字）。
-   宿主拒收缺 `kind` 的请求（`-32602`）是**正确**的——错的是我第一版 smoke 按
-   `{text, position:{line,character}}` 发。留档以免下次误判为宿主 bug。
-
-另：④a 首次执行时打的其实是**一个陈旧的 `ahp_serve` 进程**（当日 11:29 起的构建，早于
-`resolveSessionConfig` 落地），于是 `resolveSessionConfig` 回 `-32601`。那不是回归，是二进制过期；
-杀掉旧进程、用当前构建重跑即全绿。记在这里以免下次看到 `-32601` 又误判。
-
-### H.2g 三条声明面缺陷（本轮修复，2026-09-23）
-
-评审指出三条，逐条核实后全部成立，均已修：
-
-**1. 穷尽性是假的（唯一的结构性倒退）。** `command.rs` 的 `intent()` 确实没有 `_` 臂，但它穷尽的是
-**我们自己挑的 18 个名字**，不是上游 `CommandMap` 的 30 个——上游加命令不会编译失败。而且
-`CommandIntent::Declined` 是死代码：没有一项是 Declined，于是 `of_method` 对表外名字回 `None`，
-那个变体永不触发。**对自己子集的穷尽是同义反复。**
-修法：表扩到**上游全部 30 条**（顺序即 `types/common/messages.ts` 的 `CommandMap` 顺序）+
-2 条 `ClientNotificationMap`（`unsubscribe`/`dispatchAction`，它们不是 command 但同表路由），
-14 条标 `Declined`，删掉「没有 Declined」的断言，改为「表长 == 30 + 2」。
-`Declined` 因此**活了**：`createResourceWatch`/`resourceCopy|Move|Resolve|Mkdir|Request`/
-`authenticate`/`sessionConfigCompletions`/`invokeChangesetOperation`/三个 automation 命令。
-路由行为不变（declined 与 unknown 都回 `-32601`，已被
-`declined_commands_answer_method_not_found` 钉住），但上游加命令时会编译失败——这正是
-「自失效上游守卫」要防的那类漂移。（`createTerminal`/`disposeTerminal` 本轮补完，见 §H.2h。）
-
-**2. terminal 是半声明。** `parse` 认 `ahp-terminal:/`、`Channel::Terminal` 有状态类型、
-`ensure_terminal` 有路径，但 `terminal_state` 回 `None`——客户端 parse 得过、订阅只得 `not-found`。
-**半声明比不声明差**（正是我们在 `titleChanged` 上反对过的那种静默不一致）。
-用户裁决**补完**：`ahp_terminal_state`（`agent_server.rs`）接 live PTY 注册表，
-回 AHP `TerminalState`（可见网格作为一个 `Unclassified` part、`running`/`exited` 生命周期、
-`isPty`）。`claim` 报 **session** 而非 client：本宿主不在客户端之间仲裁输入，
-宣告一个不会执行的 client claim 会招来两个客户端往同一个 PTY 里打字。
-`createTerminal`/`disposeTerminal` 一并落到 `attach_terminal`/新的 `dispose_terminal`
-（drop entry 即释放：PTY handle 在 `Drop` 里收子进程），两条命令从 `Declined` 转 `Implemented`。
-实测（官方 TS client over WS）：create → 订阅拿到 **80×24 / running / isPty:true** → dispose，
-三步全绿。`--no-default-features` 腿仍干净（helper 与 `terminal_state` 双臂 cfg）。
-
-> **已退役（manox 侧）**：`manox-terminal` 整体删除后，这一整面（`attach_terminal`、
-> `terminal_input/resize/raw_tap`、`ahp_terminal_state`、终端注册表镜像）从本仓库移除。
-> **AHP 侧的 `ahp-terminal:/` 词汇保留**（`manox-ahp` 的通道、reducer、`ahp-types` 类型仍在），
-> 宿主经 `SessionRuntime` 的 `feature/unavailable` 稳定拒绝回答——客户端拿到的是拒绝，
-> 不是静默等待。以上「已服务」的记录是退役前的实现事实，作历史读；终端面改由宿主
-> （dspo/manox-app）在本地渲染，不过 AHP 通道。
-
-**3. 六个扩展通道声明了却不服务。** `extension_baseline` 是 trait 默认 `None`，runtime 侧无覆盖；
-扩展通道 `is_state_bearing()` 为 false，所以订阅它们**只**走这条路——结果是客户端读
-`_meta["x-manox"]` 看到 6 个通道，订阅任意一个收到**静默**。
-修法：`fold_journal` 现在收集 `x-manox*` 侧的行（此前直接丢弃），按通道用
-`ext::reducer::apply` 折成 `XManoxState`，`extension_baseline` 把它作为
-**`x-manox/baseline` 通知**交付（方法名已进 `_meta["x-manox"]` 声明，客户端猜不出来）。
-实测该基线是**真 fold 而非空占位**：种一条 `PlanModeChange{enabled:true}` 的 journal，
-基线回 `planMode: true`。
-**实施期新增的一条区分**：`x-manox-workspaces://` 与 `x-manox-commands://` 是
-**连接级目录**（无 session id），与四个 per-session 通道不是一类；
-`ext::is_session_scoped_channel` 把两者分开，目录通道走 `catalogue_baseline`
-（workspaces 读 `known_projects`，commands 暂回空列表）。
-
-### H.3 尚未落地（续做清单，按 plan 的 W2→W3→W4→W5 顺序）
-
-**W4 遗留的覆盖缺口（本 PR 已知，须在 W5 前补）**：删掉的 `agent_server/tests.rs` 有 130 个
-测试，其中一部分覆盖的是**仍然存在**的行为，AHP 面尚无对应用例：
-
-- 会话生命周期的多客户端语义：`detach_keeps_turn_alive`、`single_connection_multiplexes_multiple_sessions`、
-  `reinitialize_same_client_id_reseats_and_reopen_loads`、`add_owner_is_idempotent_no_duplicate_notes`。
-  AHP 侧的对应物是 channel 订阅与 `session/activeClientSet`，但**没有等价用例**。
-- 单会话写入路径：`submit_streams_turn_started_then_finished`、`create_session_with_a_cold_persisted_id_restores_history`、
-  `open_session_replays_thread_history`、`set_cwd_after_interaction_moves_engine_not_project`、
-  `set_cwd_bind_mints_a_successor_and_supersedes_the_predecessor`、`cold_submit_does_not_auto_open`。
-- 审批/提问的 parked 语义：`approve_call_round_trips_and_unparks`、`ask_expires_when_the_holding_owner_disconnects`、
-  `parked_ask_replays_to_a_late_owner`、`dual_owner_ask_first_claim_settles`。这些在 AHP 面走
-  `chat/toolCallConfirmed` 与 `chat/inputCompleted`，**是 W5「多客户端并发与 owner 语义」的前置**。
-- **40 个 `JournalWireEvent` / 21 个 projection key 的端到端归宿审计**：v2 删除前必须逐个确认
-  每一项要么落在 AHP action/state、要么落在 `x-manox` 扩展通道、要么是**有意的**结构性缺席
-  （`-32601`）。此项在 W4 执行时**未完成**，是 W5 的第一件事。
-
-**W4 收尾审计发现的声明面残余（一项已修，三项待 W5 裁决）**：W4 已把
-`commands::ALL` 从 8 条收到 3 条、`channels::ALL` 从 6 条收到 5 条（见 §H.5⑥⑦），同一次审计
-发现 `actions::ALL` 有 **4 条只声明、无生产者**，其后处置如下：
-
-| 声明 | 状态 |
-|---|---|
-| `x-manox-workspaces/baseline` | 无生产者；客户端只在 `extension_baseline` 拿一次快照 |
-| `x-manox-workspaces/changed` | 无生产者；workspace 增删改不推送给已订阅者 |
-| `x-manox-workspaces/removed` | 同上 |
-| ~~`x-manox-work/backgroundTaskStopped`~~ | **已删除**（声明面 VERSION 5，#853）：无派发臂（每次客户端派发都被拒 "no runtime intent"）、无宿主生产者（停止信号已经由 `backgroundTasksChanged` 的 `status:"Stopped"` 送达），留在声明面只是过度承诺 |
-
-**为什么不顺手修**：workspace 三个动作的正确落点比"加一个 forwarder"深一层——`manox-workspace`
-的 feed（`Baseline`/`Upsert`/`Remove`/`Order`/`Archived`）是现成的，但 `XManoxState` **没有
-`workspaces` 字段**，`ext/reducer.rs` 也不认这三个 tag；catalogue 通道的状态目前由
-`catalogue_baseline()` **旁路** fold 直接回答。所以只发 action 会 fold 成空、客户端仍然看不到
-状态——正是本 PR 反复在修的那类"接了一半"。要修就必须先决定：workspace 状态是进
-`XManoxState` 参与 fold，还是像现在这样长期走 catalogue 旁路（若是后者，这三个 action 就该
-从声明面删掉）。**这个决定留到 W5**，与"多客户端并发与 owner 语义"一起做，因为两者都动
-扩展状态模型。
-
-`x-manox-work/backgroundTaskStopped` 的处置（#853，已完成）：两条诚实路径里取了删除而非补齐
-——把它做成客户端可派发的 stop 需要先裁决可停 id 的会话作用域、与 TaskStop 工具的审批对齐、
-payload/reducer 形态，在零消费者时属于投机实现；且宿主从不发它，停止信号已经由
-`backgroundTasksChanged` 的 `status:"Stopped"` 送达，补 producer 只是冗余信号。若未来要客户端
-派发 stop，按新声明（含 VERSION bump）重新引入。
-
-### H.2i W4 准入账的第二轮补齐（2026-09-24）
-
-第二份验收意见（`/private/tmp/ahp-w3-review-and-next-2026-09-24.md`）指出四项，逐项处置：
-
-1. **四个 host→client 请求的调用点（已接）**。`route_session_capability` 现在先问 AHP：
-   `route_ahp_capability` 经 `AhpRuntime::has_capable_client` 判断该会话是否有**声明过**该能力的
-   AHP 订阅者，有则 `Host::request_client`，无则回退 v2 腿。
-   **这是传输选择而非兼容层**：v2 删除时第二条腿随之消失，第一条不变。
-   两处 fail-closed 已钉住：无合格声明者不误选本传输（`capability_routing_declines_when_no_ahp_client_declared_it`）；
-   只有声明的能力才选中该连接（`manox-ahp` 的 `only_declared_client_requests_select_a_connection`）。
-   **纠正审计者笔误**：第四个方法是 `x-manox/invokeTool`，不是 `invokeClientTool`。
-2. **pin + 手工排序（已补，走 `x-manox`）**。见上「W4 准入账」条。
-3. **`refs/agents/*` 14 个残留 ref（已清）**。删除前独立复核三条零风险依据：
-   `git log main --grep="^Agent host session"` = 0、`git ls-remote origin 'refs/agents/*'` = 0、
-   无分支引用。清理后主 checkout `git status` 干净、`main` 仍在 `f80f38a`。
-   **复发风险仍在**：hcode 当前分支 `experiment/manox-agent-host` 仍指向本仓运行，
-   只要它继续在本仓做 checkpoint 就会再累积——需在 hcode 侧关闭 checkpoint 或让它离开本仓（仓外决定）。
-4. **push + PR（已完成）**：PR #818，26 个提交，base `main`，head `ahp-host`（按用户裁决不用 `codex/` 前缀）。
-
-### H.2j W4 前置核实：计划的一条前提不成立（2026-09-24）
-
-W4 开工前逐文件核实，发现**计划 §一「`manox-session-core` 整体删除」不成立**：
-
-`crates/manox-session-core/src/agent_server.rs`（5,913 行 / 91 个方法 / 261 处 v2 引用）是
-**同一个 struct** 同时承载两件事：
-
-- **v2 网关**（~2,500 行，该删）：`handle_call`(266) / `handle_note`(256) / `route_call` /
-  `route_capability_call` / `ReplyCtx` / waterfall delivery / `fail_closed` / `apply_reply`；
-- **运行时 intent**（该留）：AHP 适配器需要的约 20 个方法
-  （`create_session_request`/`fork_session`/`submit`/`steer`/`dispose_session`/`session_thread`/
-  `archive_thread`/`set_model`/`set_cwd`/`rename_thread`/`pin_session`/`order_session`/
-  `terminal_input`/`terminal_resize`/`ahp_terminal_state`/`terminal_raw_tap`/`compact`/`plan_seed`）。
-
-**拆分可行的依据（实测）**：`src/ahp/` 对 v2 wire 层（`handle_call`/`handle_note`/`route_call`/
-`ReplyCtx`/delivery）的引用数 = **0**；对 `AgentServerInner` 内部状态（`sessions` 等）的直接访问 = **0**，
-只经方法。故窄接口足够。
-
-**但拆分不是「按方法切」**：AHP 需要的方法**间接**调 v2 通知函数，须**换出口**（改为 AHP publish）
-而非移植：
-
-| AHP 方法 | 调用的 v2 函数 |
-|---|---|
-| `create_session_request` | `route_host` / `route_note` / `replay_pending_adjudications` |
-| `submit` | `note_error` |
-| `dispose_session` / `archive_thread` | pump / streams / deliveries（v2 专属） |
-
-**另核实两点**（均与计划有出入）：
-- `RpcError` **不需要**搬——`manox-ahp` 用的是 AHP 自己的 `JsonRpcError`，而 AHP 适配器对
-  `RpcError` 引用数为 **0**。（计划把 `RpcPeer`/`MsgId` 列了，`RpcError` 未列，实测它属 v2 侧。）
-- `manox-protocol` 里 `journal`/`base64_bytes` **已是** `manox-journal` 的 re-export（W0 已搬），
-  `journal_stream.rs` 与 `wire.rs` 的外部消费者 = **0**。
-
-**结论**：W4 是一次「5,400 行删除 + 6,000 行文件拆分」，不是计划设想的三处快删。
-拆分后 `manox-session-core` 只剩 v2-free 的 gateway/journal_query/translate/waterfall 四块，
-名字已不诚实——但改名/并入会进一步扩大本次破坏面，故排 W4 之后单独收口。
-
-### H.2h 版本注记
-
-- 本轮新增 `x-manox/baseline` 通知（扩展通道基线），已进 `_meta["x-manox"]` 声明。
-- **terminal 面随后整体退役**（见 §H.2 第 2 条的注记）：词汇保留、宿主回稳定拒绝，
-  下列实现记录为历史。
-- **terminal 快照面已服务**（`createTerminal`/`disposeTerminal` + `TerminalState` 快照）；
-  `terminal/input`、`terminal/resized`、`terminal/data` 三个 action **未接**——客户端能建能看
-  但不能打字、不能改尺寸、收不到活输出。W4 前必补。
-  （初稿此处写「terminal 项已完成」，**该结论超前**：实现描述只覆盖快照，结论却把
-  「快照已服务」表述为「terminal 已完成」。已按实测订正。）
-
-0. **W2 状态：收口**（2026-09-23）。§G 的 W2 五条门禁逐条对照：
-   ① 收敛性证明（`translation_convergence.rs`，含 §H.2 那次抓到真缺陷的轨迹）——绿；
-   ② 全射/覆盖门（`translate/mod.rs` 的 `target_of` 穷举 + 编译期门）——绿；
-   ③ `快照 == fold(重放)`（L10）——绿；
-   ④a 官方 TS client over WS（§H.2e）——绿；④b 独立立项（见下）；
-   ⑤ 错误码纪律（`error.rs` 的 `DECLARED` 表 + 各 refusal 路径的测试）——绿。
-
-   **W2 认完成**（验收公式见下）。
-
-   ### 验收公式（取代「AHP 覆盖度」）
-
-   > **v2 今天能做的，AHP 面都能做 → 才能删 v2。**
-
-   AHP 30 个命令中 14 个对应 manox 不具备或不需要的能力（automation / OTLP / MCP Apps /
-   OAuth / resource-watch / changeset），按规范结构性拒掉（`-32601`）**即正确答案**，不是欠账。
-   追求 30/30 会把 manox 变成 AHP 参考实现。
-
-   按此公式的 W4 准入账（2026-09-24 复核）：
-   - ✅ `extension_baseline`（§H.2g）
-   - ✅ 四个 `x-manox` server→client 请求（§H.2i）
-   - ⛔ `terminal` 写路径 `input`/`resized`/`data`（§H.2i）—— 该面此后随 `manox-terminal`
-    退役（宿主改本地 Ghostty 面，AHP 只保留词汇 + 稳定拒绝），故此项从准入账上撤销
-   - ✅ 客户端贡献工具（`session/activeClientSet` → 既有 `embedder_tools` 路径，§H.2i）
-   - ✅ 四个 host→client 请求的**调用点**（`CapabilityClient` 的 browser/clipboard/
-     openExternal 经 `route_ahp_capability` 优先问 AHP，无合格声明者则回退 v2 腿；见 §H.2i）
-   - ✅ pin + 手工排序 —— **走 `x-manox`**（按「按能力查而非按命令查」的方法论核实了 AHP 全部
-     候选槽位：`SessionStatus` 位集 / `SessionMetadata` / `SessionSummary` / 全树
-     `pinned|sortOrder|displayOrder|reorder`，确认**无落点**）。
-     pin 写 store 行 + sidecar（与 v2 `PinThread` 同一层），且 journal 的 `PinnedArchived`
-     早已被 translator 折成 `x-manox/pinnedChanged`，读回路径本来就通；
-     排序写 `sidebar_order`，读回经 `x-manox-workspaces://` 基线的 `order`（文件夹序 +
-     每个 partition 的线程序）。
-     **实施期发现**：排序**不进 journal**——`sidebar_order` 是独立 durable 文件，v2 侧靠
-     `ThreadsUpdated` 快照广播。故 translator 无可发射的排序事件，排序是「客户端写 + 通道读回」
-     的状态，这与 pin 不同（pin 有 journal 行）。
-   - ⬜ `x-manox/fetchEntries` —— v2 在服务，W4 前需补齐或明确接受降级
-   - ⬜ `resourceResolve`/`resourceCopy`/`if_match`（基础围栏已在；v2 未服务这三条，故非阻塞）
-
-1. **④b（独立立项）**：真 VS Code Agents window 的方言税（R5 五处）。前置条件是 hcode fork 里
-   加一条可插拔 connection 来源（现只有 ambient/ssh/wsl，全是起 VS Code 自己的 agent host）。
-2. **W3**：manox-app 侧的 `AhpStore`（`ahp::Client` + reducers）、进程内 `ahp::Transport`、
-   `ConversationState` 改由 `ChatState.responseParts` 派生、删 `client_store*`/`journal_fold`/
-   `journal_translate`/`server_note_translate`、重写 `source_gates.rs`、更新 `UI-MAP.md`。
-3. **W4**：按 §F 删除清单拆除 v2；grep 门禁（生产区零 `FromClient|FromServer|ClientCall|
-   ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）；`manox-napi` 改 AHP；
-   `~/.manox/gateway-ws.json` → `ahp-ws.json`、`cx web` → `cx ahp`。
-4. **W5**：有界重放缓冲（按 `serverSeq` 重放替换快照腿）、`delivery.maxLatencyMs` 合并调优、
-   `resource*` 完整面、远程鉴权、多客户端并发与 owner 语义。
-
-### H.2f ④a 外接客户端实测：三个只有外部 client 能暴露的发现（2026-09-23）
-
-④a 的价值在执行期立刻兑现——三个发现都不是 Rust 套件能看见的：
-
-1. **`listSessions` 对真实规模不可用（已修，性能缺陷）**。原实现对**每个** session 折一次完整 journal
-   （`session_summary` → `block_on(session_state)`）。本机 401 个 session / 1.2 GB，于是
-   `listSessions` **超过 8 秒超时**——而它是客户端第一个调用、也是后续每一页的来源。改为从
-   **store 行**构建（与 v2 `threads_snapshot` 同一口径），实测 **401 个 session 上 1 ms 返回 27 条**
-   （27 = 活跃 18 + 未 superseded；归档 222 条不进列表，与 v2 侧栏一致）。store 行没有的
-   三个字段（status/activity/workingDirectories）只在**已 seed** 时填真值，否则按
-   `is_running` 给 Idle/InProgress 并留空——绝不为了三个字段去折一份 journal，也绝不编造。
-
-2. **重命名的「成功」是假的（已修，fail-open）**。用外接客户端对**真实会话**（78 MB，正被
-   Manox.app 以写租约驱动）执行 `session/titleChanged`：journal 行**没落**、sidecar **没变**，
-   而宿主回了 `Accepted`。成因有两层：
-   - `dispatch_store_journal_row` 在**冷路径**遇到外来租约时按设计**响亮跳过**
-     （`tracing::error!` + 「sidecar carries the flag」，`engine.rs:853`），但 store 侧
-     `rename_thread` 返回 `bool`，把「标题空白」和「没能持久化」**折成同一个 `false`**；
-   - dispatch 又把每个 `false` 报成「a session title cannot be blank」——**对合法标题说了假话**。
-   修法：引入 `RenameOutcome{Renamed, Blank, UnknownSession, NotPersisted}`；
-   `dispatch_store_journal_row` 返回「这行有没有落点」（活 actor 队列 或 文件存在），
-   `journal_title` 据此返回是否可持久化，dispatch 四种结局**各自给各自的 reason**。
-   实测复验：对非本进程拥有的会话现在回 `unknown session: <id>` / `… not writable from this
-   process`，对合法且可写的会话回 `Accepted` 且 journal 行确实落盘。
-   **第三层（实测追加）**：外接客户端跑完整 `createSession → subscribe → rename` 时又暴露两处
-   ——`createSession` 播种的**新会话**还没有 store 行（行要等 list refresh 扫到新文件），
-   于是 `seeded` 在 `session_state` 上 `?` 掉、对这个刚建好的会话回 `session not found`；
-   而 store 侧只按 `summaries` 认会话，把「按 path 认识但没有 summary 行」读成「unknown session」。
-   两处都修（chat 半边本来就有这个宽容，session 半边补上；store 改为 row **或** path 认得即可）。
-   最后把 `journal_title` 的前置收紧为**文件必须已存在**：仅有活引擎 route 不够——
-   一个从未 materialize 文件的引擎收到排队的 `AppendJournal` 会**无声丢弃**，
-   于是「已入队」被误报成已持久化。修后该场景回
-   `the session's journal is not writable from this process`（fail-closed），
-   而 journal 已存在的会话正常 `Accepted` 且行确实落盘。
-   **这也是「fail-closed 不是口号」的一个实例**：一个 fail-open 的写回执比拒绝更糟，
-   因为它会让每个订阅者折进一个永远无法 replay 的标题。
-
-3. **`createSession` 的 `activeClient.tools` 是上游 crate 与规范客户端的真实分歧（未修，待决）**。
-   实测帧：`{"channel":"ahp-root://","session":"…","activeClient":{"clientId":"capture"},
-   "workingDirectories":["file:///tmp"]}` → 宿主回 `-32602 invalid params: missing field
-   \`tools\``。核查：`SessionActiveClient.tools: Vec<ToolDefinition>` 在 pin 的
-   `ahp-types 1.0.0` 里**没有 `#[serde(default)]`**（必填），TS 类型 `state.d.ts:241` 同样是必填
-   `tools: ToolDefinition[]`；但**规范自己的 TS client** 在 `createSession` 里不发这个字段
-   （`createSession` 走 `CommandMap` 泛型通道，TS 的 `activeClient` 拼装不填 `tools`）。
-   即：**类型要求它、官方客户端不填它**。宿主拒绝是「按 pin 的类型」正确，但会让标准客户端的
-   正常建会话失败——属 R2/R5 类。处置选项（未定）：(a) `activeClient` 缺 `tools` 时按空表接受
-   （对客户端宽容、偏离 pin 类型）；(b) 记入 `test/upstream-workarounds` 式自失效守卫，等上游修
-   TS client。**倾向 (a)**，因为它与既有的「reference client 宽容」先例一致（`/ahp` 的
-   token/origin 闸已为 VS Code 放宽过），但这条留待用户裁决。
-
-### H.4 AHP 上游文档漂移（实施期实测）
-
-- `docs/specification/*.md` 的示例仍写 `"0.3.0"`，而 `ahp-types::version::PROTOCOL_VERSION` 为 `1.0.0`
-  ——实现以 `types/` 与 crate 为准。
-- `JsonRpcRequest.id` 在 `ahp-types` 里是 `u64`：使用字符串 id 的 JSON-RPC 客户端会在解析期被拒
-  （整帧判为 `-32700`）。官方 Rust/TS 客户端均发数字 id，故暂不处理；容忍字符串 id 记入 W5 候选。
-- 规范 §B.4 提到的 `PlanVerdict` 在 `manox-protocol` 里**不存在**（实测 `ServerCall` 只有 6 个变体），
-  计划评审经 `Approve` 腿到达；`x-manox-plan/verdictRequested|reviewSettled` 仍按 §D 声明保留（`verdict` 已改名 `reviewSettled`：resolved 边不载 approve/refine 判别式）。
-
-### H.5 W4 已执行：v2 拆除完成（2026-09-24）
-
-四项全部落地，单 PR #818。**「v2 今天能做的，AHP 面都能做」的验收式已成立**：
-`manox-protocol` 不存在了，全仓生产区零 v2 词汇。
-
-**① crate 形状（对 §F 与 §G-W4 的修订）**。计划说 `manox-session-core` 整体删除，H.2j 已证伪；
-实际拆法：
-
-- 新增 `crates/manox-ahp-runtime`：AHP 宿主背后的运行时半边——`SessionRuntime` trait（22 个方法）、
-  适配器 `RuntimeBackend`、journal→AHP 的投影半边、`journal_query`、`paths`、`error`。
-  它**不依赖** `manox-ahp`（反向才是被禁的方向），也**不依赖** `manox-session-core`。
-- `manox-session-core` 保留：会话存储 + 22 个 intent（`agent_server.rs`）+ `SessionRuntime` 的
-  实现（`ahp_gateway.rs`）+ loopback WS 监听器。名字保留到 W4 之后（改名如 `manox-gateway` 是
-  纯重命名，放进本 PR 只会扩大评审面）。
-- 进程单例的 builder 由**拥有会话存储的一方**安装（`AgentServer::global`），runtime crate 永不
-  命名具体会话运行时。安装是单向的，第二次安装被拒。
-- 测试归属：AHP 适配器测试（38 个：35 个 `#[tokio::test]` + 3 个 `#[test]`）住在 gateway 旁
-  （它们驱动活的 gateway），runtime crate 只留纯单元测试。
-
-**② 三处「re-exit」而非移植的通知点**（H.2j 列出的三处）：
-
-- `create_session_request` 的 `route_host`/`route_note`：AHP router 在 `create_session` 返回后
-  本来就发 `root/sessionAdded`，所以这两个 emit 是**同一事实的第二次宣告**，删掉即正确。
-- `open_session` 的 pump：活会话现在只是它的 `ThreadHandle`；AHP bridge 订阅 journal feed，
-  不再有 per-connection 的 pump fan-out。
-- `submit` 的 `note_error`：**拒绝已经由 intent 的 `Err` 承载**，v2 note 是并行的第二通道。
-  所有 `note_error` 调用点改为显式 refusal。
-
-**③ 拆除中暴露并修掉的 fail-closed 缺陷（都是真 bug，不是重构副作用）**：
-
-- `set_model`/`set_reasoning_effort`/`set_access_mode` 返回 `()`，失败时只发 v2 note，而 AHP
-  派发无条件回 `Accepted`——**客户端被告知模型改动已生效，然后收敛到一个会话并未运行的模型**。
-  三个 setter 及 `compact`/`plan_seed`/`set_cwd`/`goal` 改为返回 `Result`，派发据实拒绝。
-- `x-manox/goal` 与 `x-manox/invokeTool` 在声明面里**声明了却从未派发**，客户端拿到的是
-  `-32080`。两者现已接到它们命名的那条 intent 上。
-- `/ahp` 路由原本经 `AhpRuntime::router` 挂载——那个 helper 提供的是**裸 upgrade，没有 token /
-  origin 闸**。改为经监听器自己的 `ahp_upgrade` 挂载；监听器自带的测试抓到了这一点。
-
-**④ engine 侧一个既有缺陷被 W4 暴露并修掉**（`manox-agent/src/engine.rs`）：
-`run_actor` 在「no model configured」的提前 return 上**没有走 K3 关闭协议**——route 保持注册、
-sender 仍然可用，于是 `dispatch_store_journal_row` 把行投进一个再也不会 drain 的 actor 并回报
-「已入队」。表现为：重命名落了 sidecar、journal 行永远不存在。修法是提前 return 也 retire 并
-claim 已入队的行，落到 `initial_path`。（该路径在 hermetic 测试 HOME 下 100% 命中，故此前
-`title_changed_appends_the_journal_row` 在并发全量跑里必红、单跑必绿。）
-
-**⑤ 测试面**：`agent_server/tests.rs`（11,682 行 / 130 测试）整体删除——它驱动的是 v2 线面
-（`ClientCall`/`ClientNote`/`ServerNote`），协议没了，测试随之消失；它覆盖的行为要么已被删除
-（ownership note / pump / waterfall / follow stream），要么正由 `ahp_adapter_tests.rs` 在 AHP 面
-重覆盖。**这是本 PR 已知的覆盖缺口，记在 H.3。**
-
-**⑥ 声明面收口（W4 收尾新发现）**：`x-manox` 命令声明面原本列了 8 条，其中 **5 条没有任何
-运行时实现**：`fetchEntries`（AHP 原生 `fetchTurns` 已覆盖）、`modelChat`/`modelChatCancel`
-（它们喂的通道随 v2 网关一起删了）、`cancelDelivery`（delivery 是被删的 v2 waterfall 概念）、
-`shutdown`（宿主生命周期，非会话关切）。声明面只留真正被服务的 3 条
-（`compact`/`planExecute`/`goal`），未服务的四条在 `commands::ALL` 的文档里写明**为什么不服务**
-——「声明了却答不出来」比「从不提供」更坏：客户端读声明后发 `x-manox/modelChat`，无法区分
-「没编译进去」和「坏了」。同时把 `extension_commands_split_performed_from_declared` 从
-**固化该缺陷**（它把「声明了但没实现 → 回 `X_MANOX_UNSUPPORTED`」写成"诚实的答案"）改为真正的
-门禁：遍历 `commands::ALL`，任何一条落到 `X_MANOX_UNSUPPORTED` 即红。该门禁已用临时插入假声明
-验证过确实会红。
-
-**⑦ 通道面同样收口**：`channels::ALL` 原列 6 条，`x-manox-modelchat:/` 是**空声明**——它的实现
-模块随 v2 网关一起删了，订阅者只能永远等一个只可能回 `null` 的通道（会话级通道走
-`seeded.extensions`，而那条链早已没有生产者）。移出声明并在文档写明理由。
-`x-manox-commands://` 则是**有数据源却回空**：它硬编码 `{commands: []}`，而 v2 的 `ListCommands`
-读的三处注册表（`slash_builtins` / `command::try_global` / `skill::try_global`）都还在，§B.3 也
-明写这条通道就是 `ListCommands` 的落点。已实现为按 v2 相同的优先级去重合并
-（内置 → 用户命令 → skill，同名先到者胜）；新增
-`the_command_catalogue_lists_the_registry` 钉住**内容**（原测试只断言"有回答"，空列表也算有回答，
-这正是它漏过去的原因），并已用临时改回空列表验证会红。
-`ext::VERSION` 1 → 2（该常量自述"重命名或删除扩展时递增"）。
-
-**⑧ steer 的 pending-kind 修正（review request-change 后修，2026-09-24）**：
-`Translator::on_message` 的 `"user"` 分支原本对**所有** `user` 行发
-`PendingMessageKind::Queued` 并铸 `m-<entry.id>`。manox 的 steer 正是以普通 `user` 行落盘的
-（`engine.rs` 的 `steer_with_id` → `steer_message` 构造 `AgentMessage::User{id:Some(steer_id)}`），
-于是 mid-run steer 被译成「排队给下一轮」——与它的语义**相反**——且 id 与客户端 echo、宿主
-`steer` intent 三者互不相等。两个后果（先写测试复现、均红）：
-
-1. 该 entry 不被它打断的那一轮消费。`pending_user` 由 `on_turn_start` 排空，所以 steer 会在
-   下一轮开始时被当作新的用户消息**再次注入**——同一段文本跑两次。
-2. AHP 只在收到 id 匹配的 `pendingMessageRemoved` 时清 `steeringMessage`（`reducers.rs`），
-   turn 结束**不清**。`m-` 前缀的 id 永远匹配不上，于是客户端一直渲染一条文本已在 transcript
-   里的 pending steer。
-
-修法两半：`on_message` 按 `self.open`（"assistant" 分支已在用的现成信号）区分——turn 开着时
-的 `user` 行是 `Steering` 且**不进** `pending_user`；否则维持 `Queued`。steer 的 id 取该行的
-`originRpc`（即客户端 steer id）。宿主则在 `RuntimeBackend::dispatch` 确认注入后发
-`pendingMessageRemoved{kind:Steering}`；为此 `steer` 的 receipt 新增 `injected` 字段——
-**这个事实无法从 journal 推出**：`ThreadEvent::SteerInjected` 被显式排除在落盘之外
-（`engine.rs` 的 `durable_journal_payload` 早退分支），宿主没有第二条途径得知。
-这条 `Steering` 折叠只是过渡形态：mid-run steer 的最终映射改为 turn 分区（§H.10，
-2026-10-27），pending 槽位只保留 wire `pendingMessageSet` 的寿命。
-
-**⑨ 门禁**：`script/gates.sh` 六腿全绿；grep 门禁（生产区零
-`manox_protocol|FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）
-零命中。`prod-libs` 腿的 crate 列表同步为 `manox-ahp`/`manox-ahp-runtime`/`manox-journal`。
-
-### H.6 自我对抗 review：plan-review 卡片到不了客户端（2026-09-28，**阻断合并**）
-
-对 PR #818 逐提交做对抗性复核时发现：`c9522b8`（plan review 面）声称
-"`StateAction::Unknown` 走 broadcast 会 verbatim 到达客户端"，**该断言不成立**。
-
-**根因（实测，非推断）**：`ahp-types` 的 `StateAction::Unknown(Value)` 是
-`#[serde(untagged)]` 兜底变体，而 untagged 兜底**打不过已知 tag**——当 `type` 是
-`chat/inputRequested` 这种已注册变体时，serde 反序列化会走**类型化**的
-`ChatInputRequestedAction`，把该类型没有的字段**静默丢弃**。实测往返：
-
-```
-输入:  {"type":"chat/inputRequested","request":{"id":"pr-1","planReview":{"title":"Demo plan"}}}
-序列化:  保留 planReview              ← 单元测试停在这一步，所以它绿
-反序列化: {"request":{"id":"pr-1"}}   ← planReview 消失
-```
-
-丢失点在**客户端 SDK 自己**：`ahp-1.0.0/src/client.rs:965` 对每条入站 action 都做
-`serde_json::from_value::<ActionNotificationParams>`。所以 in-proc 与 WS **两条腿都丢**——
-不是传输问题，是类型系统问题，宿主侧无法绕过。
-
-**实际到达客户端的东西**：
-```json
-{"type":"chat/inputRequested","request":{"id":"plan-review:e-1","questions":[{"id":"q","kind":"single-select"}]}}
-```
-`planReview`（title / content / actions / planUri / answerQuestionId）与 `_meta` **全部丢失**。
-VS Code 拿到的是一个普通单选问题，不是它的原生 plan-review 卡片——即该提交的核心目的未达成。
-（评测本身仍可工作：`request_id` 与 `answers` 是类型化字段，保得住。）
-
-**为什么原单元测试没抓到**：它调用 `serde_json::to_value(&emitted[0].action)`，断言的是
-**进程内**动作，从未做一次往返。新增的
-`the_plan_review_card_reaches_a_subscribed_client` 走完整 host→client 路径，因此会红。
-
-**AHP 0.9 确实没有这个槽位**（已核实，不是选型疏忽）：`ChatInputRequest` 与
-`InputRequestResponsePart` 都**没有** `_meta` 之类的私有座位，所以类型化路径同样装不下
-`planReview`。这使问题从"用错了 API"升级为设计选择：
-
-- **(a)** 接受降级：用类型化 `ChatInputRequest` 发普通提问，放弃"原生卡片"这一说法，文档同步；
-- **(b)** 走已经为它准备好的通道：`x-manox-plan/verdictRequested` 与 `x-manox-plan/verdict`（后者后改名 `x-manox-plan/reviewSettled`）
-  在 `ext::actions::ALL` 里**已声明**、`ext/reducer.rs:100` **已折叠**，但**没有任何生产者**
-  ——与本 PR 早先修掉的"声明了却没有实现"是同一类缺陷（§H.5⑥⑦）。plan review 正好落在这里。
-
-**已按 (b) 实施**（同一轮 review 内完成，未等裁决——因为 (a) 会把"原生卡片"这个卖点直接删掉，
-而 (b) 是唯一能保住它的路径，且顺带消掉一个空声明）：
-
-- 计划内容（title / content / actions / planUri / canProvideFeedback）改由
-  `x-manox-plan/verdictRequested` 承载，落在 `Target::Plan` 通道
-  （`x-manox-plan:/<chat-id>`）。该 tag **已声明、已被 `ext/reducer.rs` 折叠**，payload 因此
-  进宿主扩展状态——可回填，不再是"一发了之"。它也不再依赖"协议恰好透传未知字段"。
-- 交互半边改为**类型化**的 `chat/inputRequested`（`ChatInputRequestedAction`），只承载问题
-  本体。reducer 把它折进 open turn 的 `ResponsePart::InputRequest`，客户端经
-  `chat/inputCompleted` 回答（runtime 侧按 `request_id` + `answers` 解析，两者都是类型化字段、
-  保得住）。
-
-新增 `a_plan_proposal_reaches_a_subscribed_client` 走完整 host→client 路径，断言三件事：
-问题到达订阅者、计划块进了宿主扩展状态、问题折进了 open turn。
-
-**合并状态**：CI lint 已修（`d81e2e0`），plan-review 已修（见上），故本项不再是阻断项。
-
-### H.7 Plan mode 整体退役：`/plan` 退化为内置 skill，裁决走通用 ask（2026-10-23）
-
-上文 §B.4/§D 冻结文本里 plan 模式相关的落点（`SetPlanMode`→`planModeChanged`、
-`PlanSeedExecution`→`x-manox/planExecute`、`PlanVerdict`→`verdictRequested|reviewSettled`、
-通道表 `x-manox-plan` 的「plan 模式开关 / 评审请求与裁决」描述）自本节起**全部失效**，
-不回改冻结文本。as-built：
-
-- **plan mode 不再是 harness 概念**：`manox-agent` 的 `plan_mode`/`collaboration_mode` 模块、
-  `ProposePlan` 工具、`BeforeAgentStart` 逐回合注入、`BeforeTurnEnd` 的 plan 退出门
-  handler、审批门的 plan 文件豁免、`~/.manox/plans` 目录约定、`ModePlanActive`/
-  `ModePlanApproved` 模板、engine 的 `RequestPlanMode`/`SetPlanReviewPending`/
-  `StartPlanExecution`/`ApprovePlan` 命令、`ThreadEvent::{PlanReady, PlanModeChanged}`
-  一律删除。`HookPoint::BeforeTurnEnd` 与 loop 的弹回预算作为泛型钩子点保留。
-- **journal 词汇**：`plan_mode_change` / `plan_mode_request` / `plan_review` 三个条目类型
-  删除（无兼容读，与 `a_retired_row_name_is_refused_like_an_unknown_one` 的既有裁决一致：
-  用过 plan mode 的旧会话 restore 会整文件拒载）。`plan_update`（`UpdatePlan` 执行计划快照）
-  存续。sidecar 的 `plan_file` 键停写；旧 sidecar 的未知键照旧惰性忽略。
-- **x-manox 声明面**：动作 `x-manox-plan/planModeChanged`、`/verdictRequested`、
-  `/reviewSettled` 与命令 `x-manox/planExecute` 删除；通道 `x-manox-plan:/<chat-id>` 存续，
-  **只**承载执行计划文档（`planChanged` ← `plan_update`）。`XManoxState` 失去
-  `plan_mode`/`plan_review` 字段。runtime 侧 `plan_reviews` ledger、`resolve_plan_review`、
-  `ChatInputCompleted` 的 `plan-review:` 前缀特判、`plan_seed` 一并删除。
-- **`/plan` 的新家**：`manox-agent::skill::builtin_skills()` 内嵌 `skills/plan/SKILL.md`
-  （`disable-model-invocation: true`，仅用户斜杠入口；磁盘同名 skill 遮蔽内置）。
-  `BUILTIN_SLASH_COMMANDS` 删去 `plan` 行，`x-manox-commands://` 目录自动改列
-  kind=`skill`。`/plan <task>` 走既有 `submit_skill` 分发：渲染契约正文 + 追加 task，
-  display 文本保留 `/plan <task>`。契约要求以 `AskUserQuestion` 单问题卡提案
-  （header `Plan review`，`detail` = 完整计划 markdown，`intent.kind` = `plan-review`，
-  选项 Approve / Approve with changes / Revise），答案经既有 turn-final 播种进入下一回合。
-- **通用载体（替代 H.6 的 plan 专项通道）**：`on_question` 投影把问题级 `detail`
-  markdown 写进 SDK 原生的 `ChatInputRequest.message`（单问题原样；多问题按 `header`
-  分节拼接；全无 detail → `None`，不再填工具名占位）。ahp-types 是
-  microsoft/agent-host-protocol 的 crate，无 per-question detail 槽，故不改 SDK。任何 AHP
-  客户端（含 VS Code 扩展）自此从 `message` 读 ask 的支撑文本——H.6 里「plan 块只能走
-  x-manox-plan」的前提随 plan review 的消失而解除。
-- **伴随义务**：dspo/manox-app 删 chip / `/plan` 本地命令 / plan 通道读面 / `plan-review:`
-  特判，`pending_ask_from_ahp` 改读 `req.message`；dspo/manox-vscode-extension 的
-  `plan-review-card.tsx`/`chatFold.ts` 等读 plan 通道的代码改读 `ChatInputRequest.message`。
-
-### H.8 session config 三键的 durable 权威回归 journal（2026-10-26）
-
-v0.6.5 把 session config 的权威放在 conversation 对象行（`conversation_config.rs` 旧注释
-「The journal carries no configuration of its own」），折叠器只认 journal 行但没有生产者：
-`model_change`/`thinking_level_change` 存在折叠臂（`SessionTreeEntry::ModelChange` /
-`ThinkingLevelChange` → `session/configChanged`）却无人落行，`accessMode` 连行类型都没有。
-后果：任何重订阅/宿主重启后 config 座位折不出这三键，客户端模型芯片与访问菜单回落默认值
-——纯显示漂移，但违反 L10（`快照 == fold(重放)`）。本节 as-built 把权威反转回来：
-
-- **行类型**：新增 journal 行 `access_mode_change`（`manox-harness` `session::event::Event`
-  的 `AccessModeChange { mode }`，kebab 行名 + camelCase envelope，`mode` 是 kebab wire
-  词汇 `sandbox`/`full-access`）。`replay.rs` 宿主 fold、`projection.rs` 的 `target_of`
-  全射门同步登记。
-- **生产者（仅真实变化时落行，带变更守卫）**：`model` 在 `AgentSession::set_model` 唯一
-  choke point 落 `model_change`（守卫 = 调用前 harness model；`land_set_model` 的 durable
-  拒绝回退只进镜像不落行，语义不变）；`reasoningEffort` 的 `SessionCmd::SetThinkingLevel`
-  两臂（actor 主循环 + run.rs 中段排队臂）收敛到同一落行词汇（`thinking_level_change`，
-  wire 形式字符串），守卫 = `EngineState::journaled_thinking_level`（journal 最后携带值，
-  clamp 无关；中段臂经 live serializer task 落行，绝不在 select 臂内 await append 锁——
-  round-11 自死锁禁区）；`accessMode` 的 `SessionCmd::SetAccessMode` 臂落
-  `access_mode_change`，守卫 = `EngineState::journaled_access_mode`（facade 会在 actor
-  排水前热写 gate，活镜像不能当守卫）。
-- **折叠消费**：`projection.rs` 新增 `AccessModeChange` → `configChanged{accessMode}` 臂；
-  `ThinkingLevelChange` 臂本就存在。
-- **权威反转（激进纪律，无兼容读）**：`adopt_session_model` 删 ObjectConfigSource 读取，
-  picked 直接取 kernel restore 投影出的 harness model（`model_change` 行已由 restore 折回）；
-  `ApprovalGate` 撤 `config_source`（构建/恢复时从 replay fold 播种 gate + durable 基线，
-  live `set_mode` 不变）；`merge_restored_state` 的 accessMode/effort 改从 chain 行解析，
-  无行恢复默认值——**旧 journal（无行）恢复到默认值，不迁移不做兼容读，用户重选一次即落行**。
-  sidecar 的 `access_mode`/`reasoning_effort` 缓存字段随第二答案一起删除（未知键照旧惰性忽略）。
-  `networkAccess` 不在本次范围（#953 沙箱网络重设计进行中），仍是 session-memory。
-- **config 模型**：session-mutable 三键中 `model`/`reasoningEffort`/`accessMode` 以 journal
-  行为 durable 权威，L10 门禁覆盖 config 座位（`config_seat_tests` 折叠回归：三行 → 座位
-  三键俱全，重折叠同）；conversation 对象行降级为**新建线程的 draft 意图**（app 在 create
-  前写 picks，`sync_object_config` 握手经正常 setter 派发落行）。
-- **伴随义务**：dspo/manox-app 零代码消费（AHP 面不变），随下一轨 tag bump 获取修复；
-  `createSession` 的 seed 缺口（工作目录/config 意图不落引擎，#904/#905 的补偿写入）不在
-  本轮范围、另行处理（后续补口见 §H.9）。
-
-### H.9 create 意图与中段 model 切换补上 durable 行（2026-10-26）
-
-H.8 把「已物化会话的 config 切换」接回了 journal。本节治同家族剩下的三个缺口：create 的
-project 从未解析、create 的 config 被丢弃、中段排队的 `SetModel` 不落行。
-
-- **W1：create 的 project 从 belonging 解析**。`createSession` 的 wire 参数没有 project
-  字段，宿主原先也不从别处解析（`SessionIntent.project` 恒 `None`），deferred-fresh 建线程
-  时 `Thread::open` 的 `(None, fresh)` 分支强制改用 `unfiled_workspace(id)`（
-  `/tmp/steer-<id>`）：journal header/cwd、journal 桶（`--unfiled--`）、线程行全部与
-  conversation 对象行的真实项目分叉（桌面侧栏落 "Chats"，composer 项目芯片却读授权
-  grant）。现在 `agent_server` 在 claim 之后解析
-  `project = intent.project.or_else(|| object_project_of(session_id))`——**belonging 的权威
-  是对象行，`workingDirectories` 只是授权集**，intent.project 保留显式覆盖语义；deferred 与
-  seeded 两条路径都走 `Thread::new_in_project`（cwd = 项目目录、journal 落项目桶、线程绑定
-  项目）。无对象行的 create（非桌面客户端）保持 unfiled 行为；claim 的 Reuse 早退在解析之前，
-  已物化会话绝不因解析而重铸或迁移。
-- **W2：create 的 config 接上并落行**。`backend.rs::create_session` 解析
-  `CreateSessionParams.config` 的 session-mutable 三键（`model`/`reasoningEffort`/
-  `accessMode`；`networkAccess` 与 §H.8 一样不在范围），纪律同 `apply_session_config`：
-  先整单校验（未知键、非字符串值 → 拒绝整个 create），model 串经注册表解析，失败以
-  `model/unresolvable` 拒绝，全部发生在任何状态创建之前（零落盘）。intent 一接上，
-  `Thread::set_model`/`set_access_mode`/`set_reasoning_effort` 的既有 choke point 就会为
-  真实变化落行（deferred 会话的行先缓冲，随首条 assistant 消息物化，懒物化契约不破）；无
-  config 的 create 依旧零落盘。
-- **W3：中段排队的 `SetModel` 落行**。run.rs 中段臂的 `HarnessHandle::set_model` 原先只更新
-  turn runtime 快照；现在同时把 `PendingMutation::Model` 入队，由 turn 边界
-  （`prepare_next_turn`）或 settle 的 `flush_pending_mutations_inner` 落 `model_change`
-  行——行先于同一 `TurnUpdate` 把新 model 写入下一请求，写失败即中止该 run。守卫沿用 handle
-  的按目标幂等（同一目标不重复入队），idle 路径仍走 `AgentSession::set_model` 的 choke
-  point，不产生第二行。
-- **验证**：`ahp_adapter_tests::create_intent`（对象行 → 项目 cwd/桶/线程行；无对象行 →
-  unfiled 不变；Reuse 不受影响；seeded create 同步落项目桶；create config → 首 turn 物化 →
-  冷读折叠三键俱全；无 config 零落盘；坏 model/未知键/非字符串拒绝且零落盘）与 harness 的
-  `test_handle_set_model_applies_next_turn`（中段排队 → 恰好一行 `model_change`）。
-
-### H.10 mid-run steer 折成 turn 分区：journal 顺序即阅读顺序（2026-10-27）
-
-- **症状**：桌面端（dspo/manox-app）在 agent 运行中发引导消息（⌘↩ →
-  `chat/pendingMessageSet{kind:'steering'}`），注入本身正确，但 transcript 把 agent 对引导的
-  回复（思考 + 长答）整体显示在引导消息**前面**，且永不逃逸——尾部 optimistic bubble 永远配
-  不上一个 turn。恢复（restore）后同样如此。
-- **根因**：journal 的 `turnStart` 每次 run 只有一条（内核每轮的 `TurnStart` 被
-  `adapt.rs` 压掉，`TurnStarted` 由 facade 每 run 发一次），注入的 user 行确实落在 journal 的
-  正确位置。病在 fold：`on_message` 的 user 分支在 turn 已开且已有内容时把该行折成
-  `ChatPendingMessageSet{Steering}`，落进 `ChatState.steeringMessage`——一个 journal 没有的
-  槽位。宿主在注入回执后发 Removed 清掉它（live 路径），而 restore 重放没有 Removed，槽位
-  残留；两种情况下 steer 文本都**没有持久行**，回复继续流进注入前的 turn，阅读顺序因此
-  反向。
-- **映射（本项目唯一事实源）**：`projection.rs::on_message` 的 user 行按 turn 状态分三路，与
-  §B.3 的客户端命令映射互不影响：
-  1. **无 turn 打开** → `chat/pendingMessageSet{kind:'queued'}`，进 `pending_user`，由下一个
-     `turnStart` 作为开场消息携带（不变）。
-  2. **turn 已开、尚无开场消息**（`turnStart` 没携带 pending user——deferred create 的形状）
-     → 该行是该 turn 的开场消息，以同 `turnId` 重发 `chat/turnStarted` 携带正文（不变）。
-  3. **turn 已开、已有开场消息** → mid-run user 行（客户端 steer、peer 投递、agent 注入都在
-     此列——journal 不区分它们；**不要求已有 assistant 内容**）：先按 turn 边界结清当前 turn
-     （`ChatTurnComplete`，Outcome=Complete——被该行接续），再以该 journal 行开新 turn：
-     `chat/turnStarted{turnId:'t-<entry.id>', message: 行文本,
-     queuedMessageId: <entry.id>}`。该行不再发 `pendingMessageSet`，也不进 `pending_user`。
-- **身份就是 journal 行 id**：S3 让 caller-minted 的 user 消息**以客户端 id 作为行 id**
-    落盘（`user_entry_id`），而 `AgentMessage::User.id` **不过 wire**、该行也**没有
-     `origin`**（origin pin 属 submit 路径，steer 行不带）——所以 fold 可读的唯一身份是行
-     id：客户端 steer 行的行 id 就等于它 `pendingMessageSet{Steering}` 用的 id，直接用作
-     `queuedMessageId` 即可；投影器再 mint 一个 `m-<id>` 会与客户端槽位、reducer 的**精确
-     id 清槽**都对不上（peer/agent 注入行的存储 id 匹配不到任何槽位，清白无害）。
-- **wire 生命周期不变**：客户端 Set 打开 `steeringMessage` 槽位；新 turn 的
-  `queuedMessageId` 与槽位 id 相同（行 id = 客户端 steer id），reducer 在
-  `chat/turnStarted` 上按 id 清槽（与 idle wake 回执同一形状）。注入回执的
-  `pendingMessageRemoved` 仍照发，此时为 NoOp。parked steer 被下一个 run 消费时没有注入
-  回执，清槽完全靠这条 turnStarted——身份错了就会在 live 状态里留下一个无人清除的槽位。
-- **不是 run 的终点**：分区的 `chat/turnCompleted` 携带
-  `_meta.x-manox.steerBoundary = true`。run 在同一条 journal 行上继续，所以客户端按「完成」
-  触发的 run 级动作（例如把排队消息冲成下一轮 turn）**MUST** 跳过该边界；run 自己的
-  `turnFinish` 不带此标记。一个 run 现在可以产出多个 turn：不读该标记的客户端会把边界当
-  run 结束（提前 flush follow-up、结算 run 级状态）。
-- **边界**：
-  - 连续多条 steer 各自开一个 turn（每条 user 行都必须可见；同一条回复落到最后一条 steer
-    的 turn）；非 steering 的排队行为完全不变。
-  - **parked steer 在下一个 run 的 turn 1 被消费时**（wake 流程：submit 的 durable 行先于
-    `turn_start`，turn 以它为开场，steer 行随后到达且尚无任何 assistant 内容）同样走第 3
-    路：`on_turn_start` 把携带的开场文本记进 `OpenTurn.message_text`，所以该 steer 行不会
-    被误判成「还没有开场消息」而**覆盖 prompt**；pre-steer turn 只带着开场消息、以
-    `steerBoundary` 完成（零内容 turn），回复落到 steer 的 turn。第 2 路只适用于
-    **`turn_start` 未携带开场消息**的 window。客户端（桌面按 `turnCompleted` 触发的 run
-    级动作）必须跳过该边界，并自行决定零内容 turn 的渲染。
-  - steer 行只会落在内核的**回合边界**（`agent_loop.rs` 在每轮顶部轮询 steering 队列，工具的
-    tool result 已落盘、审批不在等待中），所以边界 `finish_turn` 对未结算 tool call / 未回答
-    ask 的 settle 是防御性规则（不许悬挂），不是对活工作的取消。
-- **附带收益**：restore 重放老 journal 时 mid-run steer 行同样折成 turn 行——不再依赖
-  下游对槽位的补偿清理。
-- **验证**：`projection.rs` 的 `fold_semantics_tests`（分区内容与顺序、steer turn 的
-  `queuedMessageId` 等于行 id、连续 steer、peer/agent 注入行、wake 的零内容 pre-steer turn、
-  wire 槽位按行 id 退休、重放确定性、idle 排队与 initiating 回归）与
-  `manox-ahp/tests/e2e_in_process.rs` 的 `a_steer_turn_started_retires_the_steering_slot`。
-- **伴随义务**：dspo/manox-app 停推 retire 时刻的尾部 optimistic bubble（改由 fold 行承载
-  显示）、按新语义重写 "steered bubble lands" 断言族、steered 徽章改由 `queuedMessageId`
-  行盖章、`steerBoundary` 的完成不触发 follow-up 队列结算；修复经 release/0.6 的下一个
-  v0.6.x tag bump 消费。
+2. 进程内 channel 作为 AHP 传输合法，且 typed 帧（不序列化）满足一致性要求
+   （`tests/ahp_transport_parity.rs` 守护）。
+3. 只 advertise 并实现真正用到的动作子集；未实现动作拒绝（不是静默 no-op）。
+4. AHP 客户端对未知 `_meta` 键与未知 `x-` 方法必须忽略而不致断。
+5. i18n 与 UI 文案完全留在 manox-app；协议面不承载语言配置。
+6. 单窗口、单 host 进程；多客户端并发共享同一 `serverSeq` 域。

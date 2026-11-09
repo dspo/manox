@@ -61,8 +61,17 @@ pub trait ThreadEngine: Send + Sync {
         rx
     }
 
-    /// Token usage keyed by user-message id, as the env card renders it.
+    /// Token usage keyed by the kernel user message's stable id (S3), as the
+    /// env card renders it. A prompt message built without one keys its turn
+    /// by its ordinal among the transcript's user messages.
     fn request_token_usage(&self) -> HashMap<String, TokenUsage>;
+
+    /// Usage of the turn that just ended — the accumulated requests of the
+    /// last user turn. Key-free, so a reader that stamps the just-finished
+    /// reply never has to know how the map is keyed.
+    fn last_turn_token_usage(&self) -> Option<TokenUsage> {
+        None
+    }
 
     /// Usage of each model's most recent request — the context-budget
     /// numerator per model row (a single request's prompt size, never a
@@ -197,19 +206,21 @@ pub trait ThreadEngine: Send + Sync {
     fn goal_gate(&self) {}
 
     /// `run` with the client's origin RPC id pinned onto this turn's first
-    /// user message (§F.2) and — K5 — the journal entry id the Submit was
-    /// accepted under ([`Self::persist_user_submission`] persisted it before
-    /// the receipt): the engine arms the middleware skip from it instead of
-    /// appending its own user entry. Engines without origin support ignore
-    /// both.
+    /// user message (§F.2), the entry-level authorship of that row
+    /// ([`manox_harness::session::UserEntryUi`]), and — K5 — the journal
+    /// entry id the Submit was accepted under
+    /// ([`Self::persist_user_submission`] persisted it before the receipt):
+    /// the engine arms the middleware skip from it instead of appending its
+    /// own user entry. Engines without origin support ignore all of it.
     fn run_with_origin(
         &self,
         prompt: String,
         images: Vec<manox_harness::types::ContentBlock>,
         origin: Option<String>,
         accepted_entry: Option<String>,
+        ui: Option<manox_harness::session::UserEntryUi>,
     ) {
-        let _ = (origin, accepted_entry);
+        let _ = (origin, accepted_entry, ui);
         self.run(prompt, images);
     }
 
@@ -281,11 +292,10 @@ pub struct ReadyInfo {
     /// the authoritative active-tool set); the facade mirrors it so the
     /// composer chips derive from the thread's state.
     pub browser_suites: Vec<crate::engine::BrowserSuite>,
-    /// The journal-authoritative goal snapshot (goal migration stage ②):
-    /// the K2 rebuild's replayed last `goal` entry. `None` = the chain
-    /// never saw a goal (the bridge's db fold stands — the migration-window
-    /// fallback for pre-stage-① threads); `Some(Null)` = the explicit
-    /// clear. The facade hands it to the GoalBridge, which re-applies the
+    /// The journal-authoritative goal snapshot: the rebuild's replayed last
+    /// `goal` row on the chain. `None` = the chain never saw a goal — a chain
+    /// with no goal row has no goal; `Some(Null)` = the explicit clear. The
+    /// facade hands it to the GoalBridge's restore seed, which re-applies the
     /// restart-paused demotion (activation is never inherited).
     pub goal: Option<serde_json::Value>,
     /// Last `UpdatePlan` snapshot rebuilt journal-first (K2: the
@@ -369,7 +379,7 @@ pub enum BackendNotice {
     /// `BusOp` the facade executes on the gpui main thread (spawn member
     /// thread, inject peer message, abort member) and replies via the
     /// responder when one is attached; fire-and-forget ops (cancel fan-out)
-    /// send `None`. Generalizes the retired `TeamRequest` architecture.
+    /// send `None`.
     BusRequest {
         op: manox_harness::steer_bus::BusOp,
         responder: Option<async_channel::Sender<Result<String, String>>>,
@@ -396,8 +406,7 @@ pub enum BackendNotice {
         responder: async_channel::Sender<Result<(), String>>,
     },
     /// A dispatched subagent finished. The facade delivers the final text to
-    /// the Captain as a peer message and triggers a turn (generalizes the
-    /// retired `SailorCompleted`).
+    /// the Captain as a peer message and triggers a turn.
     SteerDelivered {
         from: manox_harness::steer_bus::AgentId,
         reason: manox_harness::steer_bus::SteerReason,

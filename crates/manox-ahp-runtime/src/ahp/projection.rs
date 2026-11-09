@@ -1,7 +1,7 @@
 //! Kernel session records → AHP actions.
 //!
 //! The kernel's jsonl session store is the only durable authority (§C, L3/L4);
-//! this module is the single projection from its [`SessionTreeEntry`] records
+//! this module is the single projection from its [`Event`] records
 //! to the AHP actions that carry the same facts, paired with the channel they
 //! belong on. There is no intermediate wire vocabulary: the record's own
 //! fields drive every arm, so a new kernel variant fails to compile here —
@@ -71,7 +71,8 @@ use ahp_types::state::{
     ToolCallConfirmationReason, ToolCallConfirmationState, ToolCallPendingConfirmationState,
     ToolCallResult, ToolCallState, ToolInput, ToolResultContent, ToolResultTextContent, UsageInfo,
 };
-use manox_harness::session::SessionTreeEntry;
+use manox_harness::session::Event;
+use manox_harness::session::UserEntryUi;
 use manox_harness::types::{AgentMessage, ContentBlock};
 use serde_json::{Value, json};
 
@@ -195,8 +196,8 @@ impl Target {
 
 /// Which channel a kernel record lands on — the compile-time totality gate:
 /// a kernel variant added without deciding where it lands is a compile error.
-pub(crate) fn target_of(entry: &SessionTreeEntry) -> Target {
-    use SessionTreeEntry as E;
+pub(crate) fn target_of(entry: &Event) -> Target {
+    use Event as E;
     match entry {
         // ── transcript ───────────────────────────────────────────────
         E::Message { .. } | E::UiNote { .. } | E::Custom { .. } | E::CustomMessage { .. } => {
@@ -516,7 +517,13 @@ struct PendingUser {
 #[derive(Debug, Clone)]
 enum Outcome {
     Complete,
-    Cancelled,
+    /// A cancelled turn. `reason` is the closer's own explanation when it has
+    /// one — the restore reconciliation and the orphan-close below both write
+    /// `"host exited"`, the same verdict the cold seed synthesizes for a dead
+    /// host's open turn.
+    Cancelled {
+        reason: Option<String>,
+    },
     Failed(ErrorInfo),
 }
 
@@ -524,7 +531,7 @@ impl Outcome {
     fn tag(&self) -> &'static str {
         match self {
             Outcome::Complete => "complete",
-            Outcome::Cancelled => "cancelled",
+            Outcome::Cancelled { .. } => "cancelled",
             Outcome::Failed(_) => "failed",
         }
     }
@@ -648,6 +655,9 @@ struct MessageRow<'a> {
     usage: Option<&'a UsageRow>,
     origin_rpc: Option<&'a str>,
     display: Option<bool>,
+    /// Entry-level authorship of a user row (the journal fact the turn's
+    /// opening `_meta` surfaces).
+    ui: Option<&'a UserEntryUi>,
 }
 
 /// One transcript row decoded from the kernel's [`AgentMessage`] shape —
@@ -916,7 +926,7 @@ impl Translator {
         chat_id: &str,
         session_id: &str,
         seq: u64,
-        entry: &SessionTreeEntry,
+        entry: &Event,
     ) -> Vec<Emitted> {
         let row = Envelope {
             seq,
@@ -932,8 +942,11 @@ impl Translator {
         let mut out = Vec::new();
         match entry {
             // ── transcript ───────────────────────────────────────────────
-            SessionTreeEntry::Message {
-                message, origin, ..
+            Event::Message {
+                message,
+                origin,
+                ui,
+                ..
             } => {
                 let decoded = decode_message(message, origin.as_deref());
                 self.on_message(
@@ -945,11 +958,12 @@ impl Translator {
                         usage: decoded.usage.as_ref(),
                         origin_rpc: decoded.origin_rpc.as_deref(),
                         display: decoded.display,
+                        ui: ui.as_ref(),
                     },
                     &mut out,
                 );
             }
-            SessionTreeEntry::UiNote { note, .. } => {
+            Event::UiNote { note, .. } => {
                 let kind = note
                     .get("kind")
                     .and_then(|v| v.as_str())
@@ -964,7 +978,7 @@ impl Translator {
                     &mut out,
                 );
             }
-            SessionTreeEntry::Custom {
+            Event::Custom {
                 custom_type, data, ..
             } => {
                 let data = data.clone().unwrap_or(Value::Null);
@@ -977,7 +991,7 @@ impl Translator {
                     &mut out,
                 );
             }
-            SessionTreeEntry::CustomMessage {
+            Event::CustomMessage {
                 custom_type,
                 content,
                 display,
@@ -1000,11 +1014,12 @@ impl Translator {
                 );
             }
             // ── turn lifecycle ───────────────────────────────────────────
-            SessionTreeEntry::TurnStart { .. } => self.on_turn_start(&chat, &row, &mut out),
-            SessionTreeEntry::TurnFinish {
+            Event::TurnStart { .. } => self.on_turn_start(&chat, &row, &mut out),
+            Event::TurnFinish {
                 cancelled,
                 failed,
                 stranded_steer_ids,
+                reason,
                 ..
             } => {
                 let outcome = if *failed {
@@ -1022,7 +1037,9 @@ impl Translator {
                         }))),
                     })
                 } else if *cancelled {
-                    Outcome::Cancelled
+                    Outcome::Cancelled {
+                        reason: reason.clone(),
+                    }
                 } else {
                     Outcome::Complete
                 };
@@ -1055,8 +1072,8 @@ impl Translator {
             // right behind the last stop. Closing the turn here split every
             // agentic turn per tool round and minted a "stopped: …" notice
             // per round.
-            SessionTreeEntry::Stop { .. } => {}
-            SessionTreeEntry::ErrorEvent { message, .. } => self.close_turn(
+            Event::Stop { .. } => {}
+            Event::ErrorEvent { message, .. } => self.close_turn(
                 &chat,
                 &row,
                 Outcome::Failed(ErrorInfo {
@@ -1067,7 +1084,7 @@ impl Translator {
                 }),
                 &mut out,
             ),
-            SessionTreeEntry::Retry {
+            Event::Retry {
                 attempt,
                 max_attempts,
                 delay_secs,
@@ -1098,14 +1115,14 @@ impl Translator {
                 );
             }
             // ── streaming ────────────────────────────────────────────────
-            SessionTreeEntry::AgentTextDelta { delta, .. } => {
+            Event::AgentTextDelta { delta, .. } => {
                 self.on_delta(&chat, &row, Run::Text, delta, &mut out);
             }
-            SessionTreeEntry::AgentThinkingDelta { delta, .. } => {
+            Event::AgentThinkingDelta { delta, .. } => {
                 self.on_delta(&chat, &row, Run::Thinking, delta, &mut out);
             }
             // ── tool activity ────────────────────────────────────────────
-            SessionTreeEntry::ToolCall {
+            Event::ToolCall {
                 call_id,
                 name,
                 title,
@@ -1118,17 +1135,17 @@ impl Translator {
                     &chat, &session, &row, call_id, name, title, status, &input, &mut out,
                 );
             }
-            SessionTreeEntry::ToolResult {
+            Event::ToolResult {
                 call_id,
                 output,
                 is_error,
                 ..
             } => self.on_tool_result(&chat, &row, call_id, output, *is_error, &mut out),
-            SessionTreeEntry::ToolOutputChunk { call_id, chunk, .. } => {
+            Event::ToolOutputChunk { call_id, chunk, .. } => {
                 self.on_tool_output(&chat, &row, call_id, chunk, &mut out);
             }
             // ── adjudications ────────────────────────────────────────────
-            SessionTreeEntry::Approval {
+            Event::Approval {
                 kind,
                 auth_id,
                 payload,
@@ -1148,7 +1165,7 @@ impl Translator {
                     &mut out,
                 );
             }
-            SessionTreeEntry::Question {
+            Event::Question {
                 kind,
                 auth_id,
                 payload,
@@ -1169,7 +1186,7 @@ impl Translator {
                 );
             }
             // ── sub-agent activity ───────────────────────────────────────
-            SessionTreeEntry::SubagentChild { .. } => {
+            Event::SubagentChild { .. } => {
                 // One child session's lifecycle event, in the parent
                 // transcript's order — and nothing to push for it: the
                 // sub-agent tree is `x-manox-work` state (the Progress rows
@@ -1177,7 +1194,7 @@ impl Translator {
                 // transcript with a card per spawn/exit the moment the bridge
                 // streamed again.
             }
-            SessionTreeEntry::RunStarted {
+            Event::RunStarted {
                 run_id,
                 kind,
                 label,
@@ -1269,7 +1286,7 @@ impl Translator {
                     ));
                 }
             }
-            SessionTreeEntry::RunSettled {
+            Event::RunSettled {
                 run_id,
                 settlement,
                 verdict,
@@ -1351,7 +1368,7 @@ impl Translator {
                     &mut out,
                 );
             }
-            SessionTreeEntry::RunContinued {
+            Event::RunContinued {
                 run_id,
                 kind,
                 follow_up,
@@ -1424,7 +1441,7 @@ impl Translator {
                     ),
                 ));
             }
-            SessionTreeEntry::RunEscalated {
+            Event::RunEscalated {
                 run_id, question, ..
             } => {
                 // The child's clarifying question, attributed and visible to
@@ -1446,7 +1463,7 @@ impl Translator {
                     &mut out,
                 );
             }
-            SessionTreeEntry::RunGuided { run_id, text, .. } => {
+            Event::RunGuided { run_id, text, .. } => {
                 // The dispatcher's mid-run guidance, attributed and visible
                 // to the agent and the user alike — the same face as a
                 // settlement or an escalation note. The child's own
@@ -1460,12 +1477,12 @@ impl Translator {
                     &mut out,
                 );
             }
-            SessionTreeEntry::SubagentProgress { .. } => {
+            Event::SubagentProgress { .. } => {
                 // Retired forwarding rows: run/* rows are the only
                 // background-work truth (no `_meta` payload, no per-tick
                 // refresh). Old journals still parse; they fold to nothing.
             }
-            SessionTreeEntry::ActiveToolsChange {
+            Event::ActiveToolsChange {
                 active_tool_names, ..
             } => out.push(Emitted::new(
                 &at,
@@ -1475,13 +1492,13 @@ impl Translator {
                 ),
             )),
             // ── session state ────────────────────────────────────────────
-            SessionTreeEntry::Title { title, .. } => out.push(Emitted::new(
+            Event::Title { title, .. } => out.push(Emitted::new(
                 &session,
                 StateAction::SessionTitleChanged(SessionTitleChangedAction {
                     title: title.clone(),
                 }),
             )),
-            SessionTreeEntry::CwdChange { cwd, .. } => {
+            Event::CwdChange { cwd, .. } => {
                 // AHP models working directories as a *granted set*; the effective
                 // directory is not a protocol field, so the grant rides the
                 // membership action and the effective value rides the config model.
@@ -1501,26 +1518,26 @@ impl Translator {
                     config_changed(json!({config_keys::WORKING_DIRECTORY: cwd})),
                 ));
             }
-            SessionTreeEntry::ProjectChange { path, .. } => out.push(Emitted::new(
+            Event::ProjectChange { path, .. } => out.push(Emitted::new(
                 &session,
                 config_changed(json!({config_keys::PROJECT: path})),
             )),
-            SessionTreeEntry::ModelChange {
+            Event::ModelChange {
                 provider, model_id, ..
             } => out.push(Emitted::new(
                 &session,
                 // Canonical `{provider}/{model}` on the wire (L8).
                 config_changed(json!({config_keys::MODEL: format!("{provider}/{model_id}")})),
             )),
-            SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => out.push(Emitted::new(
+            Event::ThinkingLevelChange { thinking_level, .. } => out.push(Emitted::new(
                 &session,
                 config_changed(json!({config_keys::REASONING_EFFORT: thinking_level})),
             )),
-            SessionTreeEntry::AccessModeChange { mode, .. } => out.push(Emitted::new(
+            Event::AccessModeChange { mode, .. } => out.push(Emitted::new(
                 &session,
                 config_changed(json!({config_keys::ACCESS_MODE: mode})),
             )),
-            SessionTreeEntry::PinnedArchived {
+            Event::PinnedArchived {
                 pinned, archived, ..
             } => {
                 out.push(Emitted::new(
@@ -1538,17 +1555,16 @@ impl Translator {
                     extension_action(ext::actions::PINNED_CHANGED, json!({"pinned": pinned})),
                 ));
             }
-            SessionTreeEntry::Label { label, .. } => out.push(Emitted::new(
+            Event::Label { label, .. } => out.push(Emitted::new(
                 &thread,
                 // A `None` label rides as the empty string — the fold holds
-                // `Some("")`, the same shape the v2 wire row carried (parity,
-                // not a clear).
+                // `Some("")` rather than clearing.
                 extension_action(
                     ext::actions::LABEL_CHANGED,
                     json!({"label": label.clone().unwrap_or_default()}),
                 ),
             )),
-            SessionTreeEntry::SessionInfo { name, .. } => out.push(Emitted::new(
+            Event::SessionInfo { name, .. } => out.push(Emitted::new(
                 &thread,
                 // The row rides nested under `data`: the fold reads that key,
                 // and a bare flatten would scatter the row's fields across the
@@ -1558,18 +1574,17 @@ impl Translator {
                     json!({"data": {"name": name}}),
                 ),
             )),
-            SessionTreeEntry::Leaf { target_id, .. } => out.push(Emitted::new(
+            Event::Leaf { target_id, .. } => out.push(Emitted::new(
                 &thread,
                 // A `None` target rides as the empty target id — the fold
-                // holds `Some("")`, the same shape the v2 wire row carried
-                // (parity, not a root reset).
+                // holds `Some("")` rather than resetting to the root.
                 extension_action(
                     ext::actions::LEAF_CHANGED,
                     json!({"targetId": target_id.clone().unwrap_or_default()}),
                 ),
             )),
             // ── annotations ──────────────────────────────────────────────
-            SessionTreeEntry::AnnotationSet { annotation, .. } => {
+            Event::AnnotationSet { annotation, .. } => {
                 // The row rides the AHP `Annotation` JSON verbatim; a row that
                 // does not parse as one is skipped loudly — the durable state
                 // stays as the last valid row left it.
@@ -1598,27 +1613,27 @@ impl Translator {
                     ),
                 }
             }
-            SessionTreeEntry::AnnotationRemoved { annotation_id, .. } => out.push(Emitted::new(
+            Event::AnnotationRemoved { annotation_id, .. } => out.push(Emitted::new(
                 &at,
                 StateAction::AnnotationsRemoved(ahp_types::actions::AnnotationsRemovedAction {
                     annotation_id: annotation_id.clone(),
                 }),
             )),
             // ── plan (execution snapshot) ──────────────────────────────
-            SessionTreeEntry::PlanUpdate { snapshot, .. } => out.push(Emitted::new(
+            Event::PlanUpdate { snapshot, .. } => out.push(Emitted::new(
                 &at,
                 extension_action(ext::actions::PLAN_CHANGED, json!({"snapshot": snapshot})),
             )),
             // ── work ─────────────────────────────────────────────────────
-            SessionTreeEntry::Goal { goal, .. } => out.push(Emitted::new(
+            Event::Goal { goal, .. } => out.push(Emitted::new(
                 &at,
                 extension_action(ext::actions::WORK_GOAL_CHANGED, json!({"goal": goal})),
             )),
-            SessionTreeEntry::BrowserSuites { suites, .. } => out.push(Emitted::new(
+            Event::BrowserSuites { suites, .. } => out.push(Emitted::new(
                 &at,
                 extension_action(ext::actions::WORK_BROWSER_SUITES, json!({"suites": suites})),
             )),
-            SessionTreeEntry::BackgroundTask { snapshot, .. } => out.push(Emitted::new(
+            Event::BackgroundTask { snapshot, .. } => out.push(Emitted::new(
                 &at,
                 extension_action(
                     ext::actions::WORK_BACKGROUND_TASKS,
@@ -1626,7 +1641,7 @@ impl Translator {
                 ),
             )),
             // ── metrics ──────────────────────────────────────────────────
-            SessionTreeEntry::Metrics {
+            Event::Metrics {
                 metric_type, data, ..
             } => out.push(Emitted::new(
                 &at,
@@ -1636,7 +1651,7 @@ impl Translator {
                 ),
             )),
             // ── compaction and branch summaries ──────────────────────────
-            SessionTreeEntry::Compaction {
+            Event::Compaction {
                 summary,
                 tokens_before,
                 retained_tail,
@@ -1671,7 +1686,7 @@ impl Translator {
                     &mut out,
                 );
             }
-            SessionTreeEntry::CompactionStarted { tokens_before, .. } => {
+            Event::CompactionStarted { tokens_before, .. } => {
                 // Activity, not transcript: a spinner edge carries no content.
                 let activity = format!("compacting ({tokens_before} tokens)");
                 out.push(Emitted::new(
@@ -1682,7 +1697,7 @@ impl Translator {
                 ));
                 mirror_activity(&chat, &session, Some(activity), &mut out);
             }
-            SessionTreeEntry::BranchSummary { summary, .. } => self.push_note(
+            Event::BranchSummary { summary, .. } => self.push_note(
                 &chat,
                 &row,
                 summary.clone(),
@@ -1707,12 +1722,27 @@ impl Translator {
             usage,
             origin_rpc,
             display,
+            ui,
         } = row;
         match role {
             "user" => {
                 let mut row = json!({"role": role, "entryId": entry.id});
                 if let Some(rpc) = origin_rpc {
                     row["originRpc"] = json!(rpc);
+                }
+                // Authorship is the row's own fact: the fold surfaces it on
+                // the message that opens the turn — carried through
+                // `pending_user` untouched, or re-issued for the initiating /
+                // steer row — so live and replayed views agree without an
+                // ordinal count or a sidecar read.
+                if let Some(ui) = ui {
+                    row["author"] = json!(ui.author);
+                    if ui.peer {
+                        row["peer"] = json!(true);
+                    }
+                    if let Some(display_text) = &ui.display_text {
+                        row["displayText"] = json!(display_text);
+                    }
                 }
                 let message = Message {
                     text: blocks_text(content),
@@ -1939,8 +1969,19 @@ impl Translator {
         if let Some(open) = self.open.take() {
             // A `turnStart` with a turn still open means the previous turn never
             // closed (a crash between rows). Close it first: AHP's reducer replaces
-            // the active turn, and its parts would vanish otherwise.
-            self.finish_turn(&open, chat, Outcome::Complete, entry, false, out);
+            // the active turn, and its parts would vanish otherwise. The verdict is
+            // the one the cold seed synthesizes for a dead host's turn — cancelled,
+            // with the host-exited reason — never a completion.
+            self.finish_turn(
+                &open,
+                chat,
+                Outcome::Cancelled {
+                    reason: Some("host exited".to_string()),
+                },
+                entry,
+                false,
+                out,
+            );
         }
         let carried = self.pending_user.pop_front();
         let (message, queued_message_id, opening_text) = match carried {
@@ -2465,6 +2506,17 @@ impl Translator {
         let duration = elapsed_ms(&open.started_at, &entry.timestamp);
         let failed = matches!(outcome, Outcome::Failed(_));
         let mut meta = json!({"entryId": entry.id, "outcome": outcome.tag()});
+        if let Outcome::Cancelled {
+            reason: Some(reason),
+        } = &outcome
+        {
+            // A close with a reason is the dead-host verdict, and the cold
+            // seed serves exactly `{outcome: "aborted", reason: "host
+            // exited"}` for the same chain — the fold must agree or
+            // `snapshot == fold(replay)` breaks.
+            meta["outcome"] = json!("aborted");
+            meta["reason"] = json!(reason);
+        }
         if open.synthetic {
             meta["synthetic"] = json!(true);
         }
@@ -2547,7 +2599,7 @@ impl Translator {
                 },
                 meta: Some(manox_meta(meta)),
             }),
-            Outcome::Cancelled => StateAction::ChatTurnCancelled(ChatTurnCancelledAction {
+            Outcome::Cancelled { .. } => StateAction::ChatTurnCancelled(ChatTurnCancelledAction {
                 turn_id: open.id.clone(),
                 duration,
                 meta: Some(manox_meta(meta)),
@@ -3411,7 +3463,7 @@ fn whole(count: u64) -> Option<i64> {
 /// The base stamps (id / parent / timestamp) apply unless the fields object
 /// overrides them.
 #[cfg(test)]
-fn kernel(mut fields: Value) -> SessionTreeEntry {
+fn kernel(mut fields: Value) -> Event {
     let mut base = json!({
         "id": "e-1",
         "parentId": None::<String>,
@@ -3664,7 +3716,7 @@ mod tests {
                 let action = serde_json::to_value(&e.action).ok()?;
                 (action["type"] == "chat/backgroundWorkSet").then_some(action)
             })
-            .expect("the legacy row still re-opens its entry");
+            .expect("the stored row still re-opens its entry");
         assert!(action["work"]["_meta"].get("agentType").is_none());
         assert_eq!(action["work"]["_meta"]["agentColor"], "pink");
     }
@@ -3772,10 +3824,9 @@ mod tests {
             "the host shape reaches the registry view verbatim, keyed by task id"
         );
 
-        // The registry property the whole-field fold used to break: a second
-        // task's row joins the view instead of replacing it, so a
-        // reconnecting client's baseline carries every task the journal has
-        // rows for.
+        // The registry property a whole-field fold breaks: a second task's
+        // row joins the view instead of replacing it, so a reconnecting
+        // client's baseline carries every task the journal has rows for.
         assert_eq!(
             state
                 .background_tasks
@@ -3805,7 +3856,7 @@ mod tests {
             kernel(json!({"type": "turn_finish", "id": "e-5",
                           "cancelled": false, "failed": false, "strandedSteerIds": []})),
         ];
-        let project = |records: &[SessionTreeEntry]| {
+        let project = |records: &[Event]| {
             let mut translator = Translator::new();
             records
                 .iter()
@@ -3893,19 +3944,20 @@ mod tests {
         let mut seq = 0u64;
         for event in &events {
             if let AgentEvent::MessageEnd { message } = event {
-                entries.push(SessionTreeEntry::Message {
+                entries.push(Event::Message {
                     id: format!("m-{seq}"),
                     parent_id: None,
                     timestamp: chrono::Utc::now(),
                     message: (**message).clone(),
                     origin: None,
+                    ui: None,
                 });
                 seq += 1;
                 continue;
             }
             for (kind, payload) in child_journal_rows(event) {
                 entries.push(
-                    SessionTreeEntry::from_kind_payload(
+                    Event::from_kind_payload(
                         kind,
                         format!("e-{seq}"),
                         None,
@@ -4018,11 +4070,162 @@ mod turn_message_tests {
             "the meta must not carry the owner: {meta:?}"
         );
     }
+
+    /// A user row carrying its entry-level authorship.
+    fn attributed_user_row(id: &str, text: &str, ui: Value) -> Event {
+        let mut fields = json!({
+            "type": "message",
+            "id": id,
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        });
+        if !ui.is_null() {
+            fields["ui"] = ui;
+        }
+        kernel(fields)
+    }
+
+    fn turn_close(id: &str) -> Event {
+        kernel(json!({
+            "type": "turn_finish",
+            "id": id,
+            "cancelled": false,
+            "failed": false,
+            "strandedSteerIds": [],
+        }))
+    }
+
+    /// Every turn-opening message's `_meta["x-manox"]`, in emission order.
+    fn turn_opening_metas(rows: &[Event]) -> Vec<Value> {
+        let mut translator = Translator::new();
+        let mut metas = Vec::new();
+        for (seq, entry) in rows.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatTurnStarted(action) = emitted.action
+                    && let Some(meta) = action.message.meta
+                {
+                    metas.push(meta[ext::META_KEY].clone());
+                }
+            }
+        }
+        metas
+    }
+
+    /// The campaign fixture: one turn opened per authorship flavour.
+    fn authorship_fixture() -> Vec<Event> {
+        vec![
+            attributed_user_row("e-0", "seed the plan", json!({"author": "harness"})),
+            kernel(json!({"type": "agent_text_delta", "id": "e-1", "delta": "planning"})),
+            turn_close("e-2"),
+            attributed_user_row("e-3", "a human prompt", Value::Null),
+            kernel(json!({"type": "agent_text_delta", "id": "e-4", "delta": "working"})),
+            turn_close("e-5"),
+            attributed_user_row(
+                "e-6",
+                "[from Sailor] wrapped",
+                json!({"author": "Sailor", "peer": true, "displayText": "unwrapped body"}),
+            ),
+            kernel(json!({"type": "agent_text_delta", "id": "e-7", "delta": "peer reply"})),
+            turn_close("e-8"),
+            attributed_user_row("e-9", "lead seed", json!({"author": "lead"})),
+            kernel(json!({"type": "agent_text_delta", "id": "e-10", "delta": "leading"})),
+            turn_close("e-11"),
+        ]
+    }
+
+    /// The journal line is the only attribution channel: folding the live
+    /// records and folding their disk round-trip (a reopen replays exactly
+    /// these lines) yields the same `_meta.author` per opening turn.
+    #[test]
+    fn authorship_rides_the_turn_opening_meta_live_and_replayed() {
+        let live_rows = authorship_fixture();
+        let live = turn_opening_metas(&live_rows);
+        let replayed_rows: Vec<Event> = live_rows
+            .iter()
+            .map(|row| {
+                let line = serde_json::to_string(row).expect("a journal line serializes");
+                serde_json::from_str(&line).expect("a journal line reads back")
+            })
+            .collect();
+        let replayed = turn_opening_metas(&replayed_rows);
+        assert_eq!(
+            live, replayed,
+            "live and replayed folds read the same attribution off the row"
+        );
+        let authors: Vec<&str> = live
+            .iter()
+            .map(|meta| meta["author"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            authors,
+            vec!["harness", "", "Sailor", "lead"],
+            "harness / human / peer / lead: {live:?}"
+        );
+        assert!(
+            live[1].get("author").is_none(),
+            "a human row stays unattributed: {live:?}"
+        );
+    }
+
+    /// A harness-injected notice is a user row with authorship, not a plain
+    /// user row: the fold says who injected it.
+    #[test]
+    fn a_harness_injected_notice_folds_as_harness_authorship() {
+        let rows = vec![
+            attributed_user_row(
+                "e-0",
+                "[harness] the model switched",
+                json!({"author": "harness"}),
+            ),
+            kernel(json!({"type": "agent_text_delta", "id": "e-1", "delta": "ack"})),
+        ];
+        let metas = turn_opening_metas(&rows);
+        assert_eq!(metas.len(), 1, "one opening turn: {metas:?}");
+        assert_eq!(metas[0]["author"], json!("harness"));
+        assert!(
+            metas[0].get("peer").is_none(),
+            "a notice is not a peer delivery: {metas:?}"
+        );
+    }
+
+    /// Peer delivery keeps its display form and its peer flag on the opening
+    /// message, so the restored bubble matches the live one.
+    #[test]
+    fn a_peer_delivery_keeps_display_text_and_the_peer_flag() {
+        let rows = vec![
+            attributed_user_row(
+                "e-0",
+                "[from Sailor] wrapped",
+                json!({"author": "Sailor", "peer": true, "displayText": "unwrapped body"}),
+            ),
+            kernel(json!({"type": "agent_text_delta", "id": "e-1", "delta": "got it"})),
+        ];
+        let metas = turn_opening_metas(&rows);
+        assert_eq!(metas[0]["author"], json!("Sailor"));
+        assert_eq!(metas[0]["peer"], json!(true));
+        assert_eq!(metas[0]["displayText"], json!("unwrapped body"));
+    }
+
+    /// A steer row (a user row arriving on an open, content-carrying turn)
+    /// opens its own turn and carries its own authorship there.
+    #[test]
+    fn a_steer_row_carries_its_authorship_into_its_own_turn() {
+        let rows = vec![
+            attributed_user_row("e-0", "start", Value::Null),
+            kernel(json!({"type": "agent_text_delta", "id": "e-1", "delta": "running"})),
+            attributed_user_row("e-2", "inject", json!({"author": "harness"})),
+        ];
+        let metas = turn_opening_metas(&rows);
+        assert_eq!(metas.len(), 2, "the steer partitions the turn: {metas:?}");
+        assert!(
+            metas[0].get("author").is_none(),
+            "the human opening stays unattributed: {metas:?}"
+        );
+        assert_eq!(metas[1]["author"], json!("harness"));
+    }
 }
 
-/// The transcript-semantics gates, ported from the retired
-/// `translation_convergence` suite when the wire vocabulary was deleted:
-/// the same `on_message` state machine, now driven by kernel records. Each
+/// The transcript-semantics gates: the same `on_message` state machine,
+/// now driven by kernel records. Each
 /// one pins a misclassification a happy-path fold cannot catch — a steer
 /// folded into the turn it interrupted puts the reply before the prompt, a
 /// stop row closed mid-loop splits one turn per tool round, a textless ask
@@ -4034,7 +4237,7 @@ mod fold_semantics_tests {
     /// Fold a journal's rows through one fresh translator and the chat
     /// reducer — the live fold's shape, and the shape the seed fold
     /// (`fold_journal_snapshot`) replays on attach.
-    fn fold(records: &[SessionTreeEntry]) -> (Vec<Emitted>, ahp_types::state::ChatState) {
+    fn fold(records: &[Event]) -> (Vec<Emitted>, ahp_types::state::ChatState) {
         let mut translator = Translator::new();
         let mut state = manox_ahp::channels::chat::initial("c-1");
         let mut emitted = Vec::new();
@@ -4049,7 +4252,7 @@ mod fold_semantics_tests {
 
     /// A turn, a mid-run steer under the client's steer id, and the turn's
     /// close — the rows a live steer produces on the kernel journal.
-    fn mid_run_steer_records() -> Vec<SessionTreeEntry> {
+    fn mid_run_steer_records() -> Vec<Event> {
         vec![
             kernel(json!({
                 "type": "message",
@@ -4274,6 +4477,94 @@ mod fold_semantics_tests {
             "Done.",
             "the reply follows the last steer"
         );
+    }
+
+    /// A `turn_start` over a turn the journal never closed closes the orphan
+    /// as a dead host's cancel — the verdict the cold seed synthesizes for the
+    /// same chain — never as a completion.
+    #[test]
+    fn a_turn_start_over_an_open_turn_closes_it_as_a_dead_host_cancel() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "u-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "hello"}]},
+                "origin": "rpc-submit",
+            })),
+            kernel(json!({"type": "turn_start", "id": "ts-1"})),
+            kernel(json!({"type": "agent_text_delta", "id": "d-2", "delta": "partial"})),
+            // The process died here: no `turn_finish` for ts-1.
+            kernel(json!({"type": "turn_start", "id": "ts-3"})),
+        ];
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut cancelled = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatTurnCancelled(action) = &emitted.action {
+                    cancelled.push(action.clone());
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        let action = cancelled
+            .first()
+            .expect("the orphaned turn closes with a cancel");
+        let meta = action
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("x-manox"))
+            .expect("the cancel carries the x-manox meta");
+        assert_eq!(meta.get("outcome"), Some(&json!("aborted")));
+        assert_eq!(meta.get("reason"), Some(&json!("host exited")));
+        assert_eq!(
+            state.turns[0].state,
+            ahp_types::state::TurnState::Cancelled,
+            "the orphaned turn folds settled, like the cold seed serves it"
+        );
+    }
+
+    /// A `turn_finish` that carries a reason (the restore reconciliation's
+    /// durable close) folds the same verdict as the cold seed: cancelled, with
+    /// the host-exited meta. `snapshot == fold(replay)` depends on it.
+    #[test]
+    fn a_reconciled_turn_finish_folds_the_dead_host_verdict() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "u-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "hello"}]},
+                "origin": "rpc-submit",
+            })),
+            kernel(json!({"type": "turn_start", "id": "ts-1"})),
+            kernel(json!({"type": "agent_text_delta", "id": "d-2", "delta": "partial"})),
+            kernel(json!({"type": "turn_finish", "id": "tf-3",
+                          "cancelled": true, "failed": false,
+                          "strandedSteerIds": [], "reason": "host exited"})),
+        ];
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut cancelled = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatTurnCancelled(action) = &emitted.action {
+                    cancelled.push(action.clone());
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        let action = cancelled.first().expect("the reconciled close cancels");
+        let meta = action
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("x-manox"))
+            .expect("the cancel carries the x-manox meta");
+        assert_eq!(meta.get("outcome"), Some(&json!("aborted")));
+        assert_eq!(meta.get("reason"), Some(&json!("host exited")));
+        assert_eq!(state.turns.len(), 1);
+        assert_eq!(state.turns[0].state, ahp_types::state::TurnState::Cancelled);
     }
 
     /// The steer turn's `queuedMessageId` is the ROW id, not a
@@ -5009,11 +5300,10 @@ mod fold_semantics_tests {
         );
     }
 
-    /// Records written by older engine builds state the AskUserQuestion
-    /// text in `header` alone — the `question` field is a later schema
-    /// addition (a device journal carries exactly this shape). The
-    /// elicitation must still carry the structured questions; an
-    /// unanswerable bare ask leaves the model waiting forever.
+    /// Records from older engine builds can state the AskUserQuestion text in
+    /// `header` alone, with no `question` field (a device journal carries
+    /// exactly this shape). The elicitation must still carry the structured
+    /// questions; an unanswerable bare ask leaves the model waiting forever.
     #[test]
     fn an_older_build_ask_payload_folds_its_questions_through_the_header() {
         let entry = kernel(json!({
@@ -5050,7 +5340,7 @@ mod fold_semantics_tests {
         assert_eq!(
             questions.len(),
             1,
-            "the v1 payload still yields its question"
+            "the older payload still yields its question"
         );
         let single = match &questions[0] {
             ahp_types::state::ChatInputQuestion::SingleSelect(s) => s,
@@ -5646,7 +5936,7 @@ mod fold_semantics_tests {
 mod preview_edits_tests {
     use super::*;
 
-    fn kernel(mut fields: Value) -> SessionTreeEntry {
+    fn kernel(mut fields: Value) -> Event {
         let mut base = json!({
             "id": "e-1",
             "parentId": None::<String>,
@@ -5803,7 +6093,7 @@ mod preview_edits_tests {
 mod annotations_tests {
     use super::*;
 
-    fn kernel(mut fields: Value) -> SessionTreeEntry {
+    fn kernel(mut fields: Value) -> Event {
         let mut base = json!({
             "id": "e-1",
             "parentId": None::<String>,
@@ -6019,7 +6309,7 @@ mod extension_gate_tests {
         // channel it must ride (an action on the WRONG extension channel
         // still folds — into the wrong bag — so `is_extension_channel` alone
         // cannot catch it).
-        let host_cases: Vec<(SessionTreeEntry, &str, &str)> = vec![
+        let host_cases: Vec<(Event, &str, &str)> = vec![
             (
                 kernel(json!({"type": "plan_update", "snapshot": {}})),
                 ext_actions::PLAN_CHANGED,
@@ -6173,7 +6463,7 @@ mod extension_gate_tests {
 mod tool_input_publication_tests {
     use super::*;
 
-    fn kernel(mut fields: Value) -> SessionTreeEntry {
+    fn kernel(mut fields: Value) -> Event {
         let mut base = json!({
             "id": "e-1",
             "parentId": None::<String>,
@@ -6189,7 +6479,7 @@ mod tool_input_publication_tests {
 
     /// Fold the records through the shared translator + reducer, exactly as a
     /// subscriber's baseline does, on both channels a client folds.
-    fn fold_both(records: &[SessionTreeEntry]) -> (ChatState, ahp_types::state::SessionState) {
+    fn fold_both(records: &[Event]) -> (ChatState, ahp_types::state::SessionState) {
         let mut translator = Translator::new();
         let mut chat = manox_ahp::channels::chat::initial("c-1");
         let mut session = manox_ahp::channels::session::initial("manox", None, None);
@@ -6202,7 +6492,7 @@ mod tool_input_publication_tests {
         (chat, session)
     }
 
-    fn fold(records: &[SessionTreeEntry]) -> ChatState {
+    fn fold(records: &[Event]) -> ChatState {
         fold_both(records).0
     }
 
@@ -6555,7 +6845,7 @@ mod tool_input_publication_tests {
 mod subagent_roster_tests {
     use super::*;
 
-    fn kernel(mut fields: Value) -> SessionTreeEntry {
+    fn kernel(mut fields: Value) -> Event {
         let mut base = json!({
             "id": "e-1",
             "parentId": None::<String>,
@@ -6569,7 +6859,7 @@ mod subagent_roster_tests {
             .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
     }
 
-    fn started(run_id: &str) -> SessionTreeEntry {
+    fn started(run_id: &str) -> Event {
         kernel(json!({
             "type": "run/started",
             "id": "e-2",
@@ -6583,7 +6873,7 @@ mod subagent_roster_tests {
         }))
     }
 
-    fn settled(run_id: &str) -> SessionTreeEntry {
+    fn settled(run_id: &str) -> Event {
         kernel(json!({
             "type": "run/settled",
             "id": "e-9",
@@ -6595,7 +6885,7 @@ mod subagent_roster_tests {
         }))
     }
 
-    fn escalated(run_id: &str) -> SessionTreeEntry {
+    fn escalated(run_id: &str) -> Event {
         kernel(json!({
             "type": "run/escalated",
             "id": "e-4",
@@ -6625,8 +6915,8 @@ mod subagent_roster_tests {
 
     /// The escalation note coaches the unified surface: `Steer` with
     /// `reason: "Dispatch"` addressed to the run id, no `to.spawn`. The
-    /// retired per-definition vocabulary must not resurface here — the note
-    /// is the only place the child's contract reaches the Captain's context.
+    /// per-definition vocabulary must not resurface here — the note is the
+    /// only place the child's contract reaches the Captain's context.
     #[test]
     fn an_escalation_note_coaches_the_unified_continuation() {
         let mut t = Translator::new();
@@ -6646,7 +6936,7 @@ mod subagent_roster_tests {
         );
         assert!(
             !text.contains("continue_run_id"),
-            "the retired parameter is gone from the coach: {text}"
+            "the `continue_run_id` parameter is gone from the coach: {text}"
         );
     }
 
@@ -6721,7 +7011,7 @@ mod run_roster_tests {
     use manox_ahp::ext::XManoxState;
     use manox_ahp::ext::reducer as ext_reducer;
 
-    fn kernel(mut fields: Value) -> SessionTreeEntry {
+    fn kernel(mut fields: Value) -> Event {
         let mut base = json!({
             "id": "e-1",
             "parentId": None::<String>,
@@ -6735,7 +7025,7 @@ mod run_roster_tests {
             .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
     }
 
-    fn started(run_id: &str, color: Option<&str>) -> SessionTreeEntry {
+    fn started(run_id: &str, color: Option<&str>) -> Event {
         let mut fields = json!({
             "type": "run/started",
             "id": "e-2",
@@ -6753,7 +7043,7 @@ mod run_roster_tests {
         kernel(fields)
     }
 
-    fn settled(run_id: &str, settlement: &str) -> SessionTreeEntry {
+    fn settled(run_id: &str, settlement: &str) -> Event {
         kernel(json!({
             "type": "run/settled",
             "id": "e-9",
@@ -6765,7 +7055,7 @@ mod run_roster_tests {
         }))
     }
 
-    fn continued(run_id: &str, kind: &str) -> SessionTreeEntry {
+    fn continued(run_id: &str, kind: &str) -> Event {
         kernel(json!({
             "type": "run/continued",
             "id": "e-12",
@@ -6821,7 +7111,7 @@ mod run_roster_tests {
 
     /// Fold the records, replaying every emission through the real ext
     /// reducer — the same path a fresh subscriber's baseline takes.
-    fn fold_roster(records: &[SessionTreeEntry]) -> XManoxState {
+    fn fold_roster(records: &[Event]) -> XManoxState {
         let mut translator = Translator::new();
         let mut state = XManoxState::default();
         for (seq, entry) in records.iter().enumerate() {
@@ -7012,7 +7302,7 @@ mod config_seat_tests {
         manox_ahp::channels::session::initial("manox", None, Some(crate::ahp::empty_config()))
     }
 
-    fn fold_config(records: &[SessionTreeEntry]) -> serde_json::Map<String, Value> {
+    fn fold_config(records: &[Event]) -> serde_json::Map<String, Value> {
         let mut translator = Translator::new();
         let mut session = seated_session();
         for (seq, entry) in records.iter().enumerate() {
@@ -7110,7 +7400,7 @@ mod config_seat_tests {
 mod tool_output_content_tests {
     use super::*;
 
-    fn kernel(mut fields: Value) -> SessionTreeEntry {
+    fn kernel(mut fields: Value) -> Event {
         let mut base = json!({
             "id": "e-1",
             "parentId": None::<String>,
@@ -7124,7 +7414,7 @@ mod tool_output_content_tests {
             .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
     }
 
-    fn records() -> Vec<SessionTreeEntry> {
+    fn records() -> Vec<Event> {
         vec![
             kernel(json!({"type": "turn_start", "id": "e-1"})),
             kernel(json!({
