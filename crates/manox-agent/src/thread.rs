@@ -7,8 +7,7 @@
 //! broadcast to the handle's subscribers. History is exposed as a display
 //! sequence (messages interleaved with persisted UI annotation cards) so the
 //! rebuild path (`ConversationState::rebuild_from_display`) replays it in
-//! order. The retired manox harness implementation was removed; see git
-//! history (or the `origin/Manox` backup branch) for it.
+//! order.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -256,8 +255,8 @@ pub enum ThreadEvent {
     /// `message_id` is that row's entry id. Synthesized by the CLIENT fold
     /// at row-arrival time so an injected steer card retires the instant
     /// its durable row appears (before the turn settles); the SERVER never
-    /// emits it. Shared vocabulary only: v2 never carries it on the wire
-    /// (`translate` skips it), and it joins no journal payload.
+    /// emits it. Shared vocabulary only: `translate` skips it, and it joins
+    /// no journal payload.
     UserRowLanded {
         message_id: String,
     },
@@ -1019,8 +1018,8 @@ impl Thread {
             None => Self::unfiled_cwd(&self.id),
         };
         let model = self.model.clone();
-        // The v1.0.0 core layout: one directory per session under its
-        // project bucket, the journal (`session.jsonl`) inside. The flat
+        // The core layout: one directory per session under its
+        // project bucket, the journal (`session.jsonl`) inside. A flat
         // `sessions/` tree is never written.
         let (sessions_dir, session_file) =
             crate::paths::core_session_parts(project.as_deref(), &self.id.0)
@@ -2168,7 +2167,7 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.respond_tool_authorization(id, response);
         }
-        // The verdict retired the card: drop the sidebar attention bit once
+        // The verdict clears the card: drop the sidebar attention bit once
         // nothing is parked. The gate entry is removed by the response, so
         // this reads the post-verdict set.
         if self.pending_auth_entries().is_empty() {
@@ -2451,10 +2450,8 @@ impl Thread {
 
     /// Run a markdown prompt-macro turn (`/plugin:command args`): render the
     /// command body with `{{ arguments }}` substituted and send it as a user
-    /// turn.
-    /// The retired manox harness additionally applies the macro's
-    /// `allowed-tools` filter for the turn; the harness runs its full
-    /// toolset.
+    /// turn. The turn runs with the harness's full toolset (no per-command
+    /// tool filter).
     pub fn submit_command(
         &mut self,
         name: &str,
@@ -2476,11 +2473,10 @@ impl Thread {
     }
 
     /// Run a skill turn: inject the named skill's body (description + body,
-    /// the user's args appended) as the user message, mirroring the retired
-    /// manox harness's `submit_skill`. The project layer under the thread's
-    /// cwd resolves on a registry miss; `disable-model-invocation` skills
-    /// stay reachable here — the flag hides them from the model, not from
-    /// the user's slash.
+    /// the user's args appended) as the user message. The project layer under
+    /// the thread's cwd resolves on a registry miss; `disable-model-invocation`
+    /// skills stay reachable here — the flag hides them from the model, not
+    /// from the user's slash.
     pub fn submit_skill(&mut self, key: &str, args: &str, ui: Option<MessageUiMetadata>) -> bool {
         let skill = crate::skill::global()
             .get(key)
@@ -3109,8 +3105,8 @@ pub(crate) mod tests {
 
     #[test]
     fn access_mode_maps_i64_roundtrip() {
-        // 1 = sandbox, 2 = full access; every other value (including the
-        // retired read-only 0) lands on the bounded default.
+        // 1 = sandbox, 2 = full access; every other value (including 0)
+        // lands on the bounded default.
         assert_eq!(AccessMode::from_i64(1), AccessMode::Sandbox);
         assert_eq!(AccessMode::from_i64(2), AccessMode::FullAccess);
         assert_eq!(AccessMode::Sandbox.as_i64(), 1);
@@ -3234,8 +3230,8 @@ pub(crate) mod tests {
         assert!(thread.with_mut(|t| t.run_slash_builtin("compact", "focus", None)));
         assert!(thread.with_mut(|t| t.run_slash_builtin("goal", "clear", None)));
 
-        // Session-level commands, the retired plan builtin, and unknowns are
-        // not owned here.
+        // Session-level commands, `/plan` (a skill, not a builtin), and
+        // unknowns are not owned here.
         assert!(!thread.with_mut(|t| t.run_slash_builtin("exit", "", None)));
         assert!(!thread.with_mut(|t| t.run_slash_builtin("quit", "", None)));
         assert!(!thread.with_mut(|t| t.run_slash_builtin("new", "", None)));
@@ -3436,7 +3432,7 @@ pub(crate) mod tests {
         );
         assert!(
             wire.get("user_attributions").is_none(),
-            "the sidecar no longer carries attribution: {wire}"
+            "the sidecar carries no attribution: {wire}"
         );
     }
 

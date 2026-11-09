@@ -1,6 +1,6 @@
 //! The process-singleton AHP runtime — one host, two transports.
 //!
-//! L11 survives the protocol change: a process owns exactly one AHP host, so
+//! L11: a process owns exactly one AHP host, so
 //! there is one `serverSeq` domain, one channel store and one set of
 //! subscriptions. Frontends differ only in how they reach it:
 //!
@@ -9,7 +9,7 @@
 //!   serialized and no port is opened.
 //! - **over websocket** — the gateway's `/ahp` route ([`AhpRuntime::router`]),
 //!   mounted on the same loopback listener (and the same token/lock/singleton
-//!   discipline) as the retiring v2 `/ws` route. Remote clients, VS Code's agent
+//!   discipline) as the rest of the gateway. Remote clients, VS Code's agent
 //!   window and AHPX all come in this way.
 //!
 //! Both legs serve the same [`Host`], so a state change published once reaches
@@ -225,7 +225,7 @@ impl AhpRuntime {
         }
     }
 
-    /// The gateway router carrying `/ahp` alongside the v2 route.
+    /// The gateway router carrying the `/ahp` route.
     #[cfg(feature = "ws-gateway")]
     pub fn router(&self, path: &str) -> axum::Router {
         manox_ahp::transport::axum_ws::router(path, (*self.host()).clone())
@@ -254,14 +254,14 @@ impl AhpRuntime {
 /// The process-singleton runtime, when it has been initialized.
 ///
 /// `None` in a host that never brought the AHP face up — a headless or napi
-/// embedder, or a test that only exercises the v2 path. Callers treat that as
+/// embedder, or a test that never starts the AHP face. Callers treat that as
 /// "this transport has no client", never as an error.
 pub fn try_runtime() -> Option<Arc<AhpRuntime>> {
     RUNTIME.get().map(Arc::clone)
 }
 
 /// The process-singleton runtime (L11). `cwd` only matters on first call, where
-/// it seeds the agent server identity the v2 hosts also use.
+/// it seeds the agent server identity.
 pub fn runtime(cwd: PathBuf) -> Arc<AhpRuntime> {
     Arc::clone(RUNTIME.get_or_init(|| {
         let build = *BUILDER.get().expect(

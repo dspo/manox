@@ -1,7 +1,7 @@
 //! The object store: projects and conversations as first-class durable
 //! rows in `~/.manox/core/objects.db`.
 //!
-//! Division of durable authority (v1.0.0):
+//! Division of durable authority:
 //!
 //! - The **journal** records the conversation process — messages, thinking,
 //!   tool calls and results, `cwd_change`. Reopening a conversation rebuilds

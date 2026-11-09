@@ -750,8 +750,8 @@ impl BrowserSuite {
     /// vocabulary (the gateway answers an error note, never a panic). This
     /// is the host-facing parse of the name the §D.3 setter carries: hosts
     /// that keep the suite as a plain string (the desktop app mirrors) run
-    /// it per item and skip the `None`s, so retired slugs in restored state
-    /// drop out without a compat read.
+    /// it per item and skip the `None`s, so slugs outside the vocabulary in
+    /// restored state drop out without a compat read.
     pub fn from_wire(name: &str) -> Option<Self> {
         match name {
             "webexplore" => Some(Self::WebExplore),
@@ -975,9 +975,6 @@ pub(super) fn build_tools(
     tools.push(Arc::new(crate::plan::UpdatePlanTool::new(
         notice_tx.clone(),
     )));
-    // Task tools (TaskCreate/TaskList/TaskUpdate/TaskGet) were removed in
-    // the tools-optimization cycle — they were retired with the Steer-based
-    // team architecture and UpdatePlan provides a strictly better alternative.
     // Goal tools ride ungated like AskUserQuestion — they persist the durable
     // goal contract, not filesystem side effects. Absent when the db is
     // unavailable.

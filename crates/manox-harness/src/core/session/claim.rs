@@ -11,7 +11,7 @@
 //
 //   untaken id        -> Mint(desired): the client drives the id it minted
 //   subagent lineage  -> refused: the id belongs to its parent's run
-//   archived          -> Mint(fresh): a retired identity is never reused
+//   archived          -> Mint(fresh): an archived identity is never reused
 //   blank             -> Reuse: the client's own not-yet-used id
 //   other directory   -> Conflict: explicit, never a silent redirect
 //   otherwise         -> Reuse: a retry drives the session it already owns

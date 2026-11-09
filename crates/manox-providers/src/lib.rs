@@ -1065,19 +1065,17 @@ pub fn known_agent_ids(config: &CxConfig) -> Vec<String> {
     ids
 }
 
-/// Canonicalize a config/registry agent id. Remaps legacy entries only:
-/// `codex-app` → `codex` (the CLI no longer proxies `cx codex app`),
-/// `Codex.app` → `ChatGPT.app` (the desktop app was renamed), and
-/// `codex+` → `codex` (the hidden fork entry was removed permanently, so
-/// stale config entries normalize onto the plain CLI). Old config `agents:`
-/// allow-lists keep working.
+/// Canonicalize a config/registry agent id: `codex-app` → `codex` (the CLI
+/// does not proxy `cx codex app`), `Codex.app` → `ChatGPT.app`, and `codex+`
+/// → `codex`. A config `agents:` allow-list keeps working across those
+/// spellings.
 pub fn canonical_agent_id(agent_id: &str) -> &str {
     match agent_id {
-        // Backward-compat for legacy config entries only; the CLI no longer proxies `codex app`.
+        // The plain CLI agent.
         "codex-app" => "codex",
-        // Backward-compat: the desktop agent was renamed Codex.app → ChatGPT.app.
+        // The same desktop agent under its current name.
         "Codex.app" => "ChatGPT.app",
-        // Backward-compat: the codex+ hidden fork was removed; legacy entries behave as codex.
+        // The plain CLI agent.
         "codex+" => "codex",
         _ => agent_id,
     }
@@ -1109,23 +1107,22 @@ pub fn agent_display_name(agent_id: &str) -> String {
 }
 
 /// Canonicalize + dedupe a config `agents:` section (first entry per canonical
-/// id wins) so legacy ids such as the removed `codex+` never round-trip back
-/// into the config file. A canonical (non-legacy) entry replaces a previously
-/// kept legacy duplicate, so the stale entry's bin/env/args payload never
-/// shadows the real one.
+/// id wins) so a `codex-app`/`codex+` spelling never round-trips back into the
+/// config file. A canonical entry replaces a previously kept alias duplicate,
+/// so the stale entry's bin/env/args payload never shadows the real one.
 pub fn normalize_agent_configs(agents: Vec<AgentConfig>) -> Vec<AgentConfig> {
     let mut normalized: Vec<(AgentConfig, bool)> = Vec::new();
     for mut agent in agents {
         let canonical = canonical_agent_id(&agent.id).to_string();
-        let legacy = canonical != agent.id;
+        let aliased = canonical != agent.id;
         agent.id = canonical;
         match normalized
             .iter()
             .position(|(existing, _)| existing.id == agent.id)
         {
-            Some(pos) if !legacy && normalized[pos].1 => normalized[pos] = (agent, false),
+            Some(pos) if !aliased && normalized[pos].1 => normalized[pos] = (agent, false),
             Some(_) => {}
-            None => normalized.push((agent, legacy)),
+            None => normalized.push((agent, aliased)),
         }
     }
     normalized.into_iter().map(|(agent, _)| agent).collect()
@@ -1316,7 +1313,7 @@ agents:
   bin: codex+
 "#;
         let config: CxConfig = yaml.parse().expect("parse");
-        // The picker candidates never surface the removed legacy id.
+        // The picker candidates never surface a `codex+` id.
         let ids = known_agent_ids(&config);
         assert!(!ids.iter().any(|id| id == "codex+"));
         assert_eq!(ids.iter().filter(|id| id.as_str() == "codex").count(), 1);
@@ -1978,10 +1975,10 @@ agents:
         );
     }
 
-    /// Legacy `agents: [Codex.app]` allow-lists written before the rename
-    /// still match the renamed `ChatGPT.app` agent.
+    /// A stored `agents: [Codex.app]` allow-list matches the `ChatGPT.app`
+    /// agent.
     #[test]
-    fn legacy_codex_app_filter_matches_chatgpt_app() {
+    fn stored_codex_app_filter_matches_chatgpt_app() {
         let yaml = r#"
 providers:
 - name: test

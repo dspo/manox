@@ -1,17 +1,16 @@
-// Immutable session identity (Session Core, format v1).
+// Immutable session identity (Session Core).
 //
-// A session's identity lives exactly once — in `header.json` inside its
-// directory under the state root — and is never rewritten after
+// A session's identity lives exactly once — in the journal header row
+// inside its directory under the state root — and is never rewritten after
 // publication. Every relationship a session has (its project anchor, its
 // subagent lineage) is a header field, not a mutable sidecar fact:
-// identity never migrates, so the redirect/supersede machinery of the
-// previous model has no equivalent here.
+// identity never migrates, and nothing redirects or supersedes it.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// On-disk format version of `header.json`. Bumped only when the header
-/// schema itself changes shape; the log carries its own evolution.
+/// Format version stamped into a session header. Bumped only when the
+/// header schema itself changes shape; the log carries its own evolution.
 pub const HEADER_FORMAT_VERSION: u32 = 1;
 
 /// Where the session came from. Root sessions are user conversations;
@@ -80,8 +79,8 @@ pub struct AgentPreset {
     pub reasoning_effort: Option<String>,
 }
 
-/// The immutable identity of one session, written once as `header.json`
-/// when the session first materializes and never touched again.
+/// The immutable identity of one session, published once as the journal's
+/// header row when the session first materializes and never touched again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionHeader {
@@ -150,7 +149,7 @@ impl SessionHeader {
 
 /// Mint a fresh session id (the claim driver's `Mint` arm and the swarm's
 /// child-id mint share this).
-/// A session's directory under the v1.0.0 core root
+/// A session's directory under the core root
 /// (`~/.manox/core/<project-slug>/<id>`). The state home follows the same
 /// resolution the provider config uses (`$HOME/.manox`).
 pub fn core_session_dir_for(cwd: &str, id: &str) -> std::path::PathBuf {

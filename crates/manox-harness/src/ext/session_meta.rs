@@ -30,11 +30,10 @@ pub struct SessionMeta {
     /// fence keeps admitting them. Empty (the default) = single-cwd.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub working_directories: Vec<String>,
-    /// Note: pre-W4 sidecars may still carry `plan_mode` / `plan_file`
-    /// keys, and retired copies of the access mode / reasoning effort
-    /// picks. All those fields are gone and `SessionMeta` ignores unknown
-    /// keys, so the stale values are inert — never read them as state (the
-    /// session-mutable config picks live in the journal's own rows).
+    /// Note: a sidecar may still carry `plan_mode` / `plan_file` keys and
+    /// older access-mode / reasoning-effort picks. `SessionMeta` ignores
+    /// unknown keys, so those values are inert — never read them as state
+    /// (the session-mutable config picks live in the journal's own rows).
     /// Last execution plan the model published via `UpdatePlan`, persisted so
     /// it survives compaction (the transcript's tool calls are summarized
     /// away) and restarts. Serialized `manox_agent::plan::PlanSnapshot`; `None`
@@ -80,8 +79,8 @@ pub struct SessionMeta {
 /// directory (and its lease) alone — dsh's shape — so its sidecar is a cache
 /// row beside the bucket: `<bucket>/cache/<id>.json`. Any other path (a
 /// caller outside the store, a test fixture) resolves to the same cache shape
-/// under `session_dir`, keyed by its file stem; the retired beside-the-file
-/// `<id>.meta.json` derivation is gone with the flat journal tree.
+/// under `session_dir`, keyed by its file stem; the cache never sits beside
+/// the journal.
 pub fn meta_path(session_dir: &Path, session_path: &Path) -> PathBuf {
     let is_journal = session_path.file_name().and_then(|name| name.to_str())
         == Some(crate::session::identity::JOURNAL_FILE);

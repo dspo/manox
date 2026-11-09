@@ -1,9 +1,8 @@
 //! The terminal channel (`ahp-terminal:/<id>`).
 //!
 //! AHP gives terminals a real channel with a claim (which client owns input)
-//! and command detection, which is strictly more than the v2 follow stream
-//! offered: several clients may observe one terminal, and ownership moves by
-//! dispatching `terminal/claimed`.
+//! and command detection: several clients may observe one terminal, and
+//! ownership moves by dispatching `terminal/claimed`.
 
 /// The terminal URI scheme prefix.
 pub const SCHEME: &str = "ahp-terminal:/";

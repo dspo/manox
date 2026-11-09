@@ -3,14 +3,12 @@
 //! [`SessionRuntime`] is what the AHP adapter speaks; this module is where those
 //! 22 methods land on the live session gateway. The adapter itself never names a
 //! gateway type — it holds a `dyn SessionRuntime` — so the two are coupled at
-//! exactly this file, and deleting the v2 wire half later cannot reach the
-//! adapter.
+//! exactly this file.
 //!
 //! **Every method here is a delegation, not a reimplementation.** The gateway's
-//! `AgentServerInner` intents are the one write path v2 and AHP have always
-//! shared (the same property `ahp_inner()` was introduced for); this adapter
-//! exists to give them a name the AHP side can hold without depending on the
-//! gateway's crate layout.
+//! `AgentServerInner` intents are the single write path; this adapter exists to
+//! give them a name the AHP side can hold without depending on the gateway's
+//! crate layout.
 
 use std::sync::Arc;
 
@@ -38,8 +36,8 @@ impl GatewayRuntime {
         }
     }
 
-    /// The wrapped server, for the gateway's own wiring (the `/ahp` route and
-    /// the v2 legs both need to reach it).
+    /// The wrapped server, for the gateway's own wiring (the `/ahp` route needs
+    /// to reach it).
     pub fn server(&self) -> &Arc<AgentServer> {
         &self.server
     }
@@ -358,8 +356,8 @@ impl SessionRuntime for GatewayRuntime {
         selected_option_id: Option<String>,
     ) -> Result<(), RuntimeError> {
         // The clicked option refines an approve verdict into its amendment
-        // shapes (the network host cards); an absent id (a legacy client,
-        // or the bare allow/deny pair) keeps the historical verdict.
+        // shapes (the network host cards); an absent id (the bare allow/deny
+        // pair) keeps the plain verdict.
         let decision = match (approved, selected_option_id.as_deref()) {
             (true, Some("allow_host_session")) => {
                 manox_agent::permission::PermissionDecision::AllowHostSession

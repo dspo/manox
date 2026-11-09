@@ -1,4 +1,4 @@
-// The event vocabulary of the session log (Session Core, format v1).
+// The event vocabulary of the session log (Session Core, format v4).
 //
 // One serde vocabulary is the whole durable schema: the log line IS the
 // wire form of an `Event` wrapped in an `Envelope`. The AHP projection
@@ -8,11 +8,9 @@
 // identity field never appears in an event payload — events carry id
 // references only, identity lives in the immutable header.
 //
-// The conversation domain (deltas, tool calls, turns) joins this enum when
-// the engine's writers are re-homed onto it; its row names are unchanged
-// from the previous journal, so the move is mechanical. This file starts
-// with the domains that have no legacy shape to inherit: session facts,
-// swarm lifecycle, and system notes.
+// The conversation domain (deltas, tool calls, turns) shares this enum with
+// session facts, swarm lifecycle, and system notes: one vocabulary, one
+// schema, no alternate row shapes.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -244,7 +242,7 @@ pub enum Event {
     // keys (`seq`/`id`/`parentId`/`timestamp`/`type`) are exclusive: payload
     // fields never reuse them, so tool handles are `callId` and subagent
     // handles `agentId` (§C.1 exclusivity rule).
-    /// A persisted UI note card (was the fire-and-forget AppendUiNote).
+    /// A persisted UI note card.
     #[serde(rename = "ui_note", rename_all = "camelCase")]
     UiNote {
         id: String,
@@ -813,11 +811,11 @@ mod tests {
         assert!(serde_json::from_str::<Envelope>(bad).is_err());
     }
 
-    /// A retired row name is refused like any other unknown one. The
-    /// vocabulary has no compatibility reads: a journal naming a row this
-    /// build does not write fails loudly instead of folding to a guess.
+    /// A row name this build does not write is refused like any other
+    /// unknown one. The vocabulary has no compatibility reads: such a
+    /// journal fails loudly instead of folding to a guess.
     #[test]
-    fn a_retired_row_name_is_refused_like_an_unknown_one() {
+    fn an_unwritten_row_name_is_refused_like_an_unknown_one() {
         let bad = r#"{"seq":1,"ts":"1970-01-01T00:00:00Z","type":"session/disposed","id":"e-1","parentId":null,"timestamp":"1970-01-01T00:00:00Z"}"#;
         assert!(serde_json::from_str::<Envelope>(bad).is_err());
     }

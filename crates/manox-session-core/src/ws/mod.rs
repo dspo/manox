@@ -168,7 +168,7 @@ pub(crate) fn publish(endpoint: GatewayEndpoint) {
     // §三.2: the file is CREATED with mode 0600 (OpenOptions::mode), never
     // write-then-chmod — the old order left a 0644 window on multi-user
     // machines carrying the live per-boot token. The follow-up
-    // set_permissions only tightens legacy files written by older builds;
+    // set_permissions only tightens files written with looser permissions;
     // it is not part of the fresh-file path's security.
     #[cfg(unix)]
     let write_result = (|| -> std::io::Result<()> {

@@ -47,7 +47,7 @@ pub fn current() -> Host {
 pub fn session_host(metadata: Option<&serde_json::Value>) -> Option<Host> {
     match metadata.and_then(|m| m.get("host")) {
         // A present but non-string (or unrecognized) value belongs to no
-        // host; only an absent key marks a pre-tag legacy file.
+        // host; only an absent key marks a file written before the tag.
         Some(value) => value.as_str().and_then(Host::from_slug),
         None => Some(Host::ManoxApp),
     }

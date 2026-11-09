@@ -21,7 +21,7 @@
 //! `manox-ahp-runtime::ahp::projection` is the single mapping, and the
 //! reducers (host and client run the same code) fold its output.
 //!
-//! Invariants kept from the v2 protocol are listed in the architecture doc §C.
+//! The architecture invariants are listed in the architecture doc §C.
 //! Two of them shape this crate:
 //!
 //! - **The kernel session store stays the only durable store.** Channel state

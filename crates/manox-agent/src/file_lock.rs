@@ -1,5 +1,5 @@
-//! Process-global file write lock registry (ported from the retired manox
-//! harness) + the kernel-path enforcement wrapper.
+//! Process-global file write lock registry + the kernel-path enforcement
+//! wrapper.
 //!
 //! NOWAIT try-lock: concurrent writes to the same path are rejected with an
 //! error so agents coordinate disjoint write ranges instead of silently
@@ -17,9 +17,8 @@
 //! Wiring: the kernel's Write/Edit tools are wrapped in
 //! [`FileLockedTool`], which acquires the path's lock for the duration of
 //! the actual execution window (approval round trips happen outside the
-//! lock) and rejects with the holder's name on conflict. The retired manox
-//! harness acquired inside its write/edit tools; the wrapper keeps the same
-//! scope without touching kernel tools.
+//! lock) and rejects with the holder's name on conflict. The wrapper keeps
+//! the lock's scope at the execution window without touching kernel tools.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -1,4 +1,4 @@
-// Round-trip a v3 JSONL session: append messages, rebuild context, switch
+// Round-trip a v4 JSONL session: append messages, rebuild context, switch
 // the leaf to branch, and reopen from disk. Covers #372 (storage format) and
 // #373 (entry types / leaf-as-entry).
 //

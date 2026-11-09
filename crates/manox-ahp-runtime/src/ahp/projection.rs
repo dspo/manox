@@ -1558,8 +1558,7 @@ impl Translator {
             Event::Label { label, .. } => out.push(Emitted::new(
                 &thread,
                 // A `None` label rides as the empty string — the fold holds
-                // `Some("")`, the same shape the v2 wire row carried (parity,
-                // not a clear).
+                // `Some("")` rather than clearing.
                 extension_action(
                     ext::actions::LABEL_CHANGED,
                     json!({"label": label.clone().unwrap_or_default()}),
@@ -1578,8 +1577,7 @@ impl Translator {
             Event::Leaf { target_id, .. } => out.push(Emitted::new(
                 &thread,
                 // A `None` target rides as the empty target id — the fold
-                // holds `Some("")`, the same shape the v2 wire row carried
-                // (parity, not a root reset).
+                // holds `Some("")` rather than resetting to the root.
                 extension_action(
                     ext::actions::LEAF_CHANGED,
                     json!({"targetId": target_id.clone().unwrap_or_default()}),
@@ -3718,7 +3716,7 @@ mod tests {
                 let action = serde_json::to_value(&e.action).ok()?;
                 (action["type"] == "chat/backgroundWorkSet").then_some(action)
             })
-            .expect("the legacy row still re-opens its entry");
+            .expect("the stored row still re-opens its entry");
         assert!(action["work"]["_meta"].get("agentType").is_none());
         assert_eq!(action["work"]["_meta"]["agentColor"], "pink");
     }
@@ -3826,10 +3824,9 @@ mod tests {
             "the host shape reaches the registry view verbatim, keyed by task id"
         );
 
-        // The registry property the whole-field fold used to break: a second
-        // task's row joins the view instead of replacing it, so a
-        // reconnecting client's baseline carries every task the journal has
-        // rows for.
+        // The registry property a whole-field fold breaks: a second task's
+        // row joins the view instead of replacing it, so a reconnecting
+        // client's baseline carries every task the journal has rows for.
         assert_eq!(
             state
                 .background_tasks
@@ -4227,9 +4224,8 @@ mod turn_message_tests {
     }
 }
 
-/// The transcript-semantics gates, ported from the retired
-/// `translation_convergence` suite when the wire vocabulary was deleted:
-/// the same `on_message` state machine, now driven by kernel records. Each
+/// The transcript-semantics gates: the same `on_message` state machine,
+/// now driven by kernel records. Each
 /// one pins a misclassification a happy-path fold cannot catch — a steer
 /// folded into the turn it interrupted puts the reply before the prompt, a
 /// stop row closed mid-loop splits one turn per tool round, a textless ask
@@ -5304,11 +5300,10 @@ mod fold_semantics_tests {
         );
     }
 
-    /// Records written by older engine builds state the AskUserQuestion
-    /// text in `header` alone — the `question` field is a later schema
-    /// addition (a device journal carries exactly this shape). The
-    /// elicitation must still carry the structured questions; an
-    /// unanswerable bare ask leaves the model waiting forever.
+    /// Records from older engine builds can state the AskUserQuestion text in
+    /// `header` alone, with no `question` field (a device journal carries
+    /// exactly this shape). The elicitation must still carry the structured
+    /// questions; an unanswerable bare ask leaves the model waiting forever.
     #[test]
     fn an_older_build_ask_payload_folds_its_questions_through_the_header() {
         let entry = kernel(json!({
@@ -5345,7 +5340,7 @@ mod fold_semantics_tests {
         assert_eq!(
             questions.len(),
             1,
-            "the v1 payload still yields its question"
+            "the older payload still yields its question"
         );
         let single = match &questions[0] {
             ahp_types::state::ChatInputQuestion::SingleSelect(s) => s,
@@ -6920,8 +6915,8 @@ mod subagent_roster_tests {
 
     /// The escalation note coaches the unified surface: `Steer` with
     /// `reason: "Dispatch"` addressed to the run id, no `to.spawn`. The
-    /// retired per-definition vocabulary must not resurface here — the note
-    /// is the only place the child's contract reaches the Captain's context.
+    /// per-definition vocabulary must not resurface here — the note is the
+    /// only place the child's contract reaches the Captain's context.
     #[test]
     fn an_escalation_note_coaches_the_unified_continuation() {
         let mut t = Translator::new();
@@ -6941,7 +6936,7 @@ mod subagent_roster_tests {
         );
         assert!(
             !text.contains("continue_run_id"),
-            "the retired parameter is gone from the coach: {text}"
+            "the `continue_run_id` parameter is gone from the coach: {text}"
         );
     }
 

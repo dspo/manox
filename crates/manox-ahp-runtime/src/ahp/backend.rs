@@ -1134,8 +1134,7 @@ impl RuntimeBackend {
         }
         // A landed assistant row changes the Q face: republish the aggregate
         // so the metrics channel stays a read model of the journal, not a
-        // stream of per-call rows the client would have to re-aggregate (the
-        // v2 `GetConversationInfo` contract, now push).
+        // stream of per-call rows the client would have to re-aggregate.
         if matches!(
             entry,
             Event::Message {
@@ -1165,8 +1164,7 @@ impl RuntimeBackend {
     /// the same numbered stream as every other channel state, and the browser of
     /// `serverSeq` stays intact.
     ///
-    /// The v2 follow-terminal stream relays the same tap per *stream*; an AHP
-    /// terminal is a channel, so one pump serves every subscriber.
+    /// An AHP terminal is a channel, so one pump serves every subscriber.
     #[cfg(feature = "terminal")]
     fn ensure_terminal_pump(&self, terminal_id: &str) {
         if self.terminal_pumps.lock().contains_key(terminal_id) {
@@ -1226,14 +1224,14 @@ impl RuntimeBackend {
 
     /// Register (or replace) one active client's contributed tools.
     ///
-    /// This is the AHP face of v2's `RegisterSessionTools`, and it fills the
+    /// This is the AHP face of session-tool registration, and it fills the
     /// same store: the engine's `embedder_tools` provider is what makes a
     /// registered tool callable by the model, so routing the protocol action
     /// here — rather than into a parallel table — is what keeps one source of
     /// truth for "the tools this session's clients contribute".
     ///
     /// Full replacement per client, matching `session/activeClientSet`'s
-    /// upsert-by-`clientId` semantics and the v2 call's own contract.
+    /// upsert-by-`clientId` semantics and the client-tool contract.
     ///
     /// Fail-closed on every input the runtime cannot honour: a session with no
     /// live engine would otherwise accept the registration, answer `Accepted`,
@@ -1622,8 +1620,8 @@ struct SeededFacts {
 /// The command/skill catalogue served on `x-manox-commands://`.
 ///
 /// AHP has no notion of a slash command, so this channel is where a client
-/// reads the palette it can offer. The three sources are the same ones the v2
-/// `ListCommands` call read, in the same precedence: built-ins first, then
+/// reads the palette it can offer. The three sources, in precedence order:
+/// built-ins first, then
 /// user commands, then skills, with a name claimed by an earlier source
 /// winning — a user command that shadows a built-in must not appear twice.
 fn command_catalogue() -> Value {
@@ -1879,8 +1877,7 @@ impl Backend for RuntimeBackend {
         // hundreds of sessions totalling gigabytes, so folding each one to
         // produce a one-line summary made `listSessions` time out — and it is
         // both the first call a client makes and the source of every later
-        // page. The v2 list path (`threads_snapshot`) reads the same rows for
-        // the same reason.
+        // page.
         //
         // The child partition rides the same walk: delegated subagent
         // sessions come back as ordinary rows (annotated with parent/kind in
@@ -2390,7 +2387,7 @@ impl Backend for RuntimeBackend {
                 // subscribed-but-never-submitted thread): the bridge the seed
                 // skipped now has an engine to bridge, and the verdict's
                 // journal row above the seed's watermark is how every client
-                // fold learns the card retired.
+                // fold learns the card cleared.
                 if matches!(
                     outcome,
                     DispatchOutcome::Accepted | DispatchOutcome::AcceptedThen(_)
@@ -2449,9 +2446,9 @@ impl Backend for RuntimeBackend {
             // registration needs no `x-manox` channel: the action *is* the
             // registration, and the host's reducer folds it into the very state
             // a subscriber reads. The runtime half is the same registration
-            // store the v2 `RegisterSessionTools` call fills, so a tool a
-            // client contributes here becomes callable by the model through the
-            // one existing path (`embedder_tools`), not a second one.
+            // store client-tool registration fills, so a tool a client
+            // contributes here becomes callable by the model through the one
+            // existing path (`embedder_tools`), not a second one.
             StateAction::SessionActiveClientSet(set) => {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
@@ -2625,8 +2622,7 @@ impl Backend for RuntimeBackend {
             // AHP has no pin bit and no ordering field (verified against
             // `SessionStatus`, `SessionMetadata` and `SessionSummary`), so both
             // ride the declared extension surface. Their durable authority is
-            // the store row plus `sidebar_order`, the same layers v2's
-            // `PinThread` / `InsertThreadBefore` use.
+            // the store row plus `sidebar_order`.
             StateAction::Unknown(tag)
                 if tag.get("type").and_then(Value::as_str)
                     == Some(manox_ahp::ext::actions::PINNED_CHANGED) =>

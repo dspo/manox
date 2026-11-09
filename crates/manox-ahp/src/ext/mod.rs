@@ -45,7 +45,7 @@ pub mod channels {
     /// chat's background work; the *persistent* run account (settled runs
     /// keep their row) is this channel's `childRunsChanged` registry.
     pub const WORK: &str = "x-manox-work:/";
-    /// Aggregated conversation metrics — the v2 Q face (per chat).
+    /// Aggregated conversation metrics for one chat (usage, cost, context).
     pub const METRICS: &str = "x-manox-metrics:/";
     /// Thread rows: pin, label, session info, leaf cursor (per session).
     pub const THREAD: &str = "x-manox-thread:/";
@@ -57,11 +57,11 @@ pub mod channels {
     /// Every declared channel prefix — and, like [`super::commands::ALL`], only
     /// the ones this build actually serves.
     ///
-    /// The v2 surface also carried a bare-model completion side stream
-    /// (`x-manox-modelchat:/`). It is **not** declared: the module that produced
-    /// it was deleted with the v2 gateway, so a subscriber would wait forever on
-    /// a channel that can only ever answer `null`. Re-declaring it is the right
-    /// move the moment a model-completion implementation exists to back it.
+    /// The bare-model completion side stream (`x-manox-modelchat:/`) is
+    /// **not** declared: no module produces it, so a subscriber would wait
+    /// forever on a channel that can only ever answer `null`. Declaring it is
+    /// the right move the moment a model-completion implementation exists to
+    /// back it.
     pub const ALL: &[&str] = &[PLAN, WORK, METRICS, THREAD, WORKSPACES, COMMANDS];
 }
 
@@ -174,17 +174,16 @@ pub mod commands {
     /// So a capability is listed here only once something answers for it.
     ///
     /// Client-contributed tools are **not** here: AHP models them natively (see
-    /// [`CLIENT_TOOLS_VIA_ACTION`]), so the v2 `RegisterSessionTools` capability
-    /// has no `x-manox` command.
+    /// [`CLIENT_TOOLS_VIA_ACTION`]), so they take no `x-manox` command.
     ///
-    /// Capabilities the v2 surface had and this face does **not** serve, none of
-    /// which is declared above:
+    /// Capabilities this face does **not** serve, none of which is declared
+    /// above:
     ///
     /// - history paging — AHP's own `fetchTurns` covers it, cursor and all;
-    /// - bare-model completions (`modelChat` / `modelChatCancel`) — the channel
-    ///   they fed was deleted with the v2 gateway, so there is nothing to call;
-    /// - adjudication retraction (`cancelDelivery`) — deliveries are the deleted
-    ///   v2 waterfall's concept; AHP settles through channel actions;
+    /// - bare-model completions (`modelChat` / `modelChatCancel`) — no channel
+    ///   backs them, so there is nothing to call;
+    /// - adjudication retraction (`cancelDelivery`) — AHP settles through
+    ///   channel actions, not a separate delivery;
     /// - process shutdown — a host-lifecycle concern, not a session one.
     pub const ALL: &[&str] = &[COMPACT, GOAL, OPEN_TURN, TEARDOWN];
 }

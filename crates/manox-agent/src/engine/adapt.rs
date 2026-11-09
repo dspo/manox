@@ -542,8 +542,6 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             Some(steps) => format!("UpdatePlan ({} steps)", steps.len()),
             None => "UpdatePlan".to_string(),
         },
-        // Task tools were removed in the tools-optimization cycle — they
-        // were retired with the Steer-based team architecture.
         "CreateGoal" => match arg("objective") {
             Some(objective) => format!("CreateGoal {}", short_value(&objective, 40)),
             None => "CreateGoal".to_string(),
@@ -629,7 +627,7 @@ fn first_string_arg(args: &serde_json::Value) -> Option<String> {
 }
 
 /// First object entry of a tool-call's arguments as a `(key, short value)`
-/// hint, mirroring the retired bridge's `summary_key`/`summary`.
+/// hint.
 pub(crate) fn arg_hint(arguments: &serde_json::Value) -> Option<(String, String)> {
     arguments.as_object()?.iter().next().map(|(key, value)| {
         let value = match value {

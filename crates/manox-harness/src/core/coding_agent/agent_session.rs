@@ -924,7 +924,7 @@ impl AgentSessionBuilder {
         self
     }
 
-    /// Pin the exact journal file (the v1.0.0 core layout writes
+    /// Pin the exact journal file (the core layout writes
     /// `<core>/<slug>/<id>/session.jsonl`; the per-session directory is the
     /// parent). When set, `build()` creates at this path and `open()` is
     /// the caller's path resolution.
@@ -2205,8 +2205,8 @@ mod tests {
                 .unwrap();
             let path = session.close().await.unwrap();
 
-            // Reopen with the same catalog: the legacy row resolves on the
-            // exact api the catalog names, not a heuristic.
+            // Reopen with the same catalog: the stored model row resolves on
+            // the exact api the catalog names, not a heuristic.
             let resumed = create_agent_session()
                 .with_model_runtime(runtime(api))
                 .open(path)
@@ -2394,7 +2394,7 @@ mod tests {
             .unwrap();
         session.prompt("hi").await.unwrap();
         // A pre-store transcript that still carries its own model row: the
-        // tolerated legacy read, and the only way a reopen can now be asked
+        // tolerated stored row, and the only way a reopen can now be asked
         // to resolve a model the catalog cannot serve.
         session
             .harness

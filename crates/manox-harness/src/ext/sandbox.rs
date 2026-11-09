@@ -151,8 +151,7 @@ pub fn validate_escalation_args(
 /// `authorized_roots` appends the root set the denial was judged against, so
 /// a refusal names where access IS allowed instead of leaving the fence's
 /// shape for the model to guess. Empty renders the marker line alone — the
-/// byte-identical legacy text (the bash output classifier has no root set to
-/// report).
+/// bytes the bash output classifier expects (it has no root set to report).
 pub fn sandbox_denial_marker(mode: AccessMode, authorized_roots: &[PathBuf]) -> String {
     let mut text = format!("[sandbox: file access denied under {} mode]", mode.wire());
     if !authorized_roots.is_empty() {
@@ -527,7 +526,7 @@ mod tests {
     #[test]
     fn i64_and_wire_vocabulary() {
         // The persisted i64: 1 = sandbox, 2 = full access; every other value
-        // (including the retired read-only 0) lands on the bounded default.
+        // (including 0) lands on the bounded default.
         assert_eq!(AccessMode::from_i64(1), AccessMode::Sandbox);
         assert_eq!(AccessMode::from_i64(2), AccessMode::FullAccess);
         assert_eq!(AccessMode::from_i64(0), AccessMode::default());
@@ -535,14 +534,14 @@ mod tests {
         assert_eq!(AccessMode::from_i64(3), AccessMode::default());
         assert_eq!(AccessMode::Sandbox.as_i64(), 1);
         assert_eq!(AccessMode::FullAccess.as_i64(), 2);
-        // The closed wire vocabulary: old three-tier names are unknown.
+        // The wire vocabulary is closed: three-tier names are unknown.
         assert_eq!(AccessMode::from_wire("sandbox"), Some(AccessMode::Sandbox));
         assert_eq!(
             AccessMode::from_wire("full-access"),
             Some(AccessMode::FullAccess)
         );
-        for legacy in ["read-only", "workspace-write", "danger-full-access", ""] {
-            assert_eq!(AccessMode::from_wire(legacy), None, "{legacy}");
+        for unknown in ["read-only", "workspace-write", "danger-full-access", ""] {
+            assert_eq!(AccessMode::from_wire(unknown), None, "{unknown}");
         }
         assert_eq!(
             serde_json::to_value(AccessMode::FullAccess).unwrap(),
@@ -566,7 +565,7 @@ mod tests {
 
     #[test]
     fn marker_and_hint_vocabulary() {
-        // No roots: the byte-identical legacy marker line.
+        // No roots: the marker line alone.
         assert_eq!(
             sandbox_denial_marker(AccessMode::Sandbox, &[]),
             "[sandbox: file access denied under sandbox mode]"

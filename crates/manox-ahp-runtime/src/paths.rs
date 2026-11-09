@@ -1,8 +1,7 @@
 //! Where a session's journal lives.
 //!
 //! The single wire-id → path mint. It lives in the runtime crate because both
-//! the AHP adapter and the v2 gateway resolve journals through it, and the
-//! gateway is the half that goes away.
+//! the AHP adapter and the session gateway resolve journals through it.
 
 use std::path::PathBuf;
 

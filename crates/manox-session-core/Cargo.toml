@@ -20,13 +20,13 @@ chrono.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 manox-workspace.workspace = true
-# v3 (AHP) W2: the read-only journal → AHP channel-state fold (`src/ahp/`)
+# (AHP): the read-only journal → AHP channel-state fold (`src/ahp/`)
 # runs the host's own translator + the shared `ahp` reducers over the
 # journal, and reads the durable vocabulary from the leaf journal crate.
 manox-ahp.workspace = true
 # The AHP runtime half: its `SessionRuntime` trait is the seam this gateway
 # implements, so the adapter never names a gateway type. No `terminal` request:
-# this host can no longer tap a PTY, and `manox-ahp-runtime` carries that flag in
+# this host cannot tap a PTY, and `manox-ahp-runtime` carries that flag in
 # its own default features for out-of-tree hosts that can.
 manox-ahp-runtime = { workspace = true, features = ["ws-gateway"] }
 ahp.workspace = true
@@ -38,7 +38,7 @@ parking_lot.workspace = true
 # (async-channel is already a dependency below.)
 axum = { workspace = true, optional = true }
 tracing.workspace = true
-# §D.2 `CreateSession` mints session ids server-side for v2 clients.
+# `CreateSession` mints session ids server-side.
 uuid.workspace = true
 async-channel.workspace = true
 
@@ -55,7 +55,7 @@ async-channel = { workspace = true }
 # W7: the WS e2e test's client leg (same version axum's ws feature already
 # pulls into the graph — no new resolution).
 tokio-tungstenite.workspace = true
-# v3 (AHP): the transport-parity test dials the gateway with the SDK's own
+# (AHP): the transport-parity test dials the gateway with the SDK's own
 # WebSocket client, so the WS leg is exercised by a real AHP client rather
 # than a hand-rolled frame pump.
 ahp-ws.workspace = true

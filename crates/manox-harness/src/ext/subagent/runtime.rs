@@ -181,9 +181,9 @@ impl SubagentRuntime {
             )));
         }
         // One atomic reservation per run: the permit is taken before the
-        // provider is asked to start and lives in the run-table entry, so two
-        // concurrent dispatches can no longer both read a stale count and
-        // overshoot the cap (the count used to be read before an `await`).
+        // provider is asked to start and lives in the run-table entry, so
+        // concurrent dispatches cannot both read a stale count and overshoot
+        // the cap.
         let capacity = match Arc::clone(&self.capacity).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -862,11 +862,8 @@ mod tests {
 
     /// Concurrent dispatches cannot overshoot the cap.
     ///
-    /// The gate used to read the live count and insert after
-    /// `provider.start().await` — a window in which every concurrent dispatch
-    /// saw the same stale count. The permit is reserved before the provider is
-    /// asked to start, so the Nth+1 reservation fails however the starts
-    /// interleave.
+    /// The permit is reserved before the provider is asked to start, so the
+    /// Nth+1 reservation fails however the starts interleave.
     #[tokio::test]
     async fn the_active_capacity_gate_survives_concurrent_dispatch() {
         let runtime = SubagentRuntime::new();

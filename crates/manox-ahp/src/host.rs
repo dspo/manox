@@ -383,10 +383,10 @@ impl Host {
 
 /// The reader's teardown, run on every exit including unwind.
 ///
-/// A panicking reader used to leave the connection "alive" in [`Inner::conns`]
+/// A panicking reader must not leave the connection "alive" in [`Inner::conns`]
 /// with waiters that never resolve: every later host → client request to it
-/// waited out its whole deadline. A panic unwinds the reader's future and drops
-/// its locals, so a drop guard is the one place teardown cannot be skipped.
+/// would wait out its whole deadline. A panic unwinds the reader's future and
+/// drops its locals, so a drop guard is the one place teardown cannot be skipped.
 struct ConnectionGuard {
     inner: Arc<Inner>,
     conn: Arc<Conn>,

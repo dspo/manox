@@ -3,11 +3,9 @@
 //! `to.spawn` = a definition name creates a run, `Dispatch` with
 //! `to.agent_address` = a run id (no spawn) continues it, `Inject` guides a
 //! live run mid-flight through the kernel's intra-session steer
-//! (`HarnessHandle::steer`), and `Abort` stops it. The per-definition
-//! delegation tools retired from the model face; their definition
-//! resolution stays as engine-internal config ([`crate::subagent`]) the
-//! run arms route through. The rewrite was aggressive by design: the
-//! retired tools' `continue_run_id` parameter has no compat alias —
+//! (`HarnessHandle::steer`), and `Abort` stops it. Definition
+//! resolution stays engine-internal config ([`crate::subagent`]) that the
+//! run arms route through; `continue_run_id` has no compat alias —
 //! continuation is `Dispatch` + run id, period. The bus also retains the
 //! TeamMember member operations (real manox Threads), which are pure gpui
 //! facade round trips (`BusOp`). The cross-session agent bus is a manox
@@ -583,8 +581,8 @@ impl SteerTool {
     }
 }
 
-/// The Dispatch-only optional parameters, carried over from the retired
-/// delegation tools' schema. Rejected on a non-Dispatch reason.
+/// The Dispatch-only optional parameters from the delegation schema.
+/// Rejected on a non-Dispatch reason.
 /// `description` is not among them: it is only meaningful on run dispatches
 /// and enforced there fail-loud (the schema does not globally require it —
 /// Inject/Abort need no label — so it may ride along harmlessly, never a

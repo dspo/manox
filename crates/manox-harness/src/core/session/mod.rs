@@ -5,10 +5,9 @@
 // context. Variant `type` tags are snake_case and field names are camelCase,
 // matching the on-disk schema exactly so real session files load.
 //
-// The `identity`/`event`/`claim` modules are the Session Core (the
-// v1.0.0 model): the header-per-session identity, the event vocabulary,
-// and the claim decision for `createSession`, running beside the tree
-// engine above.
+// The `identity`/`event`/`claim` modules are Session Core: the
+// header-per-session identity, the event vocabulary, and the claim
+// decision for `createSession`.
 
 pub mod claim;
 pub mod event;
@@ -82,8 +81,7 @@ pub(crate) struct EntryEnvelope<'a> {
 
 impl Event {
     /// The envelope fields every variant carries. One macro-driven match so a
-    /// new variant only ever adds one token here (the pre-v4 accessors were
-    /// three parallel exhaustive matches).
+    /// new variant only ever adds one token here.
     fn envelope(&self) -> EntryEnvelope<'_> {
         macro_rules! envelope_match {
             ($($variant:ident),* $(,)?) => {

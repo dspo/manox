@@ -34,9 +34,8 @@ pub const SUBAGENT_TICK: Duration = Duration::from_secs(5);
 
 /// Bound on the session-assembly phase of a start (child build + effort
 /// apply). A wedged build must fail the dispatch stage-named instead of
-/// hanging the parent turn forever — the retired Steer dispatch carried the
-/// same 90s guard. Worktree preparation sits outside it: its git commands
-/// carry their own per-command timeouts.
+/// hanging the parent turn forever. Worktree preparation sits outside it:
+/// its git commands carry their own per-command timeouts.
 pub const START_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Cap a subagent's final summary before it rides into the parent's context
@@ -339,7 +338,7 @@ impl SubagentProvider for SpawnProvider {
             .as_ref()
             .map(|w| w.path.clone())
             .unwrap_or_else(|| req.cwd.clone());
-        // The v1.0.0 core layout is the only shape a child transcript takes:
+        // The core layout is the only shape a child transcript takes:
         // one directory per child, `session.jsonl` inside — under its project
         // bucket in production, under the host-injected root in tests.
         let session_dir = match &self.session_dir {
