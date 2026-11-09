@@ -18,19 +18,18 @@ crates/                    # Rust workspace 成员（全部 gpui-free）
   manox-ahp/               # AHP 宿主层（频道、JSON-RPC、传输、x-manox 扩展面）
   manox-ahp-runtime/       # AHP 宿主背后的运行时半边（SessionRuntime 缝 + 适配器）
   manox-session-core/      # 会话核心（会话存储 + SessionRuntime 缝的实现 + loopback ws）
-  hyperlinks/              # URL/路径检测积木（宿主 markdown 渲染消费；原终端超链接用途随 manox-terminal 退役）
+  hyperlinks/              # URL/路径检测积木（宿主 markdown 渲染消费）
   supervisor/              # 子进程监督
   manox-lsp/               # LSP client 库（唯一零仓内消费者的成员，为宿主预留的积木：宿主层不集成，宿主 app 按需装配为工具或经 AHP session/activeClientSet 注册）
-  manox-napi/              # napi 宿主绑定（休眠保留：VS Code 扩展已删除）
+  manox-napi/              # napi 宿主绑定（休眠保留）
 ```
 
 ### 协议（AHP）
 
 对外协议是 **AHP**（`ahp` / `ahp-types`，pin `=1.0.0`）：宿主层在 `manox-ahp`，
 运行时半边在 `manox-ahp-runtime`，会话存储在 `manox-session-core`。
-**自研的 "protocol v2" 已整体删除**（含 `crates/manox-protocol`）——v2 能做的
-能力必须全部落在 AHP 面上（AHP 没有的那部分由 `x-manox/*` 扩展面承载），
-否则该能力就是缺的，不是"v2 里还有"。
+**AHP 是唯一对外协议**：一切能力必须落在 AHP 面上（AHP 没有的那部分由
+`x-manox/*` 扩展面承载），否则该能力就是缺的。仓库里没有第二套协议 crate。
 
 - `manox-agent` 永不认识 AHP：它只经 `ThreadHandle` / `BackendNotice` /
   `CapabilityClient` 暴露能力，协议适配一律在其上层。
@@ -42,7 +41,7 @@ crates/                    # Rust workspace 成员（全部 gpui-free）
 
 ### 仓库边界（manox / manox-app 拆分）
 
-- 本仓库**不得引入 gpui 或任何 UI 依赖**；apps、cx 启动器、ext-agents、terminal-ui（GPUI 渲染层）已迁至 `dspo/manox-app`。终端仿真核心 `manox-terminal` 已随宿主迁移 Ghostty 整体退役（AHP terminal 通道词汇保留于 manox-ahp，host 侧走 `feature/unavailable` 拒绝路径）；`hyperlinks` 仍在本仓，供宿主 markdown 渲染消费。
+- 本仓库**不得引入 gpui 或任何 UI 依赖**；apps、cx 启动器、ext-agents、terminal-ui（GPUI 渲染层）已迁至 `dspo/manox-app`。终端仿真是宿主 Ghostty 的职责（AHP terminal 通道词汇保留于 manox-ahp，host 侧走 `feature/unavailable` 拒绝路径）；`hyperlinks` 仍在本仓，供宿主 markdown 渲染消费。
 - manox-app 经 git 依赖（tag pin `tag = "vX.Y.Z"` + Cargo.lock 锁 rev）消费本仓库；本仓库 main 的每次 push 都可能很快成为下一个发布 tag 的内容——破坏性 API 变更须在 commit message 标注（`!`）。下游约定：manox-app 合并前会把对本仓的依赖 bump 到最新发布 tag，故 main 上任何提交都可能很快进入下游合并，保持 main 常绿。
 - 本仓库运行时状态根 `~/.manox/` 与 manox-app 共享（见下）；协议/磁盘格式（journal、db、sessions）的变更即两仓联合变更。
 
@@ -79,29 +78,29 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 
 ## 运行时配置（`~/.manox/`）与生态根（`~/.claude/`）
 
-持久化分两个根：**运行时状态统一位于 `~/.manox/`**（不再使用 `~/.config/cx/`）；**扩展生态资产位于 `~/.claude/`**（与 Claude Code CLI 物理共享，装一次两边可用；`MANOX_CLAUDE_HOME` 整体重定向，测试隔离用）。路径清单：
+持久化分两个根：**运行时状态统一位于 `~/.manox/`**；**扩展生态资产位于 `~/.claude/`**（与 Claude Code CLI 物理共享，装一次两边可用；`MANOX_CLAUDE_HOME` 整体重定向，测试隔离用）。路径清单：
 
 - 单一状态根：`~/.manox/`（`manox_agent::paths::manox_config_dir()` 与 `manox_providers::cx_state_dir()` 均指向它）。**多进程共享**：runtime 允许多实例共用同一状态根，跨进程协调在资源粒度——per-session 写租约（`manox_agent::session_lease`，锁文件是 journal 的同级 `<journal>.lock`，驱动即独占、进程死自动释放、冲突报 `session/already-owned`）、共享状态文件（registry/sidebar/sidecar）走 per-file flock、网关单例走 `~/.manox/gateway.lock`。无全 store 级单实例锁。
 - 生态根：`~/.claude/`（`manox_agent::paths::claude_home()`）。用户技能 `~/.claude/skills/`、斜杠命令 `~/.claude/commands/`、子 agent 定义 `~/.claude/agents/`、规则 `~/.claude/rules/`（与 CLAUDE.md 层级一同由 `claude_md.rs` 装载）；插件与市场存储亦在此根下（见 `plugin.rs`）。
 - LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/manox-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；首启时会从旧根 `~/.config/cx/` 自动复制一次（旧文件保留）
-- SQLite（v1.0.0 已退役）：`threads.db` 及其 WAL 文件不再读写；六类状态各归其家——UI 注释卡 = journal `custom` 行（`manox_ui_note`）、右侧页签注册表 = 客户端内存（manox-app 侧）、终端注册表 = 已随 manox-terminal 退役（wire 终端不复存在）、列表扫描 = header/首条消息的有界读取、token 用量 = 事件派生（`metrics` 行 → `x-manox-metrics`）、项目注册表 = `~/.manox/core/projects.registry`（每行一个项目路径，读取时排序去重）。
-- 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；v1.0.0 起新建会话 thread id == session id，指针仍服务于既有 journal 的打开/恢复；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`manox_agent::thread_registry`；跨进程 RMW 经 per-file flock 串行化）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork；多工作目录会话经 `CreateSession.workingDirectories` seed granted-root 围栏。
-- 会话（v1.0.0 core 布局，dsh 对齐）：`~/.manox/core/--<projectKey>--/<session-id>/` —— `session.jsonl`（唯一 durable 事件日志；首行即 header，`formatVersion` 在 header 内，未来格式升级把旧文件物化为 `session.v<N>.jsonl` 世代文件，dsh 的 generation 方案）。`<projectKey>` 是 `originCwd` 的 dsh `projectKey` 编码（`/`、`\`、`:` 折叠为 `-`、`[A-Za-z0-9._-]` 原样保留大小写、其余码点 `~XXXX` 转义、`--`…`--` 包裹、内段 251 上限；`manox_harness::session::identity::project_slug`）——桶是存储局部性不是身份，journal header 的 `cwd` 才是事实。派生/显示状态（pin/archive/errored/title/tag/工作目录授权/交互时间戳/read 两输入 last_settled_at+last_viewed_at——read 是派生事实不在 journal，翻转由宿主 publish 到 session 通道，客户端只声明查看）= `~/.manox/core/cache/<id>.json`（会话目录只留 journal 与锁，dsh storages/projcache 的关注点分离；`manox_harness::session_meta`）。`~/.manox/core/projects.registry` 是项目注册表。旧 `~/.manox/sessions/` 平铺树**永不再读**（无迁移、无兼容读）。
+- 线程/注释卡状态不落 SQLite：UI 注释卡 = journal `custom` 行（`manox_ui_note`）、右侧页签注册表 = 客户端内存（manox-app 侧）、终端注册表 = 宿主 Ghostty 侧（wire 终端不复存在）、列表扫描 = header/首条消息的有界读取、token 用量 = 事件派生（`metrics` 行 → `x-manox-metrics`）、项目注册表 = `~/.manox/core/projects.registry`（每行一个项目路径，读取时排序去重）。
+- 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；新建会话 thread id == session id，指针服务于既有 journal 的打开/恢复；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`manox_agent::thread_registry`；跨进程 RMW 经 per-file flock 串行化）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork；多工作目录会话经 `CreateSession.workingDirectories` seed granted-root 围栏。
+- 会话（core 布局，dsh 对齐）：`~/.manox/core/--<projectKey>--/<session-id>/` —— `session.jsonl`（唯一 durable 事件日志；首行即 header，`formatVersion` 在 header 内，未来格式升级把旧文件物化为 `session.v<N>.jsonl` 世代文件，dsh 的 generation 方案）。`<projectKey>` 是 `originCwd` 的 dsh `projectKey` 编码（`/`、`\`、`:` 折叠为 `-`、`[A-Za-z0-9._-]` 原样保留大小写、其余码点 `~XXXX` 转义、`--`…`--` 包裹、内段 251 上限；`manox_harness::session::identity::project_slug`）——桶是存储局部性不是身份，journal header 的 `cwd` 才是事实。派生/显示状态（pin/archive/errored/title/tag/工作目录授权/交互时间戳/read 两输入 last_settled_at+last_viewed_at——read 是派生事实不在 journal，翻转由宿主 publish 到 session 通道，客户端只声明查看）= `~/.manox/core/cache/<id>.json`（会话目录只留 journal 与锁，dsh storages/projcache 的关注点分离；`manox_harness::session_meta`）。`~/.manox/core/projects.registry` 是项目注册表。`~/.manox/sessions/` 平铺树**不读**（无迁移、无兼容读）。
 - 子代理会话：`~/.manox/core/--<projectKey>--/<run-id>/`（run id == 子会话 id == 子 chat id；持久化、不进侧栏）
 - 外部会话：`~/.manox/external-sessions/`（外部 CLI 会话由 manox-app 侧的 cx 驱动，目录约定在本仓库文档维护）
-- 设置：`~/.manox/settings.toml`（终端主题目录 `~/.manox/themes/` 随 `.ottytheme` 与 `manox-terminal` 一并退役，不再读取）
+- 设置：`~/.manox/settings.toml`（终端主题目录 `~/.manox/themes/` 由宿主侧维护，本仓库不读取）
 - 子 agent：`~/.claude/agents/*.md`（frontmatter name/description/tools/model + 正文；每个定义解析为引擎内部调度配置，模型面统一走 Captain 的 `Steer` 工具：`ext/subagent/` 的 SubagentRuntime/SubagentProvider/能力协商/descriptor）；MCP：`~/.manox/mcp.json`（Claude Code `mcpServers` schema，stdio 或 HTTP；项目级 `.mcp.json` 与插件 `.mcp.json` 同 schema，合并序 plugin < global < project）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
-- WS 网关端点（`cx web`，CLI 在 manox-app）：`~/.manox/gateway-ws.json`（0600；启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ws?token=…`；每次启动覆盖，进程退出后过期）。网关每机单例：`ws::start` 以非阻塞 flock 持 `~/.manox/gateway.lock`，他进程已持锁时本次 start 不绑定不发布（loud no-op）。
-- cx CLI 状态：`~/.manox/cx.db`、IPC socket `~/.manox/sessions/`（该目录自 v1.0.0 起只承载 cx 的 socket 与注册 JSON，不再是会话 journal 目录）、codex 注入目录 `~/.manox/.codex/`、`~/.manox/.patch_source`（CLI 本体在 manox-app，状态目录与本仓库共享）
+- WS 网关端点（`cx ahp`，CLI 在 manox-app）：`~/.manox/gateway-ws.json`（0600；启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ahp?token=…`；每次启动覆盖，进程退出后过期）。网关每机单例：`ws::start` 以非阻塞 flock 持 `~/.manox/gateway.lock`，他进程已持锁时本次 start 不绑定不发布（loud no-op）。
+- cx CLI 状态：`~/.manox/cx.db`、IPC socket `~/.manox/sessions/`（该目录只承载 cx 的 socket 与注册 JSON，不是会话 journal 目录）、codex 注入目录 `~/.manox/.codex/`、`~/.manox/.patch_source`（CLI 本体在 manox-app，状态目录与本仓库共享）
 - API key 源：macOS Keychain（`keychain:SERVICE`）/ env（`env:VAR`）/ 字面量（`literal:...`）/ shell（`$(shell ...)`）
 - **百炼 anthropic 兼容端点**（`*.aliyuncs.com/apps/anthropic`）：不报 `cache_creation_input_tokens`（恒 0），只报 `cache_read_input_tokens`。故 manox 的 `cache_creation` 记账对该端点恒 0 属预期，非解析/累加/持久化 bug（三链路均正确，记的就是端点报的 0）。`LastBreakpointOnly` 与 `Full` policy 对该端点均有效。
 
-### Session Core（v1.0.0）事实契约
+### Session Core 事实契约
 
 会话模型是「不可变身份 + append-only 事实 + 派生视图」。判违规按此表：
 
-- **身份面**：`header.json` 随首次 append 原子发布（O_EXCL），此后永不改写；血缘（parent/toolCallId/runId/depth）是 header 字段，不是可变旁册指针。身份只出现一次，永不迁移。
-- **事件面**：`<core>/<slug>/<session>/session.jsonl` 是唯一 durable 权威与唯一 schema（`session::event::Event`，行名 = serde tag）。铁律：**用户可见且需持久的事实必为事件；身份字段永不出现在事件 payload**（事件只带 id 引用）。退役的行名按未知行拒收，没有兼容读。
+- **身份面**：journal 文件随首次 append 原子创建（O_EXCL），首行 header 此后永不改写；血缘（parent/toolCallId/runId/depth）是 header 字段，不是可变旁册指针。身份只出现一次，永不迁移。
+- **事件面**：`<core>/<slug>/<session>/session.jsonl` 是唯一 durable 权威与唯一 schema（`session::event::Event`，行名 = serde tag）。铁律：**用户可见且需持久的事实必为事件；身份字段永不出现在事件 payload**（事件只带 id 引用）。本 build 不写的行名按未知行拒收，没有兼容读。
 - **派生面**：列表、状态位、谱系全是投影；侧栏扫描只读 header 与首条用户消息（有界），`state.json` 只是缓存。
 - **创建**：`createSession` = claim，唯一决策点是 `session::claim::decide`：未占用的 id → 驱动客户端铸的 id；同目录已物化 → 幂等复用（restore，绝不重铸）；活空白 → 复用；归档 → 铸新；目录不符 → 显式冲突（`gateway/bad-request`）；`lineage=subagent` → 拒绝（`session/already-owned`）。**应答携带最终 id，此后不变**。
 - **处置**：未物化会话的 dispose = 内存删行 + `root/sessionRemoved`；已物化会话的 dispose 不写任何 durable 标记（会话仍在列表里）。日志里没有「已处置」行。
@@ -109,7 +108,7 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 - **引擎**：`session::{identity,event,claim}` 是 Session Core 的引擎模块（`identity` 掌管 header 与 journal 路径，`event` 是行词汇，`claim` 是 `createSession` 的判定点）；写入经 `session::jsonl` 存储（format v4），行类型就是 `Event`（唯一词汇，无别名）。
 ## crates/manox-harness 接线开发纪律（harness 分层）
 
-manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`；老 manox harness 已退役并完全删除，代码存于 git 历史与 `origin/Manox` 备份分支）。接线开发遵循以下纪律：
+manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`）。接线开发遵循以下纪律：
 
 ### 分层与依赖链
 
@@ -117,7 +116,7 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`；�
 
 - **crates/manox-harness/src/core 内核**：只承载通用 agent 内核能力（循环、压缩、会话、内建工具）+ 提供拓展点与拓展机制；宿主/业务逻辑一律不进内核。
 - **crates/manox-harness/src/ext 扩展**：只经内核拓展点扩展业务能力（provider 自治注册、bash 编排、子代理、session sidecar、model_ref 等），不反向依赖宿主。
-- **manox-agent 宿主**：装配 + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、内建 skills 等）。manox-harness 是唯一 harness 后端（harness 选择 feature 已移除）。
+- **manox-agent 宿主**：装配 + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、内建 skills 等）。manox-harness 是唯一 harness 后端。
 
 `Py`（内建工具，`core/tools/py.rs`）用 RustPython 在进程内跑短脚本（frozen stdlib、无第三方包、无 TLS、≤120 行）。它**不是文件工具**——常规读写搜归 Read/Write/Edit/Grep/Glob/Ls，提示词与 `description()` 都这么写；它**不自带沙箱**：权限门控在宿主（read-only 整调用拒绝、workspace-write 放行），超时不可抢占（脚本线程被放弃后可能仍在跑），cwd 经进程级 `chdir` 串行设置并在 drop 时恢复。`sqlite` feature 开启（多一份 bundled `libsqlite3-sys`，`rusqlite` 已因此对齐到 0.40）。
 
@@ -128,7 +127,7 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`；�
 1. **通用 agent 内核能力 → crates/manox-harness/src/core**：任何 agent harness 都需要的机制，wire 名/事件形状/serde 保真（例：compaction 事件、`prompt(text,{images})`、steer 带图、Input hook）。
 2. **经内核拓展点可承载的业务能力 → manox-harness/src/ext**（不反向依赖宿主）。
 3. **宿主原创能力 → 宿主层**（例：审批门控、MCP、标题生成、斜杆路由）；内核只留缝隙（如 `AgentTool::requires_approval`），不代行政策。
-4. **定层偏离既有惯例必须显式注明理由**（写进 PR 的 Assumptions；例：manox-harness 的 MCP 工具比老 manox 更保守地过审批门控）。
+4. **定层偏离既有惯例必须显式注明理由**（写进 PR 的 Assumptions；例：manox-harness 的 MCP 工具比内建工具更保守地过审批门控）。
 
 ### 内核纪律红线
 
@@ -136,10 +135,6 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`；�
 - 内核不认宿主历史：风格别名/命名由宿主经 catalog/适配层注入（如 `LegacyAliasCatalog`）。
 - 选择/路由逻辑归扩展层或宿主，内核只给机制。
 - 同步 hook 不做异步 UI 往返：审批等异步交互在宿主 wrapper 实现（hook 只能同步阻断）。
-
-### 退役代码处置
-
-- 老 manox harness 曾退役为 `crates/harness-manox` 归档 crate；其中有价值的 harness 无关模块已迁入 agent 共享层（permission / approval_review / skill / command / frontmatter / mcp 核心 / image / title）。归档 crate 本体已完全删除——需要参考老实现时查 git 历史或 `origin/Manox` 备份分支。
 
 ### 安全语义
 
@@ -167,10 +162,10 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`；�
 
 ## 激进开发纪律
 
-manox 处于开发早期，不维护 v0→v1 升级路径，不背历史负债。
+manox 处于开发早期，不维护旧数据升级路径，不背历史负债。
 
 - **运行时禁止 schema migration**：运行时永不改 DDL、不删除/重建用户机器上的 db。`db/mod.rs` 的 `open()` 仅对全新 db `CREATE TABLE IF NOT EXISTS`，对已有 db 是 no-op。开发中的 schema 迁移，直接手动改开发机 db（`sqlite3` CLI / `ALTER TABLE` / 重建）。schema 不对就该报错报错、该 panic panic。
 - **不保留兼容字段 / 不写 fallback 兼容读**：字段失去存在理由直接删，不用 `#[serde(rename)]`/双写/`unwrap_or(default)` 续命。读不到 key 就报错，不静默回退。
-- **不写 `v0`/`legacy_`/`backward_compat` 模块**：任何以向后兼容为名的子模块/helper/trait/wrapper 直接拒。新枚举/新 schema 原地替换，删代码时同步删测试。
+- **不写向后兼容模块**：任何以向后兼容为名的子模块/helper/trait/wrapper 直接拒。新枚举/新 schema 原地替换，删代码时同步删测试。
 
 > 不确定要不要保留兼容层时，问：当前有没有外部用户的数据会因此被破坏？答案是「没有 / 用户可接受丢」——就按激进方向走。
