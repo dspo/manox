@@ -182,6 +182,14 @@ impl Backend for TestBackend {
 pub struct RecordingBackend {
     inner: TestBackend,
     dispatched: parking_lot::Mutex<Vec<(String, StateAction)>>,
+    /// The order in which reads and dispatches reached this backend.
+    ///
+    /// The lane suite asserts that a `subscribe`'s seeding work completed
+    /// before the `dispatchAction` on the same channel started — an order the
+    /// handler records here rather than one inferred from wire frames (a
+    /// dispatch that outran its subscribe is refused as unsubscribed, which
+    /// looks like a state bug instead of an ordering bug).
+    events: parking_lot::Mutex<Vec<String>>,
     /// The outcome `dispatch` answers; `None` means "accept everything".
     refusal: parking_lot::Mutex<Option<String>>,
     /// Host actions `dispatch` answers with after the accepted echo
@@ -200,6 +208,7 @@ impl RecordingBackend {
         Arc::new(Self {
             inner,
             dispatched: parking_lot::Mutex::new(Vec::new()),
+            events: parking_lot::Mutex::new(Vec::new()),
             refusal: parking_lot::Mutex::new(None),
             derived: parking_lot::Mutex::new(Vec::new()),
         })
@@ -208,6 +217,11 @@ impl RecordingBackend {
     /// Every `(channel, action)` the host dispatched, in order.
     pub fn dispatched(&self) -> Vec<(String, StateAction)> {
         self.dispatched.lock().clone()
+    }
+
+    /// The recorded read/dispatch order (see the field docs).
+    pub fn events(&self) -> Vec<String> {
+        self.events.lock().clone()
     }
 
     /// The `session/activeClientSet` entries the host dispatched.
@@ -247,12 +261,19 @@ impl Backend for RecordingBackend {
         self.inner.session_summary(session_id)
     }
     async fn session_state(&self, session_id: &str) -> Option<SessionState> {
+        self.events
+            .lock()
+            .push(format!("sessionState:{session_id}"));
         self.inner.session_state(session_id).await
     }
     async fn chat_state(&self, chat_id: &str) -> Option<ChatState> {
+        self.events.lock().push(format!("chatState:{chat_id}"));
         self.inner.chat_state(chat_id).await
     }
     async fn session_state_for_chat(&self, chat_id: &str) -> Option<String> {
+        self.events
+            .lock()
+            .push(format!("sessionStateForChat:{chat_id}"));
         self.inner.session_state_for_chat(chat_id).await
     }
     fn terminal_state(&self, terminal_id: &str) -> Option<TerminalState> {
@@ -295,6 +316,7 @@ impl Backend for RecordingBackend {
         // the channel, so the origin is not one of its observables.
         _origin: &ActionOrigin,
     ) -> DispatchOutcome {
+        self.events.lock().push(format!("dispatch:{channel}"));
         self.dispatched
             .lock()
             .push((channel.to_string(), action.clone()));
@@ -304,6 +326,180 @@ impl Backend for RecordingBackend {
             None if derived.is_empty() => DispatchOutcome::Accepted,
             None => DispatchOutcome::AcceptedThen(derived),
         }
+    }
+    async fn extension(&self, method: &str, params: &Value) -> Result<Value, HostError> {
+        self.inner.extension(method, params).await
+    }
+}
+
+/// One parked-handler class, controlled by the test.
+///
+/// Permits rather than notifications: a handler that enters the gate before the
+/// test starts waiting still counts, so a suite never races on "did it park
+/// yet", and a released handler still records that it finished.
+pub struct Gate {
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    completed: tokio::sync::Semaphore,
+}
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            completed: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    /// Block one handler until the test lets it through.
+    async fn pass(&self) {
+        self.started.add_permits(1);
+        let permit = self.release.acquire().await.expect("a gate never closes");
+        permit.forget();
+        self.completed.add_permits(1);
+    }
+
+    /// Wait until one gated handler has started; it will not proceed alone.
+    pub async fn wait_started(&self) {
+        self.started
+            .acquire()
+            .await
+            .expect("a gate never closes")
+            .forget();
+    }
+
+    /// Let one gated handler through.
+    pub fn release_one(&self) {
+        self.release.add_permits(1);
+    }
+
+    /// Wait until one released handler returned from the backend.
+    pub async fn wait_completed(&self) {
+        self.completed
+            .acquire()
+            .await
+            .expect("a gate never closes")
+            .forget();
+    }
+}
+
+/// A [`TestBackend`] whose handlers park on named gates until the test lets them
+/// through.
+///
+/// The lane suite needs both shapes of a stuck handler: one that genuinely never
+/// returns (proof the reader is a demultiplexer, not an inline dispatcher) and
+/// one the test releases on demand (proof a reply arriving after the dispatch
+/// deadline is discarded). A gate key is a session id, a chat id or a channel
+/// URI, so either a state read or a dispatch can be parked.
+pub struct ParkingBackend {
+    inner: TestBackend,
+    gates: parking_lot::Mutex<BTreeMap<String, Arc<Gate>>>,
+}
+
+impl ParkingBackend {
+    /// The seeded stand-in (session `s-1`, chat `c-1`) with no gates.
+    pub fn new() -> Arc<Self> {
+        let inner = TestBackend::default();
+        inner
+            .sessions
+            .lock()
+            .insert("s-1".to_string(), "c-1".to_string());
+        Arc::new(Self {
+            inner,
+            gates: parking_lot::Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// Park every handler that touches `key`; the returned gate controls them.
+    pub fn park(&self, key: &str) -> Arc<Gate> {
+        let gate = Arc::new(Gate::new());
+        self.gates.lock().insert(key.to_string(), gate.clone());
+        gate
+    }
+
+    fn gate(&self, key: &str) -> Option<Arc<Gate>> {
+        self.gates.lock().get(key).cloned()
+    }
+}
+
+#[async_trait]
+impl Backend for ParkingBackend {
+    fn root_state(&self) -> RootState {
+        self.inner.root_state()
+    }
+    fn list_sessions(&self) -> Vec<SessionSummary> {
+        self.inner.list_sessions()
+    }
+    fn session_summary(&self, session_id: &str) -> Option<SessionSummary> {
+        self.inner.session_summary(session_id)
+    }
+    async fn session_state(&self, session_id: &str) -> Option<SessionState> {
+        if let Some(gate) = self.gate(session_id) {
+            gate.pass().await;
+        }
+        self.inner.session_state(session_id).await
+    }
+    async fn chat_state(&self, chat_id: &str) -> Option<ChatState> {
+        if let Some(gate) = self.gate(chat_id) {
+            gate.pass().await;
+        }
+        self.inner.chat_state(chat_id).await
+    }
+    async fn session_state_for_chat(&self, chat_id: &str) -> Option<String> {
+        if let Some(gate) = self.gate(chat_id) {
+            gate.pass().await;
+        }
+        self.inner.session_state_for_chat(chat_id).await
+    }
+    fn terminal_state(&self, terminal_id: &str) -> Option<TerminalState> {
+        self.inner.terminal_state(terminal_id)
+    }
+    async fn changeset_state(&self, channel: &str) -> Option<ahp_types::state::ChangesetState> {
+        self.inner.changeset_state(channel).await
+    }
+    async fn create_session(
+        &self,
+        session_id: &str,
+        params: &CreateSessionParams,
+    ) -> Result<(), HostError> {
+        self.inner.create_session(session_id, params).await
+    }
+    async fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
+        self.inner.dispose_session(session_id).await
+    }
+    async fn create_chat(
+        &self,
+        session_id: &str,
+        chat_id: &str,
+        params: &CreateChatParams,
+    ) -> Result<(), HostError> {
+        self.inner.create_chat(session_id, chat_id, params).await
+    }
+    async fn dispose_chat(&self, chat_id: &str) -> Result<(), HostError> {
+        self.inner.dispose_chat(chat_id).await
+    }
+    async fn fetch_turns(
+        &self,
+        chat_id: &str,
+        cursor: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<Vec<Turn>, HostError> {
+        self.inner.fetch_turns(chat_id, cursor, limit).await
+    }
+    async fn dispatch(
+        &self,
+        channel: &str,
+        action: &StateAction,
+        origin: &ActionOrigin,
+    ) -> DispatchOutcome {
+        if let Some(gate) = self.gate(channel) {
+            gate.pass().await;
+        }
+        self.inner.dispatch(channel, action, origin).await
+    }
+    async fn extension_baseline(&self, channel: &str) -> Option<Value> {
+        self.inner.extension_baseline(channel).await
     }
     async fn extension(&self, method: &str, params: &Value) -> Result<Value, HostError> {
         self.inner.extension(method, params).await

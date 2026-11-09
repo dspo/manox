@@ -65,6 +65,14 @@ pub struct Conn {
     /// declares `mcpApps` alone and has no field for a host-initiated request.
     /// Empty means the client declared nothing, which selects it for nothing.
     client_requests: Mutex<Vec<String>>,
+    /// Ids of inbound requests this connection accepted and has not answered.
+    ///
+    /// A reply claims its id: whichever of the handler and the dispatch deadline
+    /// answers first removes it, so a handler that returns after its deadline
+    /// finds nothing left to answer and its reply is discarded instead of
+    /// becoming a second frame for the same request. Ids are removed when
+    /// answered, so a long-lived connection does not accumulate them.
+    reply_claims: Mutex<HashSet<MsgId>>,
 }
 
 impl Conn {
@@ -80,7 +88,31 @@ impl Conn {
             dialect: Box::new(IdentityDialect),
             pending: RpcPeer::new(),
             client_requests: Mutex::new(Vec::new()),
+            reply_claims: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Claim the answer slot for an inbound request.
+    ///
+    /// `false` means an earlier request with the same id is still unanswered.
+    /// JSON-RPC ids are unique among a peer's outstanding requests, so this is a
+    /// client violation; the later copy is dropped (first wins) rather than
+    /// letting one id receive two answers.
+    pub(crate) fn expect_reply(&self, id: u64) -> bool {
+        self.reply_claims.lock().insert(MsgId(id))
+    }
+
+    /// Answer a request at most once; `false` when it was already answered.
+    ///
+    /// The dispatch deadline and the handler race for the claim, so a late
+    /// handler reply after a timeout is silently refused instead of travelling
+    /// as a duplicate frame.
+    pub(crate) fn reply_once(&self, id: u64, message: JsonRpcMessage) -> bool {
+        if !self.reply_claims.lock().remove(&MsgId(id)) {
+            return false;
+        }
+        self.send(message);
+        true
     }
 
     /// Record the host → client request methods this connection declared.
