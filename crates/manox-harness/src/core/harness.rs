@@ -2033,10 +2033,10 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.rebuild_system_prompt();
     }
 
-    /// Drop selection names the mounted set no longer carries, logging what
-    /// went. Selections recorded by earlier builds can name retired tools (a
-    /// removed tool suite, an uninstalled MCP server); the runtime view
-    /// filtered them out silently, but the stored list kept them — and any
+    /// Drop selection names the mounted set does not carry, logging what
+    /// went. A stored selection can name tools that are not mounted (an
+    /// uninstalled MCP server, a suite this build does not ship); the runtime
+    /// view filtered them out silently, but the stored list kept them — and any
     /// later `set_active_tools` validates the whole merged list against the
     /// mounted set, so one stale name made every subsequent selection change
     /// fail forever. Pruning happens on the in-memory selection only; the
@@ -6932,7 +6932,7 @@ pub(crate) mod tests {
         });
 
         // Harness 1 leaves the transcript a pre-store session would carry:
-        // the legacy model row the reopen tolerates.
+        // the stored model row the reopen tolerates.
         let mut h1 = AgentHarness::new(
             Session::new(MemStorage::new()),
             "You are a test assistant.",
@@ -8446,9 +8446,8 @@ pub(crate) mod tests {
         assert_eq!(mounted_names(&harness), ["echo"]);
     }
 
-    /// A selection recorded by an earlier build can name tools this build no
-    /// longer mounts (the retired ChromeUse suite is the canonical case).
-    /// Restore prunes those names, so the next selection change — a browser
+    /// A stored selection can name a tool that is not mounted. Restore
+    /// prunes those names, so the next selection change — a browser
     /// suite toggle merges against the restored list and validates the whole
     /// thing against the mounted set — lands, and the newly persisted row is
     /// clean. Without the prune, every subsequent selection change fails

@@ -1,11 +1,11 @@
 //! JSON-RPC 2.0 mechanics: correlation, encoding, version negotiation.
 //!
 //! This layer knows nothing about AHP — no channels, no state, no actions. It is
-//! what `core/` builds on, and it is where the v2 protocol's most expensive
-//! lessons were paid for:
+//! what `core/` builds on, and it is where the protocol's most expensive
+//! lessons live:
 
 //! - [`peer::RpcPeer`] correlates outstanding request/response and call/reply
-//!   pairs. Its three hard rules are carried over verbatim in behaviour:
+//!   pairs. Its three hard rules hold in behaviour:
 //!   a duplicate registration is refused and the **first** waiter survives; a
 //!   closed waiter must never be produced by our own bookkeeping (callers fold a
 //!   closed receiver into a fail-closed rejection, so a clobbered waiter
@@ -13,8 +13,8 @@
 //!   hand-shake cancels every outstanding waiter with a distinguishable error so
 //!   senders can tell a connection swap from a delivery failure.
 //! - Timeouts are deliberately **not** here. The issuer owns its own deadline
-//!   (the v2 gateway ran a 300s call timeout), because a peer that guesses a
-//!   timeout for its caller cannot let a longer one through.
+//!   because a peer that guesses a timeout for its caller cannot let a longer
+//!   one through.
 //! - [`version::negotiate`] is the single place that maps a client's offered
 //!   protocol versions onto the one this build speaks.
 

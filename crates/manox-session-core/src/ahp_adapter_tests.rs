@@ -2338,7 +2338,7 @@ mod dispatch {
 
         // And a steer with no turn running reports the opposite: it opens a
         // turn of its own, so its pending entry is carried by that turn rather
-        // than retired.
+        // than cleared.
         server
             .ahp_inner()
             .session_thread("s-dispatch")
@@ -2450,14 +2450,13 @@ mod dispatch {
     }
 
     /// The rename's **durable** half: the journal row, which is the only route
-    /// either protocol face takes.
+    /// the AHP face takes.
     ///
-    /// The in-memory summary is not the contract. The v2 projection folds
-    /// `Event::Title` and the AHP translator reads the journal,
-    /// while the live `TitleChanged` event sits on `translate.rs`'s `Skip`
-    /// list — so a rename that only flipped the summary would pass a
+    /// The in-memory summary is not the contract. The AHP translator reads the
+    /// journal, while the live `TitleChanged` event sits on `translate.rs`'s
+    /// `Skip` list — so a rename that only flipped the summary would pass a
     /// summary-only assertion and still be invisible to every client following
-    /// the session. This is the cross-protocol hole, pinned.
+    /// the session. This is the client-visibility hole, pinned.
     ///
     /// A **unique session id** is load-bearing: engine routes are a
     /// process-global map keyed by thread id (`engine::engine_routes`), so
@@ -3045,7 +3044,7 @@ mod dispatch {
         assert_eq!(
             state.status & SessionStatus::InProgress.bits(),
             0,
-            "the chat status no longer claims InProgress"
+            "the chat status does not claim InProgress"
         );
         uninstall();
     }
@@ -3376,10 +3375,9 @@ mod dispatch {
     }
 
     /// The `x-manox` command face must accept a cold session too: `compact`
-    /// and `goal` are the v2 height of `Compact` and `Goal`, and a restored
-    /// session is exactly where a user reaches for them. Each arm used to
-    /// bare-look the sessions table and refuse before the runtime's own
-    /// cold-open could run.
+    /// and `goal` are the command face of the compaction and goal actions, and
+    /// a restored session is exactly where a user reaches for them. Each arm
+    /// cold-opens through the runtime instead of refusing first.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cold_restored_sessions_commands_open_it_instead_of_refusing() {
         let _guards = install();
@@ -3530,8 +3528,7 @@ mod dispatch {
             .expect("the catalogue carries a commands array");
         assert!(
             !commands.is_empty(),
-            "the built-in slash commands must appear; an empty palette is what \
-         the v2 ListCommands call never returned"
+            "the built-in slash commands must appear; an empty palette would be a bug"
         );
         let names: Vec<&str> = commands.iter().filter_map(|c| c["name"].as_str()).collect();
         assert!(
@@ -3629,7 +3626,7 @@ mod dispatch {
     }
 
     /// The capability router's AHP leg declines cleanly when the transport has
-    /// no capable client, so the v2 path still runs.
+    /// no capable client, so the router falls through to the next leg.
     ///
     /// The positive half — an AHP client that declared a capability is the one
     /// asked — is pinned in `manox-ahp`'s `only_declared_client_requests_select_a_connection`,
@@ -3675,7 +3672,7 @@ mod dispatch {
         uninstall();
     }
 
-    /// Pin and manual ordering are user-visible v2 features with no AHP slot, so
+    /// Pin and manual ordering are user-visible features with no AHP slot, so
     /// they ride the declared extension surface. Both must reach their durable
     /// layer — a pin the sidebar shows and a cold restore forgets would be the
     /// worst of both.
@@ -4240,7 +4237,7 @@ mod dispatch {
 
     // ── client-contributed tools (`session/activeClientSet`) ───────────────
     //
-    // The AHP face of v2's `RegisterSessionTools`. The registration lands in
+    // The AHP face of client-tool registration. The registration lands in
     // the runtime's embedder-tool store (so the model can call the tool) while
     // `activeClients` carries it on the protocol surface (so every subscriber
     // reads it). Both halves are asserted here, because either alone is a
@@ -4282,8 +4279,8 @@ mod dispatch {
     }
 
     /// A registration reaches the runtime's tool store, so the model can call
-    /// the tool: the AHP action and the v2 `RegisterSessionTools` call fill the
-    /// same registration the engine consults at assembly.
+    /// the tool: the AHP action and client-tool registration fill the same
+    /// registration the engine consults at assembly.
     #[tokio::test(flavor = "multi_thread")]
     async fn active_client_set_registers_tools_the_runtime_will_mount() {
         let _guards = install();
@@ -4318,7 +4315,7 @@ mod dispatch {
     }
 
     /// Re-registering replaces the set (full replacement per client), which is
-    /// both the AHP upsert contract and the v2 call's own semantics.
+    /// both the AHP upsert contract and the client-tool contract.
     #[tokio::test(flavor = "multi_thread")]
     async fn active_client_set_replaces_a_previous_registration() {
         let _guards = install();

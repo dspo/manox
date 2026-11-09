@@ -1,5 +1,5 @@
-//! Plugin lifecycle hooks (ported from the retired manox harness's `hook`
-//! module): a plugin's `hooks/hooks.json` maps lifecycle events
+//! Plugin lifecycle hooks: a plugin's `hooks/hooks.json` maps lifecycle
+//! events
 //! (`SessionStart`, `SessionEnd`, `Stop`, `PreToolUse`, `PostToolUse`) to
 //! shell commands. The command runs with `CLAUDE_PLUGIN_ROOT` set to the
 //! plugin's installed root, `CLAUDE_PROJECT_DIR` set to the owning thread's
@@ -9,8 +9,7 @@
 //!
 //! `SessionStart` fires before a session's first user turn (restored
 //! sessions skip it); `SessionEnd` fires when a thread is archived (the
-//! "session is over" analogue — the retired harness fired on thread
-//! deletion). `Stop` fires on each turn's settlement. Hooks are
+//! "session is over" analogue). `Stop` fires on each turn's settlement. Hooks are
 //! fire-and-forget and fail-open: a handler error or timeout is logged and
 //! never blocks the turn. `PreToolUse` / `PostToolUse` therefore cannot
 //! block a tool call — they are notification-only (the decision-returning
@@ -186,7 +185,7 @@ impl HookRegistry {
 /// Cross-app automation commands (osascript / AppleScript / `open -a`) would
 /// otherwise silently broker Apple Events from a plugin; flag them so the
 /// attempt is at least auditable in the trace log (hooks are fail-open and
-/// not approval-gated — same stance as the retired harness).
+/// not approval-gated — the same stance the rest of the hook surface takes.
 fn is_cross_app_automation(command: &str) -> bool {
     let lowered = command.to_ascii_lowercase();
     lowered.contains("osascript") || lowered.contains("applescript") || lowered.contains("open -a")

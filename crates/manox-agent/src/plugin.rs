@@ -103,8 +103,8 @@ impl MarketplacePluginSource {
 /// deserializes into the same variant.
 ///
 /// An unknown kind must not fail the enclosing entry, let alone the whole
-/// index: one unrecognized source used to make the entire marketplace
-/// vanish from the UI. Unknown kinds parse into
+/// index: an unrecognized source never removes the marketplace from the
+/// UI. Unknown kinds parse into
 /// [`MarketplacePluginSource::Unsupported`] — listed, never installed.
 #[derive(Debug, Clone)]
 pub enum MarketplacePluginSource {
@@ -2343,9 +2343,9 @@ mod tests {
             "live ~/.claude has installs but none enabled"
         );
         // Official-index drift probe: every entry of the largest marketplace
-        // must parse. One unparseable entry used to erase the whole
-        // marketplace from the UI (the url-kind mass, 104/203 at
-        // 2026-09); this fails loudly the day a new kind appears.
+        // must parse. An unparseable entry must never erase the whole
+        // marketplace from the UI (the url kind is the mass case); this
+        // fails loudly the day a new kind appears.
         if let Some(record) = records.iter().max_by_key(|r| r.plugin_count) {
             let index = PluginManager::load_marketplace_index(&record.root).unwrap_or_else(|e| {
                 panic!("largest marketplace {} unparseable: {e:#}", record.slug)

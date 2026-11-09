@@ -53,9 +53,9 @@ pub fn agents_dir() -> Result<PathBuf> {
     Ok(claude_home()?.join("agents"))
 }
 
-/// The v1.0.0 state root: every session lives in its own directory under a
-/// project bucket (`<root>/<project-slug>/<session-id>/session.jsonl`), the
-/// immutable identity beside it (`header.json`). The flat `sessions/` tree is
+/// The runtime state root: every session lives in its own directory under a
+/// project bucket (`<root>/<project-slug>/<session-id>/session.jsonl`), its
+/// immutable identity in the journal's header row. A flat `sessions/` tree is
 /// never read — no import, no fallback.
 pub fn core_root() -> Result<PathBuf> {
     // The store owns the sessions root (a test store points at its own
@@ -117,7 +117,7 @@ pub fn core_session_file(project: Option<&std::path::Path>, id: &str) -> Result<
 /// canonical layout — `core/<slug>/<session>/session.jsonl`. `Err` only when
 /// the config root is unresolvable; callers use
 /// [`unresolved_session_parts`], which keeps the same shape rather than
-/// falling back to the retired flat tree.
+/// falling back to a flat `sessions/` tree.
 pub fn core_session_parts(
     project: Option<&std::path::Path>,
     id: &str,
@@ -214,8 +214,8 @@ pub fn home_dir() -> Option<PathBuf> {
 
 /// Ensure the manox config root exists. Called by writers (settings, MCP
 /// config) before they lay down files; readers tolerate absence so a fresh
-/// machine with no config still boots. The plugin store no longer lives
-/// here — it moved to the shared Claude home.
+/// machine with no config still boots. The plugin store lives in the shared
+/// Claude home, not here.
 pub fn ensure_manox_config_dir() -> Result<PathBuf> {
     let dir = manox_config_dir()?;
     if dir.exists() {

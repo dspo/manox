@@ -3,16 +3,14 @@
 //! The sidebar's session list comes from the session repository (jsonl)
 //! plus a per-session UI-metadata sidecar (`manox_harness::session_meta`).
 //! The transcript persists itself, so `refresh_thread_list` only refreshes
-//! the sidebar list; manox SQLite timeline/note records are not produced.
+//! the sidebar list; no SQLite timeline/note records exist.
 //! Archived sessions are excluded from the sidebar list but stay in
-//! `session_paths` so their sidecar remains addressable. The retired manox
-//! SQLite-backed implementation was removed; see git history (or the
-//! `origin/Manox` backup branch) for it.
+//! `session_paths` so their sidecar remains addressable.
 //!
 //! A refresh is a RECONCILE, not a scan: a `read_dir` + `stat` sweep
 //! fingerprints every session file (and its sidecar); files whose append-only
 //! coverage still holds reuse the cached bounded facts (`session_index` hot
-//! map + db table), and only the new or shrunk ones take a bounded read
+//! map), and only the new or shrunk ones take a bounded read
 //! (header + first user message — never the transcript). Latency grows with
 //! CHANGES, not with history: a 40 MiB session being actively appended is
 //! never re-read.
@@ -95,7 +93,7 @@ pub struct ThreadStore {
     pending_meta_writes: Vec<MetaWrite>,
     /// Working-directory grants held in memory until the session's journal
     /// materializes: writing a sidecar for a session with no journal orphans
-    /// a meta with no log (the v1 black-hole class). Flushed the moment the
+    /// a meta with no log. Flushed the moment the
     /// journal file appears.
     pending_working_dirs: HashMap<String, Vec<String>>,
     /// View stamps observed before the session's sidecar path materialized
@@ -528,7 +526,7 @@ fn write_projects_file(path: &std::path::Path, projects: &[ProjectEntry]) -> std
 }
 
 pub(crate) fn sessions_dir() -> PathBuf {
-    // The v1.0.0 core root: per-session directories under project buckets.
+    // The core root: per-session directories under project buckets.
     // Computed DIRECTLY (never through `paths::core_root`, which resolves
     // through this store — re-entering the global during store construction
     // deadlocks).
@@ -1051,9 +1049,8 @@ impl ThreadStore {
     /// Three legs, and a rename needs all three:
     ///
     /// - **the journal** ([`Self::journal_title`]) carries `Event::Title`,
-    ///   which the v2 title projection folds (`projections.rs`) and the AHP
-    ///   translator reads (`translate/actions.rs`). It is the only route
-    ///   either takes: the live `ThreadEvent::TitleChanged` is on
+    ///   which the AHP translator reads (`translate/actions.rs`). It is the
+    ///   only route: the live `ThreadEvent::TitleChanged` is on
     ///   `translate.rs`'s `Skip` list precisely because the journal row is its
     ///   durable form.
     /// - **the in-memory summary** updates the `title_override` slot that
@@ -1619,8 +1616,7 @@ impl ThreadStore {
             self.write_meta(&tid, move |meta| meta.archived = archived);
             if archived {
                 // Plugin lifecycle: archiving ends the session's working life
-                // (the retired harness fired on thread deletion; the manox harness
-                // keeps sessions and archives instead). Fail-open, detached.
+                // (sessions are archived, never deleted). Fail-open, detached.
                 crate::plugin_hooks::fire(
                     crate::plugin_hooks::HookEvent::SessionEnd,
                     None,
@@ -1843,10 +1839,9 @@ async fn reconcile_summaries(
     dir: &std::path::Path,
     index: &mut SessionIndex,
 ) -> (Vec<SessionRow>, Vec<SessionRow>) {
-    // The cold-cache layer retired with the db: the in-memory index still
-    // accelerates a live process's repeat scans, but every restart starts
-    // from a bounded header scan — the list's content never depended on the
-    // cache anyway.
+    // The in-memory index accelerates a live process's repeat scans, but
+    // every restart starts from a bounded header scan — the list's content
+    // never depends on the cache anyway.
     index.seeded = true;
     let stats = stat_session_files(dir).await;
     let live: std::collections::HashSet<PathBuf> = stats.iter().map(|s| s.path.clone()).collect();
@@ -1923,7 +1918,7 @@ async fn reconcile_summaries(
                     );
                     // Negative cache: the failure is fingerprinted, so an
                     // unchanged file never re-reads (or re-warns) — a store
-                    // carrying legacy headerless zombies pays for them once.
+                    // carrying headerless files pays for them once.
                     index.dirty = true;
                     index.rows.insert(
                         stat.path.clone(),
@@ -2143,8 +2138,8 @@ async fn stat_session_files(dir: &std::path::Path) -> Vec<Stat> {
         // The core root is two-deep: project buckets over per-session
         // directories, the journal (`session.jsonl`) inside each. That shape
         // is the ONLY one the sidebar sees — a flat `*.jsonl` beside the
-        // buckets is the retired layout (the out-of-repo migration re-homes
-        // those files), so a stray one never lists or opens here.
+        // buckets is not a layout this store writes, so a stray one never
+        // lists or opens here.
         fn walk(dir: &std::path::Path, depth: u8, out: &mut Vec<Stat>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
@@ -2277,7 +2272,7 @@ fn resolve_depths(list: &mut [ThreadSummary]) {
 /// storage. The surfaced session is the registry's active pointer when it
 /// hits, else the newest; the row carries the THREAD's id (stable across
 /// swaps and restarts) and the active session's fields. Sessions without a
-/// thread stamp (legacy files) pass through as singleton rows keyed by
+/// thread stamp (a journal with no stamp) pass through as singleton rows keyed by
 /// their own id. Child rows (delegated subagent sessions) never group —
 /// their parent edge resolves against the same session→thread map so the
 /// catalogue annotation names the row the client actually sees. Returns
@@ -2330,7 +2325,7 @@ fn group_by_thread(
         consumed.extend(members.iter().copied());
         // The row IS the thread: stable id across session swaps, team edge
         // remapped from the leader's SESSION id to the leader's THREAD key
-        // (unresolvable legacy edges keep their raw value).
+        // (an edge that resolves to no row keeps its raw value).
         sum.id = thread_key.clone();
         if let Some(parent_session) = sum.parent_id.clone()
             && let Some(leader_thread) = session_to_thread.get(&parent_session)
@@ -2536,8 +2531,7 @@ mod tests {
     /// A rename must land a durable `title` **journal** row, not only the
     /// sidecar.
     ///
-    /// The row is the only route the two protocol faces take — the v2
-    /// projection folds `Event::Title` and the AHP translator reads
+    /// The row is the only route the AHP face takes — the translator reads
     /// the journal, while the live `TitleChanged` event is on `translate.rs`'s
     /// `Skip` list. A store-side rename that skipped this would be invisible to
     /// every client following the session, which is exactly the cross-protocol
@@ -2764,7 +2758,7 @@ mod tests {
     }
 
     /// A header-only v4 fixture: the journal a session leaves before its
-    /// first message (a subagent's dispatch declaration, a legacy
+    /// first message (a subagent's dispatch declaration, a
     /// never-materialized row).
     fn write_header_only_fixture(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
         let content = format!(
@@ -2831,7 +2825,7 @@ mod tests {
     }
 
     /// The one append that DOES touch a cached fact: a journal first scanned
-    /// before any message landed (a subagent's dispatch declaration, a legacy
+    /// before any message landed (a subagent's dispatch declaration, a
     /// header-only file) must re-read once a message arrives. The message-less
     /// row's `has_messages` gates the catalogue's recency key, so pinning it
     /// false until a shrink that an append-only writer never produces would
@@ -2950,10 +2944,9 @@ mod tests {
         );
     }
 
-    /// The canonical layout is the ONLY shape the scan admits: a journal the
-    /// retired flat tree left beside the buckets (an out-of-repo migration
-    /// re-homes those files) never lists, never resolves as an open target,
-    /// and never shadows a canonical sibling.
+    /// The canonical layout is the ONLY shape the scan admits: a journal left
+    /// beside the buckets never lists, never resolves as an open target, and
+    /// never shadows a canonical sibling.
     #[tokio::test]
     async fn a_flat_journal_is_invisible_to_the_scan() {
         let _db_path = temp_db();
@@ -2965,9 +2958,9 @@ mod tests {
                 "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{id}\"}}}}\n"
             )
         };
-        // The retired shapes: a valid session file directly in the core root,
-        // and a journal-shaped file one level short (inside a bucket, not a
-        // per-session directory).
+        // The shapes the scan refuses: a valid session file directly in the
+        // core root, and a journal-shaped file one level short (inside a
+        // bucket, not a per-session directory).
         std::fs::write(dir.join("flat-old.jsonl"), header("flat-old")).unwrap();
         let bucket = dir.join("--bucket--");
         std::fs::create_dir_all(&bucket).unwrap();
@@ -2994,9 +2987,8 @@ mod tests {
         assert_eq!(store.read(|s| s.summaries().len()), 1);
     }
 
-    /// A restart rebuilds identical rows from the bounded scan alone — the
-    /// cold-cache layer retired with the db, and the list's content never
-    /// depended on it.
+    /// A restart rebuilds identical rows from the bounded scan alone — no
+    /// cache layer exists, so the list's content never depends on one.
     #[tokio::test]
     async fn reconcile_rebuilds_identical_rows_after_a_restart() {
         let store = standalone_for_test();
@@ -3310,9 +3302,9 @@ mod tests {
     }
 
     /// A thread's real session files (base + worktree fork, both stamped
-    /// with the same header `thread` key as the retired worktree fork left them)
-    /// collapse to ONE sidebar row keyed by the thread id, following the
-    /// registry's active pointer in both directions.
+    /// with the same header `thread` key) collapse to ONE sidebar row keyed by
+    /// the thread id, following the registry's active pointer in both
+    /// directions.
     #[tokio::test]
     async fn grouping_end_to_end_over_real_session_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -3398,7 +3390,7 @@ mod tests {
         assert_eq!(
             child.parent_id.as_deref(),
             Some("captain-1"),
-            "the parent resolves to the thread row the catalogue serves (v1.0.0: thread id == session id)"
+            "the parent resolves to the thread row the catalogue serves (thread id == session id)"
         );
         assert_eq!(child.display_title(), "survey auth");
         // Addressable for reopen and flag writes; lookup reaches the
@@ -3411,7 +3403,7 @@ mod tests {
     }
 
     /// The parent edge names the catalogue's join key: a spawning session
-    /// grouped under a legacy thread key remaps the child's parent to that
+    /// grouped under a thread key remaps the child's parent to that
     /// row id (the team-edge remap's rule), so the client's fold finds the
     /// parent row the list actually carries.
     #[tokio::test]
@@ -4577,8 +4569,8 @@ mod tests {
 
         // B's viewer declares the view. The write is QUEUED for the store's
         // pass runner (a direct `refresh_now` does not drain the queue), so
-        // wait for it to land on the shared disk before A re-scans — racing
-        // the spawned runner is the flake this test used to carry.
+        // wait for it to land on the shared disk before A re-scans — the
+        // race against the spawned runner is what the wait guards against.
         b.with_mut(|s| assert!(s.mark_viewed("s-cross", 100)));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {

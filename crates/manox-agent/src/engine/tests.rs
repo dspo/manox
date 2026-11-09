@@ -628,7 +628,7 @@ async fn turn_finish_row(
     entry
 }
 
-/// Settle delivery (v2 wire): a normal settle appends a durable
+/// Settle delivery: a normal settle appends a durable
 /// `turn_finish` row — clean exit, no stranded steers, a fresh entry id
 /// chained onto the session leaf.
 #[tokio::test]
@@ -677,7 +677,7 @@ async fn settle_appends_a_turn_finish_row_on_normal_completion() {
 }
 
 /// Settle delivery, abort path: the retracted steers of the
-/// `Settled{stranded}` notice ride the same durable row, so a v2 client
+/// `Settled{stranded}` notice ride the same durable row, so a client
 /// retires its cards from the journal fold alone.
 #[tokio::test]
 async fn settle_appends_a_turn_finish_row_with_stranded_steers_on_abort() {
@@ -2759,14 +2759,14 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
     };
     appender.pin_accepted_user_entry("stale-entry-id".into(), stale_content);
 
-    // A legacy (origin-less) prompt: the drain-time resolution declines
+    // An origin-less prompt: the drain-time resolution declines
     // to persist — and clears the stale pin on its way through.
     let pinned = persist_prompt_user_entry(&session, "fresh text", &[], None, None)
         .await
         .unwrap();
     assert!(
         pinned.is_none(),
-        "a legacy prompt keeps the middleware path"
+        "an origin-less prompt keeps the middleware path"
     );
 
     let mut rig = K5Rig::new(&dir, &session);
@@ -2789,7 +2789,11 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
 
     let rows = appender.storage().journal_range(0, u64::MAX).await.unwrap();
     let users = k5_user_entries(&rows);
-    assert_eq!(users.len(), 1, "the legacy turn appended its own user row");
+    assert_eq!(
+        users.len(),
+        1,
+        "the origin-less turn appended its own user row"
+    );
     assert_eq!(users[0].0, "fresh text");
     assert_eq!(users[0].1, None);
     let id = rows
@@ -3564,10 +3568,10 @@ async fn a_submit_while_held_commits_the_held_turn() {
 
 /// A restored chain that ends inside a turn gets the close its previous
 /// process never wrote — `cancelled: true`, `failed: false`, reason
-/// `"host exited"` — and the replayed fold sees it. This is the legacy shape:
-/// no `turn_start` row, only the user row that opened the turn.
+/// `"host exited"` — and the replayed fold sees it. This is the user-row
+/// shape: no `turn_start` row, only the user row that opened the turn.
 #[tokio::test]
-async fn restore_closes_an_interrupted_legacy_turn_as_host_exited() {
+async fn restore_closes_an_interrupted_unstamped_turn_as_host_exited() {
     crate::runtime::init_hermetic_for_test();
     let dir = tempfile::tempdir().unwrap();
     let mut session = steer_test_session(&dir).await;
@@ -4199,8 +4203,8 @@ fn scripted_state_rows() -> Vec<(&'static str, serde_json::Value)> {
         ),
         ("goal", json!({ "goal": { "objective": "replay" } })),
         ("title", json!({ "title": "replayed title" })),
-        // The retired `chromeuse` slug rides along: journal rows are
-        // string-typed, so pre-removal sessions replay without a compat read.
+        // An unknown suite slug rides along: journal rows are
+        // string-typed, so a stored session replays without a compat read.
         (
             "browser_suites",
             json!({ "suites": ["webexplore", "chromeuse"] }),
@@ -4619,7 +4623,7 @@ async fn journal_replay_is_consistent_across_disk_reload() {
 /// K2 authority: the journal rebuild WINS over a diverging sidecar, and
 /// the sidecar cache is repaired toward the journal. The session-mutable
 /// config keys answer from the chain alone — a chain with no mode row
-/// restores the bounded default, and a sidecar's retired config copy is
+/// restores the bounded default, and a sidecar's stale config copy is
 /// never read.
 #[tokio::test]
 async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
@@ -4719,8 +4723,8 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
 
 /// The sidecar fills only the fields the chain has never seen (title /
 /// plan / project). The session-mutable config keys are NOT among them:
-/// a chain without config rows restores the defaults — the retired
-/// sidecar copies are dead, no fallback read survives.
+/// a chain without config rows restores the defaults — stale sidecar
+/// copies are dead, no fallback read survives.
 #[test]
 fn restored_state_falls_back_to_the_sidecar_only_for_its_cache_fields() {
     let replayed = crate::replay::ReplayedThreadState::default();
@@ -4816,8 +4820,8 @@ async fn set_thinking_level_lands_one_row_and_a_restate_lands_none() {
         "the pick lands exactly one durable row in the wire form"
     );
 
-    // Restating the level in force lands no duplicate (this is the shape
-    // the restore seed's re-apply of the replayed value used to take).
+    // Restating the level in force lands no duplicate (the restore seed
+    // re-applies the replayed value the same way).
     apply_thinking_level(&mut session, &state, &notice_tx, Some("max".to_string())).await;
     assert_eq!(effort_rows(&session).await.len(), 1);
     session.close().await.unwrap();
@@ -4898,7 +4902,7 @@ async fn store_journal_rows_route_to_the_actor_and_the_shutdown_claim_lands_them
         "the claimed row must land in the journal"
     );
 
-    // A retired route never accepts new rows: the dispatch waits for
+    // An unregistered route never accepts new rows: the dispatch waits for
     // the route's removal, then takes the cold path (no file here —
     // the row is skipped, which the wait+removal must not hang on).
     unregister_engine_route(&thread_id, &cmd_tx);

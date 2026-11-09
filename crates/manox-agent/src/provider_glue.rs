@@ -277,11 +277,10 @@ pub fn resolve_side_call_model_in(
     }
     resolved
 }
-/// Model catalog restoring legacy manox-style provider ids persisted by
-/// older sessions: `{wire}:{name}` (e.g. `anthropic:DeepSeek`) aliases the
-/// current registration name `{name}-{wire}` (`DeepSeek-anthropic`). A
-/// host-side compatibility layer — the kernel catalog only knows
-/// registration names.
+/// Model catalog mapping `{wire}:{name}` provider ids (e.g.
+/// `anthropic:DeepSeek`) to the current registration name `{name}-{wire}`
+/// (`DeepSeek-anthropic`). A host-side alias layer — the kernel catalog only
+/// knows registration names.
 pub struct LegacyAliasCatalog {
     registry: Arc<ProviderRegistry>,
 }

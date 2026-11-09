@@ -199,7 +199,7 @@ pub(super) fn prompt_user_message(text: &str, images: &[ContentBlock]) -> AgentM
 /// the normal path. The pin and any drain-time append carry the
 /// POST-expansion text (the K5 edge: the run announces the expanded
 /// shape); the acceptance-side persistence expands identically. An origin-less prompt (an internally-driven `run()`
-/// turn, a goal seed) keeps the legacy flow: the middleware
+/// turn, a goal seed) keeps the middleware flow: the middleware
 /// persists its user message at announce time.
 pub(super) async fn persist_prompt_user_entry(
     session: &AgentSession,

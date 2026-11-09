@@ -495,7 +495,7 @@ pub fn save(settings: &Settings) -> Result<()> {
 /// The merge is intentionally additive at the top level: only the keys present
 /// in the serialized [`Settings`] are overwritten. Two consequences follow.
 /// Keys the host owns (`ui_language`) survive a runtime save, and keys this
-/// crate has *retired* are never reclaimed — a stale `agent_language` or
+/// crate does not write are never reclaimed — a stale `agent_language` or
 /// `follow_up_behavior` simply stays in the file, unread and harmless, rather
 /// than being silently deleted along with anything else we failed to model.
 ///

@@ -1567,7 +1567,7 @@ mod tests {
 
     /// Definition `tools:` data resolves warn-and-skip against the child
     /// snapshot: unknown and privileged names dropped, known names kept.
-    /// With the per-definition tools retired the def's registry name needs
+    /// With per-definition tools gone the def's registry name needs
     /// no wire sanitizing — it is the `Steer` `to.spawn` value verbatim.
     #[test]
     fn resolve_definition_filters_warns_and_skips() {
@@ -2153,7 +2153,7 @@ mod tests {
         );
 
         // The terminal notice is sent after the net settled, forgot the run,
-        // and retired the observer state, so receiving it proves the funnel.
+        // and cleared the observer state, so receiving it proves the funnel.
         let notice = tokio::time::timeout(Duration::from_secs(5), notice_rx.recv())
             .await
             .expect("the net settles the run");

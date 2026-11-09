@@ -2133,9 +2133,9 @@ mod tests {
         }
     }
 
-    /// A v3 file — the journal format two generations back — is rejected on
-    /// open with that same actionable error, and the file is left untouched
-    /// (no migration, no rewrite).
+    /// A file on an older journal format is rejected on open with the same
+    /// actionable error, and the file is left untouched (no conversion, no
+    /// rewrite).
     #[tokio::test]
     async fn a_v3_file_is_rejected_and_left_untouched() {
         let dir = tempfile::tempdir().unwrap();

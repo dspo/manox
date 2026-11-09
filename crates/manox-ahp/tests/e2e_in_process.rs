@@ -346,7 +346,7 @@ async fn a_steer_turn_started_retires_the_steering_slot() {
     let chat = host.chat_state("c-1").expect("the chat is seeded");
     assert!(
         chat.steering_message.is_none(),
-        "the steer's turnStarted retired the slot by id: {:?}",
+        "the steer's turnStarted cleared the slot by id: {:?}",
         chat.steering_message
     );
     let active = chat.active_turn.expect("the steer opened a turn");

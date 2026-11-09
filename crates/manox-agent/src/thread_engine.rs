@@ -379,7 +379,7 @@ pub enum BackendNotice {
     /// `BusOp` the facade executes on the gpui main thread (spawn member
     /// thread, inject peer message, abort member) and replies via the
     /// responder when one is attached; fire-and-forget ops (cancel fan-out)
-    /// send `None`. Generalizes the retired `TeamRequest` architecture.
+    /// send `None`.
     BusRequest {
         op: manox_harness::steer_bus::BusOp,
         responder: Option<async_channel::Sender<Result<String, String>>>,
@@ -406,8 +406,7 @@ pub enum BackendNotice {
         responder: async_channel::Sender<Result<(), String>>,
     },
     /// A dispatched subagent finished. The facade delivers the final text to
-    /// the Captain as a peer message and triggers a turn (generalizes the
-    /// retired `SailorCompleted`).
+    /// the Captain as a peer message and triggers a turn.
     SteerDelivered {
         from: manox_harness::steer_bus::AgentId,
         reason: manox_harness::steer_bus::SteerReason,

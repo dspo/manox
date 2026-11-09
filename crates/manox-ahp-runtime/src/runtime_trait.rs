@@ -2,20 +2,19 @@
 //!
 //! The AHP host's adapter (this crate's [`crate::ahp`]) must drive real
 //! sessions: create them, submit turns, steer, settle approvals, read journals,
-//! own terminals. Those operations belong to the session runtime — which, while
-//! v2 lives, is the gateway in `manox-session-core`.
+//! own terminals. Those operations belong to the session runtime — the gateway
+//! in `manox-session-core`.
 //!
 //! This trait is the seam. The adapter speaks it and nothing else, so:
 //!
-//! - the session side can be the v2 gateway today and something leaner after v2
-//!   is deleted, with no change here; and
+//! - the session side can be the gateway today and something leaner later, with
+//!   no change here; and
 //! - the dependency runs one way. The runtime half does not reach into the
 //!   gateway's internals (it cannot: it never names its types), and the gateway
 //!   implements this interface rather than the reverse.
 //!
-//! The DTOs below are plain data deliberately. They were the gateway's types
-//! (`SessionIntent`, `ForkIntent`) when this code lived beside it; owning them
-//! here is what lets the gateway be deleted without touching the adapter.
+//! The DTOs below are plain data deliberately: owning them here keeps the
+//! adapter independent of the gateway's own types.
 
 use async_trait::async_trait;
 use manox_ahp::error::HostError;
@@ -47,7 +46,7 @@ pub struct ClientToolSpec {
 /// One image attached to a submission.
 ///
 /// Plain data, like [`ClientToolSpec`]: the runtime hands the bytes to the
-/// kernel and nothing here describes a wire shape. It was a v2 protocol type.
+/// kernel and nothing here describes a wire shape.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ImageAttachment {
     /// The image's raw bytes.
@@ -236,8 +235,8 @@ pub trait SessionRuntime: Send + Sync + 'static {
     }
 
     /// The conversation-info Q face for a live session: per-model usage,
-    /// cumulative totals and cost, folded from the journal (the retired v2
-    /// `GetConversationInfo`). `None` for a cold session — a session without
+    /// cumulative totals and cost, folded from the journal. `None` for a cold
+    /// session — a session without
     /// a materialized engine has no thread to fold, and its metrics channel
     /// baseline stays empty until the first submit.
     async fn conversation_metrics(&self, _session_id: &str) -> Option<Value> {
@@ -364,7 +363,7 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// the user clicked, exactly as the confirmation surfaced it — the
     /// approve-kind options beyond the bare `allow_once` (the network host
     /// amendments) are distinguishable only through it, so a client that
-    /// knows the vocabulary sends it and a legacy client may omit it.
+    /// knows the vocabulary sends it; a client that does not may omit it.
     async fn confirm_tool_call(
         &self,
         session_id: &str,
@@ -391,9 +390,9 @@ pub trait SessionRuntime: Send + Sync + 'static {
 
     /// Register the tools a client contributes to one session.
     ///
-    /// One registration path, not two: the same store v2's
-    /// `RegisterSessionTools` fills, so a contributed tool becomes callable by
-    /// the model through the existing `embedder_tools` machinery.
+    /// One registration path, not two: the same store client-tool
+    /// registration fills, so a contributed tool becomes callable by the model
+    /// through the existing `embedder_tools` machinery.
     async fn set_embedder_tools(
         &self,
         session_id: &str,

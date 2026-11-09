@@ -269,8 +269,7 @@ impl AgentServer {
         // summary write (title auto-stamps, interacted_at bumps, pin/
         // archive/tag, rescans) reaches EVERY connection as the
         // ThreadsUpdated push, so no client needs an in-process store
-        // subscription to keep its list fresh (the desktop's store-event
-        // bridge retired against this). Weak like the reload listener: a
+        // subscription to keep its list fresh. Weak like the reload listener: a
         // dropped server leaves the watcher inert, and the store's channel
         // close (teardown) retires the task. A store-less construction
         // (foreign fixtures) skips the watcher — there is nothing to watch.
@@ -467,9 +466,9 @@ impl AgentServerInner {
 
     /// Full-replacement write of one client's embedder tool set for a session.
     ///
-    /// The AHP face (`session/activeClientSet`) lands here, exactly like the v2
-    /// `RegisterSessionTools` call: both are the same registration fact, and
-    /// the engine consults this one store when it assembles a session's tools.
+    /// The AHP face (`session/activeClientSet`) lands here: it is the same
+    /// registration fact, and the engine consults this one store when it
+    /// assembles a session's tools.
     pub(crate) fn set_embedder_tools(
         &self,
         session_id: &str,
@@ -1445,7 +1444,7 @@ impl AgentServerInner {
         // engine — `dspo/manox#899` was exactly that parking outliving the
         // turn it waited for.
         // Slash resolution first (its handlers mutate the facade): a slash
-        // hit keeps the legacy transcript semantics and never takes the
+        // hit keeps the slash transcript semantics and never takes the
         // accept-time persist path. The origin pin lands here, as before —
         // a run started by a slash builtin carries it.
         let slashed = thread.with_mut(|t| {
@@ -1607,7 +1606,7 @@ impl AgentServerInner {
             // Whether the text went into the RUNNING turn or started one. The
             // caller needs the difference: an injected steer is consumed by the
             // turn it interrupted, so the pending message that announced it has
-            // to be retired, while a steer that started its own turn is carried
+            // to be cleared, while a steer that started its own turn is carried
             // by that turn like any other opening message.
             "injected": injected,
         }))
@@ -1690,7 +1689,7 @@ impl AgentServerInner {
 
     /// Select the session's model.
     ///
-    /// The refusal is reported to the caller, not only noted to the v2 clients:
+    /// The refusal is reported to the caller, not only noted to the clients:
     /// the AHP dispatch path has already folded the change into the state its
     /// subscribers reduce, so a swallowed failure would let every client
     /// converge on a model the session is not running.
@@ -1712,8 +1711,8 @@ impl AgentServerInner {
                 if let Err(reason) = thread.read(|t| t.preflight_model(&model)) {
                     return Err(unservable_model(id, &reason));
                 }
-                // T10: the v1 `ThreadInfo` republish is gone — the engine
-                // journals the change and the P-face delta refreshes chips.
+                // The engine journals the change and the P-face delta
+                // refreshes chips.
                 thread.with_mut(|t| t.set_model(model));
                 Ok(())
             }
@@ -1884,8 +1883,8 @@ impl AgentServerInner {
     ///   self-heal). The refresh is fingerprint-driven — a stat sweep in
     ///   steady state — so the await is cheap enough for a user gesture.
     /// - The live leg resolves the catalogue row id to its ACTIVE session
-    ///   id first: a legacy journal's row id (the thread key) is not the
-    ///   session id the engine assembled, and consulting the engine with
+    ///   id first: a thread-keyed journal's row id is not the session id the
+    ///   engine assembled, and consulting the engine with
     ///   the raw row id would archive without stopping anything.
     ///   Unresolvable (the store never scanned the row's path) skips the
     ///   live leg with a log line — the row exists (the batch validated
@@ -1989,8 +1988,8 @@ impl AgentServerInner {
 
     /// Pin or unpin a session (the AHP extension surface: AHP has no pin bit).
     ///
-    /// The durable authority is the store row plus the session's sidecar, the
-    /// same path v2's `PinThread` takes — a pin the sidebar shows and a cold
+    /// The durable authority is the store row plus the session's sidecar — a
+    /// pin the sidebar shows and a cold
     /// restore forgets would be the worst of both.
     pub(crate) fn pin_session(&self, session_id: &str, pinned: bool) -> bool {
         let mut applied = false;
@@ -2041,8 +2040,8 @@ impl AgentServerInner {
     ///   to the **facade**, so the sidebar and any in-process observer show the
     ///   new name at once.
     /// - `thread_store::rename_thread` performs the **durable** half: it appends
-    ///   the journal `title` entry (the row the v2 projection folds and the AHP
-    ///   translator reads) and writes the sidecar.
+    ///   the journal `title` entry (the row the AHP translator reads) and
+    ///   writes the sidecar.
     ///
     /// The facade call deliberately does **not** stand in for persistence: it
     /// feeds the consumer end of the engine's notice chain, which is *past* its

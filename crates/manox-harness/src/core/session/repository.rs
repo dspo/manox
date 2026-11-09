@@ -83,7 +83,7 @@ impl SessionRepository {
         Ok(Session::new(storage))
     }
 
-    /// Create a session at an exact file path (the v1.0.0 core layout:
+    /// Create a session at an exact file path (the core layout:
     /// `<core>/<slug>/<id>/session.jsonl`). Same deferred-materialization
     /// contract as [`Self::create`]: nothing touches disk until the first
     /// append.

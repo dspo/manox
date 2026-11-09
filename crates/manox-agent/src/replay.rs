@@ -189,9 +189,9 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
                 state.reasoning_effort = Some(thinking_level.clone());
             }
             // ── lifecycle: the chain's single open-turn fact ────────────
-            // A turn opens on its `turn_start` row and — for the legacy
-            // chains that carry no `turn_start` — on the user row that
-            // begins it; a `turn_finish` closes whichever was open.
+            // A turn opens on its `turn_start` row and — on a chain with no
+            // `turn_start` — on the user row that begins it; a `turn_finish`
+            // closes whichever was open.
             Event::TurnStart { id, .. } => {
                 state.open_turn = Some(id.clone());
             }
@@ -370,9 +370,8 @@ mod tests {
     }
 
     /// The fold's open-turn fact, in both journal shapes: the chains with a
-    /// `turn_start` row (engine-owned turns) and the legacy ones that carry
-    /// only the user row (every prompt turn written before the engine owned
-    /// the open edge).
+    /// `turn_start` row (engine-owned turns) and those carrying only the user
+    /// row (a prompt turn whose writer did not stamp the open edge).
     #[test]
     fn an_unclosed_turn_stays_open_and_a_finish_closes_it() {
         let ts = Utc::now();
@@ -417,12 +416,12 @@ mod tests {
             Some("ts-1")
         );
 
-        // Legacy shape: no turn_start row at all — the user row is the open
-        // fact, so a host that died mid-turn is still detected.
-        let legacy = vec![record(user("u-legacy"))];
+        // The user-row shape: no turn_start row at all — the user row is the
+        // open fact, so a host that died mid-turn is still detected.
+        let user_row_only = vec![record(user("u-unstamped"))];
         assert_eq!(
-            replay_thread_state(&legacy).open_turn.as_deref(),
-            Some("u-legacy")
+            replay_thread_state(&user_row_only).open_turn.as_deref(),
+            Some("u-unstamped")
         );
 
         // A later finish closes whatever was open, and a chain that ends

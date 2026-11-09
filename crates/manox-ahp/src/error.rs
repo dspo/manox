@@ -1,7 +1,7 @@
 //! Host errors and the single declaration table of codes leaving the gateway.
 //!
-//! The v2 rule survives: every production error carries a stable code (no bare
-//! messages). AHP's standard codes come from `ahp-types`; the x-manox band
+//! Every production error carries a stable code (no bare messages). AHP's
+//! standard codes come from `ahp-types`; the x-manox band
 //! `-32080..-32099` carries the extensions this host needs and refuses to
 //! silently degrade.
 

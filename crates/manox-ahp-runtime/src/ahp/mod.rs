@@ -144,8 +144,8 @@ pub(crate) async fn session_state_with_live(
 
     // The thread's chats: every session whose journal header is stamped with
     // this thread, plus the registry's active-session pointer (a freshly
-    // swapped session may not carry the stamp yet) and, for legacy
-    // singleton rows without any thread stamp, the id itself.
+    // swapped session may not carry the stamp yet) and, for singleton rows
+    // without any thread stamp, the id itself.
     let registry = manox_agent::thread_registry::load().await;
     let active = registry
         .get(thread_id)
@@ -153,9 +153,9 @@ pub(crate) async fn session_state_with_live(
         .unwrap_or_else(|| thread_id.to_string());
     let members = thread_sessions(thread_id, &active);
 
-    // The deferred intent, keyed by the session the create minted. A legacy
-    // thread whose active pointer names another session keeps the thread's
-    // own row in reach.
+    // The deferred intent, keyed by the session the create minted. A thread
+    // whose active pointer names another session keeps the thread's own row in
+    // reach.
     let overlay = intent_overlay(&active).or_else(|| {
         (active != thread_id)
             .then(|| intent_overlay(thread_id))
@@ -567,7 +567,7 @@ pub(crate) async fn open_turn_owner(chat_id: &str) -> Option<manox_harness::sess
 }
 
 /// The session ids belonging to one thread: journal-header thread stamps,
-/// the active pointer, and the legacy singleton's own id — sorted, so the
+/// the active pointer, and the singleton's own id — sorted, so the
 /// fold order (and therefore the resulting state) is deterministic.
 fn thread_sessions(thread_id: &str, active: &str) -> Vec<String> {
     let mut members: BTreeSet<String> = BTreeSet::new();
@@ -719,8 +719,8 @@ async fn fold_extension_state(
 
 fn session_stem_of(path: &Path) -> Option<String> {
     // The core layout names the journal by the shared constant; a session's id
-    // is its PARENT directory's name. Any other file is not a journal — the
-    // retired flat `<id>.jsonl` shape contributes nothing to a fold.
+    // is its PARENT directory's name. Any other file is not a journal — a flat
+    // `<id>.jsonl` contributes nothing to a fold.
     (path.file_name()?.to_str()? == manox_harness::session::identity::JOURNAL_FILE)
         .then(|| path.parent()?.file_name()?.to_str().map(str::to_string))
         .flatten()
@@ -754,7 +754,7 @@ fn read_header(path: &Path) -> Option<manox_harness::session::jsonl::JsonlSessio
 /// [`crate::paths::persisted_session_file`] uses, so enumeration and
 /// cold read can never disagree.
 fn sessions_dir() -> Option<PathBuf> {
-    // The v1.0.0 core root ITSELF, never a bucket: production sessions live
+    // The core root ITSELF, never a bucket: production sessions live
     // under `<core>/<project-slug>/<id>/session.jsonl`, and a test store's
     // fixtures may sit one level shallower — the bounded walk below reads
     // both shapes. Naming a bucket here (the fixtures' own `t`, say) would
@@ -989,8 +989,8 @@ pub(crate) fn row_status_bits(
 ///
 /// Precedence mirrors the fold's membership rule: the registry's active-session
 /// pointer (a freshly swapped session may not carry the header stamp yet), then
-/// the journal header's own thread stamp, then the legacy singleton case where
-/// the session *is* the thread.
+/// the journal header's own thread stamp, then the singleton case where the
+/// session *is* the thread.
 pub(crate) async fn thread_of_session(session_id: &str) -> Option<String> {
     let registry = manox_agent::thread_registry::load().await;
     for (thread_id, entry) in registry.iter() {
@@ -1004,8 +1004,8 @@ pub(crate) async fn thread_of_session(session_id: &str) -> Option<String> {
     {
         return Some(thread_id);
     }
-    // A journal with no thread stamp belongs to itself. v1.0.0 mints one
-    // session per conversation (thread id == session id), and a sub-agent's
+    // A journal with no thread stamp belongs to itself. The core model mints
+    // one session per conversation (thread id == session id), and a sub-agent's
     // child journal is stamped with its lineage, never with a thread — so
     // the store-row leg below, which needs a list scan to have run, is the
     // only thing standing between a client and a session whose journal is
@@ -1324,8 +1324,7 @@ mod baseline_tests {
 
     /// The wrong-shelf half of the baseline fix: the ACTIVE session carries
     /// the thread's current rows, so its journal must be folded (last) even
-    /// though the thread-URI baseline used to answer from the URI's own
-    /// journal alone.
+    /// though the thread URI names only its own journal.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_active_sessions_rows_reach_the_thread_baseline() {
         let _g = crate::test_support::lock_globals();

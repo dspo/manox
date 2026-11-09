@@ -1,10 +1,10 @@
 //! Plain data types the thread store and engine share.
 //!
-//! The v1.0.0 Session Core retired the SQLite metadata layer: every durable
-//! fact lives in the session journal (the ui-note cards are `custom` rows,
-//! `UI_NOTE_CUSTOM_TYPE`), the sidebar cache rebuilds from headers, and the
-//! project registry derives from the scan. What survives here are the
-//! in-memory shapes those consumers still share — no database behind them.
+//! The Session Core keeps every durable fact in the session journal (the
+//! ui-note cards are `custom` rows, `UI_NOTE_CUSTOM_TYPE`); the sidebar cache
+//! rebuilds from headers, and the project registry derives from the scan.
+//! What lives here are the in-memory shapes those consumers share — no
+//! database behind them.
 
 use serde::{Deserialize, Serialize};
 

@@ -84,8 +84,8 @@ pub struct SkillRegistry {
     skills: BTreeMap<String, Arc<SkillDefinition>>,
 }
 
-/// Built-in skills embedded in the binary — the retired plan mode's ritual
-/// as a one-shot contract (`plan`). Parsed from the same frontmatter format
+/// Built-in skills embedded in the binary — `plan` ships the plan ritual as a
+/// one-shot contract. Parsed from the same frontmatter format
 /// as disk skills, except a malformed embedded file panics at startup: it
 /// ships in the binary, not on a user's disk, so there is nothing to be
 /// lenient about. An empty `source` is the embedded sentinel: the

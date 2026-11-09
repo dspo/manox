@@ -3,10 +3,8 @@
 //! Reads `~/.manox/mcp.json` (layered with the project `.mcp.json` and each
 //! installed plugin's `.mcp.json`), connects every configured server (stdio
 //! or streamable HTTP) via the `rmcp` SDK, and lists their tools. The
-//! harness bridges differ:
-//! the manox harness wraps each tool as a manox `AgentTool` ([`napi_tool::McpTool`]);
-//! the retired manox harness wraps the same connected servers into its own
-//! tool type. Configuration is file-only (no UI writes) in both.
+//! harness wraps each tool as a manox `AgentTool` ([`napi_tool::McpTool`]).
+//! Configuration is file-only (no UI writes).
 //!
 //! `init` blocks until all servers finish connecting (per-server timeout);
 //! MCP is an optional enhancement and never blocks the rest of startup.

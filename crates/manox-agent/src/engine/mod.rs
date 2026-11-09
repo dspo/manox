@@ -2657,7 +2657,8 @@ fn merge_restored_state(
 /// Close a turn the previous process never closed (restore reconciliation).
 ///
 /// A journal whose tail is an open turn — a `turn_start` row, or the `user`
-/// row that opened a legacy chain's turn, with no later `turn_finish` —
+/// row that opened a turn on a chain with no `turn_start`, with no later
+/// `turn_finish` —
 /// belongs to a host that died mid-turn: nothing will ever settle it. The
 /// restore appends the close the AHP cold seed synthesizes for the same chain
 /// (`cancelled: true`, failed: false, reason `"host exited"`) and replays the

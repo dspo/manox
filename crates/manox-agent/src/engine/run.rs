@@ -971,8 +971,8 @@ pub(super) fn subscribe_harness_events(
 }
 
 /// Session header metadata: the creating host's identity, the owning thread
-/// id (the retired worktree fork copied it verbatim, so historical fork
-/// files still group under one thread), plus (for a team worker) the
+/// id (copied verbatim by the worktree fork, so every fork file groups under
+/// one thread), plus (for a team worker) the
 /// leader's session id. The links persist with the jsonl
 /// file, so they survive restarts and outlive the in-memory team.
 pub(super) fn session_metadata(thread_id: &str, parent_session: Option<&str>) -> serde_json::Value {

@@ -257,8 +257,7 @@ const ASK_DELIVERED_TEXT: &str = "Question delivered to the user. This turn ends
      yourself.";
 
 /// The model-facing seed of the turn that opens after an answered ask: one
-/// prose line naming its origin, then the canonical answers JSON line — the
-/// same vocabulary the tool result used to carry.
+/// prose line naming its origin, then the canonical answers JSON line.
 pub fn answer_seed_payload(input: &serde_json::Value, answers: Vec<AskAnswer>) -> String {
     let rows = fold_ask_answers(input, answers);
     format!(

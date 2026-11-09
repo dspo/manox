@@ -1,9 +1,9 @@
 //! The in-process transport: the desktop app's path to the host.
 //!
 //! Both halves live in one process, so messages cross as typed
-//! [`JsonRpcMessage`] values — no serialization on the hot path (the v2
-//! protocol reached the same conclusion: the in-process pair is unbounded and
-//! must never block the GPUI main thread). The wire shape is still identical:
+//! [`JsonRpcMessage`] values — no serialization on the hot path (the in-process
+//! pair is unbounded and must never block the GPUI main thread). The wire shape
+//! is still identical:
 //! the host and the SDK client exchange the same message values they would
 //! serialize over a socket, and the conformance suite runs one scenario through
 //! both this transport and the WebSocket one.
@@ -73,8 +73,8 @@ impl Transport for InprocClientTransport {
 
 /// An unbounded in-process pair: `(host side, client side)`.
 ///
-/// Unbounded is deliberate (v2 C6): two ends in one process filling a bounded
-/// pair in both directions deadlocks the GPUI main thread. A slow in-process
+/// Unbounded is deliberate: two ends in one process filling a bounded pair in
+/// both directions deadlocks the GPUI main thread. A slow in-process
 /// client costs memory, never frames.
 pub fn pair() -> (HostTransport, InprocClientTransport) {
     let (to_host_tx, to_host_rx) = async_channel::unbounded();
