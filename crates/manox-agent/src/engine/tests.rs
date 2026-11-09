@@ -979,7 +979,9 @@ fn bash_output_update_still_maps_to_tool_output() {
 fn durable_journal_mapping_round_trips_every_journaled_event() {
     use crate::thread::{ThreadEvent, ToolCallStatus};
     let events: Vec<ThreadEvent> = vec![
-        ThreadEvent::TurnStarted,
+        // `TurnStarted` is deliberately absent: the open edge is appended by
+        // the engine at run open (it must be durable before the run), not by
+        // the async notice tap.
         ThreadEvent::TurnFinished {
             cancelled: false,
             failed: true,
@@ -1082,9 +1084,14 @@ fn durable_journal_mapping_round_trips_every_journaled_event() {
 
 #[test]
 fn the_turn_start_payload_stamps_the_owning_process() {
-    let (kind, payload) =
-        durable_journal_payload(&ThreadEvent::TurnStarted).expect("turn start journals");
-    assert_eq!(kind, "turn_start");
+    // The open edge is not journaled by the notice tap (it must be durable
+    // before the run, so `run_turn` appends it synchronously) — the tap's
+    // mapping must refuse it or the turn would get two `turn_start` rows.
+    assert!(
+        durable_journal_payload(&ThreadEvent::TurnStarted).is_none(),
+        "the open edge is landed by the engine, not by the async notice tap"
+    );
+    let payload = turn_start_payload();
     assert_eq!(
         payload["owner"]["pid"],
         serde_json::json!(std::process::id()),
@@ -1183,6 +1190,7 @@ fn test_engine_state() -> Arc<EngineState> {
         journal_tx: tokio::sync::broadcast::channel(JOURNAL_FEED_CAPACITY).0,
         request_usage: Mutex::new(HashMap::new()),
         per_model_last_usage: Mutex::new(HashMap::new()),
+        last_turn_usage: Mutex::new(None),
         cumulative: Mutex::new(TokenUsage::default()),
         per_model: Mutex::new(HashMap::new()),
         cumulative_cost: Mutex::new(0.0),
@@ -3394,6 +3402,199 @@ async fn the_close_does_not_depend_on_the_projection() {
     assert_eq!(finishes, 1, "the projection never appends a close");
 }
 
+// ── restore reconciliation ──────────────────────────────────────────────────
+
+/// The last durable close: `(cancelled, failed, reason)`.
+async fn last_turn_finish(session: &AgentSession) -> Option<(bool, bool, Option<String>)> {
+    let rows = session
+        .journal_appender()
+        .storage()
+        .journal_range(0, u64::MAX)
+        .await
+        .unwrap();
+    rows.iter().rev().find_map(|record| match &record.entry {
+        manox_harness::session::Event::TurnFinish {
+            cancelled,
+            failed,
+            reason,
+            ..
+        } => Some((*cancelled, *failed, reason.clone())),
+        _ => None,
+    })
+}
+
+async fn turn_finish_count(session: &AgentSession) -> usize {
+    session
+        .journal_appender()
+        .storage()
+        .journal_range(0, u64::MAX)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.entry,
+                manox_harness::session::Event::TurnFinish { .. }
+            )
+        })
+        .count()
+}
+
+/// A Submit while a turn is held commits the held turn and starts the new
+/// one: the ask cards are withdrawn with the turn, the durable close lands,
+/// and nothing is parked outside the engine (`dspo/manox#899`).
+#[tokio::test]
+async fn a_submit_while_held_commits_the_held_turn() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let session = steer_test_session(&dir).await;
+    let cwd = dir.path().join("proj");
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+    let state = test_engine_state();
+
+    // A clean run that ends on a delivered ask holds its turn.
+    state.question_gate.register_if_absent(
+        "ask-1",
+        crate::permission::PendingAuthMeta {
+            tool_name: crate::tools::ASK_USER_QUESTION.to_string(),
+            summary: "pick one".into(),
+            input: serde_json::json!({ "question": "which?" }),
+        },
+    );
+    let facts = commit_for_test(
+        &session,
+        &Ok(vec![
+            AgentMessage::user("hello"),
+            partial_assistant("let me ask"),
+        ]),
+        false,
+        Vec::new(),
+        &state,
+        &cwd,
+        &notice_tx,
+    )
+    .await;
+    assert!(facts.held, "a delivered ask holds the turn");
+    assert!(state.awaiting_answers.load(Ordering::Relaxed));
+    assert_eq!(
+        turn_finish_count(&session).await,
+        0,
+        "a held turn is not closed yet"
+    );
+
+    // The Submit path: the open cards dismiss, the held turn commits, and the
+    // new turn is free to open.
+    withdraw_open_asks(&session.journal_appender(), &state, &notice_tx, "dismissed").await;
+    let held = state
+        .held_settle
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the turn is held");
+    finish_held_settle(
+        held,
+        false,
+        &session.journal_appender(),
+        &state,
+        &cwd,
+        &notice_tx,
+    )
+    .await;
+
+    assert!(!state.awaiting_answers.load(Ordering::Relaxed));
+    assert!(!state.running.load(Ordering::Relaxed));
+    assert_eq!(
+        last_turn_finish(&session).await,
+        Some((false, false, None)),
+        "the held turn closes complete, through the same durable tail"
+    );
+    assert!(
+        state.question_gate.pending_entries().is_empty(),
+        "the cards died with their turn"
+    );
+}
+
+/// A restored chain that ends inside a turn gets the close its previous
+/// process never wrote — `cancelled: true`, `failed: false`, reason
+/// `"host exited"` — and the replayed fold sees it. This is the legacy shape:
+/// no `turn_start` row, only the user row that opened the turn.
+#[tokio::test]
+async fn restore_closes_an_interrupted_legacy_turn_as_host_exited() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = steer_test_session(&dir).await;
+    let sessions = dir.path().join("sessions");
+    session
+        .append_message(AgentMessage::user("hello"))
+        .await
+        .unwrap();
+    session
+        .append_message(partial_assistant("partial"))
+        .await
+        .unwrap();
+    let before = session.journal_range(0, u64::MAX).await.unwrap();
+    assert!(
+        crate::replay::replay_thread_state(&before)
+            .open_turn
+            .is_some(),
+        "a chain whose tail is an open turn must be detected without turn_start"
+    );
+
+    let _ = rebuild_restored_state(&session, &sessions).await;
+
+    let after = session.journal_range(0, u64::MAX).await.unwrap();
+    assert_eq!(
+        crate::replay::replay_thread_state(&after).open_turn,
+        None,
+        "the reconciliation closes the chain"
+    );
+    assert_eq!(
+        last_turn_finish(&session).await,
+        Some((true, false, Some("host exited".to_string()))),
+        "the durable close is the cold seed's verdict"
+    );
+
+    // Idempotent: a second restore finds nothing to close.
+    let count = turn_finish_count(&session).await;
+    let _ = rebuild_restored_state(&session, &sessions).await;
+    assert_eq!(turn_finish_count(&session).await, count);
+}
+
+/// The same reconciliation on an engine-owned chain (`turn_start` row, no
+/// finish).
+#[tokio::test]
+async fn restore_closes_an_interrupted_turn_start_chain() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = steer_test_session(&dir).await;
+    let sessions = dir.path().join("sessions");
+    session
+        .append_message(AgentMessage::user("hello"))
+        .await
+        .unwrap();
+    session
+        .journal_appender()
+        .append_typed("turn_start", serde_json::json!({}))
+        .await
+        .unwrap();
+    session
+        .append_message(partial_assistant("partial"))
+        .await
+        .unwrap();
+
+    let before = session.journal_range(0, u64::MAX).await.unwrap();
+    assert!(
+        crate::replay::replay_thread_state(&before)
+            .open_turn
+            .is_some()
+    );
+    let _ = rebuild_restored_state(&session, &sessions).await;
+    assert_eq!(
+        last_turn_finish(&session).await,
+        Some((true, false, Some("host exited".to_string())))
+    );
+}
+
 /// A stream that answers every provider request immediately with a
 /// terminal assistant message carrying the request's model identity.
 struct StaticStream;
@@ -3550,7 +3751,7 @@ fn request_attribution_keys_turns_and_keeps_only_latest_request_per_model() {
         user(None),
         assistant_request(u3.clone()),
     ];
-    let (per_turn, per_model_last) = request_attribution(&messages);
+    let (per_turn, per_model_last, last_turn) = request_attribution(&messages);
 
     // Each turn accumulates under its own triggering user message: the
     // client id when the message carries one (S3), the user-message ordinal
@@ -3567,6 +3768,9 @@ fn request_attribution_keys_turns_and_keeps_only_latest_request_per_model() {
         .get("DeepSeek/deepseek-v4-flash")
         .expect("latest request keyed by provider/model");
     assert_eq!(last.cache_read_input_tokens, 300);
+
+    // The key-free footer stamp is the last turn's own total.
+    assert_eq!(last_turn, Some(to_token_usage(&u3)));
 }
 
 /// #920: the walk reads the kernel transcript alone. A chain whose derived
@@ -3582,9 +3786,13 @@ fn request_attribution_ignores_the_derived_display_shape() {
         },
         assistant_request(assistant_usage(42)),
     ];
-    let (per_turn, _) = request_attribution(&messages);
+    let (per_turn, _, last_turn) = request_attribution(&messages);
     assert_eq!(per_turn.len(), 1);
     assert_eq!(per_turn["turn-a"].cache_read_input_tokens, 42);
+    assert_eq!(
+        last_turn.map(|usage| usage.cache_read_input_tokens),
+        Some(42)
+    );
 }
 
 /// The unified Steer surface's description teaches the whole loop: the

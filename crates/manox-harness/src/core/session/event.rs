@@ -253,6 +253,12 @@ pub enum Event {
         cancelled: bool,
         failed: bool,
         stranded_steer_ids: Vec<String>,
+        /// Why the turn closed, when the closer knows something the flags do
+        /// not say (the restore reconciliation writes `"host exited"` for a
+        /// turn its previous process never closed). Absent on every live
+        /// settle, so the row shape is unchanged there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// The loop stopped advancing.
     #[serde(rename = "stop", rename_all = "camelCase")]

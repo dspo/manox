@@ -292,6 +292,9 @@ struct EngineState {
     /// Usage of each model's most recent request; the context-budget
     /// numerator behind the env card's `used / window` rows.
     per_model_last_usage: Mutex<HashMap<String, TokenUsage>>,
+    /// The accumulated usage of the transcript's last user turn: what the
+    /// conversation footer stamps onto the reply that just settled.
+    last_turn_usage: Mutex<Option<TokenUsage>>,
     cumulative: Mutex<TokenUsage>,
     per_model: Mutex<HashMap<String, TokenUsage>>,
     /// USD cost aggregated from the kernel's rate-card pricing (#418 wire
@@ -609,6 +612,7 @@ pub fn spawn_engine(
         journal_tx: journal_feed_handle.clone(),
         request_usage: Mutex::new(HashMap::new()),
         per_model_last_usage: Mutex::new(HashMap::new()),
+        last_turn_usage: Mutex::new(None),
         cumulative: Mutex::new(TokenUsage::default()),
         per_model: Mutex::new(HashMap::new()),
         cumulative_cost: Mutex::new(0.0),
@@ -839,6 +843,10 @@ impl ThreadEngine for Engine {
 
     fn per_model_last_request_usage(&self) -> HashMap<String, TokenUsage> {
         self.state.per_model_last_usage.lock().unwrap().clone()
+    }
+
+    fn last_turn_token_usage(&self) -> Option<TokenUsage> {
+        *self.state.last_turn_usage.lock().unwrap()
     }
 
     fn cumulative_token_usage(&self) -> TokenUsage {
@@ -1567,18 +1575,13 @@ async fn run_actor(
                 // turn_start follows the held turn's turn_finish.
                 if state.awaiting_answers.load(Ordering::Relaxed) {
                     held_seeds.clear();
-                    let appender = session.journal_appender();
-                    for (id, meta) in state.question_gate.withdraw_all() {
-                        run::journal_ask_decision(
-                            &appender,
-                            &id,
-                            &meta,
-                            "dismissed",
-                            &state,
-                            &notice_tx,
-                        )
-                        .await;
-                    }
+                    withdraw_open_asks(
+                        &session.journal_appender(),
+                        &state,
+                        &notice_tx,
+                        "dismissed",
+                    )
+                    .await;
                     close_held_turn(&session, &state, &cwd, &notice_tx, Vec::new(), false).await;
                 }
                 // #805 companion: the host registers its client tools only
@@ -2638,6 +2641,54 @@ fn merge_restored_state(
     }
 }
 
+/// Close a turn the previous process never closed (restore reconciliation).
+///
+/// A journal whose tail is an open turn — a `turn_start` row, or the `user`
+/// row that opened a legacy chain's turn, with no later `turn_finish` —
+/// belongs to a host that died mid-turn: nothing will ever settle it. The
+/// restore appends the close the AHP cold seed synthesizes for the same chain
+/// (`cancelled: true`, failed: false, reason `"host exited"`) and replays the
+/// closed chain, so the durable row and the synthetic served state agree and
+/// `snapshot == fold(replay)` holds. The write goes through the session's own
+/// journal writer, the same face every live close uses.
+///
+/// A failed append leaves the chain open for the next restore to retry: the
+/// cold seed still serves the turn settled, which is what a dead host's
+/// reader expects.
+async fn reconcile_open_turn(
+    session: &AgentSession,
+    records: Vec<manox_harness::session::jsonl::JournalRecord>,
+) -> (
+    Vec<manox_harness::session::jsonl::JournalRecord>,
+    crate::replay::ReplayedThreadState,
+) {
+    let replayed = crate::replay::replay_thread_state(&records);
+    if replayed.open_turn.is_none() {
+        return (records, replayed);
+    }
+    let appender = session.journal_appender();
+    let payload = serde_json::json!({
+        "cancelled": true,
+        "failed": false,
+        "strandedSteerIds": Vec::<String>::new(),
+        "reason": "host exited",
+    });
+    if let Err(err) = append_typed_resilient(&appender, "turn_finish", payload).await {
+        tracing::error!(
+            %err,
+            "restore could not close the interrupted turn; the chain keeps it open for the next restore"
+        );
+        return (records, replayed);
+    }
+    let closed = appender
+        .storage()
+        .journal_range(0, u64::MAX)
+        .await
+        .unwrap_or_default();
+    let replayed = crate::replay::replay_thread_state(&closed);
+    (closed, replayed)
+}
+
 /// Fold one session's active chain and resolve it against the sidecar
 /// cache (K2). Runs on every restore face: startup, `Open`, and
 /// `NewSession` (a fresh chain resolves entirely to sidecar defaults).
@@ -2646,7 +2697,7 @@ async fn rebuild_restored_state(
     sessions_dir: &Path,
 ) -> RestoredThreadState {
     let records = session.journal_range(0, u64::MAX).await.unwrap_or_default();
-    let replayed = crate::replay::replay_thread_state(&records);
+    let (records, replayed) = reconcile_open_turn(session, records).await;
     let (unsettled_approvals, unsettled_questions) =
         crate::replay::unsettled_interactions(&records);
     let meta = manox_harness::session_meta::load(sessions_dir, session.path())
@@ -3203,7 +3254,7 @@ async fn sync_usage(
         .iter()
         .flat_map(manox_harness::session::session_entry_to_context_messages)
         .collect();
-    let (per_turn, per_model_last) = request_attribution(&messages);
+    let (per_turn, per_model_last, last_turn) = request_attribution(&messages);
     if let Some(seq) = since
         && journal_advanced(appender, seq).await
     {
@@ -3225,6 +3276,7 @@ async fn sync_usage(
     *state.per_model_cost.lock().unwrap() = per_model_cost;
     *state.request_usage.lock().unwrap() = per_turn;
     *state.per_model_last_usage.lock().unwrap() = per_model_last;
+    *state.last_turn_usage.lock().unwrap() = last_turn;
     true
 }
 
@@ -3236,20 +3288,27 @@ async fn sync_usage(
 /// stable for a given chain.
 ///
 /// Returns the per-turn totals (each assistant request accumulates under the
-/// user message that triggered its turn) and each model's latest single
-/// request (the context-budget numerator; summing requests would count the
-/// repeated prompt prefix once per tool-loop iteration).
+/// user message that triggered its turn), each model's latest single request
+/// (the context-budget numerator; summing requests would count the repeated
+/// prompt prefix once per tool-loop iteration), and the last turn's own total
+/// (the footer's stamp, key-free).
 fn request_attribution(
     messages: &[AgentMessage],
-) -> (HashMap<String, TokenUsage>, HashMap<String, TokenUsage>) {
+) -> (
+    HashMap<String, TokenUsage>,
+    HashMap<String, TokenUsage>,
+    Option<TokenUsage>,
+) {
     let mut per_turn: HashMap<String, TokenUsage> = HashMap::new();
     let mut per_model_last: HashMap<String, TokenUsage> = HashMap::new();
     let mut turn_key: Option<String> = None;
+    let mut last_turn_key: Option<String> = None;
     let mut user_ordinal = 0usize;
     for message in messages {
         match message {
             AgentMessage::User { id, .. } => {
                 turn_key = Some(id.clone().unwrap_or_else(|| format!("user-{user_ordinal}")));
+                last_turn_key = turn_key.clone();
                 user_ordinal += 1;
             }
             AgentMessage::Assistant {
@@ -3278,7 +3337,11 @@ fn request_attribution(
             _ => {}
         }
     }
-    (per_turn, per_model_last)
+    let last_turn = last_turn_key
+        .as_ref()
+        .and_then(|key| per_turn.get(key))
+        .copied();
+    (per_turn, per_model_last, last_turn)
 }
 
 /// Kernel usage totals → the facade's token usage shape.

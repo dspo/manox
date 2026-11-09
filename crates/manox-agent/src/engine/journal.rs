@@ -31,14 +31,12 @@ pub(super) fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde
     };
     Some(match ev {
         // ── lifecycle ────────────────────────────────────────────────────
-        // The turn start stamps the owning process (§C.2 turnStart owner):
-        // the journal is shared across processes, and a reader of an open
-        // turn needs the owner's liveness to settle a dead turn on its
-        // behalf without ever killing one another process is running.
-        ThreadEvent::TurnStarted => (
-            "turn_start".into(),
-            json!({ "owner": manox_harness::session::TurnOwner::for_current_process() }),
-        ),
+        // The turn start is NOT journaled here: it is the turn's open edge,
+        // and it must be durable BEFORE the run it opens produces anything
+        // (the notice tap is an async hop, so its row could otherwise land
+        // after the turn's own close). The engine's `run_turn` appends it
+        // synchronously through the shared writer instead.
+        ThreadEvent::TurnStarted => return None,
         ThreadEvent::TurnFinished {
             cancelled,
             failed,

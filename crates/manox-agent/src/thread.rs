@@ -1667,20 +1667,14 @@ impl Thread {
         &self.request_usage
     }
 
-    /// The current turn's total, keyed off the triggering user message; the
-    /// conversation footer stamps it onto the just-finished reply at `Stop`.
+    /// The current turn's total; the conversation footer stamps it onto the
+    /// just-finished reply at `Stop`. Asked of the engine key-free: the
+    /// per-turn map is keyed by the kernel's stable message ids (#920), which
+    /// the facade's display mirror does not carry.
     pub fn last_request_token_usage(&self) -> Option<TokenUsage> {
-        let id = self
-            .messages
-            .iter()
-            .rev()
-            .find(|m| {
-                matches!(m.role, crate::language_model::Role::User)
-                    && m.provenance == crate::message::MessageProvenance::User
-            })?
-            .id
-            .clone();
-        self.request_usage.get(&id).copied()
+        self.engine
+            .as_ref()
+            .and_then(|engine| engine.last_turn_token_usage())
     }
 
     pub fn per_model_last_request_usage(&self) -> HashMap<String, TokenUsage> {

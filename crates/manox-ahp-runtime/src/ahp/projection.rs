@@ -516,7 +516,13 @@ struct PendingUser {
 #[derive(Debug, Clone)]
 enum Outcome {
     Complete,
-    Cancelled,
+    /// A cancelled turn. `reason` is the closer's own explanation when it has
+    /// one — the restore reconciliation and the orphan-close below both write
+    /// `"host exited"`, the same verdict the cold seed synthesizes for a dead
+    /// host's open turn.
+    Cancelled {
+        reason: Option<String>,
+    },
     Failed(ErrorInfo),
 }
 
@@ -524,7 +530,7 @@ impl Outcome {
     fn tag(&self) -> &'static str {
         match self {
             Outcome::Complete => "complete",
-            Outcome::Cancelled => "cancelled",
+            Outcome::Cancelled { .. } => "cancelled",
             Outcome::Failed(_) => "failed",
         }
     }
@@ -1005,6 +1011,7 @@ impl Translator {
                 cancelled,
                 failed,
                 stranded_steer_ids,
+                reason,
                 ..
             } => {
                 let outcome = if *failed {
@@ -1022,7 +1029,9 @@ impl Translator {
                         }))),
                     })
                 } else if *cancelled {
-                    Outcome::Cancelled
+                    Outcome::Cancelled {
+                        reason: reason.clone(),
+                    }
                 } else {
                     Outcome::Complete
                 };
@@ -1939,8 +1948,19 @@ impl Translator {
         if let Some(open) = self.open.take() {
             // A `turnStart` with a turn still open means the previous turn never
             // closed (a crash between rows). Close it first: AHP's reducer replaces
-            // the active turn, and its parts would vanish otherwise.
-            self.finish_turn(&open, chat, Outcome::Complete, entry, false, out);
+            // the active turn, and its parts would vanish otherwise. The verdict is
+            // the one the cold seed synthesizes for a dead host's turn — cancelled,
+            // with the host-exited reason — never a completion.
+            self.finish_turn(
+                &open,
+                chat,
+                Outcome::Cancelled {
+                    reason: Some("host exited".to_string()),
+                },
+                entry,
+                false,
+                out,
+            );
         }
         let carried = self.pending_user.pop_front();
         let (message, queued_message_id, opening_text) = match carried {
@@ -2465,6 +2485,17 @@ impl Translator {
         let duration = elapsed_ms(&open.started_at, &entry.timestamp);
         let failed = matches!(outcome, Outcome::Failed(_));
         let mut meta = json!({"entryId": entry.id, "outcome": outcome.tag()});
+        if let Outcome::Cancelled {
+            reason: Some(reason),
+        } = &outcome
+        {
+            // A close with a reason is the dead-host verdict, and the cold
+            // seed serves exactly `{outcome: "aborted", reason: "host
+            // exited"}` for the same chain — the fold must agree or
+            // `snapshot == fold(replay)` breaks.
+            meta["outcome"] = json!("aborted");
+            meta["reason"] = json!(reason);
+        }
         if open.synthetic {
             meta["synthetic"] = json!(true);
         }
@@ -2547,7 +2578,7 @@ impl Translator {
                 },
                 meta: Some(manox_meta(meta)),
             }),
-            Outcome::Cancelled => StateAction::ChatTurnCancelled(ChatTurnCancelledAction {
+            Outcome::Cancelled { .. } => StateAction::ChatTurnCancelled(ChatTurnCancelledAction {
                 turn_id: open.id.clone(),
                 duration,
                 meta: Some(manox_meta(meta)),
@@ -4274,6 +4305,94 @@ mod fold_semantics_tests {
             "Done.",
             "the reply follows the last steer"
         );
+    }
+
+    /// A `turn_start` over a turn the journal never closed closes the orphan
+    /// as a dead host's cancel — the verdict the cold seed synthesizes for the
+    /// same chain — never as a completion.
+    #[test]
+    fn a_turn_start_over_an_open_turn_closes_it_as_a_dead_host_cancel() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "u-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "hello"}]},
+                "origin": "rpc-submit",
+            })),
+            kernel(json!({"type": "turn_start", "id": "ts-1"})),
+            kernel(json!({"type": "agent_text_delta", "id": "d-2", "delta": "partial"})),
+            // The process died here: no `turn_finish` for ts-1.
+            kernel(json!({"type": "turn_start", "id": "ts-3"})),
+        ];
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut cancelled = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatTurnCancelled(action) = &emitted.action {
+                    cancelled.push(action.clone());
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        let action = cancelled
+            .first()
+            .expect("the orphaned turn closes with a cancel");
+        let meta = action
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("x-manox"))
+            .expect("the cancel carries the x-manox meta");
+        assert_eq!(meta.get("outcome"), Some(&json!("aborted")));
+        assert_eq!(meta.get("reason"), Some(&json!("host exited")));
+        assert_eq!(
+            state.turns[0].state,
+            ahp_types::state::TurnState::Cancelled,
+            "the orphaned turn folds settled, like the cold seed serves it"
+        );
+    }
+
+    /// A `turn_finish` that carries a reason (the restore reconciliation's
+    /// durable close) folds the same verdict as the cold seed: cancelled, with
+    /// the host-exited meta. `snapshot == fold(replay)` depends on it.
+    #[test]
+    fn a_reconciled_turn_finish_folds_the_dead_host_verdict() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "u-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "hello"}]},
+                "origin": "rpc-submit",
+            })),
+            kernel(json!({"type": "turn_start", "id": "ts-1"})),
+            kernel(json!({"type": "agent_text_delta", "id": "d-2", "delta": "partial"})),
+            kernel(json!({"type": "turn_finish", "id": "tf-3",
+                          "cancelled": true, "failed": false,
+                          "strandedSteerIds": [], "reason": "host exited"})),
+        ];
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut cancelled = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatTurnCancelled(action) = &emitted.action {
+                    cancelled.push(action.clone());
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        let action = cancelled.first().expect("the reconciled close cancels");
+        let meta = action
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("x-manox"))
+            .expect("the cancel carries the x-manox meta");
+        assert_eq!(meta.get("outcome"), Some(&json!("aborted")));
+        assert_eq!(meta.get("reason"), Some(&json!("host exited")));
+        assert_eq!(state.turns.len(), 1);
+        assert_eq!(state.turns[0].state, ahp_types::state::TurnState::Cancelled);
     }
 
     /// The steer turn's `queuedMessageId` is the ROW id, not a

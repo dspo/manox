@@ -376,9 +376,11 @@ pub(super) async fn run_turn(
     let mut turn = TurnCommit::open(session, state, notice_tx, cwd);
     turn.adopt_steers(std::mem::take(run_steers));
     state.running.store(true, Ordering::Relaxed);
-    // The turn's open edge: the single `TurnStarted` every turn emits. It is
-    // journaled as the `turn_start` row (owner stamp) by the notice tap and
-    // mirrored by the facade onto its running flag.
+    // The turn's open edge, landed BEFORE the run: the durable `turn_start`
+    // row goes through the shared writer synchronously (the notice tap is an
+    // async hop, and a row that landed after the turn's own close would fold
+    // as a second, phantom turn) and the notice then tells the facade.
+    land_turn_start(turn.appender(), state, notice_tx).await;
     send_notice(
         notice_tx,
         BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)),
@@ -462,6 +464,28 @@ pub(super) async fn run_turn(
         outcome,
         abort_requested: drive.abort_requested,
         held: facts.held,
+    }
+}
+
+/// Land the turn's open row (K4 discipline: bounded retry, a durable loss
+/// record, one facade notice). A turn whose open row was lost still runs — its
+/// close is what every reader waits for — but the loss is never silent.
+async fn land_turn_start(
+    appender: &Arc<JournalAppender>,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    if let Err(err) = append_typed_resilient(appender, "turn_start", turn_start_payload()).await {
+        if let Some(row) = record_journal_loss(appender, "turn_start", &err).await {
+            state.pending_journal.lock().unwrap().push(row);
+        }
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
+                "journal append permanently failed for `turn_start`: {err:#}; the entry was dropped"
+            )))),
+            "error notice",
+        );
     }
 }
 

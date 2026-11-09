@@ -457,6 +457,14 @@ pub(super) fn derive_outcome(
     }
 }
 
+/// The durable `turn_start` payload: the turn's open row stamps the owning
+/// process (§C.2 turnStart owner) — the journal is shared across processes, and
+/// a reader of an open turn needs the owner's liveness to settle a dead turn on
+/// its behalf without ever killing one another process is running.
+pub(super) fn turn_start_payload() -> serde_json::Value {
+    serde_json::json!({ "owner": manox_harness::session::TurnOwner::for_current_process() })
+}
+
 /// Whether any open ask card was delivered by a run of THIS process (a
 /// stale card re-parked at restore never holds a turn: its turn predates
 /// the process, so no settle of ours may close or seed it).

@@ -1284,6 +1284,7 @@ mod baseline_tests {
                     cancelled: false,
                     failed: false,
                     stranded_steer_ids: vec![],
+                    reason: None,
                 })
                 .await
                 .unwrap();
@@ -1467,6 +1468,7 @@ mod baseline_tests {
                 cancelled: false,
                 failed: false,
                 stranded_steer_ids: Vec::new(),
+                reason: None,
             })
             .await
             .unwrap();

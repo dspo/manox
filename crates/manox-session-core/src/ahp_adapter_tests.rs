@@ -299,6 +299,7 @@ fn turn_finish() -> E {
         cancelled: false,
         failed: false,
         stranded_steer_ids: Vec::new(),
+        reason: None,
     }
 }
 
@@ -1472,14 +1473,14 @@ mod dispatch {
         uninstall();
     }
 
-    /// A submit that lands mid-turn is parked and then drained into a
-    /// follow-up turn when the turn settles.
-    ///
-    /// The drain is the one piece of turn bookkeeping the gateway cannot
-    /// delegate: parking without draining strands the user's text forever,
-    /// and the receipt it already returned said the submission was accepted.
+    /// A submit that lands mid-turn is handed to the engine, never parked in
+    /// the gateway: the actor owns the ordering (a held turn is committed
+    /// before the new one starts, a running one queues the submit as its
+    /// follow-up). Parking it here is `dspo/manox#899` — a held turn cleared
+    /// the gateway's running flag never, so every later submit stranded in a
+    /// queue nothing drained.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_mid_turn_submit_is_drained_into_a_follow_up_turn() {
+    async fn a_mid_turn_submit_reaches_the_engine_without_parking() {
         let _guards = install();
         let (server, _backend) = fixture().await;
         let engine = attach_engine(&server);
@@ -1493,9 +1494,7 @@ mod dispatch {
         )));
         await_until(|| server.turn_active_for_test("s-dispatch")).await;
 
-        // The submit intent is what parks: with the turn active the text
-        // cannot run now, so it must wait for the settle edge.
-        let parked = inner
+        let receipt = inner
             .submit(
                 "owner",
                 "s-dispatch",
@@ -1505,25 +1504,27 @@ mod dispatch {
                 None,
             )
             .await
-            .expect("a parked submit still answers a receipt");
-        assert_eq!(parked["accepted"], serde_json::json!(true));
-        assert!(
-            engine.prompts.lock().is_empty(),
-            "a mid-turn submit must not start a run of its own"
+            .expect("a mid-turn submit still answers a receipt");
+        assert_eq!(receipt["accepted"], serde_json::json!(true));
+        await_until(|| !engine.prompts.lock().is_empty()).await;
+        assert_eq!(
+            engine.prompts.lock().as_slice(),
+            ["queued text"],
+            "the submit reaches the engine at once; the actor orders it"
         );
 
-        // Settle: the parked text must become the follow-up run.
+        // The settle edge re-sends nothing: the text is not parked anywhere.
         thread.handle_notice(manox_agent::thread_engine::BackendNotice::Settled {
             cancelled: false,
             failed: false,
             steered: Vec::new(),
             stranded: Vec::new(),
         });
-        await_until(|| !engine.prompts.lock().is_empty()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
-            engine.prompts.lock().as_slice(),
-            ["queued text"],
-            "the drained batch runs as one follow-up turn, with its own text"
+            engine.prompts.lock().len(),
+            1,
+            "no second run of the same text at settle"
         );
         uninstall();
     }

@@ -15,6 +15,7 @@
 
 use manox_harness::session::Event;
 use manox_harness::session::jsonl::JournalRecord;
+use manox_harness::types::AgentMessage;
 
 /// The journal-backed observable state of one thread, folded from its
 /// active chain. Every field is `None` while the chain carries no entry for
@@ -49,6 +50,12 @@ pub struct ReplayedThreadState {
     /// Reasoning effort from the last `thinking_level_change` entry (the
     /// raw wire string, `"off"` included; the merge parses it).
     pub reasoning_effort: Option<String>,
+    /// The id of the turn this chain ends inside: a `turn_start` row (or a
+    /// `user` message row) with no later `turn_finish`. Legacy chains carry
+    /// no `turn_start` row at all, so the user row is the shape that catches
+    /// a host that died mid-turn there. `None` means the last turn closed and
+    /// the restore has nothing to reconcile.
+    pub open_turn: Option<String>,
 }
 
 /// An approval or question request the chain never answered.
@@ -181,8 +188,25 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             Event::ThinkingLevelChange { thinking_level, .. } => {
                 state.reasoning_effort = Some(thinking_level.clone());
             }
+            // ── lifecycle: the chain's single open-turn fact ────────────
+            // A turn opens on its `turn_start` row and — for the legacy
+            // chains that carry no `turn_start` — on the user row that
+            // begins it; a `turn_finish` closes whichever was open.
+            Event::TurnStart { id, .. } => {
+                state.open_turn = Some(id.clone());
+            }
+            Event::TurnFinish { .. } => {
+                state.open_turn = None;
+            }
             // ── transcript + display domain (rebuilt by the kernel's own
             //    transcript projection, not by this fold) ────────────────
+            Event::Message {
+                id,
+                message: AgentMessage::User { .. },
+                ..
+            } => {
+                state.open_turn = Some(id.clone());
+            }
             Event::Message { .. }
             | Event::UiNote { .. }
             | Event::Custom { .. }
@@ -200,8 +224,6 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             // no second model answer to carry.
             Event::ModelChange { .. }
             | Event::ActiveToolsChange { .. }
-            | Event::TurnStart { .. }
-            | Event::TurnFinish { .. }
             | Event::Stop { .. }
             | Event::Retry { .. }
             | Event::ErrorEvent { .. }
@@ -345,6 +367,81 @@ mod tests {
         assert_eq!(state.title.as_deref(), Some("second"));
         assert_eq!(state.pinned, Some(false));
         assert_eq!(state.archived, Some(true));
+    }
+
+    /// The fold's open-turn fact, in both journal shapes: the chains with a
+    /// `turn_start` row (engine-owned turns) and the legacy ones that carry
+    /// only the user row (every prompt turn written before the engine owned
+    /// the open edge).
+    #[test]
+    fn an_unclosed_turn_stays_open_and_a_finish_closes_it() {
+        let ts = Utc::now();
+        let id = || uuid::Uuid::new_v4().to_string();
+        let user = |row_id: &str| E::Message {
+            id: row_id.to_string(),
+            parent_id: None,
+            timestamp: ts,
+            message: manox_harness::types::AgentMessage::user("hello"),
+            origin: None,
+        };
+        let finish = |row_id: &str| E::TurnFinish {
+            id: row_id.to_string(),
+            parent_id: None,
+            timestamp: ts,
+            cancelled: false,
+            failed: false,
+            stranded_steer_ids: Vec::new(),
+            reason: None,
+        };
+        let start = |row_id: &str| E::TurnStart {
+            id: row_id.to_string(),
+            parent_id: None,
+            timestamp: ts,
+            owner: None,
+        };
+
+        // Engine-owned shape: the turn_start row is the open fact.
+        let with_start = vec![
+            record(user("u-1")),
+            record(start("ts-1")),
+            record(E::AgentTextDelta {
+                id: id(),
+                parent_id: None,
+                timestamp: ts,
+                delta: "partial".into(),
+            }),
+        ];
+        assert_eq!(
+            replay_thread_state(&with_start).open_turn.as_deref(),
+            Some("ts-1")
+        );
+
+        // Legacy shape: no turn_start row at all — the user row is the open
+        // fact, so a host that died mid-turn is still detected.
+        let legacy = vec![record(user("u-legacy"))];
+        assert_eq!(
+            replay_thread_state(&legacy).open_turn.as_deref(),
+            Some("u-legacy")
+        );
+
+        // A later finish closes whatever was open, and a chain that ends
+        // closed reports none.
+        let closed = [
+            record(user("u-2")),
+            record(start("ts-2")),
+            record(finish("tf-2")),
+        ];
+        assert_eq!(replay_thread_state(&closed).open_turn, None);
+        // A user row after the close opens the next turn.
+        let reopened = [
+            record(user("u-3")),
+            record(finish("tf-3")),
+            record(user("u-4")),
+        ];
+        assert_eq!(
+            replay_thread_state(&reopened).open_turn.as_deref(),
+            Some("u-4")
+        );
     }
 
     #[test]
