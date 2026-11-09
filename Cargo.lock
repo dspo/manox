@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "hyperlinks"
-version = "0.8.2"
+version = "0.9.0"
 
 [[package]]
 name = "iana-time-zone"
@@ -2994,7 +2994,7 @@ dependencies = [
 
 [[package]]
 name = "manox-agent"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3048,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "manox-ahp"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "ahp",
  "ahp-types",
@@ -3068,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "manox-ahp-runtime"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "ahp",
  "ahp-types",
@@ -3095,7 +3095,7 @@ dependencies = [
 
 [[package]]
 name = "manox-harness"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3136,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "manox-lsp"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3153,7 +3153,7 @@ dependencies = [
 
 [[package]]
 name = "manox-napi"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "ahp-types",
  "async-channel",
@@ -3169,7 +3169,7 @@ dependencies = [
 
 [[package]]
 name = "manox-providers"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3182,7 +3182,7 @@ dependencies = [
 
 [[package]]
 name = "manox-session-core"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "ahp",
  "ahp-types",
@@ -3212,7 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "manox-workspace"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5818,7 +5818,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "supervisor"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-channel",
