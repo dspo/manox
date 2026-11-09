@@ -161,7 +161,7 @@ pub(super) fn project_browser_suites(active: &[String]) -> Vec<BrowserSuite> {
 
 /// The shared mid-run journal writer (`AgentSession::journal_appender`): the
 /// same session `Arc` the persistence middleware holds, so a mid-run append
-/// is linearized by the session's append lock and broadcasts to followers
+/// is serialized by the session's journal writer and broadcasts to followers
 /// like any other append.
 pub(super) type JournalAppender =
     manox_harness::session::Session<manox_harness::session::jsonl::JsonlSessionStorage>;

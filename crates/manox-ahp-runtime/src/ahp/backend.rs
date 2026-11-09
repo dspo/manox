@@ -4453,8 +4453,9 @@ mod turn_cancel_ask_settlement_tests {
         )
         .await
         .expect("create the journal");
+        let storage = manox_harness::session::Session::new(storage);
         storage
-            .append_entries(&[
+            .append_entries(vec![
                 kernel_entry(serde_json::json!({
                     "type": "message",
                     "id": "sentry-0",

@@ -15,11 +15,11 @@
 //              the inversion heal, both laying the chain-dense order down
 //              through the atomic temp+rename below.
 //
-// Two storage instances over one file (the cold-append path, embedder
-// processes) each hold a private append lock — nothing serializes them
-// against each other but the write fence below. The fence (an exclusive
-// `flock` plus the stale-view reload in `append_entry_locked`) serializes
-// and linearizes those instances, and the loader tolerates the damage they
+// One storage instance is written by one journal writer task; two instances
+// over one file (the cold-append path, embedder processes) are serialized
+// against each other by the write fence below. The fence (a bounded
+// exclusive `flock` plus the stale-view reload in `append_entry_fenced`)
+// linearizes those instances, and the loader tolerates the damage they
 // already produced: an entry line may sit before its parent as long as the
 // chain is globally intact — every parent exists somewhere in the file, no
 // cycle, and a v4 `seq` equals the chain depth. Memory is ordered by the
@@ -32,10 +32,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, broadcast};
 
+use crate::session::journal::{JournalError, JournalWrite};
 use crate::session::{SessionStorage, SessionTreeEntry};
 use serde_json::Value as JsonValue;
 
@@ -44,8 +46,8 @@ use serde_json::Value as JsonValue;
 const FORMAT_VERSION: u32 = 4;
 
 /// The previous format. v3 files still open (seq is backfilled from chain
-/// depth in memory) and are rewritten in full as v4 under the append lock on
-/// the first append — the lazy §C.1 migration.
+/// depth in memory) and are rewritten in full as v4 on the first append —
+/// the lazy §C.1 migration, in the writer's command order.
 const LEGACY_FORMAT_VERSION: u32 = 3;
 
 /// Broadcast capacity for [`JournalEvent`] subscribers. A lagging subscriber
@@ -55,7 +57,7 @@ const LEGACY_FORMAT_VERSION: u32 = 3;
 const JOURNAL_BROADCAST_CAPACITY: usize = 4096;
 
 /// One journal event as broadcast by [`JsonlSessionStorage`] at every append,
-/// in strict seq order (sent under the append lock).
+/// in strict seq order (the writer's FIFO order).
 #[derive(Debug, Clone)]
 pub struct JournalEvent {
     /// Chain depth of the appended entry (dense 0-based along its chain).
@@ -117,20 +119,16 @@ pub struct JsonlSessionStorage {
     /// otherwise it is the last appended entry's id.
     leaf_id: Mutex<Option<String>>,
     /// entry id → chain depth (§C.1 seq). Assigned at the single append point
-    /// under `append_lock` (L4); on load the depths come from a memoized
-    /// parent walk — order-independent, so a recoverable line-order inversion
-    /// changes nothing here.
+    /// (L4) — the journal's writer task; on load the depths come from a
+    /// memoized parent walk — order-independent, so a recoverable line-order
+    /// inversion changes nothing here.
     seq_index: Mutex<std::collections::HashMap<String, u64>>,
     /// The on-disk format version of the opened file (3 until the first
     /// append rewrites it to 4).
     file_version: Mutex<u32>,
     /// Ordered journal append notifications (one per successful append, in
-    /// seq order, sent under the append lock).
+    /// seq order, sent in the writer's FIFO order).
     journal_tx: broadcast::Sender<JournalEvent>,
-    /// Serializes the write → index → cursor sequence so concurrent appends
-    /// never interleave the three steps and diverge disk order from the
-    /// in-memory index or the cursor.
-    append_lock: Mutex<()>,
     /// Metadata read from the header (file is authoritative on reopen).
     pub metadata: JsonlSessionMetadata,
     /// The file has not been written yet: the header and buffered entries
@@ -206,7 +204,6 @@ impl JsonlSessionStorage {
             seq_index: Mutex::new(std::collections::HashMap::new()),
             file_version: Mutex::new(FORMAT_VERSION),
             journal_tx,
-            append_lock: Mutex::new(()),
             metadata,
             deferred: Mutex::new(false),
             needs_rewrite: Mutex::new(false),
@@ -252,7 +249,6 @@ impl JsonlSessionStorage {
             seq_index: Mutex::new(std::collections::HashMap::new()),
             file_version: Mutex::new(FORMAT_VERSION),
             journal_tx,
-            append_lock: Mutex::new(()),
             metadata,
             deferred: Mutex::new(true),
             needs_rewrite: Mutex::new(false),
@@ -278,7 +274,7 @@ impl JsonlSessionStorage {
         // the lock so it never parks other instances' appends.
         let bytes = {
             let mut file = File::open(path).await?;
-            flock_shared(&file).await?;
+            flock_shared(path, &file).await?;
             let mut bytes = Vec::new();
             bytes.reserve(file.metadata().await?.len() as usize);
             file.read_to_end(&mut bytes).await?;
@@ -294,7 +290,6 @@ impl JsonlSessionStorage {
             seq_index: Mutex::new(parsed.seq_index),
             file_version: Mutex::new(parsed.header_version),
             journal_tx,
-            append_lock: Mutex::new(()),
             metadata: parsed.metadata,
             deferred: Mutex::new(false),
             needs_rewrite: Mutex::new(parsed.needs_rewrite),
@@ -336,11 +331,14 @@ impl JsonlSessionStorage {
     /// Constraints (the fork path always satisfies them): the file must
     /// be materialized and on the current format version — a deferred or
     /// v3 file is rejected rather than silently materialized/migrated
-    /// mid-batch; route those through [`Self::append_entry`]. Index,
-    /// cursor, and journal-broadcast updates mirror `append_entry` per
-    /// entry, in batch order, under the same lock.
-    pub async fn append_entries(&self, entries: &[SessionTreeEntry]) -> Result<(), anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
+    /// mid-batch; route those through [`SessionStorage::append_entry`].
+    /// Index, cursor, and journal-broadcast updates mirror a single append
+    /// per entry, in batch order.
+    pub async fn append_entries_batch(
+        &self,
+        entries: &[SessionTreeEntry],
+        _write: JournalWrite,
+    ) -> Result<(), anyhow::Error> {
         if *self.deferred.lock().await {
             anyhow::bail!("append_entries requires a materialized session (file is deferred)");
         }
@@ -350,7 +348,7 @@ impl JsonlSessionStorage {
         let Some(last) = entries.last() else {
             return Ok(());
         };
-        // The write fence (B3), same contract as `append_entry_locked`: the
+        // The write fence (B3), same contract as `append_entry_fenced`: the
         // batch's phase-1 validation must run against on-disk truth, so a
         // file that grew since this view was built reloads first —
         // otherwise the batch's seqs and parents derive from a stale tail
@@ -371,13 +369,13 @@ impl JsonlSessionStorage {
             // A line-order-inverted file heals through the per-entry path
             // (each append may take the whole-file rewrite); the batch's
             // single multi-line append cannot lay the healed order down.
-            // Drop the fence FIRST: `append_entry_locked` acquires its own,
+            // Drop the fence FIRST: `append_entry_fenced` acquires its own,
             // and flock counts per open file description — a second fd's
-            // blocking LOCK_EX out of this process would wait forever on
-            // the one still held here (self-deadlock).
+            // LOCK_EX out of this process would spin against the one still
+            // held here until its budget expired.
             drop(fence);
             for entry in entries {
-                self.append_entry_locked(entry, false).await?;
+                self.append_entry_fenced(entry, false).await?;
             }
             return Ok(());
         }
@@ -413,8 +411,8 @@ impl JsonlSessionStorage {
             depths.insert(id.to_string(), seq);
             seqs.push(seq);
         }
-        // Phase 2: ONE fenced write; then index/cursor/broadcast under the
-        // same lock hold, mirroring append_entry_locked's post-write order.
+        // Phase 2: ONE fenced write; then index/cursor/broadcast, mirroring
+        // append_entry_fenced's post-write order.
         // A fence-less non-deferred append means the file vanished beneath
         // a live session (external deletion): recover by whole-file rewrite
         // — header + history + batch — exactly the single-entry path's
@@ -428,13 +426,13 @@ impl JsonlSessionStorage {
                 // has them. Flush waits for the in-flight write, so the row
                 // this call reports is visible to a cold reader (a sibling
                 // storage, the sidebar scan, another process) before the
-                // lock is released, and two appends can never hit the file
-                // out of the order their locks were held in.
+                // fence is released, and the writer's FIFO order keeps two
+                // appends from hitting the file out of order.
                 fenced.file.flush().await?;
                 *self.disk_size.lock().await += lines.len() as u64;
             }
             None => {
-                let written = self.rewrite_file_v4_locked(Some(&lines)).await?;
+                let written = self.rewrite_file_v4(Some(&lines)).await?;
                 *self.needs_rewrite.lock().await = false;
                 *self.disk_size.lock().await = written;
             }
@@ -457,27 +455,27 @@ impl JsonlSessionStorage {
         Ok(())
     }
 
-    /// The write → index → cursor sequence, atomic under
-    /// [`Self::append_lock`]. Trait methods take the lock and delegate here.
+    /// The write → index → cursor sequence. The journal's writer task calls
+    /// this in FIFO order, so the sequence is single-writer by construction;
+    /// the in-memory locks below are short and never held across I/O.
     /// A duplicate or empty id is refused before anything touches disk — the
     /// walk index would otherwise silently overwrite one entry with another.
     ///
     /// v4 (§C.1/L4): the seq — the new entry's chain depth — is assigned
     /// here and nowhere else, stamped into the line, recorded in
-    /// `seq_index`, and broadcast in seq order while the lock is held.
-    /// Appending to a file still on v3 rewrites it in full as v4 first (the
-    /// lazy migration; the rewrite reuses the buffered-seq values computed
-    /// at load).
+    /// `seq_index`, and broadcast in seq order. Appending to a file still on
+    /// v3 rewrites it in full as v4 first (the lazy migration; the rewrite
+    /// reuses the buffered-seq values computed at load).
     ///
     /// `force_materialize` writes the entry — and every buffered row before
     /// it — to disk even while the session is still deferred (the K5
     /// acceptance-time append: a persisted Submit must survive a crash that
     /// happens before any assistant message materializes the file).
-    async fn append_entry_locked(
+    async fn append_entry_fenced(
         &self,
         entry: &SessionTreeEntry,
         force_materialize: bool,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<u64, anyhow::Error> {
         if entry.id().is_empty() {
             anyhow::bail!("refusing entry with empty id");
         }
@@ -567,7 +565,7 @@ impl JsonlSessionStorage {
             // no zombie; the accepted text must be on disk before the
             // receipt's crash window opens).
             if is_assistant || force_materialize {
-                let written = self.rewrite_file_v4_locked(Some(&line)).await?;
+                let written = self.rewrite_file_v4(Some(&line)).await?;
                 *self.deferred.lock().await = false;
                 *self.disk_size.lock().await = written;
             }
@@ -579,7 +577,7 @@ impl JsonlSessionStorage {
             // deleted file: one atomic whole-file replace writes the header
             // and the in-memory chain (plus this line) — only the layout
             // changes, never the history.
-            let written = self.rewrite_file_v4_locked(Some(&line)).await?;
+            let written = self.rewrite_file_v4(Some(&line)).await?;
             *self.needs_rewrite.lock().await = false;
             *self.disk_size.lock().await = written;
         } else {
@@ -607,20 +605,20 @@ impl JsonlSessionStorage {
         // The cursor follows this entry: a `leaf` entry redirects to its
         // `targetId`, otherwise the entry becomes the cursor itself.
         *self.leaf_id.lock().await = entry.leaf_cursor_after();
-        // Ordered notification: sent under the append lock so subscribers
-        // observe strictly increasing seq. No subscribers is fine.
+        // Ordered notification: the writer's FIFO order is the seq order, so
+        // subscribers observe strictly increasing seq. No subscribers is fine.
         let _ = self.journal_tx.send(JournalEvent {
             seq,
             entry: std::sync::Arc::new(entry.clone()),
         });
-        Ok(())
+        Ok(seq)
     }
 
     /// Rewrite the whole file as v4 (header + every indexed entry with its
     /// stamped seq, optionally plus one more line) in a single write. Used by
-    /// deferred materialization and the lazy v3 migration, both under
-    /// `append_lock`.
-    async fn rewrite_file_v4_locked(&self, extra_line: Option<&str>) -> Result<u64, anyhow::Error> {
+    /// deferred materialization and the lazy v3 migration, both in the
+    /// writer's command order.
+    async fn rewrite_file_v4(&self, extra_line: Option<&str>) -> Result<u64, anyhow::Error> {
         let header = SessionHeader {
             type_tag: "session".into(),
             version: FORMAT_VERSION,
@@ -650,9 +648,9 @@ impl JsonlSessionStorage {
         // the sidebar scan or an ecosystem tool reading the journal) staring
         // at a half-written or empty session file; with rename, readers see
         // either the complete old file or the complete new one, never a
-        // truncation in between. `append_lock` serializes rewrites WITHIN
-        // one instance only — two instances over one file (the B3 cold
-        // append race) each hold their own — so the temp name itself is
+        // truncation in between. The writer's FIFO order serializes rewrites
+        // WITHIN one instance only — two instances over one file (the B3
+        // cold append race) each have their own — so the temp name itself is
         // unique per rewrite (pid + process-local counter): a concurrent
         // writer can never truncate this rewrite's artifact mid-flight.
         // The `.tmp` suffix keeps session-directory scans
@@ -999,15 +997,23 @@ fn parse_file(path: &Path, bytes: &[u8]) -> Result<ParsedFile, anyhow::Error> {
 }
 
 /// The cross-instance write fence: an exclusive `flock` over the session
-/// file, acquired by path. The per-instance append lock cannot see a SECOND
-/// storage object over the same file — the cold-append path and embedder
-/// processes open their own instances — and two private locks interleaving
-/// `write_all` calls is exactly how a child line once landed before its
-/// parent. The fence serializes append critical sections across ALL
-/// instances of the file, process-wide and system-wide.
+/// file, acquired by path. The writer task serializes appends WITHIN one
+/// storage instance; the fence serializes them across ALL instances of the
+/// file (the cold-append path, embedder processes), process-wide and
+/// system-wide. Acquisition is non-blocking with a bounded retry budget: a
+/// held fence times out into [`JournalError::Busy`], never a parked thread.
 struct WriteFence {
     file: File,
 }
+
+/// How long an append waits for another instance's fence before reporting
+/// `Busy`. Critical sections are one line long, so this is generous.
+const WRITE_FENCE_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long a cold read waits for an in-flight append's exclusive fence.
+/// A 62k-line journal's append critical section is one write, so five
+/// seconds bounds a pathological holder without parking the reader forever.
+const READ_FENCE_BUDGET: Duration = Duration::from_secs(5);
 
 impl WriteFence {
     /// Acquire the fence, retrying a bounded number of times when the path
@@ -1016,35 +1022,43 @@ impl WriteFence {
     /// fence a replaced inode). `Ok(None)` when the file does not exist — a
     /// deferred session has nothing on disk to fence, and no other instance
     /// can contend for a file that is not there.
-    async fn acquire(path: &Path) -> Result<Option<Self>, anyhow::Error> {
+    async fn acquire(path: &Path) -> Result<Option<Self>, JournalError> {
         for _ in 0..16 {
-            if !tokio::fs::try_exists(path).await? {
+            if !tokio::fs::try_exists(path)
+                .await
+                .map_err(JournalError::from)?
+            {
                 return Ok(None);
             }
             let owned_path = path.to_path_buf();
             let attempt =
-                tokio::task::spawn_blocking(move || -> Result<Option<File>, anyhow::Error> {
+                tokio::task::spawn_blocking(move || -> Result<Option<File>, JournalError> {
                     use std::os::unix::io::AsRawFd;
                     let file = std::fs::OpenOptions::new()
                         .append(true)
                         .read(true)
-                        .open(&owned_path)?;
-                    let fd = file.as_raw_fd();
-                    // Blocking acquire: critical sections are one line long,
-                    // so waiters queue briefly; the blocking pool absorbs
-                    // the parked threads.
-                    if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
-                        anyhow::bail!(
-                            "failed to fence {}: {}",
-                            owned_path.display(),
-                            std::io::Error::last_os_error()
-                        );
-                    }
+                        .open(&owned_path)
+                        .map_err(|err| JournalError::Failed(err.into()))?;
+                    crate::fs_lock::flock_fd(file.as_raw_fd(), true, WRITE_FENCE_BUDGET).map_err(
+                        |err| {
+                            if err.kind() == std::io::ErrorKind::WouldBlock {
+                                JournalError::Busy {
+                                    path: owned_path.clone(),
+                                    budget: WRITE_FENCE_BUDGET,
+                                }
+                            } else {
+                                JournalError::Failed(err.into())
+                            }
+                        },
+                    )?;
                     // The path must still resolve to the fenced inode: a
                     // rename between open and lock leaves this fd fencing
                     // the replaced file. `None` asks the caller to retry.
-                    let fenced = file.metadata()?;
-                    let current = std::fs::metadata(&owned_path)?;
+                    let fenced = file
+                        .metadata()
+                        .map_err(|err| JournalError::Failed(err.into()))?;
+                    let current = std::fs::metadata(&owned_path)
+                        .map_err(|err| JournalError::Failed(err.into()))?;
                     use std::os::unix::fs::MetadataExt;
                     if fenced.dev() != current.dev() || fenced.ino() != current.ino() {
                         return Ok(None);
@@ -1052,35 +1066,40 @@ impl WriteFence {
                     Ok(Some(File::from_std(file)))
                 })
                 .await
-                .map_err(|e| anyhow::anyhow!("fence task failed: {e}"))?;
+                .map_err(|e| JournalError::Failed(anyhow::anyhow!("fence task failed: {e}")))?;
             match attempt {
                 Ok(Some(file)) => return Ok(Some(Self { file })),
                 Ok(None) => continue,
                 Err(error) => return Err(error),
             }
         }
-        anyhow::bail!(
+        Err(JournalError::Failed(anyhow::anyhow!(
             "session file {} kept swapping under the write fence",
             path.display()
-        )
+        )))
     }
 }
 
 /// Take a shared `flock` on an already-open file — the read fence. Loads
 /// see a stable snapshot, never a mid-append tail; the lock lives with the
-/// file handle and releases when the caller drops it.
-async fn flock_shared(file: &File) -> Result<(), anyhow::Error> {
+/// file handle and releases when the caller drops it. The acquire is
+/// non-blocking with a bounded budget, so a held write fence can never park
+/// a cold read indefinitely.
+async fn flock_shared(path: &Path, file: &File) -> Result<(), anyhow::Error> {
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
-    let rc = tokio::task::spawn_blocking(move || unsafe { libc::flock(fd, libc::LOCK_SH) })
+    crate::fs_lock::flock_fd_async(fd, false, READ_FENCE_BUDGET)
         .await
-        .map_err(|e| anyhow::anyhow!("flock task failed: {e}"))?;
-    if rc != 0 {
-        anyhow::bail!(
-            "failed to fence a session file for reading: {}",
-            std::io::Error::last_os_error()
-        );
-    }
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::Error::from(JournalError::Busy {
+                    path: path.to_path_buf(),
+                    budget: READ_FENCE_BUDGET,
+                })
+            } else {
+                anyhow::Error::from(err)
+            }
+        })?;
     Ok(())
 }
 
@@ -1174,18 +1193,32 @@ fn validate_entry_wire(value: &JsonValue) -> Result<(), anyhow::Error> {
 
 #[async_trait::async_trait]
 impl SessionStorage for JsonlSessionStorage {
-    async fn create_entry_id(&self) -> Result<String, anyhow::Error> {
+    async fn create_entry_id(&self, _write: JournalWrite) -> Result<String, anyhow::Error> {
         Ok(uuid::Uuid::new_v4().to_string())
     }
 
-    async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        self.append_entry_locked(entry, false).await
+    async fn append_entry(
+        &self,
+        entry: &SessionTreeEntry,
+        _write: JournalWrite,
+    ) -> Result<u64, anyhow::Error> {
+        self.append_entry_fenced(entry, false).await
     }
 
-    async fn append_entry_durable(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        self.append_entry_locked(entry, true).await
+    async fn append_entry_durable(
+        &self,
+        entry: &SessionTreeEntry,
+        _write: JournalWrite,
+    ) -> Result<u64, anyhow::Error> {
+        self.append_entry_fenced(entry, true).await
+    }
+
+    async fn append_batch(
+        &self,
+        entries: &[SessionTreeEntry],
+        write: JournalWrite,
+    ) -> Result<(), anyhow::Error> {
+        self.append_entries_batch(entries, write).await
     }
 
     async fn get_entry(&self, id: &str) -> Result<Option<SessionTreeEntry>, anyhow::Error> {
@@ -1206,8 +1239,11 @@ impl SessionStorage for JsonlSessionStorage {
         Ok(leaf_id)
     }
 
-    async fn set_leaf_id(&self, leaf_id: Option<&str>) -> Result<(), anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
+    async fn set_leaf_id(
+        &self,
+        leaf_id: Option<&str>,
+        write: JournalWrite,
+    ) -> Result<(), anyhow::Error> {
         // Validate the target exists before recording the move.
         if let Some(id) = leaf_id {
             let exists = self.entries.lock().await.iter().any(|e| e.id() == id);
@@ -1216,7 +1252,7 @@ impl SessionStorage for JsonlSessionStorage {
             }
         }
         let parent_id = self.leaf_id.lock().await.clone();
-        let id = self.create_entry_id().await?;
+        let id = self.create_entry_id(write).await?;
         let entry = SessionTreeEntry::Leaf {
             id,
             parent_id,
@@ -1226,7 +1262,7 @@ impl SessionStorage for JsonlSessionStorage {
         // Reuse the shared append path so the leaf entry lands on disk, in the
         // in-memory index, and as the cursor through one code path — the
         // cursor becomes the leaf's `targetId` via `leaf_cursor_after`.
-        self.append_entry_locked(&entry, false).await
+        self.append_entry_fenced(&entry, false).await.map(|_| ())
     }
 
     async fn get_entries(
@@ -1366,6 +1402,50 @@ impl SessionStorage for JsonlSessionStorage {
 }
 
 #[cfg(test)]
+/// Storage-level test driver: every write goes through the real journal
+/// actor, so these tests exercise the single-writer append path they
+/// assert on instead of calling a storage write method directly.
+struct TestStorage {
+    storage: std::sync::Arc<JsonlSessionStorage>,
+    journal: std::sync::Arc<crate::session::Journal<JsonlSessionStorage>>,
+}
+
+#[cfg(test)]
+impl TestStorage {
+    fn new(storage: JsonlSessionStorage) -> Self {
+        let storage = std::sync::Arc::new(storage);
+        let journal = crate::session::Journal::new(std::sync::Arc::clone(&storage));
+        TestStorage { storage, journal }
+    }
+
+    async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<u64, anyhow::Error> {
+        Ok(self
+            .journal
+            .append_verbatim(entry.clone(), false)
+            .await?
+            .seq)
+    }
+
+    async fn set_leaf_id(&self, target: Option<&str>) -> Result<(), anyhow::Error> {
+        self.journal.set_leaf(target.map(str::to_string)).await?;
+        Ok(())
+    }
+
+    async fn append_entries(&self, entries: &[SessionTreeEntry]) -> Result<(), anyhow::Error> {
+        self.journal.append_batch(entries.to_vec()).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestStorage {
+    type Target = JsonlSessionStorage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+#[cfg(test)]
 mod tests {
     /// §二.6 torn-tail tolerance: an unparseable TAIL line in a file
     /// WITHOUT the trailing newline is a torn append (the non-atomic
@@ -1386,6 +1466,7 @@ mod tests {
         let storage = JsonlSessionStorage::open(&torn_path)
             .await
             .expect("the torn tail is tolerated");
+        let storage = TestStorage::new(storage);
         let records = storage.journal_range(0, u64::MAX).await.unwrap();
         assert_eq!(
             records.len(),
@@ -1430,6 +1511,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
 
         let entry = SessionTreeEntry::Message {
             id: "test-1".into(),
@@ -1487,6 +1569,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
         storage
             .append_entry(&priced_assistant("a1", 10, 5, 3))
             .await
@@ -1545,6 +1628,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
         let mut entry = priced_assistant("a1", 10, 5, 3);
         if let SessionTreeEntry::Message {
             message: crate::types::AgentMessage::Assistant { usage, .. },
@@ -1567,6 +1651,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
         let mut entry = priced_assistant("a1", 60, 30, 10);
         if let SessionTreeEntry::Message {
             message: crate::types::AgentMessage::Assistant { usage, .. },
@@ -1588,6 +1673,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
         let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+        let storage = TestStorage::new(storage);
         let target = SessionTreeEntry::Message {
             id: "m1".into(),
             parent_id: None,
@@ -1622,6 +1708,7 @@ mod tests {
         // Rebuilt from the file on reopen, not only maintained on append.
         drop(storage);
         let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+        let reopened = TestStorage::new(reopened);
         assert_eq!(
             reopened.get_label("m1").await.unwrap().as_deref(),
             Some("final")
@@ -1634,6 +1721,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
         storage
             .append_entry(&SessionTreeEntry::Label {
                 id: "l1".into(),
@@ -1653,6 +1741,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
         assert_eq!(storage.get_session_name().await.unwrap(), None);
         for (id, name) in [("s1", Some("old")), ("s2", Some("  new  "))] {
             storage
@@ -1677,6 +1766,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
         storage
             .append_entry(&SessionTreeEntry::Message {
                 id: "m1".into(),
@@ -1729,6 +1819,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
         for i in 0..5 {
             storage
                 .append_entry(&SessionTreeEntry::Message {
@@ -1778,6 +1869,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+        let storage = TestStorage::new(storage);
         storage
             .append_entry(&SessionTreeEntry::Message {
                 id: "b1".into(),
@@ -1800,6 +1892,7 @@ mod tests {
         drop(storage);
 
         let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+        let reopened = TestStorage::new(reopened);
         let entry = reopened.get_entry("b1").await.unwrap().unwrap();
         let SessionTreeEntry::Message { message, .. } = entry else {
             panic!("expected a message entry");
@@ -1834,6 +1927,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
 
         assert!(storage.get_leaf_id().await.unwrap().is_none());
 
@@ -1867,6 +1961,7 @@ mod tests {
         let reopened = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
             .await
             .unwrap();
+        let reopened = TestStorage::new(reopened);
         assert_eq!(reopened.get_leaf_id().await.unwrap(), Some("m1".into()));
 
         // set_leaf_id(None) records a cursor reset to null.
@@ -1888,6 +1983,7 @@ mod tests {
             let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
                 .await
                 .unwrap();
+            let storage = TestStorage::new(storage);
             let msg = SessionTreeEntry::Message {
                 id: "m1".into(),
                 parent_id: None,
@@ -1900,6 +1996,7 @@ mod tests {
         }
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
+        let storage = TestStorage::new(storage);
         let entries = storage.get_entries(Default::default()).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(storage.get_leaf_id().await.unwrap(), Some("m1".into()));
@@ -1956,6 +2053,7 @@ mod tests {
 
         // Reopen: the file is authoritative, so the fork metadata survives.
         let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+        let reopened = TestStorage::new(reopened);
         let m = &reopened.metadata;
         assert_eq!(m.id, "fork");
         assert_eq!(
@@ -2053,6 +2151,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
 
         let root = SessionTreeEntry::Message {
             id: "root".into(),
@@ -2098,6 +2197,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
 
         let pre = SessionTreeEntry::Message {
             id: "pre".into(),
@@ -2139,7 +2239,7 @@ mod tests {
 
         // The context projection keeps the compaction plus everything after
         // it; with no first_kept_entry_id, nothing before it survives.
-        let session = Session::new(storage);
+        let session = Session::from_arc(storage.storage.clone());
         let ctx = session.build_context_entries().await.unwrap();
         assert_eq!(ctx.len(), 2);
         assert_eq!(ctx[0].id(), "comp");
@@ -2154,6 +2254,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
         let base = chrono::Utc::now();
         let compaction = |id: &str, parent: &str, secs: i64| SessionTreeEntry::Compaction {
             id: id.into(),
@@ -2196,17 +2297,17 @@ mod tests {
             .await
             .unwrap();
 
-        let session = Session::new(storage);
+        let session = Session::from_arc(storage.storage.clone());
 
-        session.storage().set_leaf_id(Some("postA")).await.unwrap();
+        session.move_to(Some("postA")).await.unwrap();
         let ts = session.latest_compaction_timestamp().await.unwrap();
         assert_eq!(ts, Some(base + chrono::Duration::seconds(1)));
 
-        session.storage().set_leaf_id(Some("compB")).await.unwrap();
+        session.move_to(Some("compB")).await.unwrap();
         let ts = session.latest_compaction_timestamp().await.unwrap();
         assert_eq!(ts, Some(base + chrono::Duration::seconds(3)));
 
-        session.storage().set_leaf_id(Some("root")).await.unwrap();
+        session.move_to(Some("root")).await.unwrap();
         let ts = session.latest_compaction_timestamp().await.unwrap();
         assert_eq!(ts, None);
     }
@@ -2222,6 +2323,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
 
         let root = SessionTreeEntry::Message {
             id: "root".into(),
@@ -2258,6 +2360,7 @@ mod tests {
         let reopened = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
             .await
             .unwrap();
+        let reopened = TestStorage::new(reopened);
         let path = reopened.get_path(Some("child")).await.unwrap();
         assert_eq!(path.len(), 2);
         assert_eq!(path[1].parent_id(), Some("root"));
@@ -2287,6 +2390,7 @@ mod tests {
         tokio::fs::write(&path, contents).await.unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
+        let storage = TestStorage::new(storage);
 
         let entries = storage.get_entries(Default::default()).await.unwrap();
         assert_eq!(entries.len(), 3);
@@ -2361,6 +2465,7 @@ mod tests {
         tokio::fs::write(&path, contents).await.unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
+        let storage = TestStorage::new(storage);
         let entries = storage.get_entries(Default::default()).await.unwrap();
         assert_eq!(entries.len(), 2);
 
@@ -2444,6 +2549,7 @@ mod tests {
         tokio::fs::write(&path, contents).await.unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
+        let storage = TestStorage::new(storage);
 
         // Trailing leaf redirects the cursor to its targetId.
         assert_eq!(storage.get_leaf_id().await.unwrap(), Some("b1".into()));
@@ -2525,6 +2631,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
         let entry = SessionTreeEntry::Label {
             id: "lab1".into(),
             parent_id: None,
@@ -2561,14 +2668,15 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
             .await
             .unwrap();
-        let session = Session::new(storage);
+        let storage = TestStorage::new(storage);
+        let session = Session::from_arc(storage.storage.clone());
 
         let m1 = session
             .append_message(AgentMessage::user("first"))
             .await
             .unwrap();
         // Branch back to m1: a leaf entry is persisted, cursor redirects to m1.
-        session.storage().set_leaf_id(Some(&m1)).await.unwrap();
+        session.move_to(Some(&m1)).await.unwrap();
         assert_eq!(
             session.storage().get_leaf_id().await.unwrap(),
             Some(m1.clone())
@@ -2603,6 +2711,7 @@ mod tests {
         let reopened = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
             .await
             .unwrap();
+        let reopened = TestStorage::new(reopened);
         assert_eq!(reopened.get_leaf_id().await.unwrap(), Some(m2.clone()));
         assert_eq!(
             reopened
@@ -2614,7 +2723,7 @@ mod tests {
         );
 
         // The walked context skips the leaf entry: m2 → m1, no leaf in path.
-        let session = Session::new(reopened);
+        let session = Session::from_arc(reopened.storage.clone());
         let ctx = session.build_context_entries().await.unwrap();
         assert_eq!(ctx.len(), 2);
         assert_eq!(ctx[0].id(), m1);
@@ -2675,7 +2784,8 @@ mod tests {
         tokio::fs::write(&path, contents).await.unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
-        let session = Session::new(storage);
+        let storage = TestStorage::new(storage);
+        let session = Session::from_arc(storage.storage.clone());
         let context = session.build_session_context().await.unwrap();
 
         fn text_of(m: &AgentMessage) -> &str {
@@ -2739,7 +2849,8 @@ mod tests {
         tokio::fs::write(&path, contents).await.unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
-        let session = Session::new(storage);
+        let storage = TestStorage::new(storage);
+        let session = Session::from_arc(storage.storage.clone());
         let context = session.build_session_context().await.unwrap();
 
         // Settings entries contribute no message; the null-content assistant
@@ -2782,6 +2893,7 @@ mod tests {
         tokio::fs::write(&path, contents).await.unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
+        let storage = TestStorage::new(storage);
         let entries = storage.get_entries(Default::default()).await.unwrap();
         assert_eq!(entries.len(), 2);
         match &entries[0] {
@@ -2807,9 +2919,10 @@ mod tests {
         }
 
         // The producer face lands the same row vocabulary a reopen reads.
-        let session = Session::new(storage);
+        let session = Session::from_arc(storage.storage.clone());
         session.append_access_mode_change("sandbox").await.unwrap();
         let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+        let reopened = TestStorage::new(reopened);
         let entries = reopened.get_entries(Default::default()).await.unwrap();
         let last = entries.last().unwrap();
         match last {
@@ -2863,9 +2976,10 @@ mod tests {
 
     /// append_entries on a line-order-inverted file routes through the
     /// per-entry heal path — which must drop the fence first: flock counts
-    /// per open file description, so a second blocking LOCK_EX out of this
-    /// process on the still-held file self-deadlocks. The timeout turns a
-    /// regression back into a test failure instead of a hung suite.
+    /// per open file description, so a second LOCK_EX out of this process
+    /// against the still-held file would burn the write budget and fail as
+    /// Busy. The timeout turns a regression back into a test failure instead
+    /// of a hung suite.
     #[tokio::test]
     async fn append_entries_heals_an_inverted_file_without_self_deadlock() {
         use crate::session::Session;
@@ -2886,6 +3000,7 @@ mod tests {
         );
         std::fs::write(&path, contents).unwrap();
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
+        let storage = TestStorage::new(storage);
         // The batch chains onto the file's leaf (c1), the fork shape.
         let batch = vec![
             message_entry("b1", Some("c1"), "batch one"),
@@ -2901,7 +3016,8 @@ mod tests {
 
         // The file healed to chain order and carries the batch linearly.
         let reopened = JsonlSessionStorage::open(&path).await.unwrap();
-        let session = Session::new(reopened);
+        let reopened = TestStorage::new(reopened);
+        let session = Session::from_arc(reopened.storage.clone());
         let branch = session.get_branch().await.unwrap();
         let texts: Vec<&str> = branch.iter().map(user_text).collect();
         assert_eq!(texts, vec!["x", "p", "c1", "batch one", "batch two"]);
@@ -2917,6 +3033,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+        let storage = TestStorage::new(storage);
         storage
             .append_entry(&message_entry("m1", None, "history"))
             .await
@@ -2932,7 +3049,8 @@ mod tests {
         // The rewrite recovered a complete file: header present, history
         // and batch on one chain.
         let reopened = JsonlSessionStorage::open(&path).await.unwrap();
-        let session = Session::new(reopened);
+        let reopened = TestStorage::new(reopened);
+        let session = Session::from_arc(reopened.storage.clone());
         let branch = session.get_branch().await.unwrap();
         let texts: Vec<&str> = branch.iter().map(user_text).collect();
         assert_eq!(texts, vec!["history", "batch one", "batch two"]);
@@ -3088,7 +3206,8 @@ mod tests {
         b.append_message(AgentMessage::user("b2")).await.unwrap();
 
         let reopened = JsonlSessionStorage::open(&path).await.unwrap();
-        let session = Session::new(reopened);
+        let reopened = TestStorage::new(reopened);
+        let session = Session::from_arc(reopened.storage.clone());
         let branch = session.get_branch().await.unwrap();
         let texts: Vec<&str> = branch.iter().map(user_text).collect();
         assert_eq!(
@@ -3116,7 +3235,8 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
             .await
             .unwrap();
-        let session = std::sync::Arc::new(Session::new(storage));
+        let storage = TestStorage::new(storage);
+        let session = std::sync::Arc::new(Session::from_arc(storage.storage.clone()));
 
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -3181,6 +3301,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
         let entry = SessionTreeEntry::Message {
             id: "m1".into(),
             parent_id: None,
@@ -3206,13 +3327,16 @@ mod tests {
         assert_eq!(storage.get_leaf_id().await.unwrap().as_deref(), Some("m1"));
     }
 
-    /// An entry with an empty id is refused on append.
+    /// The writer assigns an id when the entry carries none, so an id-less
+    /// append lands instead of reaching the storage's empty-id guard. That
+    /// guard still refuses a directly built id-less row.
     #[tokio::test]
-    async fn test_append_rejects_empty_entry_id() {
+    async fn test_append_assigns_an_id_to_an_entry_without_one() {
         let dir = tempfile::tempdir().unwrap();
         let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
             .await
             .unwrap();
+        let storage = TestStorage::new(storage);
         let entry = SessionTreeEntry::Message {
             id: String::new(),
             parent_id: None,
@@ -3220,15 +3344,20 @@ mod tests {
             message: AgentMessage::user("bad"),
             origin: None,
         };
-        let err = storage.append_entry(&entry).await.unwrap_err();
+        let seq = storage.append_entry(&entry).await.unwrap();
+        assert_eq!(seq, 0);
+        let entries = storage.get_entries(Default::default()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].id().is_empty(), "the writer minted the id");
+
+        // The storage's own guard stays in place for a row that bypasses the
+        // writer's id assignment.
+        let err = storage
+            .storage
+            .append_entry_fenced(&entry, false)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("empty id"), "{err}");
-        assert!(
-            storage
-                .get_entries(Default::default())
-                .await
-                .unwrap()
-                .is_empty()
-        );
     }
 
     /// A header line with an empty id or cwd is corruption, not a valid
@@ -3389,6 +3518,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("session.jsonl");
             let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+            let storage = TestStorage::new(storage);
             let mut rx = storage.subscribe_journal();
 
             storage
@@ -3425,6 +3555,7 @@ mod tests {
             // Reopen: v4 header, dense stamped lines, same chain.
             drop(storage);
             let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+            let reopened = TestStorage::new(reopened);
             assert_eq!(reopened.journal_cursor().await, 2);
             let reread = reopened.journal_range(0, u64::MAX).await.unwrap();
             assert_eq!(reread.len(), 3);
@@ -3447,6 +3578,7 @@ mod tests {
 
             // v3 opens with backfilled seqs; nothing is rewritten yet.
             let storage = JsonlSessionStorage::open(&path).await.unwrap();
+            let storage = TestStorage::new(storage);
             assert_eq!(storage.journal_cursor().await, 1);
             assert_eq!(storage.journal_range(0, 0).await.unwrap().len(), 1);
             let before = tokio::fs::read_to_string(&path).await.unwrap();
@@ -3470,6 +3602,7 @@ mod tests {
 
             drop(storage);
             let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+            let reopened = TestStorage::new(reopened);
             assert_eq!(reopened.journal_cursor().await, 2);
         }
 
@@ -3509,6 +3642,7 @@ mod tests {
             }
             tokio::fs::write(&path, &contents).await.unwrap();
             let storage = JsonlSessionStorage::open(&path).await.unwrap();
+            let storage = TestStorage::new(storage);
 
             // High-frequency integrity sampling: the reader thread stats
             // the path in a tight loop and records every distinct observed
@@ -3609,6 +3743,7 @@ mod tests {
             );
             tokio::fs::write(&path, contents).await.unwrap();
             let storage = JsonlSessionStorage::open(&path).await.unwrap();
+            let storage = TestStorage::new(storage);
 
             // Restore the directory mode even on a panicking assertion.
             struct PermGuard(std::path::PathBuf, u32);
@@ -3693,6 +3828,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("session.jsonl");
             let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+            let storage = TestStorage::new(storage);
             storage
                 .append_entry(&user_message("m1", None, "one"))
                 .await
@@ -3725,6 +3861,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("session.jsonl");
             let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+            let storage = TestStorage::new(storage);
             for i in 0..5 {
                 let parent = if i == 0 { None } else { Some(format!("m{i}")) };
                 let parent = parent.as_deref();
@@ -3749,6 +3886,7 @@ mod tests {
             let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
                 .await
                 .unwrap();
+            let storage = TestStorage::new(storage);
             let err = storage
                 .append_entry(&user_message("m1", Some("ghost"), "one"))
                 .await
@@ -3772,7 +3910,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
-        let session = Session::new(storage);
+        let storage = TestStorage::new(storage);
+        let session = Session::from_arc(storage.storage.clone());
 
         session
             .append_message_with_origin(AgentMessage::user("echo me"), Some("rpc-42".into()))
@@ -3897,6 +4036,7 @@ mod tests {
                 .await
                 .unwrap();
             let storage = JsonlSessionStorage::open(&path).await.unwrap();
+            let storage = TestStorage::new(storage);
             let origins: Vec<Option<String>> = storage
                 .get_entries(Default::default())
                 .await
@@ -3939,6 +4079,7 @@ mod deferred_probe_tests {
         )
         .await
         .unwrap();
+        let storage = TestStorage::new(storage);
         storage
             .append_entry(&SessionTreeEntry::ModelChange {
                 id: "m0".into(),
@@ -3994,9 +4135,11 @@ mod append_entries_tests {
         let a = JsonlSessionStorage::create(&dir_a.path().join("s.jsonl"), batch_meta())
             .await
             .unwrap();
+        let a = TestStorage::new(a);
         let b = JsonlSessionStorage::create(&dir_b.path().join("s.jsonl"), batch_meta())
             .await
             .unwrap();
+        let b = TestStorage::new(b);
         let chain = vec![chain_entry("e0", None), chain_entry("e1", Some("e0"))];
 
         for e in &chain {
@@ -4042,6 +4185,7 @@ mod append_entries_tests {
         let s = JsonlSessionStorage::create(&path, batch_meta())
             .await
             .unwrap();
+        let s = TestStorage::new(s);
         let before = tokio::fs::read_to_string(&path).await.unwrap();
         let dup = vec![chain_entry("e0", None), chain_entry("e0", None)];
         let err = s.append_entries(&dup).await.unwrap_err();
@@ -4081,6 +4225,7 @@ mod append_entries_tests {
             let storage = JsonlSessionStorage::create(&path, batch_meta())
                 .await
                 .unwrap();
+            let storage = TestStorage::new(storage);
             storage
                 .append_entry(&SessionTreeEntry::ModelChange {
                     id: "m0".into(),

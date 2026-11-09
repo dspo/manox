@@ -931,7 +931,8 @@ pub(crate) async fn fork_session(
         .iter()
         .map(|r| r.entry.clone())
         .collect();
-    target.append_entries(&prefix).await.map_err(|err| {
+    let target = manox_harness::session::Session::new(target);
+    target.append_entries(prefix).await.map_err(|err| {
         manox_ahp_runtime::error::RuntimeError::new(format!("fork row copy failed: {err}"))
             .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
     })?;
@@ -1267,7 +1268,8 @@ impl AgentServerInner {
                     Some(entry)
                 })
                 .collect();
-            storage.append_entries(&seed_rows).await.map_err(|err| {
+            let storage = manox_harness::session::Session::new(storage);
+            storage.append_entries(seed_rows).await.map_err(|err| {
                 manox_ahp_runtime::error::RuntimeError::new(format!(
                     "seed row append failed: {err}"
                 ))

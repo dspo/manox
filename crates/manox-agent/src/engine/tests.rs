@@ -1008,11 +1008,13 @@ async fn journal_relay_feeds_storage_appends_in_seq_order() {
     )
     .await
     .unwrap();
+    let session = manox_harness::session::Session::new(storage);
+    let storage = session.storage();
     let state = test_engine_state();
     spawn_journal_relay_rx(storage.subscribe_journal(), state.journal_tx.clone());
     let mut feed = state.journal_tx.subscribe();
 
-    use manox_harness::session::{SessionStorage, SessionTreeEntry};
+    use manox_harness::session::SessionTreeEntry;
     for i in 0..3 {
         let parent = if i == 0 {
             None
@@ -1020,8 +1022,8 @@ async fn journal_relay_feeds_storage_appends_in_seq_order() {
             Some(format!("e{}", i - 1))
         };
         let parent = parent.as_deref();
-        storage
-            .append_entry(&SessionTreeEntry::TurnStart {
+        session
+            .append_verbatim(SessionTreeEntry::TurnStart {
                 id: format!("e{i}"),
                 parent_id: parent.map(str::to_string),
                 timestamp: chrono::Utc::now(),

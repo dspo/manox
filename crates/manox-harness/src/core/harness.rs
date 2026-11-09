@@ -1400,7 +1400,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
 
     /// The shared session handle — the same `Arc` the persistence
     /// middleware holds. A mid-run writer through this handle is safe by
-    /// construction: the session's append lock linearizes
+    /// construction: the session's journal writer linearizes
     /// parent-selection + append, so a concurrent appender can never fork
     /// the chain (the storage broadcast fires for every append regardless
     /// of caller, so followers see the row live).
@@ -4312,10 +4312,17 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl SessionStorage for MemStorage {
-        async fn create_entry_id(&self) -> Result<String, anyhow::Error> {
+        async fn create_entry_id(
+            &self,
+            _write: crate::session::JournalWrite,
+        ) -> Result<String, anyhow::Error> {
             Ok(uuid::Uuid::new_v4().to_string())
         }
-        async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
+        async fn append_entry(
+            &self,
+            entry: &SessionTreeEntry,
+            _write: crate::session::JournalWrite,
+        ) -> Result<u64, anyhow::Error> {
             if matches!(entry, SessionTreeEntry::ActiveToolsChange { .. })
                 && *self.fail_active_tools.lock().unwrap()
             {
@@ -4331,9 +4338,12 @@ pub(crate) mod tests {
             // backend's contract: a `get_leaf_id` right after reflects this
             // entry without a separate `set_leaf_id`.
             let cursor = entry.leaf_cursor_after();
-            self.entries.lock().unwrap().push(entry.clone());
+            let mut entries = self.entries.lock().unwrap();
+            let seq = entries.len() as u64;
+            entries.push(entry.clone());
+            drop(entries);
             *self.leaf_id.lock().unwrap() = cursor;
-            Ok(())
+            Ok(seq)
         }
         async fn get_entry(&self, id: &str) -> Result<Option<SessionTreeEntry>, anyhow::Error> {
             Ok(self
@@ -4347,7 +4357,11 @@ pub(crate) mod tests {
         async fn get_leaf_id(&self) -> Result<Option<String>, anyhow::Error> {
             Ok(self.leaf_id.lock().unwrap().clone())
         }
-        async fn set_leaf_id(&self, leaf_id: Option<&str>) -> Result<(), anyhow::Error> {
+        async fn set_leaf_id(
+            &self,
+            leaf_id: Option<&str>,
+            _write: crate::session::JournalWrite,
+        ) -> Result<(), anyhow::Error> {
             *self.leaf_id.lock().unwrap() = leaf_id.map(|s| s.to_string());
             Ok(())
         }
@@ -8109,82 +8123,38 @@ pub(crate) mod tests {
     async fn test_restore_projects_all_entry_variants_and_settings() {
         let storage = MemStorage::new();
         let session = Session::new(storage);
-        let storage = session.storage();
 
-        storage
-            .append_entry(&SessionTreeEntry::ThinkingLevelChange {
-                id: "t1".into(),
-                parent_id: None,
-                timestamp: chrono::Utc::now(),
-                thinking_level: "high".into(),
-            })
+        session.append_thinking_level_change("high").await.unwrap();
+        session
+            .append_model_change("anthropic", "claude-opus")
             .await
             .unwrap();
-        storage
-            .append_entry(&SessionTreeEntry::ModelChange {
-                id: "mc".into(),
-                parent_id: Some("t1".into()),
-                timestamp: chrono::Utc::now(),
-                provider: "anthropic".into(),
-                model_id: "claude-opus".into(),
-            })
+        let user_entry = session
+            .append_message(AgentMessage::user("hello"))
             .await
             .unwrap();
-        storage
-            .append_entry(&SessionTreeEntry::Message {
-                id: "m1".into(),
-                parent_id: Some("mc".into()),
-                timestamp: chrono::Utc::now(),
-                message: AgentMessage::user("hello"),
-                origin: None,
-            })
-            .await
-            .unwrap();
-        storage
-            .append_entry(&SessionTreeEntry::CustomMessage {
-                id: "cm1".into(),
-                parent_id: Some("m1".into()),
-                timestamp: chrono::Utc::now(),
-                custom_type: "notice".into(),
-                content: vec![ContentBlock::Text {
+        session
+            .append_custom_message(
+                "notice",
+                vec![ContentBlock::Text {
                     text: "heads up".into(),
                     signature: None,
                 }],
-                details: None,
-                display: true,
-            })
+                None,
+                true,
+            )
             .await
             .unwrap();
-        storage
-            .append_entry(&SessionTreeEntry::BranchSummary {
-                id: "bs1".into(),
-                parent_id: Some("cm1".into()),
-                timestamp: chrono::Utc::now(),
-                from_id: "m1".into(),
-                summary: "explored a side branch".into(),
-                details: None,
-                usage: None,
-                from_hook: None,
-            })
+        session
+            .append_branch_summary(&user_entry, "explored a side branch", &[], &[], None, false)
             .await
             .unwrap();
-        storage
-            .append_entry(&SessionTreeEntry::Message {
-                id: "m2".into(),
-                parent_id: Some("bs1".into()),
-                timestamp: chrono::Utc::now(),
-                message: AgentMessage::user("after"),
-                origin: None,
-            })
+        session
+            .append_message(AgentMessage::user("after"))
             .await
             .unwrap();
-        storage
-            .append_entry(&SessionTreeEntry::ActiveToolsChange {
-                id: "at1".into(),
-                parent_id: Some("m2".into()),
-                timestamp: chrono::Utc::now(),
-                active_tool_names: vec!["echo".into()],
-            })
+        session
+            .append_active_tools_change(&["echo".to_string()])
             .await
             .unwrap();
 
@@ -8263,14 +8233,7 @@ pub(crate) mod tests {
         let storage = MemStorage::new();
         let session = Session::new(storage);
         session
-            .storage()
-            .append_entry(&SessionTreeEntry::ModelChange {
-                id: "mc".into(),
-                parent_id: None,
-                timestamp: chrono::Utc::now(),
-                provider: "anthropic".into(),
-                model_id: "claude-opus".into(),
-            })
+            .append_model_change("anthropic", "claude-opus")
             .await
             .unwrap();
 

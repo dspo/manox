@@ -3,6 +3,50 @@
 
 use super::*;
 
+/// Land one live journal row inside the select. The writer serializes
+/// appends, so awaiting the reply here cannot deadlock the run branch.
+///
+/// A permanent loss (K4, L3) is fail-loud: the state the row describes
+/// already took effect, so the first loss records itself durably, notifies
+/// the facade, and cancels the turn; later rows of the same dead-storage run
+/// park for the settle/idle drain without re-signaling (one notice, one
+/// abort — the turn is already converging). Returns whether this row's loss
+/// cancelled the turn.
+#[allow(clippy::too_many_arguments)] // the K4 tail needs every sink it reports to
+async fn land_live_row(
+    appender: &Arc<JournalAppender>,
+    kind: String,
+    payload: serde_json::Value,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    handle: &manox_harness::harness::HarnessHandle,
+    loss_signaled: &mut bool,
+) -> bool {
+    let Err(err) = append_typed_resilient(appender, &kind, payload.clone()).await else {
+        return false;
+    };
+    if *loss_signaled {
+        state.pending_journal.lock().unwrap().push((kind, payload));
+        return false;
+    }
+    if let Some(row) = record_journal_loss(appender, &kind, &err).await {
+        state.pending_journal.lock().unwrap().push(row);
+    }
+    if kind == "error" {
+        return false;
+    }
+    *loss_signaled = true;
+    send_notice(
+        notice_tx,
+        BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
+            "journal append permanently failed for `{kind}`: {err:#}; cancelling the turn"
+        )))),
+        "journal-loss turn cancellation",
+    );
+    handle.abort();
+    true
+}
+
 /// Drive one session run to completion while still servicing mid-run
 /// commands (abort/steer/cancel/shutdown) through the session handle.
 /// Shared by user prompts, idle-wakeups, and answer-seeded turns.
@@ -30,63 +74,13 @@ where
     F: std::future::Future<Output = anyhow::Result<Vec<AgentMessage>>>,
 {
     tokio::pin!(run);
-    // Live journal appends run on a dedicated serializer task, never inline
-    // in this select. The `run` branch below shares THIS task, and its
-    // persistence middleware holds the session's append lock across file-I/O
-    // await points (`append_message_with_origin` → `append_line`); a select
-    // handler that awaits the same lock suspends the whole task, so the
-    // select can never poll the run branch again to release it — a same-task
-    // self-deadlock that froze the turn forever with the journal tail stuck
-    // mid-round (the round-11 stall). The serializer keeps facade rows
-    // ordered (FIFO channel, sequential appends) and stays linearized
-    // against middleware appends by the same session append lock.
-    let (live_row_tx, mut live_row_rx) = mpsc::unbounded_channel::<(String, serde_json::Value)>();
-    let live_appender = Arc::clone(appender);
-    let live_state = Arc::clone(state);
-    let live_notice = notice_tx.clone();
-    let live_handle = handle.clone();
-    // K4 fail-closed flag: a permanent mid-run append loss cancels the turn;
-    // drive_run folds this into `abort_requested` so settle reports it.
-    let live_abort = Arc::new(AtomicBool::new(false));
-    let live_abort_flag = Arc::clone(&live_abort);
-    let live_appends = tokio::spawn(async move {
-        let mut loss_signaled = false;
-        while let Some((kind, payload)) = live_row_rx.recv().await {
-            let Err(err) = append_typed_resilient(&live_appender, &kind, payload.clone()).await
-            else {
-                continue;
-            };
-            // Permanent loss (K4, L3): the state this row describes already
-            // took effect, so the run must not silently continue without it.
-            // The first loss records itself durably, notifies the facade,
-            // and cancels the turn; later rows of the same dead-storage run
-            // park for the settle/idle drain without re-signaling (one
-            // notice, one abort — the turn is already converging).
-            if loss_signaled {
-                live_state
-                    .pending_journal
-                    .lock()
-                    .unwrap()
-                    .push((kind, payload));
-                continue;
-            }
-            if let Some(row) = record_journal_loss(&live_appender, &kind, &err).await {
-                live_state.pending_journal.lock().unwrap().push(row);
-            }
-            if kind != "error" {
-                loss_signaled = true;
-                send_notice(
-                    &live_notice,
-                    BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
-                        "journal append permanently failed for `{kind}`: {err:#}; cancelling the turn"
-                    )))),
-                    "journal-loss turn cancellation",
-                );
-                live_abort_flag.store(true, Ordering::SeqCst);
-                live_handle.abort();
-            }
-        }
-    });
+    // The journal writer serializes appends: this select may await an append
+    // reply directly. The writer is a separate task that owns the write
+    // order, and no caller holds a lock across file I/O, so a select handler
+    // waiting on an append can never block the run branch from making
+    // progress — the run's own appends are just more commands in the same
+    // FIFO queue.
+    let mut loss_signaled = false;
     let mut abort_requested = false;
     let mut channel_open = true;
     let mut live_ticker = tokio::time::interval(LIVE_HISTORY_TICK);
@@ -95,9 +89,9 @@ where
     // re-synced at run start (the settle/ready path already mirrored).
     live_ticker.tick().await;
     // Stall watchdog: a turn whose journal tail stops moving while the run
-    // future stays pending is the round-11 stall shape (tools finished, no
-    // durable rows, no settle). The warn carries the frozen cursor so the
-    // log bracket around the stall is unmissable; it repeats every 2 minutes.
+    // future stays pending has durable progress stuck behind something. The
+    // warn carries the frozen cursor so the log bracket around the stall is
+    // unmissable; it repeats every 2 minutes.
     let mut watchdog_cursor: Option<u64> = None;
     let mut watchdog_last_move = std::time::Instant::now();
     let appender_for_watchdog = appender;
@@ -172,21 +166,28 @@ where
                     // Mid-run switch: the change lands on the runtime snapshot
                     // at once and governs the next request. The row decision
                     // is the same durable baseline the idle arm diffs against
-                    // — a restate of the journal's carried level lands no
-                    // row — and a real switch journals through the shared
-                    // landing vocabulary via the serializer task (never an
-                    // inline append-lock await, which would deadlock this
-                    // select against the run branch holding the lock: the
-                    // round-11 stall).
+                    // — a restate of the journal's carried level lands no row
+                    // — and a real switch journals through the shared landing
+                    // vocabulary. Awaiting the writer here is safe: it is a
+                    // separate task and no lock spans its file I/O.
                     handle.set_thinking_level(level.clone());
                     let wire = thinking_level_wire(&level);
                     if state.journaled_thinking_level.lock().unwrap().as_deref()
                         != Some(wire.as_str())
                     {
-                        let _ = live_row_tx.send((
+                        if land_live_row(
+                            appender,
                             "thinking_level_change".into(),
                             thinking_level_row_payload(&wire),
-                        ));
+                            state,
+                            notice_tx,
+                            handle,
+                            &mut loss_signaled,
+                        )
+                        .await
+                        {
+                            abort_requested = true;
+                        }
                         *state.journaled_thinking_level.lock().unwrap() = Some(wire);
                     }
                 }
@@ -214,18 +215,25 @@ where
                     state.pending_ui_notes.lock().unwrap().push(record);
                 }
                 Some(SessionCmd::AppendJournal { kind, payload }) => {
-                    // Forwarded to the serializer task spawned above — this
-                    // arm must NEVER await the session's append lock inline:
-                    // the run branch of this same select suspends holding it
-                    // (the persistence middleware's file I/O), and a handler
-                    // await would deadlock the task against itself (the
-                    // round-11 stall). Rows still append LIVE through the
-                    // shared session handle in emission order; parking for
-                    // settle hid subagent/retry/background rows for the whole
-                    // run (L5 — the round-8 repro: a dispatched Sailor's
-                    // failure never reached the journal while the captain
-                    // kept working).
-                    let _ = live_row_tx.send((kind, payload));
+                    // Rows append LIVE through the shared session handle in
+                    // emission order: the writer serializes them against the
+                    // run's own appends, and awaiting its reply here cannot
+                    // block the run branch (the writer is a separate task).
+                    // Parking for settle would hide subagent/retry/background
+                    // rows for the whole run (L5).
+                    if land_live_row(
+                        appender,
+                        kind,
+                        payload,
+                        state,
+                        notice_tx,
+                        handle,
+                        &mut loss_signaled,
+                    )
+                    .await
+                    {
+                        abort_requested = true;
+                    }
                 }
                 Some(SessionCmd::JournalSnapshot { reply }) => {
                     // Answer live off the storage (same read face as the
@@ -256,17 +264,6 @@ where
             result = &mut run => break result,
         }
     };
-    // Drain the serializer before returning: every AppendJournal received
-    // mid-run has landed (or parked for settle) before settle_run reads the
-    // journal. The run future has finished, so the append lock is free and
-    // the drain is bounded by the queued rows.
-    drop(live_row_tx);
-    let _ = live_appends.await;
-    // A K4 fail-closed cancel (permanent journal loss) counts as the abort
-    // it was: settle reports `cancelled` and strands the run's steers.
-    if live_abort.load(Ordering::SeqCst) {
-        abort_requested = true;
-    }
     (result, abort_requested)
 }
 

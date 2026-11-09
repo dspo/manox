@@ -263,7 +263,6 @@ mod cold_write_read_probe {
     // design; dropping them at an await would unsynchronize the suite.
     #![allow(clippy::await_holding_lock)]
     use super::*;
-    use manox_harness::session::SessionStorage;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn seeded_file_round_trips_through_cold_read() {
@@ -300,8 +299,10 @@ mod cold_write_read_probe {
             details: None,
             display: false,
         };
-        storage.append_entry(&entry).await.unwrap();
-        drop(storage);
+        manox_harness::session::Session::new(storage)
+            .append_verbatim(entry)
+            .await
+            .unwrap();
         match cold_read("probe-seed-1").await {
             ColdRead::Data(data) => {
                 assert_eq!(data.records.len(), 1);
