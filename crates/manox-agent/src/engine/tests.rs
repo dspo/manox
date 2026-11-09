@@ -4083,13 +4083,21 @@ async fn subagent_session_persists_under_host_dir_with_metadata() {
         manox_harness::subagent::StopReason::Completed,
         "the child completes: {result:?}"
     );
+    // The canonical layout under the host-injected root: one directory per
+    // run, `session.jsonl` inside.
     let mut entries = tokio::fs::read_dir(&subagents).await.unwrap();
     let mut header = None;
     while let Some(entry) = entries.next_entry().await.unwrap() {
-        let content = tokio::fs::read_to_string(entry.path()).await.unwrap();
+        let path = entry
+            .path()
+            .join(manox_harness::session::identity::JOURNAL_FILE);
+        if !path.is_file() {
+            continue;
+        }
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
         header = Some(content.lines().next().unwrap().to_string());
     }
-    let header = header.expect("one transcript under the host dir");
+    let header = header.expect("one canonical transcript under the host root");
     assert!(
         header.contains("\"metadata\":{\"subagent\":{")
             && header.contains("\"type\":\"Explore\"")
@@ -6191,9 +6199,9 @@ async fn child_journal_opens_with_the_inherited_mode_and_follows_a_live_flip() {
         .await
         .expect("dispatch starts");
     let run_id = run.id.clone();
-    let journal = subagents.join(manox_harness::session::repository::session_file_name(
-        &run_id,
-    ));
+    let journal = subagents
+        .join(&run_id)
+        .join(manox_harness::session::identity::JOURNAL_FILE);
 
     // The registry entries (feed + writer) are live the moment the dispatch
     // returns — the guard rides the run task, not the dispatch return. The

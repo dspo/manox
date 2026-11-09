@@ -4088,9 +4088,9 @@ mod mcp_dispatch_tests {
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&dir).unwrap();
         let store = manox_agent::thread_store::standalone_for_test_at(&dir);
-        write_journal_fixture(&dir, "s-stamped", Some("hello"));
+        let stamped_journal = write_journal_fixture(&dir, "s-stamped", Some("hello"));
         write_journal_fixture(&dir, "s-silent", None);
-        manox_harness::session_meta::update(&dir, &dir.join("s-stamped.jsonl"), |meta| {
+        manox_harness::session_meta::update(&dir, &stamped_journal, |meta| {
             meta.interacted_at = Some(100);
             meta.last_settled_at = Some(150);
         })
@@ -4160,8 +4160,13 @@ mod mcp_dispatch_tests {
     /// A flat journal fixture: the header plus, when `first_user` is set,
     /// one user message (the shape the store suite's fixtures use). The
     /// header-only variant is the never-spoke session.
-    fn write_journal_fixture(dir: &std::path::Path, id: &str, first_user: Option<&str>) {
-        std::fs::create_dir_all(dir).unwrap();
+    /// A canonical journal fixture (`<dir>/<bucket>/<id>/session.jsonl`) —
+    /// the only shape the store's scan admits.
+    fn write_journal_fixture(
+        dir: &std::path::Path,
+        id: &str,
+        first_user: Option<&str>,
+    ) -> std::path::PathBuf {
         let mut content = format!(
             "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{id}\"}}}}\n"
         );
@@ -4170,7 +4175,13 @@ mod mcp_dispatch_tests {
                 "{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-09-13T00:00:01Z\",\"seq\":0,\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"timestamp\":1770000000000}}}}\n"
             ));
         }
-        std::fs::write(dir.join(format!("{id}.jsonl")), content).unwrap();
+        let path = dir
+            .join("--fixture--")
+            .join(id)
+            .join(manox_harness::session::identity::JOURNAL_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        path
     }
 
     /// The catalogue aggregation: ranked rows first — their interaction-rank

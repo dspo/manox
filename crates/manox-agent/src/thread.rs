@@ -920,14 +920,8 @@ impl Thread {
         let loading = initial_path.is_some();
         let model = crate::provider_glue::default_model();
         let (sessions_dir, session_file) =
-            crate::paths::core_session_parts(project.as_deref(), &id.0).unwrap_or_else(|_| {
-                (
-                    crate::paths::manox_config_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join("sessions"),
-                    None,
-                )
-            });
+            crate::paths::core_session_parts(project.as_deref(), &id.0)
+                .unwrap_or_else(|_| crate::paths::unresolved_session_parts(&id.0));
         // The goal bridge is shared with the engine's goal tools; its
         // restore seed rides the Ready chain (seed_from_journal — the
         // journal is the goal authority; stage ③ retired the db leg and
@@ -1023,14 +1017,8 @@ impl Thread {
         // project bucket, the journal (`session.jsonl`) inside. The flat
         // `sessions/` tree is never written.
         let (sessions_dir, session_file) =
-            crate::paths::core_session_parts(project.as_deref(), &self.id.0).unwrap_or_else(|_| {
-                (
-                    crate::paths::manox_config_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join("sessions"),
-                    None,
-                )
-            });
+            crate::paths::core_session_parts(project.as_deref(), &self.id.0)
+                .unwrap_or_else(|_| crate::paths::unresolved_session_parts(&self.id.0));
         // A fresh spawn has nothing to restore: the default (already
         // ready) watch is the honest value, so the receiver is dropped.
         let SpawnedEngine {
@@ -1935,14 +1923,8 @@ impl Thread {
         let reasoning_effort = self.reasoning_effort;
         // A member works in its leader's project, so it shards there.
         let (sessions_dir, session_file) =
-            crate::paths::core_session_parts(self.project.as_deref(), &id.0).unwrap_or_else(|_| {
-                (
-                    crate::paths::manox_config_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join("sessions"),
-                    None,
-                )
-            });
+            crate::paths::core_session_parts(self.project.as_deref(), &id.0)
+                .unwrap_or_else(|_| crate::paths::unresolved_session_parts(&id.0));
         let SpawnedEngine {
             engine,
             events,
@@ -4279,8 +4261,14 @@ pub(crate) mod tests {
         let store = crate::thread_store::global();
         let dir = crate::thread_store::global_sessions_dir();
         std::fs::create_dir_all(&dir).unwrap();
+        // The canonical layout is the only shape the scan admits.
+        let journal = dir
+            .join("--thread-test--")
+            .join("dirty-scan")
+            .join(manox_harness::session::identity::JOURNAL_FILE);
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
         std::fs::write(
-            dir.join("dirty-scan.jsonl"),
+            &journal,
             "{\"type\":\"session\",\"version\":4,\"id\":\"dirty-scan\",\"timestamp\":\"\
              2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{\"host\":\"manox\",\
              \"thread\":\"dirty-scan\"}}\n{\"type\":\"message\",\"id\":\"m1\",\"parentId\"\
@@ -4336,7 +4324,12 @@ pub(crate) mod tests {
             session_path: Mutex::new(None),
         });
         let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("t-settle-stamp.jsonl");
+        let session = dir
+            .path()
+            .join("--thread-test--")
+            .join("t-settle-stamp")
+            .join(manox_harness::session::identity::JOURNAL_FILE);
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
         std::fs::write(&session, b"{}\n").unwrap();
         engine.set_session_path(session.clone());
         let thread = thread_with_engine_id(HistoryPhase::Ready, engine, "t-settle-stamp");

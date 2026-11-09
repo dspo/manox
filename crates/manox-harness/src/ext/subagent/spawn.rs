@@ -107,8 +107,9 @@ pub struct SpawnProvider {
     /// child snapshot so a child cannot re-delegate (nesting is structurally
     /// disabled in this iteration).
     delegation_names: HashSet<String>,
-    /// Persistent directory for subagent session transcripts. Without one
-    /// the session lives in a throwaway tempdir removed on exit.
+    /// Host-injected ROOT for the child transcript. The child always takes
+    /// the canonical layout inside it (`<root>/<run-id>/session.jsonl`);
+    /// without one the root is the child cwd's project bucket.
     session_dir: Option<PathBuf>,
     /// Host bridge for transcript/health surfaces.
     observer: Option<Arc<dyn RunObserver>>,
@@ -174,7 +175,9 @@ impl SpawnProvider {
         self
     }
 
-    /// Persistent directory for subagent session transcripts.
+    /// Host-injected root for the child transcript (tests pin it to a temp
+    /// dir). The child's own directory is created inside it, so the canonical
+    /// `<root>/<run-id>/session.jsonl` layout holds either way.
     pub fn with_session_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.session_dir = Some(dir.into());
         self
@@ -336,30 +339,21 @@ impl SubagentProvider for SpawnProvider {
             .as_ref()
             .map(|w| w.path.clone())
             .unwrap_or_else(|| req.cwd.clone());
-        let (session_dir, session_file, temp_guard): (
-            PathBuf,
-            Option<PathBuf>,
-            Option<tempfile::TempDir>,
-        ) = match &self.session_dir {
-            // An explicit dir (tests) keeps the legacy flat layout.
-            Some(dir) => (dir.clone(), None, None),
-            // Production: the v1.0.0 core layout — one directory per
-            // child under its project bucket, `session.jsonl` inside.
-            None => {
-                let dir = crate::session::identity::core_session_dir_for(
-                    &child_cwd.to_string_lossy(),
-                    &run_id,
-                );
-                let file = dir.join(crate::session::identity::JOURNAL_FILE);
-                (dir, Some(file), None)
-            }
+        // The v1.0.0 core layout is the only shape a child transcript takes:
+        // one directory per child, `session.jsonl` inside — under its project
+        // bucket in production, under the host-injected root in tests.
+        let session_dir = match &self.session_dir {
+            Some(root) => root.join(&run_id),
+            None => crate::session::identity::core_session_dir_for(
+                &child_cwd.to_string_lossy(),
+                &run_id,
+            ),
         };
+        let session_file = session_dir.join(crate::session::identity::JOURNAL_FILE);
         let mut builder = create_agent_session()
             .with_cwd(child_cwd.clone())
             .with_session_dir(session_dir.clone())
-            .with_session_file(session_file.clone().unwrap_or_else(|| {
-                session_dir.join(crate::session::repository::session_file_name(&run_id))
-            }))
+            .with_session_file(session_file.clone())
             // The child session id IS the run id: every parent-side row
             // keyed by run id (progress ticks, tool-call correlation) then
             // names the child's own chat channel (`ahp-chat:/<run_id>`)
@@ -402,11 +396,7 @@ impl SubagentProvider for SpawnProvider {
         // creating a fresh session: the file carries its own header
         // (lineage, persona binding) and the follow-up prompt rides the
         // same drive loop, budgets, and salvage as a first dispatch.
-        let continuation_path = req.continuation_of.as_ref().map(|_| {
-            session_file.clone().unwrap_or_else(|| {
-                session_dir.join(crate::session::repository::session_file_name(&run_id))
-            })
-        });
+        let continuation_path = req.continuation_of.as_ref().map(|_| session_file.clone());
         if let Some(path) = &continuation_path
             && !path.exists()
         {
@@ -554,7 +544,6 @@ impl SubagentProvider for SpawnProvider {
         let task_provider = provider_name.clone();
         let task_label = label.clone();
         tokio::spawn(async move {
-            let _temp_guard = temp_guard; // hold the throwaway transcript dir alive
             // Every registry half (feed + writer + steer) dies with the run, on
             // every ending — the guard moved into the task lives to the
             // drive loop's exit, not just the dispatch return.

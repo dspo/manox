@@ -113,9 +113,11 @@ pub fn core_session_file(project: Option<&std::path::Path>, id: &str) -> Result<
 
 /// `(dir, exact-file)` for a session's core location: the per-session
 /// directory the engine passes on (snapshots, notes checks) plus the
-/// journal file the builder pins. `Err` only when the config dir is
-/// unresolvable — callers fall back to the legacy flat shape rather than
-/// refusing to spawn.
+/// journal file the builder pins. This is the single constructor for the
+/// canonical layout — `core/<slug>/<session>/session.jsonl`. `Err` only when
+/// the config root is unresolvable; callers use
+/// [`unresolved_session_parts`], which keeps the same shape rather than
+/// falling back to the retired flat tree.
 pub fn core_session_parts(
     project: Option<&std::path::Path>,
     id: &str,
@@ -123,6 +125,16 @@ pub fn core_session_parts(
     let dir = core_session_dir(project, id)?;
     let file = dir.join(manox_harness::session::identity::JOURNAL_FILE);
     Ok((dir, Some(file)))
+}
+
+/// The canonical `(dir, file)` pair for a process whose config root is
+/// unresolvable: rooted at the launch directory, but still
+/// `<root>/sessions/<id>/session.jsonl`, so a session created in that
+/// degenerate environment stays visible to the canonical-only scan.
+pub fn unresolved_session_parts(id: &str) -> (PathBuf, Option<PathBuf>) {
+    let dir = PathBuf::from(".").join("sessions").join(id);
+    let file = dir.join(manox_harness::session::identity::JOURNAL_FILE);
+    (dir, Some(file))
 }
 
 /// `$HOME/.claude/skills` — user-authored skills (`<name>/SKILL.md`).

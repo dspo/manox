@@ -6244,10 +6244,7 @@ mod teardown {
         // resolves through (the scanned rows always have one).
         manox_agent::thread_store::global().with_mut(|s| {
             s.insert_summary_for_test("s-teardown", None);
-            s.note_session_path(
-                "s-teardown",
-                &manox_agent::thread_store::global_sessions_dir().join("s-teardown.jsonl"),
-            );
+            s.note_session_path("s-teardown", &super::core_journal("s-teardown"));
         });
         let engine = StopAllEngine::new(&["sub-1", "sub-2"]);
         let (_notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
