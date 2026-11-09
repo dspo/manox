@@ -4043,7 +4043,7 @@ mod tests {
 
     /// B3/P0-4 (review round 3): two store decisions on one engine-less
     /// thread each spawn their own cold append — fresh storage instances
-    /// whose instance-scoped append locks never see each other. Raced on a
+    /// whose writers never see each other. Raced on a
     /// v3 file (where both appends also race the lazy v3→v4 migration,
     /// which used to share one temp name), they must still land a LINEAR
     /// chain: the chain-walking journal_range reads BOTH `pinned_archived`

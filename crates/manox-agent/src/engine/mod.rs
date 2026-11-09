@@ -244,8 +244,8 @@ fn spawn_journal_relay_rx(
 ///
 /// Reads the storage directly through the shared appender (the same `Arc`
 /// the persistence middleware holds), so the answer is current at any await
-/// point — including mid-run, where live appends already land on the storage
-/// under the append lock (L5 read face: reads never park behind the run).
+/// point — including mid-run, where live appends already land through the
+/// journal writer (L5 read face: reads never park behind the run).
 async fn reply_journal_snapshot(
     appender: &JournalAppender,
     reply: tokio::sync::oneshot::Sender<JournalSnapshotData>,

@@ -205,7 +205,10 @@ async fn seed_session(id: &str, thread: &str, cwd: &str, events: Vec<(&str, E)>)
     )
     .await
     .unwrap();
-    storage.append_entries(&entries).await.unwrap();
+    manox_harness::session::Session::new(storage)
+        .append_entries(entries)
+        .await
+        .unwrap();
 }
 
 /// Write one delegated child session journal (header-only): the
@@ -777,7 +780,10 @@ mod dispatch {
             .into_iter()
             .map(|(eid, parent, event)| with_chain(eid, parent.map(str::to_string), event))
             .collect();
-        storage.append_entries(&entries).await.expect("appends");
+        manox_harness::session::Session::new(storage)
+            .append_entries(entries)
+            .await
+            .expect("appends");
     }
 
     /// The full host assembly (AhpRuntime over a gateway) seeded with one
@@ -2011,11 +2017,10 @@ mod dispatch {
         )
         .await
         .unwrap();
-        storage
-            .append_entries(&[with_chain("e-1", None, user("child prompt"))])
+        manox_harness::session::Session::new(storage)
+            .append_entries(vec![with_chain("e-1", None, user("child prompt"))])
             .await
             .unwrap();
-        drop(storage);
 
         let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
         let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));

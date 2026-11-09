@@ -49,11 +49,7 @@ async fn main() {
     );
 
     // Switch the leaf back to the first answer and grow a branch from it.
-    session
-        .storage()
-        .set_leaf_id(Some(&m2))
-        .await
-        .expect("set leaf");
+    session.move_to(Some(&m2)).await.expect("set leaf");
     session
         .append_message(AgentMessage::user("branched follow-up"))
         .await

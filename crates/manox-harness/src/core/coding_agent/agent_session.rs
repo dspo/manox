@@ -690,7 +690,7 @@ impl AgentSession {
 
     /// The shared mid-run journal writer: the same `Arc<Session>` the
     /// persistence middleware holds. Appends through it are linearized by
-    /// the session's append lock (parent-selection + append never fork the
+    /// the session's journal writer (parent-selection + append never fork the
     /// chain) and broadcast to journal subscribers like any other append —
     /// a host can persist facade-level rows (subagent progress, retries)
     /// WHILE a run holds the session, instead of parking them for

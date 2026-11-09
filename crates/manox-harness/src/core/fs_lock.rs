@@ -45,6 +45,12 @@ pub struct FileLock {
     _file: File,
 }
 
+/// Whether a failed `flock` lost a race for the lock rather than failing.
+fn is_contended(err: &io::Error) -> bool {
+    err.raw_os_error()
+        .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+}
+
 /// One `LOCK_EX | LOCK_NB` attempt on `lock_path`, creating the lock file
 /// if absent. `Err(WouldBlock)` when someone else holds it.
 fn try_once(lock_path: &Path) -> io::Result<FileLock> {
@@ -61,10 +67,7 @@ fn try_once(lock_path: &Path) -> io::Result<FileLock> {
         return Ok(FileLock { _file: file });
     }
     let err = io::Error::last_os_error();
-    let contended = err
-        .raw_os_error()
-        .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN);
-    if contended {
+    if is_contended(&err) {
         Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!("lock held elsewhere: {}", lock_path.display()),
@@ -72,6 +75,52 @@ fn try_once(lock_path: &Path) -> io::Result<FileLock> {
     } else {
         Err(err)
     }
+}
+
+/// Take a `flock` on an already-open descriptor without ever blocking it:
+/// every attempt is `LOCK_NB`, and contention retries on the shared cadence
+/// until `budget` elapses, then reports `WouldBlock`. `budget == ZERO` is a
+/// single attempt. A holder that never releases is a bounded timeout, never
+/// a parked thread — the journal's per-file fences use this so no read or
+/// write can wait forever on another process.
+pub fn flock_fd(fd: std::os::fd::RawFd, exclusive: bool, budget: Duration) -> io::Result<()> {
+    let flags = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    } | libc::LOCK_NB;
+    let start = Instant::now();
+    loop {
+        // SAFETY: `flock` is a standard POSIX operation on a valid owned fd.
+        if unsafe { libc::flock(fd, flags) } == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if !is_contended(&err) {
+            return Err(err);
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= budget {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("timed out after {elapsed:?} (budget {budget:?}) waiting for a file fence"),
+            ));
+        }
+        std::thread::sleep(RETRY_INTERVAL.min(budget - elapsed));
+    }
+}
+
+/// The async flavor of [`flock_fd`]: the retry loop parks on the blocking
+/// pool, never on an async worker thread. The descriptor must stay valid
+/// for the duration of the call (the caller owns the file).
+pub async fn flock_fd_async(
+    fd: std::os::fd::RawFd,
+    exclusive: bool,
+    budget: Duration,
+) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || flock_fd(fd, exclusive, budget))
+        .await
+        .map_err(|e| io::Error::other(format!("flock task failed: {e}")))?
 }
 
 /// Acquire the exclusive lock, retrying contention until `budget` elapses.

@@ -539,7 +539,7 @@ pub(super) async fn wait_then_cold_journal_append(
 
 /// B3 (review round 3): the cold-append serialization locks, keyed by
 /// journal path. Each cold append opens a FRESH storage instance whose
-/// `append_lock`/leaf/seq views are instance-scoped — two spawned
+/// writer/leaf/seq views are instance-scoped — two spawned
 /// decisions on one engine-less thread (pin + archive is the canonical
 /// pair, and a retiring actor's `Fate::Wait` queue funnels several)
 /// raced: same parent, self-stamped seqs, a forked chain the load
@@ -563,7 +563,7 @@ pub(super) fn cold_append_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
 
 /// Cold journal append for a decision whose thread has no live engine (K3):
 /// open the session file and land the typed row through the same storage
-/// face a live actor uses (`append_typed`: parent selection + append lock +
+/// face a live actor uses (`append_typed`: writer-ordered parent selection +
 /// seq stamp + journal broadcast). Safe because the registry protocol
 /// guarantees no live storage writes this file while the route is absent.
 /// A thread whose journal never materialized has no file: the row is
@@ -603,10 +603,10 @@ pub(super) async fn cold_journal_append(
             return;
         }
     };
-    // B3: the file-level serialization the per-instance append_lock cannot
-    // give — held across the open (leaf/seq view) AND the append (stamp +
-    // write + the v3 lazy migration), so concurrent cold appends to one
-    // file run strictly one after another. The live-engine path needs no
+    // B3: the file-level serialization a fresh storage instance's own writer
+    // cannot give — held across the open (leaf/seq view) AND the append
+    // (stamp + write + the v3 lazy migration), so concurrent cold appends to
+    // one file run strictly one after another. The live-engine path needs no
     // such lock: its actor owns the file.
     let path_lock = cold_append_lock(&path);
     let _guard = path_lock.lock().await;

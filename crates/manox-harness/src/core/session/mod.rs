@@ -13,13 +13,17 @@
 pub mod claim;
 pub mod event;
 pub mod identity;
+pub mod journal;
 pub mod jsonl;
 pub mod repository;
+
+pub use journal::{Appended, Journal, JournalError, JournalWrite, ParentIntent};
 
 use crate::types::{AgentMessage, Usage};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
 
 /// A single entry in the session tree.
 ///
@@ -157,6 +161,125 @@ impl SessionTreeEntry {
         self.envelope().timestamp
     }
 
+    /// The entry's own id, for the writer's id assignment on an entry built
+    /// without one.
+    pub(crate) fn set_id(&mut self, value: String) {
+        macro_rules! set_id_match {
+            ($($variant:ident),* $(,)?) => {
+                match self {
+                    $(
+                        SessionTreeEntry::$variant { id, .. } => *id = value,
+                    )*
+                }
+            };
+        }
+        set_id_match!(
+            Message,
+            Compaction,
+            ModelChange,
+            ThinkingLevelChange,
+            AccessModeChange,
+            CwdChange,
+            ActiveToolsChange,
+            BranchSummary,
+            Custom,
+            CustomMessage,
+            Label,
+            SessionInfo,
+            Leaf,
+            AnnotationSet,
+            AnnotationRemoved,
+            UiNote,
+            TurnStart,
+            TurnFinish,
+            Stop,
+            Retry,
+            ErrorEvent,
+            AgentTextDelta,
+            AgentThinkingDelta,
+            ToolCall,
+            ToolResult,
+            ToolOutputChunk,
+            SubagentChild,
+            SubagentProgress,
+            ProjectChange,
+            PlanUpdate,
+            Goal,
+            Title,
+            BrowserSuites,
+            BackgroundTask,
+            Approval,
+            Question,
+            PinnedArchived,
+            CompactionStarted,
+            Metrics,
+            RunStarted,
+            RunSettled,
+            RunEscalated,
+            RunContinued,
+            RunGuided,
+        )
+    }
+
+    /// Attach the entry to the writer-resolved parent.
+    pub(crate) fn set_parent_id(&mut self, value: Option<String>) {
+        macro_rules! set_parent_match {
+            ($($variant:ident),* $(,)?) => {
+                match self {
+                    $(
+                        SessionTreeEntry::$variant { parent_id, .. } => *parent_id = value,
+                    )*
+                }
+            };
+        }
+        set_parent_match!(
+            Message,
+            Compaction,
+            ModelChange,
+            ThinkingLevelChange,
+            AccessModeChange,
+            CwdChange,
+            ActiveToolsChange,
+            BranchSummary,
+            Custom,
+            CustomMessage,
+            Label,
+            SessionInfo,
+            Leaf,
+            AnnotationSet,
+            AnnotationRemoved,
+            UiNote,
+            TurnStart,
+            TurnFinish,
+            Stop,
+            Retry,
+            ErrorEvent,
+            AgentTextDelta,
+            AgentThinkingDelta,
+            ToolCall,
+            ToolResult,
+            ToolOutputChunk,
+            SubagentChild,
+            SubagentProgress,
+            ProjectChange,
+            PlanUpdate,
+            Goal,
+            Title,
+            BrowserSuites,
+            BackgroundTask,
+            Approval,
+            Question,
+            PinnedArchived,
+            CompactionStarted,
+            Metrics,
+            RunStarted,
+            RunSettled,
+            RunEscalated,
+            RunContinued,
+            RunGuided,
+        )
+    }
+
     /// Build a typed entry from its wire kind + payload (§C.2). The payload
     /// object is merged over the envelope fields and the result must
     /// deserialize as exactly one typed variant — an unknown kind or a
@@ -215,20 +338,28 @@ impl SessionTreeEntry {
 }
 
 /// Trait for session storage backends.
+///
+/// The write methods take a [`JournalWrite`] — a token only the journal's
+/// writer task can mint — so the append order has exactly one owner. Reads
+/// take no token and stay callable from anywhere.
 #[async_trait::async_trait]
 pub trait SessionStorage: Send + Sync {
     /// Generate a new unique entry ID.
-    async fn create_entry_id(&self) -> Result<String, anyhow::Error>;
+    async fn create_entry_id(&self, write: JournalWrite) -> Result<String, anyhow::Error>;
 
     /// Append an entry to the session and synchronously advance the leaf
-    /// cursor to it.
+    /// cursor to it. Returns the entry's chain depth (`seq`).
     ///
     /// The cursor after the append is the entry's own id, except for a `leaf`
     /// entry whose cursor is its `targetId`. Implementations must update their
     /// persisted cursor within this call so a later `get_leaf_id` reflects the
     /// append even if no further write follows — callers must not pair
     /// `append_entry` with a separate `set_leaf_id` for the same cursor move.
-    async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error>;
+    async fn append_entry(
+        &self,
+        entry: &SessionTreeEntry,
+        write: JournalWrite,
+    ) -> Result<u64, anyhow::Error>;
 
     /// Append an entry that MUST be on durable storage when this call
     /// returns (K5 Submit acceptance: the entry survives a crash that
@@ -236,8 +367,25 @@ pub trait SessionStorage: Send + Sync {
     /// write-behind materializes the file here instead of waiting for its
     /// usual trigger; the default has no deferral to force, so it delegates
     /// to [`Self::append_entry`].
-    async fn append_entry_durable(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
-        self.append_entry(entry).await
+    async fn append_entry_durable(
+        &self,
+        entry: &SessionTreeEntry,
+        write: JournalWrite,
+    ) -> Result<u64, anyhow::Error> {
+        self.append_entry(entry, write).await
+    }
+
+    /// Append a prepared chain in one storage write. The entries carry
+    /// their own ids and parents; the default appends them one by one.
+    async fn append_batch(
+        &self,
+        entries: &[SessionTreeEntry],
+        write: JournalWrite,
+    ) -> Result<(), anyhow::Error> {
+        for entry in entries {
+            self.append_entry(entry, write).await?;
+        }
+        Ok(())
     }
 
     /// Get an entry by ID.
@@ -250,7 +398,11 @@ pub trait SessionStorage: Send + Sync {
     /// Implementations must validate that the target id exists before
     /// persisting; the appended entry's cursor (its `targetId`) becomes the
     /// new leaf.
-    async fn set_leaf_id(&self, leaf_id: Option<&str>) -> Result<(), anyhow::Error>;
+    async fn set_leaf_id(
+        &self,
+        leaf_id: Option<&str>,
+        write: JournalWrite,
+    ) -> Result<(), anyhow::Error>;
 
     /// Get a window of entries in append order. See [`SessionEntryCursor`].
     async fn get_entries(
@@ -285,12 +437,12 @@ pub trait SessionStorage: Send + Sync {
 }
 
 /// A session wraps a SessionStorage with context-building logic.
+///
+/// Appends are messages to the journal's writer task: the writer resolves
+/// the parent, assigns the id, and applies the storage write. No caller
+/// holds a lock across file I/O.
 pub struct Session<S: SessionStorage> {
-    storage: S,
-    /// Serializes parent-selection + append so concurrent appends never read
-    /// the same leaf and fork sibling branches — the linearized per-session
-    /// append queue.
-    append_lock: tokio::sync::Mutex<()>,
+    journal: Arc<Journal<S>>,
     /// The RPC id a client pinned to THIS turn's first user message (the
     /// echo-retirement contract, §F.2): the host sets it when Submit carries
     /// `origin_rpc`; the persistence middleware drains it on exactly that
@@ -330,9 +482,13 @@ fn user_entry_id(message: &AgentMessage) -> Option<String> {
 
 impl<S: SessionStorage> Session<S> {
     pub fn new(storage: S) -> Self {
+        Self::from_arc(Arc::new(storage))
+    }
+
+    /// A session over a storage the caller also holds for reads.
+    pub fn from_arc(storage: Arc<S>) -> Self {
         Session {
-            storage,
-            append_lock: tokio::sync::Mutex::new(()),
+            journal: Journal::new(storage),
             pending_user_origin: std::sync::Mutex::new(None),
             accepted_user_entry: std::sync::Mutex::new(None),
         }
@@ -376,9 +532,13 @@ impl<S: SessionStorage> Session<S> {
     }
 
     pub fn storage(&self) -> &S {
-        &self.storage
+        self.journal.storage()
     }
+}
 
+/// The append face: every write is one command to the journal's writer,
+/// which owns parent selection, id assignment, and the storage write.
+impl<S: SessionStorage + 'static> Session<S> {
     /// Append a message entry and return the entry ID.
     pub async fn append_message(&self, message: AgentMessage) -> Result<String, anyhow::Error> {
         self.append_message_with_origin(message, None).await
@@ -395,26 +555,23 @@ impl<S: SessionStorage> Session<S> {
         message: AgentMessage,
         origin: Option<String>,
     ) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
         // S3 stable-id: a `user` message carrying a caller-minted id (a client
         // `Steer` message id) lands under that id so the durable row's id is
         // the id the client already correlates against; every other message
-        // (and a `user` without an id) keeps the storage-generated id.
-        let id = match user_entry_id(&message) {
-            Some(id) => id,
-            None => self.storage.create_entry_id().await?,
-        };
-        let parent_id = self.storage.get_leaf_id().await?;
-
+        // (and a `user` without an id) keeps the writer-assigned id.
+        let id = user_entry_id(&message).unwrap_or_default();
         let entry = SessionTreeEntry::Message {
-            id: id.clone(),
-            parent_id,
+            id,
+            parent_id: None,
             timestamp: Utc::now(),
             message,
             origin,
         };
-        self.storage.append_entry(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?
+            .id)
     }
 
     /// Append a message entry that MUST be on disk when this call returns
@@ -429,22 +586,19 @@ impl<S: SessionStorage> Session<S> {
         message: AgentMessage,
         origin: Option<String>,
     ) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = match user_entry_id(&message) {
-            Some(id) => id,
-            None => self.storage.create_entry_id().await?,
-        };
-        let parent_id = self.storage.get_leaf_id().await?;
-
+        let id = user_entry_id(&message).unwrap_or_default();
         let entry = SessionTreeEntry::Message {
-            id: id.clone(),
-            parent_id,
+            id,
+            parent_id: None,
             timestamp: Utc::now(),
             message,
             origin,
         };
-        self.storage.append_entry_durable(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, true)
+            .await?
+            .id)
     }
 
     /// Append a `model_change` entry and return the entry ID.
@@ -453,19 +607,18 @@ impl<S: SessionStorage> Session<S> {
         provider: &str,
         model_id: &str,
     ) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
-
         let entry = SessionTreeEntry::ModelChange {
-            id: id.clone(),
-            parent_id,
+            id: String::new(),
+            parent_id: None,
             timestamp: Utc::now(),
             provider: provider.to_string(),
             model_id: model_id.to_string(),
         };
-        self.storage.append_entry(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?
+            .id)
     }
 
     /// Append a `cwd_change` entry and return the entry ID.
@@ -474,18 +627,17 @@ impl<S: SessionStorage> Session<S> {
     /// restore projects the latest one as the session's effective working
     /// directory (the header cwd stays the launch directory forever).
     pub async fn append_cwd_change(&self, cwd: &str) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
-
         let entry = SessionTreeEntry::CwdChange {
-            id: id.clone(),
-            parent_id,
+            id: String::new(),
+            parent_id: None,
             timestamp: Utc::now(),
             cwd: cwd.to_string(),
         };
-        self.storage.append_entry(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?
+            .id)
     }
 
     /// Append an `active_tools_change` entry and return the entry ID.
@@ -493,18 +645,17 @@ impl<S: SessionStorage> Session<S> {
         &self,
         active_tool_names: &[String],
     ) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
-
         let entry = SessionTreeEntry::ActiveToolsChange {
-            id: id.clone(),
-            parent_id,
+            id: String::new(),
+            parent_id: None,
             timestamp: Utc::now(),
             active_tool_names: active_tool_names.to_vec(),
         };
-        self.storage.append_entry(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?
+            .id)
     }
 
     /// Append a `thinking_level_change` entry and return the entry ID.
@@ -513,18 +664,17 @@ impl<S: SessionStorage> Session<S> {
     /// restore projects the latest one onto the agent (`None` on the session
     /// reads as `"off"`).
     pub async fn append_thinking_level_change(&self, level: &str) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
-
         let entry = SessionTreeEntry::ThinkingLevelChange {
-            id: id.clone(),
-            parent_id,
+            id: String::new(),
+            parent_id: None,
             timestamp: Utc::now(),
             thinking_level: level.to_string(),
         };
-        self.storage.append_entry(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?
+            .id)
     }
 
     /// Append an `access_mode_change` entry and return the entry ID.
@@ -533,18 +683,17 @@ impl<S: SessionStorage> Session<S> {
     /// restore projects the latest one onto the permission gate. `mode` is
     /// the kebab wire vocabulary (`sandbox` / `full-access`).
     pub async fn append_access_mode_change(&self, mode: &str) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
-
         let entry = SessionTreeEntry::AccessModeChange {
-            id: id.clone(),
-            parent_id,
+            id: String::new(),
+            parent_id: None,
             timestamp: Utc::now(),
             mode: mode.to_string(),
         };
-        self.storage.append_entry(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?
+            .id)
     }
 
     /// Append an `access_mode_change` entry on the K5 durable face: a
@@ -558,18 +707,17 @@ impl<S: SessionStorage> Session<S> {
         &self,
         mode: &str,
     ) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
-
         let entry = SessionTreeEntry::AccessModeChange {
-            id: id.clone(),
-            parent_id,
+            id: String::new(),
+            parent_id: None,
             timestamp: Utc::now(),
             mode: mode.to_string(),
         };
-        self.storage.append_entry_durable(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, true)
+            .await?
+            .id)
     }
 
     /// Append a compaction entry and return the entry ID and timestamp.
@@ -590,14 +738,10 @@ impl<S: SessionStorage> Session<S> {
         authorship: CompactionAuthorship,
         retained_tail: Option<Vec<AgentMessage>>,
     ) -> Result<(String, DateTime<Utc>), anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
         let timestamp = Utc::now();
-
         let entry = SessionTreeEntry::Compaction {
-            id: id.clone(),
-            parent_id,
+            id: String::new(),
+            parent_id: None,
             timestamp,
             summary: summary.to_string(),
             first_kept_entry_id,
@@ -607,8 +751,11 @@ impl<S: SessionStorage> Session<S> {
             details: authorship.details,
             from_hook: Some(authorship.from_hook),
         };
-        self.storage.append_entry(&entry).await?;
-        Ok((id, timestamp))
+        let appended = self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?;
+        Ok((appended.id, timestamp))
     }
 
     /// Timestamp of the compaction bounding the current path, if any.
@@ -629,8 +776,8 @@ impl<S: SessionStorage> Session<S> {
     /// active path in chronological order — all entry types, across however
     /// many compaction boundaries the path spans.
     pub async fn get_branch(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
-        let leaf_id = self.storage.get_leaf_id().await?;
-        self.storage.get_path(leaf_id.as_deref()).await
+        let leaf_id = self.storage().get_leaf_id().await?;
+        self.storage().get_path(leaf_id.as_deref()).await
     }
 
     /// Build the active, compaction-aware entry list.
@@ -685,12 +832,9 @@ impl<S: SessionStorage> Session<S> {
         usage: Option<Usage>,
         from_hook: bool,
     ) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
         let entry = SessionTreeEntry::BranchSummary {
-            id: id.clone(),
-            parent_id,
+            id: String::new(),
+            parent_id: None,
             timestamp: Utc::now(),
             from_id: from_id.to_string(),
             summary: summary.to_string(),
@@ -701,20 +845,41 @@ impl<S: SessionStorage> Session<S> {
             usage,
             from_hook: Some(from_hook),
         };
-        self.storage.append_entry(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?
+            .id)
     }
 
     /// Move the session cursor to an earlier entry, appending a `leaf` entry
     /// that records the branch point. `None` resets the
     /// cursor to the root.
     pub async fn move_to(&self, target_id: Option<&str>) -> Result<(), anyhow::Error> {
-        self.storage.set_leaf_id(target_id).await
+        self.journal.set_leaf(target_id.map(str::to_string)).await?;
+        Ok(())
     }
 
     /// The current leaf (cursor) entry id.
     pub async fn leaf_id(&self) -> Result<Option<String>, anyhow::Error> {
-        self.storage.get_leaf_id().await
+        self.storage().get_leaf_id().await
+    }
+
+    /// Append a fully-formed entry verbatim through the writer: the caller
+    /// supplies the id and parent (a fork copy, a fixture chain) and the
+    /// writer still owns the append order.
+    pub async fn append_verbatim(&self, entry: SessionTreeEntry) -> Result<String, anyhow::Error> {
+        Ok(self.journal.append_verbatim(entry, false).await?.id)
+    }
+
+    /// Append a prepared chain in one storage write. The entries carry their
+    /// own ids and parents (a fork copy); the batch is one journal command so
+    /// a deferred session materializes once.
+    pub async fn append_entries(
+        &self,
+        entries: Vec<SessionTreeEntry>,
+    ) -> Result<Vec<String>, anyhow::Error> {
+        Ok(self.journal.append_batch(entries).await?)
     }
 
     /// Append a `custom` entry whose payload the harness does not interpret.
@@ -723,37 +888,38 @@ impl<S: SessionStorage> Session<S> {
         custom_type: &str,
         data: Option<JsonValue>,
     ) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
         let entry = SessionTreeEntry::Custom {
-            id: id.clone(),
-            parent_id,
+            id: String::new(),
+            parent_id: None,
             timestamp: Utc::now(),
             custom_type: custom_type.to_string(),
             data,
         };
-        self.storage.append_entry(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?
+            .id)
     }
 
     /// Append a typed v4 journal entry by its wire kind (§C.2). The payload
     /// object's keys must match the variant's camelCase field names;
-    /// `id`/`parentId`/`timestamp` are assigned here so the chain stays
-    /// single-writer. `message`/`compaction` are refused — they own richer
-    /// append paths (`append_message`, the compaction flow) that must not be
-    /// bypassed.
+    /// `id`/`parentId`/`timestamp` are assigned by the writer so the chain
+    /// stays single-writer. `message`/`compaction` are refused — they own
+    /// richer append paths (`append_message`, the compaction flow) that must
+    /// not be bypassed.
     pub async fn append_typed(
         &self,
         kind: &str,
         payload: JsonValue,
     ) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
-        let entry = SessionTreeEntry::from_kind_payload(kind, id, parent_id, Utc::now(), payload)?;
-        self.storage.append_entry(&entry).await?;
-        Ok(entry.id().to_string())
+        let entry =
+            SessionTreeEntry::from_kind_payload(kind, String::new(), None, Utc::now(), payload)?;
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?
+            .id)
     }
 
     /// Append a `custom_message` entry whose payload the harness does not
@@ -765,20 +931,20 @@ impl<S: SessionStorage> Session<S> {
         details: Option<JsonValue>,
         display: bool,
     ) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
         let entry = SessionTreeEntry::CustomMessage {
-            id: id.clone(),
-            parent_id,
+            id: String::new(),
+            parent_id: None,
             timestamp: Utc::now(),
             custom_type: custom_type.to_string(),
             content,
             details,
             display,
         };
-        self.storage.append_entry(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?
+            .id)
     }
 
     /// Attach a short human-readable label to an entry in the tree.
@@ -787,48 +953,48 @@ impl<S: SessionStorage> Session<S> {
         target_id: &str,
         label: Option<String>,
     ) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
         let entry = SessionTreeEntry::Label {
-            id: id.clone(),
-            parent_id,
+            id: String::new(),
+            parent_id: None,
             timestamp: Utc::now(),
             target_id: target_id.to_string(),
             label,
         };
-        self.storage.append_entry(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?
+            .id)
     }
 
     /// Set the session's display name via a `session_info` entry.
     pub async fn set_session_name(&self, name: &str) -> Result<String, anyhow::Error> {
-        let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
-        let parent_id = self.storage.get_leaf_id().await?;
         let entry = SessionTreeEntry::SessionInfo {
-            id: id.clone(),
-            parent_id,
+            id: String::new(),
+            parent_id: None,
             timestamp: Utc::now(),
             name: Some(name.to_string()),
         };
-        self.storage.append_entry(&entry).await?;
-        Ok(id)
+        Ok(self
+            .journal
+            .append(entry, ParentIntent::Tail, false)
+            .await?
+            .id)
     }
 
     /// What this session cost. See [`SessionStats`].
     pub async fn stats(&self) -> Result<SessionStats, anyhow::Error> {
-        self.storage.get_session_stats().await
+        self.storage().get_session_stats().await
     }
 
     /// The label attached to an entry, if any.
     pub async fn label(&self, id: &str) -> Result<Option<String>, anyhow::Error> {
-        self.storage.get_label(id).await
+        self.storage().get_label(id).await
     }
 
     /// The session's name, if one was set.
     pub async fn name(&self) -> Result<Option<String>, anyhow::Error> {
-        self.storage.get_session_name().await
+        self.storage().get_session_name().await
     }
 
     /// Every entry of one type, in append order.
@@ -836,7 +1002,7 @@ impl<S: SessionStorage> Session<S> {
         &self,
         entry_type: EntryType,
     ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
-        self.storage.find_entries(entry_type).await
+        self.storage().find_entries(entry_type).await
     }
 
     /// A window of entries in append order. See [`SessionEntryCursor`].
@@ -844,7 +1010,7 @@ impl<S: SessionStorage> Session<S> {
         &self,
         cursor: SessionEntryCursor,
     ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
-        self.storage.get_entries(cursor).await
+        self.storage().get_entries(cursor).await
     }
 }
 
@@ -1697,7 +1863,7 @@ impl<S: SessionStorage> Session<S> {
         let start_id = match query.start {
             BranchStart::None => return Ok(Vec::new()),
             BranchStart::Leaf => self
-                .storage
+                .storage()
                 .get_leaf_id()
                 .await
                 .map_err(|e| BranchQueryError::InvalidSession(e.to_string()))?,
@@ -1710,7 +1876,7 @@ impl<S: SessionStorage> Session<S> {
         let mut path: Vec<SessionTreeEntry> = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut current = self
-            .storage
+            .storage()
             .get_entry(&start_id)
             .await
             .map_err(|e| BranchQueryError::InvalidSession(e.to_string()))?
@@ -1733,7 +1899,7 @@ impl<S: SessionStorage> Session<S> {
                 break;
             };
             current = self
-                .storage
+                .storage()
                 .get_entry(parent_id)
                 .await
                 .map_err(|e| BranchQueryError::InvalidSession(e.to_string()))?
@@ -2091,8 +2257,7 @@ mod branch_query_tests {
         let storage = crate::harness::tests::MemStorage::new();
         let session = Session::new(storage);
         session
-            .storage()
-            .append_entry(&SessionTreeEntry::Message {
+            .append_verbatim(SessionTreeEntry::Message {
                 id: "orphan".into(),
                 parent_id: Some("missing-parent".into()),
                 timestamp: Utc::now(),
@@ -2119,8 +2284,7 @@ mod branch_query_tests {
         assert!(matches!(err, BranchQueryError::InvalidSession(_)), "{err}");
 
         session
-            .storage()
-            .append_entry(&SessionTreeEntry::Message {
+            .append_verbatim(SessionTreeEntry::Message {
                 id: "cycle-a".into(),
                 parent_id: Some("cycle-b".into()),
                 timestamp: Utc::now(),
@@ -2130,8 +2294,7 @@ mod branch_query_tests {
             .await
             .unwrap();
         session
-            .storage()
-            .append_entry(&SessionTreeEntry::Message {
+            .append_verbatim(SessionTreeEntry::Message {
                 id: "cycle-b".into(),
                 parent_id: Some("cycle-a".into()),
                 timestamp: Utc::now(),
