@@ -123,6 +123,14 @@ fn embedded_ipv4(segments: [u16; 8]) -> Ipv4Addr {
     )
 }
 
+/// 198.18.0.0/15, IANA's benchmarking range — and the placeholder range a
+/// transparent proxy/TUN in fake-IP mode answers every name with, taking
+/// resolution over from the system resolver.
+fn is_fake_ip_v4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 198 && b & 0xfe == 18
+}
+
 /// One DNS64 prefix this network synthesizes answers under: the prefix octets
 /// plus the RFC 6052 length they occupy.
 struct Nat64Prefix {
@@ -206,6 +214,16 @@ impl Resolve for PublicUnicastResolver {
             let addrs: Vec<SocketAddr> = inner.resolve(name).await?.collect();
             if addrs.is_empty() {
                 return Err(format!("empty DNS answer for {host}").into());
+            }
+            // A fake-IP answer set — every name answered from the benchmarking
+            // range — is a transparent proxy/TUN owning resolution, not an
+            // SSRF attempt: name the cause instead of the generic refusal.
+            if addrs
+                .iter()
+                .all(|addr| matches!(addr.ip(), IpAddr::V4(v4) if is_fake_ip_v4(v4)))
+            {
+                *blocked.lock() = Some(WebFetchError::FakeIpDns { host: host.clone() });
+                return Err(format!("fake-IP answer set for {host}").into());
             }
             // Only an IPv6 answer can reach a destination through NAT64, so the
             // discovery query is spent only where it can matter.
@@ -519,6 +537,23 @@ mod tests {
     async fn hostname_resolving_to_private_space_is_blocked() {
         let resolver = unicast_resolver(&[("private.test", &["127.0.0.1:80"])]);
         let err = resolve_host(&resolver, "private.test").await.unwrap_err();
+        assert!(err.contains("non-public"), "{err}");
+    }
+
+    /// Every answer inside the benchmarking range is the fake-IP signature;
+    /// a set mixing it with a public answer keeps the generic refusal.
+    #[tokio::test]
+    async fn pure_fake_ip_answers_are_diagnosed_and_mixed_sets_are_not() {
+        let resolver = unicast_resolver(&[
+            ("fake.test", &["198.18.0.5"]),
+            ("fake-upper.test", &["198.19.255.7"]),
+            ("mixed.test", &["198.18.0.5", "93.184.216.34"]),
+        ]);
+        for host in ["fake.test", "fake-upper.test"] {
+            let err = resolve_host(&resolver, host).await.unwrap_err();
+            assert!(err.contains("fake-IP"), "{host}: {err}");
+        }
+        let err = resolve_host(&resolver, "mixed.test").await.unwrap_err();
         assert!(err.contains("non-public"), "{err}");
     }
 }
