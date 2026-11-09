@@ -2,10 +2,11 @@
 //!
 //! A slash command is a markdown file (`<name>.md`) whose frontmatter carries
 //! `description` / `argument-hint` / `allowed-tools` / `disable-model-invocation`
-//! and whose body is a prompt template with a `$ARGUMENTS` placeholder. The
-//! user types `/plugin:command <args>`; the engine substitutes `$ARGUMENTS`
-//! with the raw args and injects the rendered body as a user message. This
-//! mirrors Claude Code's command mechanism — the body is a natural-language
+//! and whose body is a prompt template with a `{{ arguments }}` placeholder.
+//! The user types `/plugin:command <args>`; the engine substitutes
+//! `{{ arguments }}` with the raw args and injects the rendered body as a user
+//! message. This mirrors Claude Code's command mechanism — the body is a
+//! natural-language
 //! instruction the model then carries out, not an imperative script.
 //!
 //! `allowed-tools` gates the turn: the model may only call tools whose name
@@ -74,10 +75,9 @@ pub struct CommandDefinition {
 
 impl CommandDefinition {
     /// Render the command body, substituting `arguments` into the
-    /// `{{ arguments }}` placeholder. Legacy `$ARGUMENTS` placeholders are
-    /// rewritten first so old command files keep working. Command bodies are
-    /// untrusted prose, so a Tera-incompatible literal `{{` falls back to plain
-    /// substitution rather than breaking the render.
+    /// `{{ arguments }}` placeholder; every other byte renders as written.
+    /// Command bodies are untrusted prose, so a Tera-incompatible literal `{{`
+    /// falls back to plain substitution rather than breaking the render.
     pub fn render(&self, args: &str) -> String {
         crate::prompt::render_command_body(&self.body, args)
     }
@@ -334,7 +334,7 @@ allowed-tools: Bash(node:*), AskUserQuestion, Read\n\
             argument_hint: None,
             allowed_tools: Vec::new(),
             disable_model_invocation: false,
-            body: "Review $ARGUMENTS now".to_string(),
+            body: "Review {{ arguments }} now".to_string(),
             source: PathBuf::new(),
         };
         assert_eq!(cmd.render("HEAD~1"), "Review HEAD~1 now");
@@ -402,7 +402,7 @@ mod builtin_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("tutor.md"),
-            "---\ndescription: Tutor\nargument-hint: <topic>\n---\nTour $ARGUMENTS",
+            "---\ndescription: Tutor\nargument-hint: <topic>\n---\nTour {{ arguments }}",
         )
         .unwrap();
         let cmd = resolve_project(proj.path(), "tutor").unwrap();

@@ -33,7 +33,7 @@ use crate::goal_driver::{render_goal_blocked_wrapup, render_goal_complete_wrapup
 use crate::thread::ThreadEvent;
 use crate::thread_engine::{BackendNotice, send_notice};
 
-/// Incremental fold cache: `seq` is the highest thread-event seq folded.
+/// The bridge's working fold state.
 #[derive(Debug, Clone, Default)]
 struct GoalFoldCache {
     state: GoalFoldState,
@@ -41,10 +41,9 @@ struct GoalFoldCache {
 
 /// Shared goal state between the thread facade (gpui thread, owns user-side
 /// operations) and the goal tools (engine actor, tokio). All operations fold
-/// the durable event stream synchronously (local SQLite) and update the
-/// shared cache; model-side operations additionally emit `GoalChanged`
-/// through the engine notice channel, user-side operations emit on the
-/// facade.
+/// the durable event stream synchronously and update the shared cache;
+/// model-side operations additionally emit `GoalChanged` through the engine
+/// notice channel, user-side operations emit on the facade.
 pub struct GoalBridge {
     thread_id: String,
     notice_tx: Mutex<Option<mpsc::UnboundedSender<BackendNotice>>>,
@@ -64,23 +63,20 @@ pub struct GoalBridge {
     /// rationale as `armed`: the engine sets it and settles it on the actor
     /// thread, and tool reads happen inside a run that only the actor drives.
     goal_round_active: AtomicBool,
-    /// The store handle for the journal-routing leg of the goal authority
-    /// migration (stage ① dual-write). Captured at construction — NOT read
-    /// through the process global per append, so tests injecting a
-    /// standalone store stay immune to cross-test global churn. `None`
-    /// skips the journal leg (store-less fixtures; the db event log is the
-    /// bridge's working store until stage ②).
+    /// The store handle that routes each goal snapshot onto the thread
+    /// journal. Captured at construction — NOT read through the process
+    /// global per append, so tests injecting a standalone store stay immune
+    /// to cross-test global churn. `None` skips the journal row (store-less
+    /// fixtures fold in memory only).
     store: Option<crate::thread_store::StoreHandle>,
 }
 
 impl GoalBridge {
-    /// The bridge for a thread. Stage ③ (the db retirement): infallible —
-    /// the goal state lives in-process (the fold cache) and in the journal
-    /// (the `goal` snapshot rows); the restore seed rides the engine's
-    /// Ready chain (`seed_from_journal`, stage ②), where the restart-paused
-    /// demotion applies (activation is never inherited, and startup never
-    /// resumes autonomous work on its own). The db event-log dependency —
-    /// and its "goal features disabled" degrade — is gone.
+    /// The bridge for a thread. The goal state lives in-process (the fold
+    /// cache) and in the journal (the `goal` snapshot rows); the restore seed
+    /// rides the engine's Ready chain (`seed_from_journal`), where the
+    /// restart-paused demotion applies (activation is never inherited, and
+    /// startup never resumes autonomous work on its own).
     pub fn for_thread(thread_id: &str) -> Arc<Self> {
         Arc::new(Self::new(
             thread_id.to_string(),
@@ -99,15 +95,14 @@ impl GoalBridge {
         }
     }
 
-    /// Goal authority migration, stage ② (the restore seed from the
-    /// JOURNAL; stage ③ retired the db leg it once fell back to). The
-    /// engine's K2 rebuild replays the chain's `goal` snapshots and hands
-    /// the last one here; the fold cache takes it WHOLESALE (no event
-    /// re-fold — later mutations append on top of the seeded state).
+    /// The restore seed from the JOURNAL: the last `goal` row on the chain is
+    /// the only authority. The engine's rebuild replays the chain's `goal`
+    /// snapshots and hands the last one here; the fold cache takes it WHOLESALE
+    /// (no event re-fold — later mutations append on top of the seeded state).
     /// `None` = the chain never saw a goal → the fold stands as-is.
     /// `Some(Null)` = the explicit clear. A seeded Active goal demotes to
-    /// restart-paused through the usual mutation path, so the journal sees
-    /// the demotion too (the stage-① route).
+    /// restart-paused through the usual mutation path, so the journal sees the
+    /// demotion too.
     pub fn seed_from_journal(&self, goal: Option<serde_json::Value>) {
         let Some(snapshot) = goal else {
             return;
@@ -157,9 +152,8 @@ impl GoalBridge {
         *self.notice_tx.lock().unwrap() = Some(tx);
     }
 
-    /// Current goal projection: the in-process fold state (stage ③ — no db
-    /// stream to sync; the fold is seeded on restore by `seed_from_journal`
-    /// and kept current by every mutation).
+    /// Current goal projection: the in-process fold state, seeded on restore
+    /// by `seed_from_journal` and kept current by every mutation.
     pub fn snapshot(&self) -> Option<ThreadGoal> {
         self.fold.lock().unwrap().state.current.clone()
     }
@@ -193,9 +187,8 @@ impl GoalBridge {
 
     /// Validate an event against the cached fold, persist it, and re-fold.
     fn append_event(&self, event: &GoalEvent) -> Result<()> {
-        // Single-event form of the batch funnel: one persistence path for
-        // the db append AND the goal-authority journal routing (the stage-①
-        // dual-write below) — create/edit/set-status once silently bypassed
+        // Single-event form of the batch funnel: one persistence path for the
+        // journal route below — create/edit/set-status once silently bypassed
         // the batch funnel's journal leg.
         self.append_events(std::slice::from_ref(event))
     }
@@ -208,12 +201,11 @@ impl GoalBridge {
 
     /// Validate and persist a batch atomically (replace = tombstone + create).
     fn append_events(&self, events: &[GoalEvent]) -> Result<()> {
-        // Stage ③: the db event log is retired — the journal is the durable
-        // authority (the FULL-state `goal` snapshot routed below, last entry
-        // wins — the replay fold), the fold cache the working state (seeded
-        // on restore by `seed_from_journal`). The batch validates + applies
-        // under one lock: a failing event leaves the fold untouched
-        // (replace = tombstone + create stays atomic).
+        // The journal is the durable authority (the FULL-state `goal` snapshot
+        // routed below, last entry wins — the replay fold), the fold cache the
+        // working state (seeded on restore by `seed_from_journal`). The batch
+        // validates + applies under one lock: a failing event leaves the fold
+        // untouched (replace = tombstone + create stays atomic).
         {
             let mut cache = self.fold.lock().unwrap();
             let mut state = cache.state.clone();
@@ -222,7 +214,7 @@ impl GoalBridge {
             }
             cache.state = state;
         }
-        // Routing is the store's K3 dispatch: the live engine actor
+        // Routing is the store's decision-row dispatch: the live engine actor
         // serializes the row, a store-less fixture skips it.
         if let Some(store) = self.store.as_ref() {
             let snapshot = self.fold.lock().unwrap().state.current.clone();
@@ -753,24 +745,18 @@ mod tests {
     use super::*;
     use crate::goal::GoalEventKind;
 
-    /// Goal authority migration, stage ②: the journal seed is the restore
-    /// authority — a snapshot replaces the fold wholesale, the explicit
-    /// null clears it, a seeded Active goal demotes to restart-paused
-    /// (through the mutation path, so both persistence legs see it), and
-    /// `None` leaves the db fold standing (the migration-window fallback).
+    /// The journal seed is the restore authority: a snapshot seeds the fold,
+    /// the explicit null clears it, a seeded Active goal demotes to
+    /// restart-paused (through the mutation path, so the journal sees it), and
+    /// `None` leaves a chain that never saw a goal with no goal.
     #[test]
     fn journal_seed_is_the_restore_authority() {
         let (bridge, _rx) = bridge_in(&tempfile::tempdir().unwrap());
-        // A db-folded goal exists (the pre-migration shape).
-        bridge
-            .create_goal("db goal".into(), None, None, GoalActor::User)
-            .unwrap();
-        // None: the chain never saw a goal — the db fold stands.
+        // None: the chain never saw a goal — no goal.
         bridge.seed_from_journal(None);
-        assert_eq!(bridge.snapshot().unwrap().objective, "db goal");
-        // A journal snapshot replaces the fold wholesale.
-        let mut seeded = bridge.snapshot().unwrap();
-        seeded.objective = "journal goal".into();
+        assert!(bridge.snapshot().is_none());
+        // A journal snapshot seeds the fold wholesale.
+        let mut seeded = ThreadGoal::new("t1".into(), "journal goal".into(), None, None).unwrap();
         seeded.status = GoalStatus::Active;
         bridge.seed_from_journal(Some(serde_json::to_value(&seeded).unwrap()));
         let snap = bridge.snapshot().unwrap();
@@ -782,10 +768,9 @@ mod tests {
         assert!(bridge.snapshot().is_none());
     }
 
-    /// Goal authority migration, stage ① (dual-write): every goal event
-    /// batch also routes a `goal` journal row — the FULL folded state as
-    /// the payload (last-entry-wins authority), dispatched through the
-    /// store's K3 router (here: a live engine route). The clear batch
+    /// Every goal event batch routes a `goal` journal row — the FULL folded
+    /// state as the payload (last-entry-wins authority), dispatched through the
+    /// store's decision-row router (here: a live engine route). The clear batch
     /// routes the explicit null snapshot.
     #[tokio::test]
     async fn goal_batches_route_journal_snapshot_rows() {
@@ -801,7 +786,7 @@ mod tests {
         bridge.set_sender(notice_tx);
 
         bridge
-            .create_goal("ship stage one".into(), None, None, GoalActor::User)
+            .create_goal("ship the release".into(), None, None, GoalActor::User)
             .expect("create routes");
         let row = tokio::time::timeout(std::time::Duration::from_secs(5), cmd_rx.recv())
             .await
@@ -812,7 +797,7 @@ mod tests {
                 assert_eq!(kind, "goal");
                 assert_eq!(
                     payload["goal"]["objective"].as_str(),
-                    Some("ship stage one"),
+                    Some("ship the release"),
                     "the row carries the FULL folded state: {payload}"
                 );
             }
@@ -836,9 +821,8 @@ mod tests {
         }
     }
 
-    /// A db-free bridge with a live notice channel (stage ③: the goal state
-    /// is the in-process fold + the journal route; `_dir` is kept so the
-    /// call sites stay put).
+    /// A bridge with a live notice channel that folds in memory only (no
+    /// journal route); `_dir` is kept so the call sites stay put.
     fn bridge_in(
         _dir: &tempfile::TempDir,
     ) -> (Arc<GoalBridge>, mpsc::UnboundedReceiver<BackendNotice>) {
@@ -1003,9 +987,8 @@ mod tests {
         assert!(bridge.armed());
         // The replace batch (tombstone + create) applies as one fold
         // transaction; the emit happens once at the facade entry point (the
-        // internal append_events does not emit). The db event-sequence
-        // assertion retired with the db (stage ③) — the journal snapshot
-        // route's shape is pinned by goal_batches_route_journal_snapshot_rows.
+        // internal append_events does not emit). The journal snapshot route's
+        // shape is pinned by goal_batches_route_journal_snapshot_rows.
         drop(rx);
     }
 
@@ -1056,9 +1039,8 @@ mod tests {
     }
 
     #[test]
-    /// Restart-paused demotion (activation is never inherited), in its
-    /// stage-③ shape: the restore seed arrives through the journal
-    /// (`seed_from_journal`), not a db reopen.
+    /// Restart-paused demotion (activation is never inherited): the restore
+    /// seed arrives through the journal (`seed_from_journal`).
     fn restore_seed_pauses_active_goal_and_stays_disarmed() {
         let dir = tempfile::tempdir().unwrap();
         let (bridge, _rx) = bridge_in(&dir);

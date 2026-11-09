@@ -1328,10 +1328,10 @@ async fn run_actor(
     // reads; shared so mid-run history refreshes never borrow the session.
     let live_mirror: Arc<Mutex<LiveTranscript>> = Arc::new(Mutex::new(LiveTranscript::default()));
     let restored_provider_responses = successful_provider_responses(session.harness_messages());
-    // K2: the journal-first restore rebuild — the active chain is the
-    // authority for every field §C.2 entries carry, the sidecar fills the
-    // fields the chain has never seen, and a diverging cache is repaired
-    // toward the journal.
+    // The journal-first restore rebuild: the active chain is the authority
+    // for every field §C.2 entries carry, the sidecar fills the fields the
+    // chain has never seen, and a diverging cache is repaired toward the
+    // journal.
     let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
     let title_scheduler = TitleScheduler::new(
         runtime.clone(),
@@ -1981,7 +1981,7 @@ async fn run_actor(
                     &bus,
                 )
                 .await;
-                // K2: the journal-first rebuild resolves the swapped-in
+                // The journal-first rebuild resolves the swapped-in
                 // session's observable state (authority: its active chain;
                 // gap-fill: its sidecar).
                 let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
@@ -2405,7 +2405,7 @@ async fn load_title_scheduler(
     provider_responses: usize,
     journal_title: Option<String>,
 ) -> PersistedTitleScheduler {
-    // K2: the journal chain's title is the authority; the sidecar fills a
+    // The journal chain's title is the authority; the sidecar fills a
     // chain that never saw a `title` entry.
     let sidecar = manox_harness::session_meta::load(sessions_dir, session_path)
         .await
@@ -2470,7 +2470,7 @@ async fn write_plan_snapshot_sidecar(
 
 /// Parse the facade's effort knob wire value; other levels (e.g. "off")
 /// are not user-facing and yield `None`. Shared with the journal replay
-/// fold (K2), which reads the same vocabulary off `thinking_level_change`
+/// fold, which reads the same vocabulary off `thinking_level_change`
 /// entries.
 pub(crate) fn parse_reasoning_effort(raw: &str) -> Option<ReasoningEffort> {
     match raw {
@@ -2526,7 +2526,7 @@ fn repark_unsettled(state: &Arc<EngineState>, restored: &RestoredThreadState) {
     }
 }
 
-/// Re-apply the persisted access mode after a session switch (K2): the
+/// Re-apply the persisted access mode after a session switch: the
 /// mode comes from the journal-first restore rebuild; align the gate, the
 /// facade's chip, and the durable diff baseline with it.
 fn resync_access_mode(
@@ -2545,7 +2545,7 @@ fn resync_access_mode(
     );
 }
 
-/// The observable state of a restored thread (K2), resolved journal-first:
+/// The observable state of a restored thread, resolved journal-first:
 /// every field a §C.2 state-change entry carries rebuilds from the active
 /// chain ([`crate::replay::replay_thread_state`]) — the session-mutable
 /// config keys (`access_mode_change` / `thinking_level_change`) included —
@@ -2569,9 +2569,8 @@ struct RestoredThreadState {
     unsettled_questions: Vec<crate::replay::UnsettledInteraction>,
     plan_snapshot: Option<serde_json::Value>,
     title: Option<String>,
-    /// Journal authority (goal stage ②): the replayed last `goal` snapshot
-    /// (`Some(Null)` = the explicit clear; `None` = the chain never saw one
-    /// — the bridge keeps its db fold).
+    /// Journal authority: the replayed last `goal` snapshot (`Some(Null)` =
+    /// the explicit clear; `None` = the chain never saw one).
     goal: Option<serde_json::Value>,
     pinned: bool,
     archived: bool,
@@ -2589,7 +2588,7 @@ fn journal_plan_snapshot(
         .filter(|value| !value.as_array().is_some_and(|plan| plan.is_empty()))
 }
 
-/// Resolve the journal replay against the sidecar cache (the K2 merge):
+/// Resolve the journal replay against the sidecar cache:
 /// journal-backed fields win wherever the chain carries them; the sidecar
 /// fills exactly the fields the chain has never seen (title / plan /
 /// project). Pure and total — every restore face applies this resolution
@@ -2690,7 +2689,7 @@ async fn reconcile_open_turn(
 }
 
 /// Fold one session's active chain and resolve it against the sidecar
-/// cache (K2). Runs on every restore face: startup, `Open`, and
+/// cache. Runs on every restore face: startup, `Open`, and
 /// `NewSession` (a fresh chain resolves entirely to sidecar defaults).
 async fn rebuild_restored_state(
     session: &AgentSession,
@@ -2717,7 +2716,7 @@ async fn rebuild_restored_state(
     let repair_title = replayed
         .title
         .filter(|title| meta.title.as_deref() != Some(title.as_str()));
-    // K2 title repair, ENABLED (the rename-route decision): the only
+    // Title repair, ENABLED (the rename-route decision): the only
     // direct-sidecar title writer is `set_external_title`, which serves
     // EXTERNAL TUI sessions — they carry no journal chain, never reach
     // this rebuild, and their sidecar is desktop-authoritative by design
@@ -2950,7 +2949,7 @@ async fn write_project_sidecar(sessions_dir: &Path, session_path: &Path, project
 }
 
 /// Bind a session to its project (K3): the sidecar cache write plus the
-/// `project_change` journal entry — the entry is the authority (K2), the
+/// `project_change` journal entry — the entry is the authority, the
 /// sidecar stays the derived fast-list cache. The append runs the shared
 /// fail-loud discipline; a still-down storage parks the loss record for
 /// the next drain and the facade hears one `Error` notice.

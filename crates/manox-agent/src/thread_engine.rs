@@ -290,11 +290,10 @@ pub struct ReadyInfo {
     /// the authoritative active-tool set); the facade mirrors it so the
     /// composer chips derive from the thread's state.
     pub browser_suites: Vec<crate::engine::BrowserSuite>,
-    /// The journal-authoritative goal snapshot (goal migration stage ②):
-    /// the K2 rebuild's replayed last `goal` entry. `None` = the chain
-    /// never saw a goal (the bridge's db fold stands — the migration-window
-    /// fallback for pre-stage-① threads); `Some(Null)` = the explicit
-    /// clear. The facade hands it to the GoalBridge, which re-applies the
+    /// The journal-authoritative goal snapshot: the rebuild's replayed last
+    /// `goal` row on the chain. `None` = the chain never saw a goal — a chain
+    /// with no goal row has no goal; `Some(Null)` = the explicit clear. The
+    /// facade hands it to the GoalBridge's restore seed, which re-applies the
     /// restart-paused demotion (activation is never inherited).
     pub goal: Option<serde_json::Value>,
     /// Last `UpdatePlan` snapshot rebuilt journal-first (K2: the

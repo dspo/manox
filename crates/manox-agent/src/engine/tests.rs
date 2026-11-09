@@ -4649,8 +4649,8 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
          holds no config answer anymore"
     );
     assert_eq!(rebuilt.project, Some(PathBuf::from("/journal/project")));
-    // Goal stage ②: the rebuild passes the replayed journal snapshot
-    // through to the Ready chain (the bridge seed's authority).
+    // The rebuild passes the replayed journal snapshot through to the Ready
+    // chain (the bridge seed's authority).
     assert_eq!(
         rebuilt
             .goal
