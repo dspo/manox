@@ -59,11 +59,11 @@ pub fn persisted_session_file(session_id: &str) -> Option<PathBuf> {
         .map(|_| manox_agent::thread_store::global_sessions_dir())
         .or_else(|| manox_agent::paths::core_root().ok())?;
     // The core root is two-deep: project buckets over per-session
-    // directories, the journal (`log.v1.jsonl`) inside each — a session's
+    // directories, the journal (`session.jsonl`) inside each — a session's
     // directory name IS its id. The walk is bounded to that shape and never
-    // falls back to the legacy `sessions/` tree (dead since the cutover);
-    // an id with no file anywhere resolves `None`, and the create flows
-    // mint their paths through the core layout helpers, not this gate.
+    // falls back to the flat `sessions/` tree; an id with no file anywhere
+    // resolves `None`, and the create flows mint their paths through the core
+    // layout helpers, not this gate.
     fn find(dir: &std::path::Path, id: &str, depth: u8) -> Option<std::path::PathBuf> {
         let entries = std::fs::read_dir(dir).ok()?;
         for entry in entries.flatten() {

@@ -577,7 +577,7 @@ fn thread_sessions(thread_id: &str, active: &str) -> Vec<String> {
         return members.into_iter().collect();
     };
     // The core layout is two-deep (buckets over per-session directories,
-    // `log.v1.jsonl` inside); a session's directory name is its id. The
+    // `session.jsonl` inside); a session's directory name is its id. The
     // walk stays bounded to that shape.
     fn collect(dir: &Path, depth: u8, thread_id: &str, members: &mut BTreeSet<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -760,7 +760,7 @@ fn read_header(path: &Path) -> Option<manox_harness::session::jsonl::JsonlSessio
 /// cold read can never disagree.
 fn sessions_dir() -> Option<PathBuf> {
     // The v1.0.0 core root ITSELF, never a bucket: production sessions live
-    // under `<core>/<project-slug>/<id>/log.v1.jsonl`, and a test store's
+    // under `<core>/<project-slug>/<id>/session.jsonl`, and a test store's
     // fixtures may sit one level shallower — the bounded walk below reads
     // both shapes. Naming a bucket here (the fixtures' own `t`, say) would
     // make the enumeration resolve a directory production never writes, so
@@ -1054,7 +1054,7 @@ mod baseline_tests {
     /// The member enumeration reads the core root, not one bucket.
     ///
     /// Production journals live under `<core>/<project-slug>/<id>/
-    /// log.v1.jsonl`; a scan pointed at a single bucket (the test fixtures'
+    /// session.jsonl`; a scan pointed at a single bucket (the test fixtures'
     /// own `t`, say) resolves a directory production never writes, so every
     /// thread's members silently collapse to the active pointer — the
     /// multi-session catalog and the member fold lose every other journal.

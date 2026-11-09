@@ -30,9 +30,9 @@ libc.workspace = true
 
 [features]
 default = ["terminal", "mcp"]
-# Protocol-side plumbing only: the AHP terminal channel pumps in `ahp/`.
-# The PTY/grid implementation lived in manox-terminal (removed); the arms
-# now answer through the SessionRuntime trait's refusal paths.
+# The AHP terminal channel's refusal face: the feature compiles the channel
+# plumbing, no PTY lives in this host, and `SessionRuntime`'s terminal methods
+# answer the unavailability.
 terminal = []
 # The MCP face: the process-global registry snapshot mirrors into every
 # session's `customizations`, start/stop requests drive the registry, and

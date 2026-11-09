@@ -175,7 +175,7 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
 }
 
 /// A session journal's path in the core layout (bucket over per-session
-/// directories, `log.v1.jsonl` inside) under the store's root.
+/// directories, `session.jsonl` inside) under the store's root.
 fn core_journal(id: &str) -> std::path::PathBuf {
     manox_agent::thread_store::global_sessions_dir()
         .join("t")
@@ -491,7 +491,7 @@ fn probe_real_journal_fold() {
     let dst = manox_agent::thread_store::global_sessions_dir().join(src.file_name().unwrap());
     std::fs::copy(&src, &dst).unwrap();
     manox_agent::runtime::handle().block_on(async {
-        // The core layout: `log.v1.jsonl` inside a directory named by the
+        // The core layout: `session.jsonl` inside a directory named by the
         // session's id.
         let session_id = src.parent().unwrap().file_name().unwrap().to_str().unwrap();
         match chat_state(session_id).await {
