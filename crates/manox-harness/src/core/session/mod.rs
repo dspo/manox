@@ -17,6 +17,7 @@ pub mod journal;
 pub mod jsonl;
 pub mod repository;
 
+pub use event::UserEntryUi;
 pub use journal::{Appended, Journal, JournalError, JournalWrite, ParentIntent};
 
 use crate::types::{AgentMessage, Usage};
@@ -435,6 +436,11 @@ pub struct Session<S: SessionStorage> {
     /// `origin_rpc`; the persistence middleware drains it on exactly that
     /// append. One-shot by construction.
     pending_user_origin: std::sync::Mutex<Option<String>>,
+    /// The authorship of THIS turn's first user message (the entry-level
+    /// `ui` fact): the host pins it when it injects a message on an agent's
+    /// behalf; the persistence middleware drains it on exactly that user
+    /// append. One-shot by construction, like `pending_user_origin`.
+    pending_user_ui: std::sync::Mutex<Option<UserEntryUi>>,
     /// K5 one-shot skip: the entry id and serialized content of the user
     /// message already persisted before the run (at Submit acceptance, or at
     /// drain for a queued submit). The persistence middleware consumes the
@@ -477,6 +483,7 @@ impl<S: SessionStorage> Session<S> {
         Session {
             journal: Journal::new(storage),
             pending_user_origin: std::sync::Mutex::new(None),
+            pending_user_ui: std::sync::Mutex::new(None),
             accepted_user_entry: std::sync::Mutex::new(None),
         }
     }
@@ -484,6 +491,13 @@ impl<S: SessionStorage> Session<S> {
     /// Pin the origin RPC id for this turn's first user message (§F.2).
     pub fn set_pending_user_origin(&self, origin: Option<String>) {
         *self.pending_user_origin.lock().unwrap() = origin;
+    }
+
+    /// Pin the authorship of this turn's first user message. `None` clears a
+    /// stale pin: a run that died before announcing its message must not leak
+    /// its attribution into the next row.
+    pub fn set_pending_user_ui(&self, ui: Option<UserEntryUi>) {
+        *self.pending_user_ui.lock().unwrap() = ui;
     }
 
     /// K5: pin the journal entry of the user message already persisted
@@ -518,6 +532,12 @@ impl<S: SessionStorage> Session<S> {
         self.pending_user_origin.lock().unwrap().take()
     }
 
+    /// Drain the pending authorship on the same one-shot discipline as the
+    /// origin: exactly the user message this turn announces consumes it.
+    pub fn take_pending_user_ui(&self) -> Option<UserEntryUi> {
+        self.pending_user_ui.lock().unwrap().take()
+    }
+
     pub fn storage(&self) -> &S {
         self.journal.storage()
     }
@@ -542,6 +562,18 @@ impl<S: SessionStorage + 'static> Session<S> {
         message: AgentMessage,
         origin: Option<String>,
     ) -> Result<String, anyhow::Error> {
+        self.append_message_with_origin_and_ui(message, origin, None)
+            .await
+    }
+
+    /// [`Self::append_message_with_origin`] plus the entry-level authorship
+    /// of a user row the human did not type; `None` leaves the row human.
+    pub async fn append_message_with_origin_and_ui(
+        &self,
+        message: AgentMessage,
+        origin: Option<String>,
+        ui: Option<UserEntryUi>,
+    ) -> Result<String, anyhow::Error> {
         // S3 stable-id: a `user` message carrying a caller-minted id (a client
         // `Steer` message id) lands under that id so the durable row's id is
         // the id the client already correlates against; every other message
@@ -553,6 +585,7 @@ impl<S: SessionStorage + 'static> Session<S> {
             timestamp: Utc::now(),
             message,
             origin,
+            ui,
         };
         Ok(self
             .journal
@@ -573,6 +606,18 @@ impl<S: SessionStorage + 'static> Session<S> {
         message: AgentMessage,
         origin: Option<String>,
     ) -> Result<String, anyhow::Error> {
+        self.append_message_durable_with_ui(message, origin, None)
+            .await
+    }
+
+    /// [`Self::append_message_durable`] plus the entry-level authorship of a
+    /// user row the human did not type.
+    pub async fn append_message_durable_with_ui(
+        &self,
+        message: AgentMessage,
+        origin: Option<String>,
+        ui: Option<UserEntryUi>,
+    ) -> Result<String, anyhow::Error> {
         let id = user_entry_id(&message).unwrap_or_default();
         let entry = Event::Message {
             id,
@@ -580,6 +625,7 @@ impl<S: SessionStorage + 'static> Session<S> {
             timestamp: Utc::now(),
             message,
             origin,
+            ui,
         };
         Ok(self
             .journal
@@ -1250,6 +1296,7 @@ mod tests {
             timestamp: Utc::now(),
             message: AgentMessage::user(text),
             origin: None,
+            ui: None,
         }
     }
 
@@ -1339,6 +1386,7 @@ mod tests {
                 timestamp: Utc::now(),
             },
             origin: None,
+            ui: None,
         };
         let path = vec![
             Event::ModelChange {
@@ -1439,6 +1487,7 @@ mod tests {
             timestamp: Utc::now(),
             message: AgentMessage::user("hi"),
             origin,
+            ui: None,
         };
 
         let none_wire = serde_json::to_string(&base(None)).unwrap();
@@ -2236,6 +2285,7 @@ mod branch_query_tests {
                 timestamp: Utc::now(),
                 message: AgentMessage::user("orphan"),
                 origin: None,
+                ui: None,
             })
             .await
             .unwrap();
@@ -2263,6 +2313,7 @@ mod branch_query_tests {
                 timestamp: Utc::now(),
                 message: AgentMessage::user("a"),
                 origin: None,
+                ui: None,
             })
             .await
             .unwrap();
@@ -2273,6 +2324,7 @@ mod branch_query_tests {
                 timestamp: Utc::now(),
                 message: AgentMessage::user("b"),
                 origin: None,
+                ui: None,
             })
             .await
             .unwrap();

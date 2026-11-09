@@ -103,6 +103,7 @@ mod tests {
                 id: None,
             },
             origin: None,
+            ui: None,
         }
     }
 

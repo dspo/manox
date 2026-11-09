@@ -47,6 +47,22 @@ pub enum SettlementKind {
     MaxTokens,
 }
 
+/// Authorship of a user row the human did not type.
+///
+/// It rides the entry (`Event::Message::ui`), not a sidecar: the fold reads
+/// the journal, so a row's attribution must be a journal fact. Live and
+/// replayed views then agree by construction. Absent means human input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserEntryUi {
+    /// Routing name: "lead" | "harness" | an agent's name.
+    pub author: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub peer: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_text: Option<String>,
+}
+
 /// The whole durable vocabulary of a session log: one serde enum is the
 /// single schema. Wire names are the row names — the conversation domain
 /// keeps its historical names, and the swarm/disposal rows join them under
@@ -67,6 +83,11 @@ pub enum Event {
         /// every other entry and on older session files.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
+        /// Send-time authorship of this user row (`None` = the human typed
+        /// it). Entry-level so the AHP fold attributes the row without any
+        /// sidecar read; every other variant stays attribution-free.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui: Option<UserEntryUi>,
     },
     #[serde(rename = "compaction", rename_all = "camelCase")]
     Compaction {
@@ -689,6 +710,7 @@ mod tests {
                 id: None,
             },
             origin: None,
+            ui: None,
         };
         assert!(user.marks_interaction());
         let other = Event::Title {
@@ -711,6 +733,60 @@ mod tests {
             gated_denials: None,
         };
         assert!(!run.marks_interaction());
+    }
+
+    /// Authorship rides the user row as an optional entry fact: absent means
+    /// human input, and only the set fields reach the wire.
+    #[test]
+    fn a_user_rows_authorship_is_an_optional_entry_fact() {
+        let row = |ui: Option<UserEntryUi>| Event::Message {
+            id: "e-1".into(),
+            parent_id: None,
+            timestamp: DateTime::<Utc>::UNIX_EPOCH,
+            message: crate::types::AgentMessage::user("hi"),
+            origin: None,
+            ui,
+        };
+
+        let human = serde_json::to_string(&row(None)).unwrap();
+        assert!(
+            !human.contains("\"ui\""),
+            "a human row must not leak an attribution key: {human}"
+        );
+
+        let harness = serde_json::to_string(&row(Some(UserEntryUi {
+            author: "harness".into(),
+            peer: false,
+            display_text: None,
+        })))
+        .unwrap();
+        assert!(
+            harness.contains(r#""ui":{"author":"harness"}"#),
+            "only the set fields serialize (peer=false and no display text stay off the wire): {harness}"
+        );
+
+        let peer = serde_json::to_string(&row(Some(UserEntryUi {
+            author: "Sailor".into(),
+            peer: true,
+            display_text: Some("unwrapped body".into()),
+        })))
+        .unwrap();
+        assert!(
+            peer.contains(r#""ui":{"author":"Sailor","peer":true,"displayText":"unwrapped body"}"#),
+            "the camelCase entry shape round-trips: {peer}"
+        );
+        let back: Event = serde_json::from_str(&peer).unwrap();
+        match back {
+            Event::Message { ui, .. } => assert_eq!(
+                ui,
+                Some(UserEntryUi {
+                    author: "Sailor".into(),
+                    peer: true,
+                    display_text: Some("unwrapped body".into()),
+                })
+            ),
+            other => panic!("expected Message, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1480,6 +1480,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("hello"),
             origin: None,
+            ui: None,
         };
         storage.append_entry(&entry).await.unwrap();
 
@@ -1521,6 +1522,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
             },
             origin: None,
+            ui: None,
         }
     }
 
@@ -1543,6 +1545,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 message: crate::types::AgentMessage::user("hi"),
                 origin: None,
+                ui: None,
             })
             .await
             .unwrap();
@@ -1641,6 +1644,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: crate::types::AgentMessage::user("hi"),
             origin: None,
+            ui: None,
         };
         storage.append_entry(&target).await.unwrap();
         for (id, label) in [
@@ -1735,6 +1739,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 message: crate::types::AgentMessage::user("hi"),
                 origin: None,
+                ui: None,
             })
             .await
             .unwrap();
@@ -1789,6 +1794,7 @@ mod tests {
                     timestamp: chrono::Utc::now(),
                     message: crate::types::AgentMessage::user(format!("{i}")),
                     origin: None,
+                    ui: None,
                 })
                 .await
                 .unwrap();
@@ -1847,6 +1853,7 @@ mod tests {
                     timestamp: chrono::Utc::now(),
                 },
                 origin: None,
+                ui: None,
             })
             .await
             .unwrap();
@@ -1898,6 +1905,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("hi"),
             origin: None,
+            ui: None,
         };
         storage.append_entry(&msg).await.unwrap();
         assert_eq!(storage.get_leaf_id().await.unwrap(), Some("m1".into()));
@@ -1951,6 +1959,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 message: AgentMessage::user("hi"),
                 origin: None,
+                ui: None,
             };
             storage.append_entry(&msg).await.unwrap();
             // No `leaf` entry exists; the cursor is the last appended entry.
@@ -2200,6 +2209,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("root"),
             origin: None,
+            ui: None,
         };
         let child = Event::Message {
             id: "child".into(),
@@ -2207,6 +2217,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("child"),
             origin: None,
+            ui: None,
         };
         let leaf = Event::Message {
             id: "leaf".into(),
@@ -2214,6 +2225,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("leaf"),
             origin: None,
+            ui: None,
         };
 
         storage.append_entry(&root).await.unwrap();
@@ -2246,6 +2258,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("pre-compaction"),
             origin: None,
+            ui: None,
         };
         let compaction = Event::Compaction {
             id: "comp".into(),
@@ -2265,6 +2278,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("post-compaction"),
             origin: None,
+            ui: None,
         };
 
         storage.append_entry(&pre).await.unwrap();
@@ -2315,6 +2329,7 @@ mod tests {
             timestamp: base + chrono::Duration::seconds(secs),
             message: AgentMessage::user(id),
             origin: None,
+            ui: None,
         };
 
         let root = Event::Message {
@@ -2323,6 +2338,7 @@ mod tests {
             timestamp: base,
             message: AgentMessage::user("root"),
             origin: None,
+            ui: None,
         };
         storage.append_entry(&root).await.unwrap();
         storage
@@ -2372,6 +2388,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("root"),
             origin: None,
+            ui: None,
         };
         let child = Event::Message {
             id: "child".into(),
@@ -2379,6 +2396,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("child"),
             origin: None,
+            ui: None,
         };
         storage.append_entry(&root).await.unwrap();
         storage.append_entry(&child).await.unwrap();
@@ -3011,6 +3029,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user(text),
             origin: None,
+            ui: None,
         }
     }
 
@@ -3341,6 +3360,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("first"),
             origin: None,
+            ui: None,
         };
         storage.append_entry(&entry).await.unwrap();
         let dup = Event::Message {
@@ -3349,6 +3369,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("second"),
             origin: None,
+            ui: None,
         };
         let err = storage.append_entry(&dup).await.unwrap_err();
         assert!(err.to_string().contains("duplicate entry id m1"), "{err}");
@@ -3376,6 +3397,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("bad"),
             origin: None,
+            ui: None,
         };
         let seq = storage.append_entry(&entry).await.unwrap();
         assert_eq!(seq, 0);
@@ -3521,6 +3543,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 message: AgentMessage::user(text),
                 origin: None,
+                ui: None,
             }
         }
 
@@ -4110,6 +4133,7 @@ mod append_entries_tests {
             timestamp: chrono::Utc::now(),
             message: crate::types::AgentMessage::user("batch"),
             origin: None,
+            ui: None,
         }
     }
 

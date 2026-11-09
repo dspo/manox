@@ -206,6 +206,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
             },
             origin: None,
+            ui: None,
         }
     }
 
@@ -220,6 +221,7 @@ mod tests {
                 id: None,
             },
             origin: None,
+            ui: None,
         }
     }
 
@@ -243,6 +245,7 @@ mod tests {
                     timestamp: chrono::Utc::now(),
                 },
                 origin: None,
+                ui: None,
             },
             Event::Compaction {
                 id: "c".into(),

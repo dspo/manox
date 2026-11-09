@@ -688,6 +688,12 @@ impl AgentSession {
         self.harness.session().set_pending_user_origin(origin);
     }
 
+    /// Pin the authorship of this turn's first user message (the entry-level
+    /// `ui` fact); `None` clears a stale pin.
+    pub fn set_pending_user_ui(&self, ui: Option<crate::session::UserEntryUi>) {
+        self.harness.session().set_pending_user_ui(ui);
+    }
+
     /// The shared mid-run journal writer: the same `Arc<Session>` the
     /// persistence middleware holds. Appends through it are linearized by
     /// the session's journal writer (parent-selection + append never fork the

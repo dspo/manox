@@ -464,6 +464,7 @@ mod tests {
                     timestamp: chrono::Utc::now(),
                     message: AgentMessage::user("first"),
                     origin: None,
+                    ui: None,
                 },
                 false,
             )
@@ -493,6 +494,7 @@ mod tests {
                             timestamp: chrono::Utc::now(),
                             message: AgentMessage::user("pending"),
                             origin: None,
+                            ui: None,
                         },
                         false,
                     )
@@ -521,6 +523,7 @@ mod tests {
                     timestamp: chrono::Utc::now(),
                     message: AgentMessage::user("later"),
                     origin: None,
+                    ui: None,
                 },
                 false,
             )
@@ -562,6 +565,7 @@ mod tests {
                     timestamp: chrono::Utc::now(),
                     message: AgentMessage::user("blocked"),
                     origin: None,
+                    ui: None,
                 },
                 false,
             )
