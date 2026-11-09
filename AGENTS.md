@@ -90,7 +90,7 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 - 外部会话：`~/.manox/external-sessions/`（外部 CLI 会话由 manox-app 侧的 cx 驱动，目录约定在本仓库文档维护）
 - 设置：`~/.manox/settings.toml`（终端主题目录 `~/.manox/themes/` 由宿主侧维护，本仓库不读取）
 - 子 agent：`~/.claude/agents/*.md`（frontmatter name/description/tools/model + 正文；每个定义解析为引擎内部调度配置，模型面统一走 Captain 的 `Steer` 工具：`ext/subagent/` 的 SubagentRuntime/SubagentProvider/能力协商/descriptor）；MCP：`~/.manox/mcp.json`（Claude Code `mcpServers` schema，stdio 或 HTTP；项目级 `.mcp.json` 与插件 `.mcp.json` 同 schema，合并序 plugin < global < project）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
-- WS 网关端点（`cx ahp`，CLI 在 manox-app）：`~/.manox/gateway-ws.json`（0600；启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ahp?token=…`；每次启动覆盖，进程退出后过期）。网关每机单例：`ws::start` 以非阻塞 flock 持 `~/.manox/gateway.lock`，他进程已持锁时本次 start 不绑定不发布（loud no-op）。
+- WS 网关端点（`cx web`，CLI 在 manox-app；路由为 `/ahp`）：`~/.manox/gateway-ws.json`（0600；启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ahp?token=…`；每次启动覆盖，进程退出后过期）。网关每机单例：`ws::start` 以非阻塞 flock 持 `~/.manox/gateway.lock`，他进程已持锁时本次 start 不绑定不发布（loud no-op）。
 - cx CLI 状态：`~/.manox/cx.db`、IPC socket `~/.manox/sessions/`（该目录只承载 cx 的 socket 与注册 JSON，不是会话 journal 目录）、codex 注入目录 `~/.manox/.codex/`、`~/.manox/.patch_source`（CLI 本体在 manox-app，状态目录与本仓库共享）
 - API key 源：macOS Keychain（`keychain:SERVICE`）/ env（`env:VAR`）/ 字面量（`literal:...`）/ shell（`$(shell ...)`）
 - **百炼 anthropic 兼容端点**（`*.aliyuncs.com/apps/anthropic`）：不报 `cache_creation_input_tokens`（恒 0），只报 `cache_read_input_tokens`。故 manox 的 `cache_creation` 记账对该端点恒 0 属预期，非解析/累加/持久化 bug（三链路均正确，记的就是端点报的 0）。`LastBreakpointOnly` 与 `Full` policy 对该端点均有效。
