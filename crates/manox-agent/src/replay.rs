@@ -3,8 +3,7 @@
 //!
 //! This fold is the authority behind the engine's restore path (K2): every
 //! field a §C.2 state-change entry carries rebuilds from the chain, and the
-//! session sidecar is a derived cache that only fills fields the chain has
-//! never seen (legacy journals predate the decision-point entries). The
+//! chain is the only source — replay reads the journal and nothing else. The
 //! match below is exhaustive — a new kernel entry variant must classify
 //! here (state-bearing or ignored) before it compiles, mirroring the
 //! projection fold's coverage gate.
@@ -14,14 +13,13 @@
 //! IO inside the fold. That is the replay half of the L10 gate; the
 //! regression half (disk reload == live memory) lives in the engine tests.
 
-use manox_harness::session::SessionTreeEntry;
+use manox_harness::session::Event;
 use manox_harness::session::jsonl::JournalRecord;
 
 /// The journal-backed observable state of one thread, folded from its
-/// active chain. Every field is `None` while the chain carries no entry
-/// for it — the restore path falls back to the sidecar cache for exactly
-/// those fields (K2 migration window: old journals never saw the
-/// decision-point entries).
+/// active chain. Every field is `None` while the chain carries no entry for
+/// it — the journal is the only source of replay state, so a field with no
+/// entry has no journaled value.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReplayedThreadState {
     /// Display title from the last `title` entry.
@@ -116,13 +114,13 @@ pub fn unsettled_interactions(
     let mut questions = Vec::new();
     for record in records {
         match &record.entry {
-            SessionTreeEntry::Approval {
+            Event::Approval {
                 kind,
                 auth_id,
                 payload,
                 ..
             } => track(&mut approvals, kind, auth_id, payload),
-            SessionTreeEntry::Question {
+            Event::Question {
                 kind,
                 auth_id,
                 payload,
@@ -142,10 +140,10 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
     for record in records {
         match &record.entry {
             // ── journal-backed state (K2 authority) ─────────────────────
-            SessionTreeEntry::Title { title, .. } => {
+            Event::Title { title, .. } => {
                 state.title = Some(title.clone());
             }
-            SessionTreeEntry::PinnedArchived {
+            Event::PinnedArchived {
                 pinned, archived, ..
             } => {
                 state.pinned = Some(*pinned);
@@ -153,45 +151,45 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             }
             // Durable user annotations: latest-wins per annotation id on the
             // replayed map — the same fold the notes cell renders from.
-            SessionTreeEntry::AnnotationSet { annotation, .. } => {
+            Event::AnnotationSet { annotation, .. } => {
                 if let Some(id) = annotation.get("id").and_then(serde_json::Value::as_str) {
                     state
                         .annotations
                         .insert(id.to_string(), Some(annotation.clone()));
                 }
             }
-            SessionTreeEntry::AnnotationRemoved { annotation_id, .. } => {
+            Event::AnnotationRemoved { annotation_id, .. } => {
                 state.annotations.insert(annotation_id.clone(), None);
             }
-            SessionTreeEntry::ProjectChange { path, .. } => {
+            Event::ProjectChange { path, .. } => {
                 state.project = Some(path.clone());
             }
-            SessionTreeEntry::PlanUpdate { snapshot, .. } => {
+            Event::PlanUpdate { snapshot, .. } => {
                 state.plan_snapshot = Some(snapshot.clone());
             }
-            SessionTreeEntry::Goal { goal, .. } => {
+            Event::Goal { goal, .. } => {
                 state.goal = Some(goal.clone().unwrap_or(serde_json::Value::Null));
             }
-            SessionTreeEntry::CwdChange { cwd, .. } => {
+            Event::CwdChange { cwd, .. } => {
                 state.cwd = Some(cwd.clone());
             }
             // ── session config (the journal rows are the durable authority):
             // last row wins, exactly the fold the AHP projection runs.
-            SessionTreeEntry::AccessModeChange { mode, .. } => {
+            Event::AccessModeChange { mode, .. } => {
                 state.access_mode = Some(mode.clone());
             }
-            SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => {
+            Event::ThinkingLevelChange { thinking_level, .. } => {
                 state.reasoning_effort = Some(thinking_level.clone());
             }
             // ── transcript + display domain (rebuilt by the kernel's own
             //    transcript projection, not by this fold) ────────────────
-            SessionTreeEntry::Message { .. }
-            | SessionTreeEntry::UiNote { .. }
-            | SessionTreeEntry::Custom { .. }
-            | SessionTreeEntry::CustomMessage { .. }
-            | SessionTreeEntry::Compaction { .. }
-            | SessionTreeEntry::CompactionStarted { .. }
-            | SessionTreeEntry::BranchSummary { .. } => {}
+            Event::Message { .. }
+            | Event::UiNote { .. }
+            | Event::Custom { .. }
+            | Event::CustomMessage { .. }
+            | Event::Compaction { .. }
+            | Event::CompactionStarted { .. }
+            | Event::BranchSummary { .. } => {}
             // ── live-only or kernel-owned state: the active tool set rides
             //    `active_tools_change` through the kernel, and
             //    lifecycle/delta/metrics rows carry no persistable thread
@@ -200,33 +198,33 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             // The model row is here too, deliberately: the harness's own
             // restore projection reads it onto the agent, so this fold has
             // no second model answer to carry.
-            SessionTreeEntry::ModelChange { .. }
-            | SessionTreeEntry::ActiveToolsChange { .. }
-            | SessionTreeEntry::TurnStart { .. }
-            | SessionTreeEntry::TurnFinish { .. }
-            | SessionTreeEntry::Stop { .. }
-            | SessionTreeEntry::Retry { .. }
-            | SessionTreeEntry::ErrorEvent { .. }
-            | SessionTreeEntry::AgentTextDelta { .. }
-            | SessionTreeEntry::AgentThinkingDelta { .. }
-            | SessionTreeEntry::ToolCall { .. }
-            | SessionTreeEntry::ToolResult { .. }
-            | SessionTreeEntry::ToolOutputChunk { .. }
-            | SessionTreeEntry::SubagentChild { .. }
-            | SessionTreeEntry::SubagentProgress { .. }
-            | SessionTreeEntry::BrowserSuites { .. }
-            | SessionTreeEntry::BackgroundTask { .. }
-            | SessionTreeEntry::Approval { .. }
-            | SessionTreeEntry::Question { .. }
-            | SessionTreeEntry::Label { .. }
-            | SessionTreeEntry::SessionInfo { .. }
-            | SessionTreeEntry::Leaf { .. }
-            | SessionTreeEntry::RunStarted { .. }
-            | SessionTreeEntry::RunSettled { .. }
-            | SessionTreeEntry::RunEscalated { .. }
-            | SessionTreeEntry::RunContinued { .. }
-            | SessionTreeEntry::RunGuided { .. }
-            | SessionTreeEntry::Metrics { .. } => {}
+            Event::ModelChange { .. }
+            | Event::ActiveToolsChange { .. }
+            | Event::TurnStart { .. }
+            | Event::TurnFinish { .. }
+            | Event::Stop { .. }
+            | Event::Retry { .. }
+            | Event::ErrorEvent { .. }
+            | Event::AgentTextDelta { .. }
+            | Event::AgentThinkingDelta { .. }
+            | Event::ToolCall { .. }
+            | Event::ToolResult { .. }
+            | Event::ToolOutputChunk { .. }
+            | Event::SubagentChild { .. }
+            | Event::SubagentProgress { .. }
+            | Event::BrowserSuites { .. }
+            | Event::BackgroundTask { .. }
+            | Event::Approval { .. }
+            | Event::Question { .. }
+            | Event::Label { .. }
+            | Event::SessionInfo { .. }
+            | Event::Leaf { .. }
+            | Event::RunStarted { .. }
+            | Event::RunSettled { .. }
+            | Event::RunEscalated { .. }
+            | Event::RunContinued { .. }
+            | Event::RunGuided { .. }
+            | Event::Metrics { .. } => {}
         }
     }
     state
@@ -236,9 +234,9 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use manox_harness::session::SessionTreeEntry as E;
+    use manox_harness::session::Event as E;
 
-    fn record(entry: SessionTreeEntry) -> JournalRecord {
+    fn record(entry: Event) -> JournalRecord {
         // The fold never reads seq; a dense counter keeps the fixtures
         // honest about chain order.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -252,7 +250,7 @@ mod tests {
         (uuid::Uuid::new_v4().to_string(), None, Utc::now())
     }
 
-    fn park_entry(kind: &str, is_approval: bool, auth: &str) -> SessionTreeEntry {
+    fn park_entry(kind: &str, is_approval: bool, auth: &str) -> Event {
         let id = uuid::Uuid::new_v4().to_string();
         let (_, parent, ts) = envelope();
         let payload = serde_json::json!({
@@ -347,17 +345,6 @@ mod tests {
         assert_eq!(state.title.as_deref(), Some("second"));
         assert_eq!(state.pinned, Some(false));
         assert_eq!(state.archived, Some(true));
-    }
-
-    #[test]
-    fn fields_without_entries_stay_none() {
-        // The K2 fallback contract: a legacy chain with no decision-point
-        // entries leaves every field `None` so the restore path reads the
-        // sidecar cache instead of overwriting it with defaults.
-        let state = replay_thread_state(&[]);
-        assert_eq!(state, ReplayedThreadState::default());
-        assert!(state.title.is_none() && state.pinned.is_none());
-        assert!(state.project.is_none());
     }
 
     #[test]

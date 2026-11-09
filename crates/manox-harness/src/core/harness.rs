@@ -17,7 +17,7 @@ use crate::agent_loop::StreamFn;
 use crate::compaction::{self, CompactionPreparation, CompactionResult, CompactionSettings};
 use crate::core::provider::retry;
 use crate::env::{ExecutionEnv, TokioExecutionEnv};
-use crate::session::{CompactionAuthorship, Session, SessionStorage, SessionTreeEntry};
+use crate::session::{CompactionAuthorship, Event, Session, SessionStorage};
 use crate::tool::{AgentToolResult, LocalToolContext, ToolState};
 use crate::types::{
     AgentContext, AgentEvent, AgentMessage, CacheRetention, ContentBlock, Model, StopReason, Usage,
@@ -693,7 +693,7 @@ pub struct SessionBeforeCompactEvent<'a> {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub preparation: &'a CompactionPreparation,
-    pub branch_entries: &'a [SessionTreeEntry],
+    pub branch_entries: &'a [Event],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_instructions: Option<&'a str>,
 }
@@ -728,7 +728,7 @@ pub struct SessionBeforeTreeEvent<'a> {
     pub old_leaf_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub common_ancestor_id: Option<&'a str>,
-    pub entries_to_summarize: &'a [SessionTreeEntry],
+    pub entries_to_summarize: &'a [Event],
     pub user_wants_summary: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_instructions: Option<&'a str>,
@@ -2724,7 +2724,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             .rev()
             .find(|e| old_ids.contains(e.id()))
             .map(|e| e.id().to_string());
-        let abandoned: Vec<SessionTreeEntry> = old_path
+        let abandoned: Vec<Event> = old_path
             .iter()
             .rev()
             .take_while(|e| common_ancestor.as_deref() != Some(e.id()))
@@ -2737,11 +2737,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         // The target's message text rides on the result for user/custom
         // targets.
         let editor_text = match &target_entry {
-            SessionTreeEntry::Message {
+            Event::Message {
                 message: AgentMessage::User { content, .. },
                 ..
             }
-            | SessionTreeEntry::CustomMessage { content, .. } => Some(
+            | Event::CustomMessage { content, .. } => Some(
                 content
                     .iter()
                     .filter_map(|b| match b {
@@ -2950,12 +2950,12 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         // Move the cursor (a user/custom target focuses its parent), then
         // hang the summary on the new branch when one was produced.
         let new_leaf = match &target_entry {
-            SessionTreeEntry::Message {
+            Event::Message {
                 message: AgentMessage::User { .. },
                 parent_id,
                 ..
             }
-            | SessionTreeEntry::CustomMessage { parent_id, .. } => parent_id.clone(),
+            | Event::CustomMessage { parent_id, .. } => parent_id.clone(),
             _ => Some(target_id.to_string()),
         };
         self.session.move_to(new_leaf.as_deref()).await?;
@@ -4081,8 +4081,8 @@ fn extract_summary(message: &AgentMessage) -> (String, Option<Usage>) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::session::Event;
     use crate::session::SessionStorage;
-    use crate::session::SessionTreeEntry;
     use crate::types::{AgentEvent, ContentBlock, StopReason, ThinkingKind, Usage};
     use tokio_util::sync::CancellationToken;
 
@@ -4271,7 +4271,7 @@ pub(crate) mod tests {
 
     // In-memory session storage for testing.
     pub(crate) struct MemStorage {
-        entries: std::sync::Mutex<Vec<SessionTreeEntry>>,
+        entries: std::sync::Mutex<Vec<Event>>,
         leaf_id: std::sync::Mutex<Option<String>>,
         /// Number of `append_entry` calls so far.
         append_calls: std::sync::Mutex<u64>,
@@ -4298,8 +4298,8 @@ pub(crate) mod tests {
 
         /// Rebuild a storage over persisted entries, cursor at the tail — the
         /// same state a reopen of the JSONL file would produce.
-        fn from_entries(entries: Vec<SessionTreeEntry>) -> Self {
-            let leaf_id = entries.last().and_then(SessionTreeEntry::leaf_cursor_after);
+        fn from_entries(entries: Vec<Event>) -> Self {
+            let leaf_id = entries.last().and_then(Event::leaf_cursor_after);
             MemStorage {
                 entries: std::sync::Mutex::new(entries),
                 leaf_id: std::sync::Mutex::new(leaf_id),
@@ -4320,10 +4320,10 @@ pub(crate) mod tests {
         }
         async fn append_entry(
             &self,
-            entry: &SessionTreeEntry,
+            entry: &Event,
             _write: crate::session::JournalWrite,
         ) -> Result<u64, anyhow::Error> {
-            if matches!(entry, SessionTreeEntry::ActiveToolsChange { .. })
+            if matches!(entry, Event::ActiveToolsChange { .. })
                 && *self.fail_active_tools.lock().unwrap()
             {
                 anyhow::bail!("injected active-tools change failure");
@@ -4345,7 +4345,7 @@ pub(crate) mod tests {
             *self.leaf_id.lock().unwrap() = cursor;
             Ok(seq)
         }
-        async fn get_entry(&self, id: &str) -> Result<Option<SessionTreeEntry>, anyhow::Error> {
+        async fn get_entry(&self, id: &str) -> Result<Option<Event>, anyhow::Error> {
             Ok(self
                 .entries
                 .lock()
@@ -4368,7 +4368,7 @@ pub(crate) mod tests {
         async fn get_entries(
             &self,
             cursor: crate::session::SessionEntryCursor,
-        ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+        ) -> Result<Vec<Event>, anyhow::Error> {
             let entries = self.entries.lock().unwrap();
             let tail = entries.iter().skip(cursor.after_entry_seq);
             Ok(match cursor.limit {
@@ -4379,7 +4379,7 @@ pub(crate) mod tests {
         async fn find_entries(
             &self,
             entry_type: crate::session::EntryType,
-        ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+        ) -> Result<Vec<Event>, anyhow::Error> {
             Ok(self
                 .entries
                 .lock()
@@ -4396,7 +4396,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match e {
-                    SessionTreeEntry::Label {
+                    Event::Label {
                         target_id, label, ..
                     } if target_id == id => Some(label.as_deref().unwrap_or("").trim().to_string()),
                     _ => None,
@@ -4411,7 +4411,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match e {
-                    SessionTreeEntry::SessionInfo { name, .. } => {
+                    Event::SessionInfo { name, .. } => {
                         Some(name.as_deref().unwrap_or("").trim().to_string())
                     }
                     _ => None,
@@ -4424,15 +4424,16 @@ pub(crate) mod tests {
             let mut stats = crate::session::SessionStats::default();
             for entry in entries.iter() {
                 let usage = match entry {
-                    SessionTreeEntry::Message { message, .. } => {
+                    Event::Message { message, .. } => {
                         stats.message_count += 1;
                         match message {
                             AgentMessage::Assistant { usage, .. } => Some(&**usage),
                             _ => None,
                         }
                     }
-                    SessionTreeEntry::Compaction { usage, .. }
-                    | SessionTreeEntry::BranchSummary { usage, .. } => usage.as_ref(),
+                    Event::Compaction { usage, .. } | Event::BranchSummary { usage, .. } => {
+                        usage.as_ref()
+                    }
                     _ => None,
                 };
                 let Some(usage) = usage.filter(|u| u.cost.is_some()) else {
@@ -4449,10 +4450,7 @@ pub(crate) mod tests {
             }
             Ok(stats)
         }
-        async fn get_path(
-            &self,
-            leaf_id: Option<&str>,
-        ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+        async fn get_path(&self, leaf_id: Option<&str>) -> Result<Vec<Event>, anyhow::Error> {
             // Mirror the JSONL backend: walk the full path to the root, with
             // the same loud errors for an unknown leaf or a broken chain.
             // Returning every entry regardless of the cursor would mask
@@ -4463,9 +4461,9 @@ pub(crate) mod tests {
                 Some(id) if entries.iter().any(|e| e.id() == id) => id.to_string(),
                 Some(id) => anyhow::bail!("entry {id} not found"),
             };
-            let mut index: std::collections::HashMap<&str, &SessionTreeEntry> =
+            let mut index: std::collections::HashMap<&str, &Event> =
                 entries.iter().map(|e| (e.id(), e)).collect();
-            let mut path: Vec<&SessionTreeEntry> = Vec::new();
+            let mut path: Vec<&Event> = Vec::new();
             let mut current_id: Option<&str> = Some(&target_id);
             while let Some(id) = current_id {
                 let entry = match index.remove(id) {
@@ -4612,7 +4610,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let compaction_id = match entries.last() {
-            Some(SessionTreeEntry::Compaction { id, .. }) => id.clone(),
+            Some(Event::Compaction { id, .. }) => id.clone(),
             other => panic!("expected a compaction entry, got {:?}", other),
         };
         // The cursor is the compaction's own id, not a leaf's target.
@@ -4910,7 +4908,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .all(|e| !matches!(e, SessionTreeEntry::Compaction { .. })),
+                .all(|e| !matches!(e, Event::Compaction { .. })),
             "no compaction entry persisted"
         );
         // The transcript is untouched.
@@ -5086,7 +5084,7 @@ pub(crate) mod tests {
         }
     }
 
-    async fn compaction_entries(harness: &AgentHarness<MemStorage>) -> Vec<SessionTreeEntry> {
+    async fn compaction_entries(harness: &AgentHarness<MemStorage>) -> Vec<Event> {
         harness
             .session()
             .storage()
@@ -5094,7 +5092,7 @@ pub(crate) mod tests {
             .await
             .expect("entries")
             .into_iter()
-            .filter(|e| matches!(e, SessionTreeEntry::Compaction { .. }))
+            .filter(|e| matches!(e, Event::Compaction { .. }))
             .collect()
     }
 
@@ -5167,7 +5165,7 @@ pub(crate) mod tests {
         assert!(
             entries.iter().any(|e| matches!(
                 e,
-                SessionTreeEntry::Message {
+                Event::Message {
                     message: AgentMessage::Assistant {
                         stop_reason: Some(StopReason::Error),
                         ..
@@ -5998,7 +5996,7 @@ pub(crate) mod tests {
         let rows: Vec<&str> = entries
             .iter()
             .filter_map(|e| match e {
-                SessionTreeEntry::ModelChange { model_id, .. } => Some(model_id.as_str()),
+                Event::ModelChange { model_id, .. } => Some(model_id.as_str()),
                 _ => None,
             })
             .collect();
@@ -6362,7 +6360,7 @@ pub(crate) mod tests {
         let first_reply = entries
             .iter()
             .find_map(|e| match e {
-                SessionTreeEntry::Message {
+                Event::Message {
                     id,
                     message: AgentMessage::Assistant { .. },
                     ..
@@ -6406,7 +6404,7 @@ pub(crate) mod tests {
         let summary = entries
             .iter()
             .find_map(|e| match e {
-                SessionTreeEntry::BranchSummary { summary, .. } => Some(summary.clone()),
+                Event::BranchSummary { summary, .. } => Some(summary.clone()),
                 _ => None,
             })
             .expect("hook summary persisted");
@@ -6550,7 +6548,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match e {
-                    SessionTreeEntry::ActiveToolsChange {
+                    Event::ActiveToolsChange {
                         active_tool_names, ..
                     } => Some(active_tool_names.clone()),
                     _ => None,
@@ -7070,7 +7068,7 @@ pub(crate) mod tests {
         assert!(
             !entries
                 .iter()
-                .any(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. })),
+                .any(|e| matches!(e, Event::ThinkingLevelChange { .. })),
             "a thinking-level change must not be journaled: {entries:?}"
         );
     }
@@ -7301,7 +7299,7 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .find_map(|e| match e {
-                SessionTreeEntry::Compaction {
+                Event::Compaction {
                     summary,
                     from_hook,
                     details,
@@ -7917,7 +7915,7 @@ pub(crate) mod tests {
             .unwrap();
         let entries = storage.get_entries(Default::default()).await.unwrap();
         let boundary = entries.iter().find_map(|e| match e {
-            SessionTreeEntry::Compaction {
+            Event::Compaction {
                 summary,
                 tokens_before,
                 ..
@@ -8276,7 +8274,7 @@ pub(crate) mod tests {
         assert!(
             !entries
                 .iter()
-                .any(|e| matches!(e, SessionTreeEntry::ModelChange { .. })),
+                .any(|e| matches!(e, Event::ModelChange { .. })),
             "a model switch must not be journaled: {entries:?}"
         );
     }
@@ -8333,7 +8331,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         match entries.last() {
-            Some(SessionTreeEntry::ActiveToolsChange {
+            Some(Event::ActiveToolsChange {
                 active_tool_names, ..
             }) => assert_eq!(active_tool_names, &["echo".to_string()]),
             other => panic!("expected a trailing ActiveToolsChange, got {other:?}"),
@@ -8425,7 +8423,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         match entries.last() {
-            Some(SessionTreeEntry::ActiveToolsChange {
+            Some(Event::ActiveToolsChange {
                 active_tool_names, ..
             }) => assert_eq!(
                 active_tool_names,
@@ -8780,7 +8778,7 @@ pub(crate) mod tests {
         let first_reply_id = entries
             .iter()
             .find_map(|e| match e {
-                SessionTreeEntry::Message {
+                Event::Message {
                     id,
                     message: AgentMessage::Assistant { .. },
                     ..
@@ -8824,7 +8822,7 @@ pub(crate) mod tests {
         assert!(
             entries
                 .iter()
-                .any(|e| matches!(e, SessionTreeEntry::BranchSummary { .. })),
+                .any(|e| matches!(e, Event::BranchSummary { .. })),
             "{entries:?}"
         );
     }
@@ -8872,7 +8870,7 @@ pub(crate) mod tests {
         let first_reply_id = entries
             .iter()
             .find_map(|e| match e {
-                SessionTreeEntry::Message {
+                Event::Message {
                     id,
                     message: AgentMessage::Assistant { .. },
                     ..
@@ -8896,7 +8894,7 @@ pub(crate) mod tests {
         assert!(
             !entries
                 .iter()
-                .any(|e| matches!(e, SessionTreeEntry::BranchSummary { .. })),
+                .any(|e| matches!(e, Event::BranchSummary { .. })),
             "no summary entry without summarize: {entries:?}"
         );
 
@@ -8905,7 +8903,7 @@ pub(crate) mod tests {
         let first_user_id = entries
             .iter()
             .find_map(|e| match e {
-                SessionTreeEntry::Message {
+                Event::Message {
                     id,
                     message: AgentMessage::User { .. },
                     ..
@@ -8959,7 +8957,7 @@ pub(crate) mod tests {
         let first_reply_id = entries
             .iter()
             .find_map(|e| match e {
-                SessionTreeEntry::Message {
+                Event::Message {
                     id,
                     message: AgentMessage::Assistant { .. },
                     ..
@@ -8990,7 +8988,7 @@ pub(crate) mod tests {
         assert!(
             entries.iter().any(|e| matches!(
                 e,
-                SessionTreeEntry::Label { target_id, label, .. }
+                Event::Label { target_id, label, .. }
                     if target_id == &summary_id && label.as_deref() == Some("nav-summary")
             )),
             "label must attach to the summary entry: {entries:?}"
@@ -9000,7 +8998,7 @@ pub(crate) mod tests {
         let first_user_id = entries
             .iter()
             .find_map(|e| match e {
-                SessionTreeEntry::Message {
+                Event::Message {
                     id,
                     message: AgentMessage::User { .. },
                     ..
@@ -9028,7 +9026,7 @@ pub(crate) mod tests {
         assert!(
             entries.iter().any(|e| matches!(
                 e,
-                SessionTreeEntry::Label { target_id, label, .. }
+                Event::Label { target_id, label, .. }
                     if target_id == &first_user_id && label.as_deref() == Some("nav-target")
             )),
             "label must attach to the target entry without a summary: {entries:?}"
@@ -9080,7 +9078,7 @@ pub(crate) mod tests {
         let first_reply_id = entries
             .iter()
             .find_map(|e| match e {
-                SessionTreeEntry::Message {
+                Event::Message {
                     id,
                     message: AgentMessage::Assistant { .. },
                     ..
@@ -9110,7 +9108,7 @@ pub(crate) mod tests {
         assert!(
             !entries
                 .iter()
-                .any(|e| matches!(e, SessionTreeEntry::BranchSummary { .. })),
+                .any(|e| matches!(e, Event::BranchSummary { .. })),
             "aborted navigation must not append a summary: {entries:?}"
         );
 
@@ -9138,9 +9136,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            !entries
-                .iter()
-                .any(|e| matches!(e, SessionTreeEntry::Label { .. })),
+            !entries.iter().any(|e| matches!(e, Event::Label { .. })),
             "cancelled navigation must not append anything: {entries:?}"
         );
     }
@@ -9219,7 +9215,7 @@ pub(crate) mod tests {
         assert!(
             entries.iter().any(|e| matches!(
                 e,
-                SessionTreeEntry::Message {
+                Event::Message {
                     message: AgentMessage::User { content, .. },
                     ..
                 } if matches!(&content[0], ContentBlock::Text { text, .. } if text == "appended")
@@ -9267,7 +9263,7 @@ pub(crate) mod tests {
         assert!(
             entries.iter().any(|e| matches!(
                 e,
-                SessionTreeEntry::Message {
+                Event::Message {
                     message: AgentMessage::BashExecution { command, .. },
                     ..
                 } if command == "echo mid-run"
@@ -9373,7 +9369,7 @@ pub(crate) mod tests {
                 continue;
             };
             let entry = harness.session().storage().get_entry(id).await.unwrap();
-            let Some(SessionTreeEntry::Message {
+            let Some(Event::Message {
                 message: stored, ..
             }) = entry
             else {
@@ -9692,7 +9688,7 @@ pub(crate) mod tests {
         assert!(
             !entries
                 .iter()
-                .any(|e| matches!(e, SessionTreeEntry::ModelChange { .. })),
+                .any(|e| matches!(e, Event::ModelChange { .. })),
             "shutdown must not flush queued mutations: {entries:?}"
         );
     }
@@ -9834,7 +9830,7 @@ pub(crate) mod tests {
             .unwrap();
         assert!(entries.iter().any(|e| matches!(
             e,
-            SessionTreeEntry::ActiveToolsChange { active_tool_names, .. }
+            Event::ActiveToolsChange { active_tool_names, .. }
                 if active_tool_names == &["echo".to_string()]
         )));
     }
@@ -10441,7 +10437,7 @@ pub(crate) mod tests {
         let persisted: Vec<&str> = entries
             .iter()
             .filter_map(|e| match e {
-                SessionTreeEntry::Message {
+                Event::Message {
                     message: AgentMessage::User { content, .. },
                     ..
                 } => content.iter().find_map(|b| match b {

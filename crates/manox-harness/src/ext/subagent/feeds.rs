@@ -257,7 +257,7 @@ mod tests {
         let mut second = child_journal_feed(&run_id).expect("clones keep coming");
         tx.send(JournalEvent {
             seq: 4,
-            entry: std::sync::Arc::new(crate::session::SessionTreeEntry::Title {
+            entry: std::sync::Arc::new(crate::session::Event::Title {
                 id: "e-4".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -356,7 +356,7 @@ mod tests {
         assert!(
             matches!(
                 entries.last(),
-                Some(crate::session::SessionTreeEntry::AccessModeChange { mode, .. }) if mode == "sandbox"
+                Some(crate::session::Event::AccessModeChange { mode, .. }) if mode == "sandbox"
             ),
             "the propagated row landed in the child journal: {entries:?}"
         );

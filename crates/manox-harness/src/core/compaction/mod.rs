@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::session::SessionTreeEntry;
+use crate::session::Event;
 use crate::types::{AgentMessage, ContentBlock, StopReason, Usage};
 
 /// Compaction settings. Serializes as camelCase (`reserveTokens`,
@@ -655,7 +655,7 @@ pub fn build_turn_prefix_prompt(prefix_messages: &[AgentMessage]) -> String {
 /// Returns `None` when nothing would be summarized — the session layer
 /// answers with "Nothing to compact".
 pub fn build_preparation(
-    branch: &[SessionTreeEntry],
+    branch: &[Event],
     messages: &[AgentMessage],
     cut_point: &CutPoint,
     first_kept_entry_id: Option<String>,
@@ -670,7 +670,7 @@ pub fn build_preparation(
     // not the compaction entry itself. Folding it twice would duplicate the
     // prior summary in the prompt.
     let previous_summary = branch.iter().rev().find_map(|e| match e {
-        SessionTreeEntry::Compaction { summary, .. } => Some(summary.clone()),
+        Event::Compaction { summary, .. } => Some(summary.clone()),
         _ => None,
     });
     let start = usize::from(previous_summary.is_some());
@@ -738,22 +738,19 @@ impl std::error::Error for NothingToCompact {}
 /// classified as read / written / edited, and a previous (non-hook) compaction
 /// carrying `{readFiles, modifiedFiles}` details seeds the accumulator so file
 /// operations survive across repeated compactions.
-fn extract_file_operations(
-    messages: &[AgentMessage],
-    branch: &[SessionTreeEntry],
-) -> FileOperations {
+fn extract_file_operations(messages: &[AgentMessage], branch: &[Event]) -> FileOperations {
     let mut ops = FileOperations::default();
     // The latest compaction on the path seeds the accumulator with the file
     // lists it recorded. A hook-authored boundary owns its own details shape;
     // only the harness's `{readFiles, modifiedFiles}` payload carries forward.
-    if let Some(SessionTreeEntry::Compaction {
+    if let Some(Event::Compaction {
         details: Some(d),
         from_hook,
         ..
     }) = branch
         .iter()
         .rev()
-        .find(|e| matches!(e, SessionTreeEntry::Compaction { .. }))
+        .find(|e| matches!(e, Event::Compaction { .. }))
         && *from_hook != Some(true)
     {
         if let Some(arr) = d.get("readFiles").and_then(|v| v.as_array()) {

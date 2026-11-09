@@ -232,7 +232,7 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 ### W2 域翻译与状态收敛（manox）
 
-- `projection.rs`（manox-ahp-runtime）：kernel 会话记录 **全射** → AHP 动作（消息、流式 delta 的 create-then-append、tool-call 生命周期、usage、lifecycle、title/activity、workingDirectories、config 承载 model/effort/accessMode/browserSuite（行源 `model_change`/`thinking_level_change`/`access_mode_change`，见 §H.8）、compaction、分支/摘要）；projection 值 → 通道状态字段。**2026-10-09 起无中间 wire 词汇**：`manox-journal`（§C.2 v2 遗产词汇 crate）已删除，投影输入即 kernel `SessionTreeEntry` 记录（#878）。
+- `projection.rs`（manox-ahp-runtime）：kernel 会话记录 **全射** → AHP 动作（消息、流式 delta 的 create-then-append、tool-call 生命周期、usage、lifecycle、title/activity、workingDirectories、config 承载 model/effort/accessMode/browserSuite（行源 `model_change`/`thinking_level_change`/`access_mode_change`，见 §H.8）、compaction、分支/摘要）；projection 值 → 通道状态字段。**2026-10-09 起无中间 wire 词汇**：`manox-journal`（§C.2 v2 遗产词汇 crate）已删除，投影输入即 kernel `Event` 记录（#878）。
 - 审批面：`Approve` → `toolCallReady`(+`options[]`)/`toolCallConfirmed`（含 mid-execution 再确认、可编辑参数、result confirmation 三态的映射取舍）；`AskUserQuestion` → elicitation；`PlanVerdict` → x-manox-plan。
 - 副作用派发：`chat/turnStarted|pendingMessageSet|turnCancelled|toolCallConfirmed|inputCompleted|isArchivedChanged|workingDirectory*` 等 → 现有内核调用（原 27 个 note 的落点）。
 - x-manox 全线 + `resource*` 最小面（`resourceRead/Write/List/Delete` + ContentRef，落在会话工作目录围栏内，fail-closed）。
@@ -489,7 +489,7 @@ confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
 1. **journal**：`thread_store.journal_title` 经 `dispatch_store_journal_row` 追加 `title` 行。
    kind 与 payload 与 `engine.rs:513` 为 `TitleChanged` 产的完全一致，所以用户重命名与模型生成标题
    落**同一种行**。这一行是 v2 与 AHP **两边唯一的路线**：v2 `projections.rs:203` 折
-   `SessionTreeEntry::Title`，AHP `translate/actions.rs:595` 读 journal；而实时
+   `Event::Title`，AHP `translate/actions.rs:595` 读 journal；而实时
    `ThreadEvent::TitleChanged` 恰在 `translate.rs:104` 的 `Skip` 表里——它本就不该被折叠，只该被 journal。
 2. **内存行**：`rename_thread` 更新 `title_override` 槽（`display_title()` 第一优先级），
    facade 另经 `handle_notice` 拿到实时事件，侧栏立刻改名。
@@ -1028,7 +1028,7 @@ VS Code 拿到的是一个普通单选问题，不是它的原生 plan-review �
 
 v0.6.5 把 session config 的权威放在 conversation 对象行（`conversation_config.rs` 旧注释
 「The journal carries no configuration of its own」），折叠器只认 journal 行但没有生产者：
-`model_change`/`thinking_level_change` 存在折叠臂（`SessionTreeEntry::ModelChange` /
+`model_change`/`thinking_level_change` 存在折叠臂（`Event::ModelChange` /
 `ThinkingLevelChange` → `session/configChanged`）却无人落行，`accessMode` 连行类型都没有。
 后果：任何重订阅/宿主重启后 config 座位折不出这三键，客户端模型芯片与访问菜单回落默认值
 ——纯显示漂移，但违反 L10（`快照 == fold(重放)`）。本节 as-built 把权威反转回来：

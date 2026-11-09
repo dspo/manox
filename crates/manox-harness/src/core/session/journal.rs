@@ -65,13 +65,21 @@ pub enum JournalError {
     Closed,
     /// The cross-process fence stayed held past its budget.
     Busy { path: PathBuf, budget: Duration },
+    /// The file's header names a format this build does not read. The
+    /// journal has one on-disk format; an older file is converted by the
+    /// one-time operator migration, never by the runtime.
+    UnsupportedFormat {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
     /// The append failed for any other reason.
     Failed(anyhow::Error),
 }
 
 impl JournalError {
     /// Recover a typed journal error that travelled through `anyhow` (the
-    /// storage write face is `anyhow`-shaped), so `Busy` and `Closed` stay
+    /// storage write face is `anyhow`-shaped), so the typed variants stay
     /// matchable at the seam that produced them.
     pub(crate) fn recover(err: anyhow::Error) -> Self {
         match err.downcast::<JournalError>() {
@@ -100,6 +108,17 @@ impl std::fmt::Display for JournalError {
             JournalError::Busy { path, budget } => write!(
                 f,
                 "journal write fence stayed held for {budget:?}: {}",
+                path.display()
+            ),
+            JournalError::UnsupportedFormat {
+                path,
+                found,
+                supported,
+            } => write!(
+                f,
+                "session journal {} is on format v{found}; this build reads only v{supported}. \
+                 The file predates the current format and must be converted by the one-time \
+                 operator migration",
                 path.display()
             ),
             JournalError::Failed(err) => write!(f, "{err:#}"),
@@ -330,7 +349,7 @@ async fn write_one<S: SessionStorage>(
 mod tests {
     use super::*;
     use crate::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
-    use crate::session::{Session, SessionTreeEntry};
+    use crate::session::{Event, Session};
     use crate::types::AgentMessage;
     use std::time::{Duration, Instant};
 
@@ -439,7 +458,7 @@ mod tests {
         let journal = Journal::new(Arc::clone(&storage));
         let first = journal
             .append_verbatim(
-                SessionTreeEntry::Message {
+                Event::Message {
                     id: "m1".into(),
                     parent_id: None,
                     timestamp: chrono::Utc::now(),
@@ -468,7 +487,7 @@ mod tests {
             async move {
                 journal
                     .append_verbatim(
-                        SessionTreeEntry::Message {
+                        Event::Message {
                             id: "m2".into(),
                             parent_id: None,
                             timestamp: chrono::Utc::now(),
@@ -496,7 +515,7 @@ mod tests {
         let started = Instant::now();
         let later = journal
             .append_verbatim(
-                SessionTreeEntry::Message {
+                Event::Message {
                     id: "m3".into(),
                     parent_id: None,
                     timestamp: chrono::Utc::now(),
@@ -537,7 +556,7 @@ mod tests {
         let started = Instant::now();
         let result = journal
             .append_verbatim(
-                SessionTreeEntry::Message {
+                Event::Message {
                     id: "m1".into(),
                     parent_id: None,
                     timestamp: chrono::Utc::now(),

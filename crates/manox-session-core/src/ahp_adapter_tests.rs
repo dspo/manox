@@ -5,7 +5,7 @@ use ahp_types::state::{ResponsePart, ToolCallState, ToolResultContent, TurnState
 use ahp_types::state::{SessionLifecycle, SessionStatus};
 use chrono::{DateTime, Utc};
 use manox_ahp_runtime::ahp::{chat_state, session_state};
-use manox_harness::session::SessionTreeEntry as E;
+use manox_harness::session::Event as E;
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 use manox_harness::types::{AgentMessage, ContentBlock, Usage};
 use serde_json::json;
@@ -724,7 +724,7 @@ mod dispatch {
     use ahp_types::version::PROTOCOL_VERSION;
     use manox_ahp::backend::{Backend, DispatchOutcome};
     use manox_ahp::channels::{chat, session};
-    use manox_harness::session::SessionTreeEntry as E;
+    use manox_harness::session::Event as E;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1828,7 +1828,7 @@ mod dispatch {
         std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
         std::fs::write(
             &session_file,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"s-dispatch\",\
+            "{\"type\":\"session\",\"version\":4,\"id\":\"s-dispatch\",\
          \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
          \"metadata\":{\"host\":\"manox\"}}\n",
         )
@@ -2449,7 +2449,7 @@ mod dispatch {
     /// either protocol face takes.
     ///
     /// The in-memory summary is not the contract. The v2 projection folds
-    /// `SessionTreeEntry::Title` and the AHP translator reads the journal,
+    /// `Event::Title` and the AHP translator reads the journal,
     /// while the live `TitleChanged` event sits on `translate.rs`'s `Skip`
     /// list — so a rename that only flipped the summary would pass a
     /// summary-only assertion and still be invisible to every client following
@@ -2471,7 +2471,7 @@ mod dispatch {
         std::fs::write(
             &session_file,
             format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"{session_id}\",\
+                "{{\"type\":\"session\",\"version\":4,\"id\":\"{session_id}\",\
              \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
              \"metadata\":{{\"host\":\"manox\"}}}}\n"
             ),
@@ -2523,7 +2523,7 @@ mod dispatch {
                 .expect("journal reads")
                 .into_iter()
                 .filter_map(|record| match record.entry {
-                    manox_harness::session::SessionTreeEntry::Title { title, .. } => Some(title),
+                    manox_harness::session::Event::Title { title, .. } => Some(title),
                     _ => None,
                 })
                 .collect();
@@ -3551,7 +3551,7 @@ mod dispatch {
     /// subscriber would have reached — not an empty placeholder.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_extension_baseline_carries_the_folded_state() {
-        use manox_harness::session::SessionTreeEntry as E;
+        use manox_harness::session::Event as E;
         let _guards = install();
         let session_id = "s-ext-baseline";
         super::seed_session(
@@ -4638,7 +4638,7 @@ mod create_intent {
     use manox_ahp::channels::session;
     use manox_harness::provider_registry::ProviderRegistry;
     use manox_harness::provider_registry::{Api, Cost, ProviderConfig, ProviderModelConfig};
-    use manox_harness::session::SessionTreeEntry;
+    use manox_harness::session::Event;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
@@ -4735,7 +4735,7 @@ mod create_intent {
         panic!("the engine never assembled its appender");
     }
 
-    async fn rows(path: &Path) -> Vec<SessionTreeEntry> {
+    async fn rows(path: &Path) -> Vec<Event> {
         manox_harness::session::jsonl::JsonlSessionStorage::open(path)
             .await
             .expect("the journal opens")
@@ -4753,10 +4753,10 @@ mod create_intent {
         for _ in 0..500 {
             if path.exists() {
                 let entries = rows(path).await;
-                let has = |want: fn(&SessionTreeEntry) -> bool| entries.iter().any(want);
-                if has(|e| matches!(e, SessionTreeEntry::ModelChange { .. }))
-                    && has(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. }))
-                    && has(|e| matches!(e, SessionTreeEntry::AccessModeChange { .. }))
+                let has = |want: fn(&Event) -> bool| entries.iter().any(want);
+                if has(|e| matches!(e, Event::ModelChange { .. }))
+                    && has(|e| matches!(e, Event::ThinkingLevelChange { .. }))
+                    && has(|e| matches!(e, Event::AccessModeChange { .. }))
                 {
                     return;
                 }
@@ -4837,7 +4837,7 @@ mod create_intent {
         assert!(
             entries.iter().any(|e| matches!(
                 e,
-                SessionTreeEntry::ProjectChange { path, .. }
+                Event::ProjectChange { path, .. }
                     if path.as_deref() == Some(project_string.as_str())
             )),
             "the thread row's project binding is journaled: {entries:?}"
@@ -5068,7 +5068,7 @@ mod create_intent {
         assert!(
             entries.iter().any(|e| matches!(
                 e,
-                SessionTreeEntry::ModelChange { provider, model_id, .. }
+                Event::ModelChange { provider, model_id, .. }
                     if provider == "p-beta" && model_id == "beta"
             )),
             "the model pick journals its row: {entries:?}"
@@ -5774,7 +5774,7 @@ mod create_intent {
                 && snapshot.records.iter().any(|record| {
                     matches!(
                         &record.entry,
-                        SessionTreeEntry::Custom { custom_type, .. }
+                        Event::Custom { custom_type, .. }
                             if custom_type == manox_agent::db::UI_NOTE_CUSTOM_TYPE
                     )
                 })

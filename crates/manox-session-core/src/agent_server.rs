@@ -927,7 +927,7 @@ pub(crate) async fn fork_session(
         manox_ahp_runtime::error::RuntimeError::new(format!("fork file creation failed: {err}"))
             .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
     })?;
-    let prefix: Vec<manox_harness::session::SessionTreeEntry> = records[..=through]
+    let prefix: Vec<manox_harness::session::Event> = records[..=through]
         .iter()
         .map(|r| r.entry.clone())
         .collect();
@@ -997,9 +997,7 @@ impl AgentServerInner {
     ) -> Option<manox_harness::session::jsonl::JsonlSessionMetadata> {
         let bytes = std::fs::read(path).ok()?;
         let line_end = bytes.iter().position(|b| *b == b'\n')?;
-        manox_harness::session::jsonl::parse_header_line(&bytes[..line_end])
-            .ok()
-            .map(|(meta, _)| meta)
+        manox_harness::session::jsonl::parse_header_line(path, &bytes[..line_end]).ok()
     }
 
     /// The durable facts one claim decision runs on: the live table, the
@@ -1251,11 +1249,11 @@ impl AgentServerInner {
                 ))
                 .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
             })?;
-            let seed_rows: Vec<manox_harness::session::SessionTreeEntry> = seed_blocks
+            let seed_rows: Vec<manox_harness::session::Event> = seed_blocks
                 .into_iter()
                 .scan(None::<String>, |parent, block| {
                     let entry_id = uuid::Uuid::new_v4().to_string();
-                    let entry = manox_harness::session::SessionTreeEntry::CustomMessage {
+                    let entry = manox_harness::session::Event::CustomMessage {
                         id: entry_id.clone(),
                         parent_id: parent.clone(),
                         timestamp: chrono::Utc::now(),

@@ -206,7 +206,7 @@ pub fn harness_messages_to_messages(input: &[AgentMessage]) -> Vec<Message> {
 /// away notes inside the kept segment (the tail payload holds only
 /// messages) — the same loss as the summarized history itself.
 pub fn entries_to_display(
-    entries: &[manox_harness::session::SessionTreeEntry],
+    entries: &[manox_harness::session::Event],
 ) -> (Vec<HistoryEntry>, Vec<PositionedNote>) {
     let mut display: Vec<HistoryEntry> = Vec::new();
     let mut notes: Vec<PositionedNote> = Vec::new();
@@ -217,7 +217,7 @@ pub fn entries_to_display(
     let mut folded: Vec<(String, usize, usize)> = Vec::new();
     for entry in entries {
         match entry {
-            manox_harness::session::SessionTreeEntry::Custom {
+            manox_harness::session::Event::Custom {
                 custom_type, data, ..
             } => {
                 if custom_type == UI_NOTE_CUSTOM_TYPE {
@@ -240,7 +240,7 @@ pub fn entries_to_display(
                 }
                 continue;
             }
-            manox_harness::session::SessionTreeEntry::AnnotationSet { annotation, .. } => {
+            manox_harness::session::Event::AnnotationSet { annotation, .. } => {
                 if let Some((id, note)) = annotation_ui_note(annotation) {
                     retract_note(&mut folded, &id, &mut display, &mut notes);
                     notes.push(PositionedNote {
@@ -251,9 +251,7 @@ pub fn entries_to_display(
                     folded.push((id, display.len() - 1, notes.len() - 1));
                 }
             }
-            manox_harness::session::SessionTreeEntry::AnnotationRemoved {
-                annotation_id, ..
-            } => {
+            manox_harness::session::Event::AnnotationRemoved { annotation_id, .. } => {
                 retract_note(&mut folded, annotation_id, &mut display, &mut notes);
             }
             _ => {
@@ -620,10 +618,10 @@ pub(crate) fn arg_hint(arguments: &serde_json::Value) -> Option<(String, String)
 mod tests {
     use super::*;
     use crate::db::UiNoteKind;
-    use manox_harness::session::SessionTreeEntry;
+    use manox_harness::session::Event;
 
-    fn message_entry(id: &str, text: &str) -> SessionTreeEntry {
-        SessionTreeEntry::Message {
+    fn message_entry(id: &str, text: &str) -> Event {
+        Event::Message {
             id: id.to_string(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -632,8 +630,8 @@ mod tests {
         }
     }
 
-    fn note_entry(text: &str) -> SessionTreeEntry {
-        SessionTreeEntry::Custom {
+    fn note_entry(text: &str) -> Event {
+        Event::Custom {
             id: format!("note-{text}"),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -650,7 +648,7 @@ mod tests {
         let entries = vec![
             message_entry("m1", "one"),
             note_entry("boom"),
-            SessionTreeEntry::Custom {
+            Event::Custom {
                 id: "other".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -680,7 +678,7 @@ mod tests {
         // projection of `m1 [dropped] m2 [kept] c1(keeps m2) m3` is
         // [c1, m2, note-kept, m3]; positions count the summary + m2.
         let entries = vec![
-            SessionTreeEntry::Compaction {
+            Event::Compaction {
                 id: "c1".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -711,8 +709,8 @@ mod tests {
         assert_eq!(kinds, vec!["m", "m", "n", "m"]);
     }
 
-    fn annotation_set_entry(id: &str, annotation: serde_json::Value) -> SessionTreeEntry {
-        SessionTreeEntry::AnnotationSet {
+    fn annotation_set_entry(id: &str, annotation: serde_json::Value) -> Event {
+        Event::AnnotationSet {
             id: id.to_string(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -720,8 +718,8 @@ mod tests {
         }
     }
 
-    fn annotation_removed_entry(id: &str, annotation_id: &str) -> SessionTreeEntry {
-        SessionTreeEntry::AnnotationRemoved {
+    fn annotation_removed_entry(id: &str, annotation_id: &str) -> Event {
+        Event::AnnotationRemoved {
             id: id.to_string(),
             parent_id: None,
             timestamp: chrono::Utc::now(),

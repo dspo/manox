@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use crate::core::session::SessionTreeEntry;
+use crate::core::session::Event;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// A lazily-read session transcript, oldest entry first.
@@ -44,15 +44,11 @@ impl SessionTranscriptStream {
     /// alone rather than dropped or split). `None` at EOF or after the first
     /// malformed line — the preview stops and the authoritative path owns the
     /// error.
-    pub async fn next_batch(
-        &mut self,
-        max_entries: usize,
-        max_bytes: usize,
-    ) -> Option<Vec<SessionTreeEntry>> {
+    pub async fn next_batch(&mut self, max_entries: usize, max_bytes: usize) -> Option<Vec<Event>> {
         if self.done {
             return None;
         }
-        let mut batch: Vec<SessionTreeEntry> = Vec::new();
+        let mut batch: Vec<Event> = Vec::new();
         let mut bytes = 0usize;
         while batch.len() < max_entries && bytes < max_bytes {
             let mut line = String::new();
@@ -67,7 +63,7 @@ impl SessionTranscriptStream {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<SessionTreeEntry>(&line) {
+            match serde_json::from_str::<Event>(&line) {
                 Ok(entry) => {
                     bytes = bytes.saturating_add(line.len());
                     batch.push(entry);
@@ -90,11 +86,11 @@ impl SessionTranscriptStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::session::SessionTreeEntry;
+    use crate::core::session::Event;
     use crate::core::types::{AgentMessage, ContentBlock};
 
-    fn message_entry(id: &str, text: &str) -> SessionTreeEntry {
-        SessionTreeEntry::Message {
+    fn message_entry(id: &str, text: &str) -> Event {
+        Event::Message {
             id: id.to_string(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -131,7 +127,7 @@ mod tests {
             .collect();
         write_session(
             &path,
-            r#"{"type":"session","version":3,"id":"s1"}"#,
+            r#"{"type":"session","version":4,"id":"s1"}"#,
             &entries.iter().map(String::as_str).collect::<Vec<_>>(),
         );
 
@@ -164,7 +160,7 @@ mod tests {
             .collect();
         write_session(
             &path,
-            r#"{"type":"session","version":3,"id":"s1"}"#,
+            r#"{"type":"session","version":4,"id":"s1"}"#,
             &entries.iter().map(String::as_str).collect::<Vec<_>>(),
         );
 
@@ -198,7 +194,7 @@ mod tests {
         let good = serde_json::to_string(&message_entry("m0", "hello")).unwrap();
         write_session(
             &path,
-            r#"{"type":"session","version":3,"id":"s1"}"#,
+            r#"{"type":"session","version":4,"id":"s1"}"#,
             &[&good, "not json at all", &good],
         );
         let mut stream = SessionTranscriptStream::open(&path).await.unwrap();
@@ -211,7 +207,7 @@ mod tests {
     async fn header_only_session_yields_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
-        write_session(&path, r#"{"type":"session","version":3,"id":"s1"}"#, &[]);
+        write_session(&path, r#"{"type":"session","version":4,"id":"s1"}"#, &[]);
         let mut stream = SessionTranscriptStream::open(&path).await.unwrap();
         assert!(stream.next_batch(usize::MAX, usize::MAX).await.is_none());
     }

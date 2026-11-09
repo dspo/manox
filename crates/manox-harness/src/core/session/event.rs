@@ -48,10 +48,9 @@ pub enum SettlementKind {
 }
 
 /// The whole durable vocabulary of a session log: one serde enum is the
-/// single schema (absorbed from the former `SessionTreeEntry`; that name
-/// lives on as a type alias while call sites migrate). Wire names are the
-/// row names — the conversation domain keeps its historical names, and the
-/// swarm/disposal rows join them under the same tag.
+/// single schema. Wire names are the row names — the conversation domain
+/// keeps its historical names, and the swarm/disposal rows join them under
+/// the same tag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Event {
@@ -172,8 +171,8 @@ pub enum Event {
         data: Option<JsonValue>,
     },
     /// An extension message whose payload the harness does not interpret.
-    /// `content` is a plain string or an array of text/image blocks, matching
-    /// the v3 schema.
+    /// `content` is a plain string or an array of text/image blocks, the
+    /// flat wire shape.
     #[serde(rename = "custom_message", rename_all = "camelCase")]
     CustomMessage {
         id: String,

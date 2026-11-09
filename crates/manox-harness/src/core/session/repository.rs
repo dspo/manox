@@ -171,7 +171,7 @@ impl SessionRepository {
     /// correct answer to "which host owns this file" without paying for a
     /// list.
     pub async fn header(&self, path: &Path) -> Result<JsonlSessionMetadata, anyhow::Error> {
-        Ok(read_header(path).await?.0)
+        read_header(path).await
     }
 }
 
@@ -189,7 +189,7 @@ pub struct ScannedSession {
 /// facts (the sidebar store's reconcile). [`SessionRepository::info`] drops
 /// the verdict — a non-caching caller renders one pass and moves on.
 pub async fn scan_session(path: &Path) -> Result<ScannedSession, anyhow::Error> {
-    let (metadata, _version) = read_header(path).await?;
+    let metadata = read_header(path).await?;
     let file_metadata = tokio::fs::metadata(path).await?;
     let modified_at = file_metadata
         .modified()
@@ -250,9 +250,9 @@ async fn build_session_info(path: &Path) -> Result<SessionInfo, anyhow::Error> {
 }
 
 /// Read and validate the first (header) line of a session file, growing the
-/// read until the newline arrives. Returns the parsed metadata plus the
-/// on-disk format version.
-async fn read_header(path: &Path) -> Result<(JsonlSessionMetadata, u32), anyhow::Error> {
+/// read until the newline arrives. A header on an unsupported format version
+/// is rejected with `JournalError::UnsupportedFormat`.
+async fn read_header(path: &Path) -> Result<JsonlSessionMetadata, anyhow::Error> {
     let mut file = File::open(path).await?;
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = vec![0u8; 4096];
@@ -276,7 +276,7 @@ async fn read_header(path: &Path) -> Result<(JsonlSessionMetadata, u32), anyhow:
         .iter()
         .position(|&b| b == b'\n')
         .unwrap_or(buffer.len());
-    crate::session::jsonl::parse_header_line(&buffer[..line_end])
+    crate::session::jsonl::parse_header_line(path, &buffer[..line_end])
 }
 
 /// The member patterns the scan tests, as const byte slices — the hot path

@@ -95,7 +95,7 @@ pub enum AgentMessage {
         /// instead of the storage-generated one, so the injected row's id is
         /// the id the client already correlates its echo against. `None` (and
         /// every message built without it) keeps the storage-generated id.
-        /// Never crosses the wire — the row id lives on `SessionTreeEntry`,
+        /// Never crosses the wire — the row id lives on `Event`,
         /// so the serialized `user` shape is byte-identical to the pre-S3
         /// form (§ D.2 "旧 client 对新 server 无 wire 破坏").
         #[serde(skip, default)]

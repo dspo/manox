@@ -7,7 +7,7 @@
 
 use manox_harness::AgentMessage;
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
-use manox_harness::session::{Session, SessionStorage, SessionTreeEntry};
+use manox_harness::session::{Event, Session, SessionStorage};
 
 #[tokio::main]
 async fn main() {
@@ -76,17 +76,17 @@ async fn main() {
     println!("ids: m1={m1} m2={m2} m4={m4}");
 }
 
-fn print_path(label: &str, path: &[SessionTreeEntry]) {
+fn print_path(label: &str, path: &[Event]) {
     let names: Vec<String> = path
         .iter()
         .map(|e| match e {
-            SessionTreeEntry::Message { message, .. } => match message {
+            Event::Message { message, .. } => match message {
                 AgentMessage::User { content, .. } => {
                     format!("user:{}", first_text(content))
                 }
                 _ => "assistant".into(),
             },
-            SessionTreeEntry::Compaction { .. } => "compaction".into(),
+            Event::Compaction { .. } => "compaction".into(),
             _ => "other".into(),
         })
         .collect();

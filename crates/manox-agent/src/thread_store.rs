@@ -1050,7 +1050,7 @@ impl ThreadStore {
     ///
     /// Three legs, and a rename needs all three:
     ///
-    /// - **the journal** ([`Self::journal_title`]) carries `SessionTreeEntry::Title`,
+    /// - **the journal** ([`Self::journal_title`]) carries `Event::Title`,
     ///   which the v2 title projection folds (`projections.rs`) and the AHP
     ///   translator reads (`translate/actions.rs`). It is the only route
     ///   either takes: the live `ThreadEvent::TitleChanged` is on
@@ -2546,7 +2546,7 @@ mod tests {
     /// sidecar.
     ///
     /// The row is the only route the two protocol faces take — the v2
-    /// projection folds `SessionTreeEntry::Title` and the AHP translator reads
+    /// projection folds `Event::Title` and the AHP translator reads
     /// the journal, while the live `TitleChanged` event is on `translate.rs`'s
     /// `Skip` list. A store-side rename that skipped this would be invisible to
     /// every client following the session, which is exactly the cross-protocol
@@ -2562,7 +2562,7 @@ mod tests {
         // nowhere to put the row, and the sidecar carries the flag instead.
         std::fs::write(
             &session,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"t-title\",\
+            "{\"type\":\"session\",\"version\":4,\"id\":\"t-title\",\
              \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
              \"metadata\":{\"host\":\"manox\"}}\n",
         )
@@ -2594,7 +2594,7 @@ mod tests {
                 })
                 .into_iter()
                 .filter_map(|record| match record.entry {
-                    manox_harness::session::SessionTreeEntry::Title { title, .. } => Some(title),
+                    manox_harness::session::Event::Title { title, .. } => Some(title),
                     _ => None,
                 })
                 .collect()
@@ -3274,7 +3274,7 @@ mod tests {
         let (base_id, fork_id, thread_key) = ("base-session", "fork-session", "thread-1");
         let header = |id: &str, cwd: &str| {
             format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"{cwd}\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{thread_key}\"}}}}\n"
+                "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"{cwd}\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{thread_key}\"}}}}\n"
             )
         };
         tokio::fs::write(
@@ -3745,7 +3745,7 @@ mod tests {
         // its `session_paths` entry) addressable for follow-up writes.
         std::fs::write(
             &session,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"t1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{\"host\":\"manox\"}}\n",
+            "{\"type\":\"session\",\"version\":4,\"id\":\"t1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{\"host\":\"manox\"}}\n",
         )
         .unwrap();
         let store = store_handle();
@@ -3941,15 +3941,15 @@ mod tests {
         let db_path = temp_db();
         crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
-        // Real session files (v3 headers: the cold append rides the lazy
-        // v3→v4 migration like any other writer). The child carries its
+        // Real session files: the cold append opens them through their
+        // header row like any other writer. The child carries its
         // team edge in the header so the post-write rescans (which rebuild
         // the summaries from disk) keep the cascade link.
         let write_session = |id: &str, metadata: &str| {
             let path = dir.path().join(format!("{id}.jsonl"));
             std::fs::write(
                 &path,
-                format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{metadata}}}\n"),
+                format!("{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{metadata}}}\n"),
             )
             .unwrap();
             path
@@ -3980,10 +3980,8 @@ mod tests {
                 })
                 .into_iter()
                 .filter_map(|record| match record.entry {
-                    manox_harness::session::SessionTreeEntry::PinnedArchived {
-                        pinned,
-                        archived,
-                        ..
+                    manox_harness::session::Event::PinnedArchived {
+                        pinned, archived, ..
                     } => Some((pinned, archived)),
                     _ => None,
                 })
@@ -4043,10 +4041,9 @@ mod tests {
 
     /// B3/P0-4 (review round 3): two store decisions on one engine-less
     /// thread each spawn their own cold append — fresh storage instances
-    /// whose writers never see each other. Raced on a
-    /// v3 file (where both appends also race the lazy v3→v4 migration,
-    /// which used to share one temp name), they must still land a LINEAR
-    /// chain: the chain-walking journal_range reads BOTH `pinned_archived`
+    /// whose writers never see each other. Raced on one file (where both
+    /// appends also race each other through the write fence), they must
+    /// still land a LINEAR chain: the chain-walking journal_range reads BOTH `pinned_archived`
     /// rows. Pre-fix the pair forked — both rows parented to the same
     /// leaf, each seq self-stamped, the load validator accepts siblings,
     /// and the cursor kept only the file-last branch, so the range never
@@ -4069,10 +4066,8 @@ mod tests {
                 })
                 .into_iter()
                 .filter_map(|record| match record.entry {
-                    manox_harness::session::SessionTreeEntry::PinnedArchived {
-                        pinned,
-                        archived,
-                        ..
+                    manox_harness::session::Event::PinnedArchived {
+                        pinned, archived, ..
                     } => Some((pinned, archived)),
                     _ => None,
                 })
@@ -4098,7 +4093,7 @@ mod tests {
             let path = dir.path().join(format!("{id}.jsonl"));
             std::fs::write(
                 &path,
-                format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{{\"host\":\"manox\"}}}}\n"),
+                format!("{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{{\"host\":\"manox\"}}}}\n"),
             )
             .unwrap();
             store.with_mut(|s| {
