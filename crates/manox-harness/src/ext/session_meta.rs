@@ -383,13 +383,22 @@ mod tests {
         assert!(cleared.plan_snapshot.is_none());
     }
 
+    /// Write raw bytes at the sidecar's cache path, creating the directory
+    /// the cache row lives in (the canonical layout keeps sidecars out of the
+    /// session directory).
+    async fn write_raw_sidecar(dir: &std::path::Path, session: &std::path::Path, raw: &str) {
+        let path = meta_path(dir, session);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(path, raw).await.unwrap();
+    }
+
     #[tokio::test]
     async fn corrupt_sidecar_surfaces_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("abc.jsonl");
-        tokio::fs::write(meta_path(dir.path(), &session), "{not json")
-            .await
-            .unwrap();
+        write_raw_sidecar(dir.path(), &session, "{not json").await;
         assert!(load(dir.path(), &session).await.is_err());
     }
 
@@ -451,9 +460,7 @@ mod tests {
     async fn update_self_heals_corrupt_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("abc.jsonl");
-        tokio::fs::write(meta_path(dir.path(), &session), "{\"broken\":")
-            .await
-            .unwrap();
+        write_raw_sidecar(dir.path(), &session, "{\"broken\":").await;
         update(dir.path(), &session, |meta| meta.archived = true)
             .await
             .unwrap();
