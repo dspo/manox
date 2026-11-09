@@ -101,12 +101,12 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 会话模型是「不可变身份 + append-only 事实 + 派生视图」。判违规按此表：
 
 - **身份面**：`header.json` 随首次 append 原子发布（O_EXCL），此后永不改写；血缘（parent/toolCallId/runId/depth）是 header 字段，不是可变旁册指针。身份只出现一次，永不迁移。
-- **事件面**：`log.v1.jsonl` 是唯一 durable 权威与唯一 schema（`session::event::Event`，行名 = serde tag）。铁律：**用户可见且需持久的事实必为事件；身份字段永不出现在事件 payload**（事件只带 id 引用）。退役的行名按未知行拒收，没有兼容读。
+- **事件面**：`<core>/<slug>/<session>/session.jsonl` 是唯一 durable 权威与唯一 schema（`session::event::Event`，行名 = serde tag）。铁律：**用户可见且需持久的事实必为事件；身份字段永不出现在事件 payload**（事件只带 id 引用）。退役的行名按未知行拒收，没有兼容读。
 - **派生面**：列表、状态位、谱系全是投影；侧栏扫描只读 header 与首条用户消息（有界），`state.json` 只是缓存。
 - **创建**：`createSession` = claim，唯一决策点是 `session::claim::decide`：未占用的 id → 驱动客户端铸的 id；同目录已物化 → 幂等复用（restore，绝不重铸）；活空白 → 复用；归档 → 铸新；目录不符 → 显式冲突（`gateway/bad-request`）；`lineage=subagent` → 拒绝（`session/already-owned`）。**应答携带最终 id，此后不变**。
 - **处置**：未物化会话的 dispose = 内存删行 + `root/sessionRemoved`；已物化会话的 dispose 不写任何 durable 标记（会话仍在列表里）。日志里没有「已处置」行。
 - **Swarm**：每个 run 落父日志恰两行（`run/started` + `run/settled`），进度不上父日志；run id == 子会话 id == 子 chat id。结算 kind 全枚举（completed/timed-out/stalled/aborted/error/refusal/max-tokens）由生产者给出，下游不得按字符串前缀判词（唯一例外：`manox-agent` 的 transcript 重建按 verdict 行**结尾**判状态，见 `ext/subagent/settlement.rs` 顶部）。子会话 chat 只读（`ChatOrigin{tool}` + `ChatInteractivity::ReadOnly`）；`AskParent` 的答案经 `continue_run_id` 续跑同一子会话（不是 AHP InputRequest）。子会话的**常驻名册**（live + settled，settled 带 verdict 不摘除）在 `x-manox-work/childRunsChanged`（fold 进 `XManoxState.childRuns`，按 runId upsert）；chat 的 `backgroundWork` 是 live-only 面，settle 即摘行——两套词汇不混用（D12）。
-- **Engine 阶段**：`session::{identity,event,store,claim}` 是 v1.0.0 引擎；当前写入仍走 `jsonl` 树引擎（共用同一 `Event` 词汇与同一 `log.v1.jsonl`），`CoreStore` 的物化/租约/header-only 扫描**尚未接线**（staged，勿当成现役写入路径读）。
+- **引擎**：`session::{identity,event,claim}` 是 Session Core 的引擎模块（`identity` 掌管 header 与 journal 路径，`event` 是行词汇，`claim` 是 `createSession` 的判定点）；写入经 `session::jsonl` 存储（format v4），行类型就是 `Event`——`SessionTreeEntry` 是它保留的旧类型名别名。
 ## crates/manox-harness 接线开发纪律（harness 分层）
 
 manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`；老 manox harness 已退役并完全删除，代码存于 git 历史与 `origin/Manox` 备份分支）。接线开发遵循以下纪律：
