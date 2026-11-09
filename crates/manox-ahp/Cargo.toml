@@ -17,6 +17,7 @@ ahp-types.workspace = true
 # lives. Client-facing SDK pieces of that crate are not used here.
 ahp.workspace = true
 async-channel.workspace = true
+async-trait.workspace = true
 axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 parking_lot.workspace = true

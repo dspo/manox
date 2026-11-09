@@ -15,6 +15,7 @@ use ahp_types::state::{
     AgentInfo, ChatState, RootState, SessionLifecycle, SessionModelInfo, SessionState,
     SessionSummary, TerminalState, Turn,
 };
+use async_trait::async_trait;
 use manox_ahp::backend::{Backend, DispatchOutcome};
 use manox_ahp::channels::{chat, root, session};
 use manox_ahp::error::HostError;
@@ -53,6 +54,7 @@ impl TestBackend {
     }
 }
 
+#[async_trait]
 impl Backend for TestBackend {
     fn root_state(&self) -> RootState {
         root::with_agents(vec![agent()], None)
@@ -72,7 +74,7 @@ impl Backend for TestBackend {
         Some(summary_of(session_id, &chat_id))
     }
 
-    fn session_state(&self, session_id: &str) -> Option<SessionState> {
+    async fn session_state(&self, session_id: &str) -> Option<SessionState> {
         let chat_id = {
             let sessions = self.sessions.lock();
             Self::chat_of_locked(&sessions, session_id)?
@@ -80,12 +82,12 @@ impl Backend for TestBackend {
         Some(session_state_with(&chat_id))
     }
 
-    fn chat_state(&self, chat_id: &str) -> Option<ChatState> {
+    async fn chat_state(&self, chat_id: &str) -> Option<ChatState> {
         let owned = self.sessions.lock().values().any(|id| id == chat_id);
         owned.then(|| chat::initial(chat_id))
     }
 
-    fn session_state_for_chat(&self, chat_id: &str) -> Option<String> {
+    async fn session_state_for_chat(&self, chat_id: &str) -> Option<String> {
         self.sessions
             .lock()
             .iter()
@@ -97,7 +99,7 @@ impl Backend for TestBackend {
         None
     }
 
-    fn changeset_state(&self, channel: &str) -> Option<ahp_types::state::ChangesetState> {
+    async fn changeset_state(&self, channel: &str) -> Option<ahp_types::state::ChangesetState> {
         // The runtime answers a git session with a real (possibly empty)
         // state — exactly what exercised the snapshot path's changeset arm.
         channel
@@ -110,7 +112,7 @@ impl Backend for TestBackend {
             })
     }
 
-    fn create_session(
+    async fn create_session(
         &self,
         session_id: &str,
         _params: &CreateSessionParams,
@@ -121,12 +123,12 @@ impl Backend for TestBackend {
         Ok(())
     }
 
-    fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
+    async fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
         self.sessions.lock().remove(session_id);
         Ok(())
     }
 
-    fn create_chat(
+    async fn create_chat(
         &self,
         session_id: &str,
         chat_id: &str,
@@ -138,12 +140,12 @@ impl Backend for TestBackend {
         Ok(())
     }
 
-    fn dispose_chat(&self, chat_id: &str) -> Result<(), HostError> {
+    async fn dispose_chat(&self, chat_id: &str) -> Result<(), HostError> {
         self.sessions.lock().retain(|_, chat| chat != chat_id);
         Ok(())
     }
 
-    fn fetch_turns(
+    async fn fetch_turns(
         &self,
         _chat_id: &str,
         _cursor: Option<&str>,
@@ -152,7 +154,7 @@ impl Backend for TestBackend {
         Ok(Vec::new())
     }
 
-    fn dispatch(
+    async fn dispatch(
         &self,
         _channel: &str,
         _action: &StateAction,
@@ -161,11 +163,11 @@ impl Backend for TestBackend {
         DispatchOutcome::Accepted
     }
 
-    fn extension_baseline(&self, channel: &str) -> Option<Value> {
+    async fn extension_baseline(&self, channel: &str) -> Option<Value> {
         (channel == "x-manox-workspaces://").then(|| serde_json::json!({ "rows": [] }))
     }
 
-    fn extension(&self, _method: &str, _params: &Value) -> Result<Value, HostError> {
+    async fn extension(&self, _method: &str, _params: &Value) -> Result<Value, HostError> {
         Err(HostError::Unimplemented("extension".to_string()))
     }
 }
@@ -233,6 +235,7 @@ impl RecordingBackend {
     }
 }
 
+#[async_trait]
 impl Backend for RecordingBackend {
     fn root_state(&self) -> RootState {
         self.inner.root_state()
@@ -243,48 +246,48 @@ impl Backend for RecordingBackend {
     fn session_summary(&self, session_id: &str) -> Option<SessionSummary> {
         self.inner.session_summary(session_id)
     }
-    fn session_state(&self, session_id: &str) -> Option<SessionState> {
-        self.inner.session_state(session_id)
+    async fn session_state(&self, session_id: &str) -> Option<SessionState> {
+        self.inner.session_state(session_id).await
     }
-    fn chat_state(&self, chat_id: &str) -> Option<ChatState> {
-        self.inner.chat_state(chat_id)
+    async fn chat_state(&self, chat_id: &str) -> Option<ChatState> {
+        self.inner.chat_state(chat_id).await
     }
-    fn session_state_for_chat(&self, chat_id: &str) -> Option<String> {
-        self.inner.session_state_for_chat(chat_id)
+    async fn session_state_for_chat(&self, chat_id: &str) -> Option<String> {
+        self.inner.session_state_for_chat(chat_id).await
     }
     fn terminal_state(&self, terminal_id: &str) -> Option<TerminalState> {
         self.inner.terminal_state(terminal_id)
     }
-    fn create_session(
+    async fn create_session(
         &self,
         session_id: &str,
         params: &CreateSessionParams,
     ) -> Result<(), HostError> {
-        self.inner.create_session(session_id, params)
+        self.inner.create_session(session_id, params).await
     }
-    fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
-        self.inner.dispose_session(session_id)
+    async fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
+        self.inner.dispose_session(session_id).await
     }
-    fn create_chat(
+    async fn create_chat(
         &self,
         session_id: &str,
         chat_id: &str,
         params: &CreateChatParams,
     ) -> Result<(), HostError> {
-        self.inner.create_chat(session_id, chat_id, params)
+        self.inner.create_chat(session_id, chat_id, params).await
     }
-    fn dispose_chat(&self, chat_id: &str) -> Result<(), HostError> {
-        self.inner.dispose_chat(chat_id)
+    async fn dispose_chat(&self, chat_id: &str) -> Result<(), HostError> {
+        self.inner.dispose_chat(chat_id).await
     }
-    fn fetch_turns(
+    async fn fetch_turns(
         &self,
         chat_id: &str,
         cursor: Option<&str>,
         limit: Option<i64>,
     ) -> Result<Vec<Turn>, HostError> {
-        self.inner.fetch_turns(chat_id, cursor, limit)
+        self.inner.fetch_turns(chat_id, cursor, limit).await
     }
-    fn dispatch(
+    async fn dispatch(
         &self,
         channel: &str,
         action: &StateAction,
@@ -302,8 +305,8 @@ impl Backend for RecordingBackend {
             None => DispatchOutcome::AcceptedThen(derived),
         }
     }
-    fn extension(&self, method: &str, params: &Value) -> Result<Value, HostError> {
-        self.inner.extension(method, params)
+    async fn extension(&self, method: &str, params: &Value) -> Result<Value, HostError> {
+        self.inner.extension(method, params).await
     }
 }
 

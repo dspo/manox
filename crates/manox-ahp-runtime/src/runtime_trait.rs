@@ -17,6 +17,7 @@
 //! (`SessionIntent`, `ForkIntent`) when this code lived beside it; owning them
 //! here is what lets the gateway be deleted without touching the adapter.
 
+use async_trait::async_trait;
 use manox_ahp::error::HostError;
 use serde_json::Value;
 
@@ -138,6 +139,11 @@ pub struct TerminalSnapshot {
 ///
 /// Every method is fallible with [`RuntimeError`]: a capability the runtime
 /// cannot honour is a refusal the caller reports, never a silent no-op.
+///
+/// The effectful half is async so the adapter awaits runtime work on the
+/// runtime. The sync half answers from memory only: liveness, the live
+/// terminal snapshot, the journal feed handle and the store-backed setters.
+#[async_trait]
 pub trait SessionRuntime: Send + Sync + 'static {
     /// The live terminal's snapshot, when this runtime owns that terminal.
     fn terminal_state(&self, terminal_id: &str) -> Option<TerminalSnapshot>;
@@ -159,7 +165,7 @@ pub trait SessionRuntime: Send + Sync + 'static {
     ) -> Option<tokio::sync::broadcast::Receiver<std::sync::Arc<Vec<u8>>>>;
 
     /// Spawn (or re-attach) a terminal under a caller-chosen id.
-    fn create_terminal(
+    async fn create_terminal(
         &self,
         session_id: &str,
         terminal_id: &str,
@@ -168,22 +174,27 @@ pub trait SessionRuntime: Send + Sync + 'static {
     ) -> Result<(), RuntimeError>;
 
     /// Release a terminal and its PTY.
-    fn dispose_terminal(&self, terminal_id: &str) -> Result<(), RuntimeError>;
+    async fn dispose_terminal(&self, terminal_id: &str) -> Result<(), RuntimeError>;
 
     /// Forward keystrokes to a terminal's PTY.
-    fn terminal_input(&self, terminal_id: &str, data: &str) -> Result<(), RuntimeError>;
+    async fn terminal_input(&self, terminal_id: &str, data: &str) -> Result<(), RuntimeError>;
 
     /// Resize a terminal's PTY grid.
-    fn terminal_resize(&self, terminal_id: &str, cols: u16, rows: u16) -> Result<(), RuntimeError>;
+    async fn terminal_resize(
+        &self,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), RuntimeError>;
 
     /// Create (or adopt) a session.
-    fn create_session(&self, owner: &str, intent: SessionIntent) -> Result<(), RuntimeError>;
+    async fn create_session(&self, owner: &str, intent: SessionIntent) -> Result<(), RuntimeError>;
 
     /// Fork a session's journal through an entry.
-    fn fork_session(&self, owner: &str, intent: ForkIntent) -> Result<(), RuntimeError>;
+    async fn fork_session(&self, owner: &str, intent: ForkIntent) -> Result<(), RuntimeError>;
 
     /// Dispose a session and release its live resources.
-    fn dispose_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError>;
+    async fn dispose_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError>;
 
     /// Whether the runtime currently drives this session.
     fn has_session(&self, session_id: &str) -> bool;
@@ -192,7 +203,7 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// so its runtime face is addressable — the same cold-open the
     /// submit/cancel/settle paths take. A genuinely unknown id answers
     /// not-found from the open itself.
-    fn open_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError>;
+    async fn open_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError>;
 
     /// Ensure the runtime drives `session_id`, cold-opening it when the
     /// journal proves it exists but this process has no live engine.
@@ -202,11 +213,11 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// owes its client an answer, so writing paths call this first instead
     /// of refusing a session the journal proves exists. A genuinely unknown
     /// id keeps its not-found refusal, answered by the open itself.
-    fn ensure_live(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError> {
+    async fn ensure_live(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError> {
         if self.has_session(session_id) {
             return Ok(());
         }
-        self.open_session(owner, session_id)
+        self.open_session(owner, session_id).await
     }
 
     /// The conversation-info Q face for a live session: per-model usage,
@@ -214,15 +225,20 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// `GetConversationInfo`). `None` for a cold session — a session without
     /// a materialized engine has no thread to fold, and its metrics channel
     /// baseline stays empty until the first submit.
-    fn conversation_metrics(&self, _session_id: &str) -> Option<Value> {
+    async fn conversation_metrics(&self, _session_id: &str) -> Option<Value> {
         None
     }
 
     /// Submit a user turn.
-    fn submit(&self, owner: &str, session_id: &str, text: String) -> Result<Value, RuntimeError>;
+    async fn submit(
+        &self,
+        owner: &str,
+        session_id: &str,
+        text: String,
+    ) -> Result<Value, RuntimeError>;
 
     /// Inject a steer into the running turn (or park it when idle).
-    fn steer(
+    async fn steer(
         &self,
         session_id: &str,
         message_id: &str,
@@ -233,7 +249,7 @@ pub trait SessionRuntime: Send + Sync + 'static {
     fn drop_queued(&self, session_id: &str, message_id: &str);
 
     /// Cancel the session's running turn.
-    fn cancel_turn(&self, session_id: &str) -> Result<(), RuntimeError>;
+    async fn cancel_turn(&self, session_id: &str) -> Result<(), RuntimeError>;
 
     /// Select the session's model.
     ///
@@ -241,12 +257,12 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// folded the change into the state its subscribers reduce, so swallowing
     /// the failure would leave every client converging on a model the session
     /// is not running.
-    fn set_model(&self, session_id: &str, model: &str) -> Result<(), RuntimeError>;
+    async fn set_model(&self, session_id: &str, model: &str) -> Result<(), RuntimeError>;
 
     /// Validate a config change WITHOUT landing any of it. The dispatch
     /// gate runs this over every key before applying any, so a multi-key
     /// write never lands half of itself under a rejection.
-    fn preflight_config(
+    async fn preflight_config(
         &self,
         session_id: &str,
         model: Option<&str>,
@@ -256,16 +272,20 @@ pub trait SessionRuntime: Send + Sync + 'static {
     ) -> Result<(), RuntimeError>;
 
     /// Select the session's reasoning effort.
-    fn set_reasoning_effort(&self, session_id: &str, effort: &str) -> Result<(), RuntimeError>;
+    async fn set_reasoning_effort(
+        &self,
+        session_id: &str,
+        effort: &str,
+    ) -> Result<(), RuntimeError>;
 
     /// Select the session's access mode.
-    fn set_access_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError>;
+    async fn set_access_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError>;
 
     /// Switch the session's sandbox network access (`off`/`on`).
-    fn set_network_access(&self, session_id: &str, access: &str) -> Result<(), RuntimeError>;
+    async fn set_network_access(&self, session_id: &str, access: &str) -> Result<(), RuntimeError>;
 
     /// Move the session's effective working directory.
-    fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError>;
+    async fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError>;
 
     /// Archive or unarchive the session.
     fn archive_session(&self, owner: &str, session_id: &str, archived: bool);
@@ -289,11 +309,15 @@ pub trait SessionRuntime: Send + Sync + 'static {
     fn set_project_alias(&self, path: &str, alias: Option<&str>) -> bool;
 
     /// Compact the session's history.
-    fn compact(&self, session_id: &str, instructions: Option<String>) -> Result<(), RuntimeError>;
+    async fn compact(
+        &self,
+        session_id: &str,
+        instructions: Option<String>,
+    ) -> Result<(), RuntimeError>;
 
     /// Apply one goal lifecycle action (`create`/`edit`/`replace`/`clear`/
     /// `pause`/`resume`), the `x-manox/goal` seam.
-    fn goal(
+    async fn goal(
         &self,
         session_id: &str,
         action: &str,
@@ -310,7 +334,7 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// parent edges, then the session itself). Returns a receipt naming what
     /// was issued. The default is a refusal: a runtime without the container
     /// face must not accept a teardown it can never honour.
-    fn teardown_container(
+    async fn teardown_container(
         &self,
         _owner: &str,
         _session_id: &str,
@@ -326,7 +350,7 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// approve-kind options beyond the bare `allow_once` (the network host
     /// amendments) are distinguishable only through it, so a client that
     /// knows the vocabulary sends it and a legacy client may omit it.
-    fn confirm_tool_call(
+    async fn confirm_tool_call(
         &self,
         session_id: &str,
         auth_id: &str,
@@ -336,7 +360,7 @@ pub trait SessionRuntime: Send + Sync + 'static {
 
     /// Settle a question card: the client's submitted answers, or a
     /// non-answer close (dismissed to speak, or cancelled with the turn).
-    fn answer_question(
+    async fn answer_question(
         &self,
         session_id: &str,
         request_id: &str,
@@ -355,7 +379,12 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// One registration path, not two: the same store v2's
     /// `RegisterSessionTools` fills, so a contributed tool becomes callable by
     /// the model through the existing `embedder_tools` machinery.
-    fn set_embedder_tools(&self, session_id: &str, client_id: &str, tools: Vec<ClientToolSpec>);
+    async fn set_embedder_tools(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        tools: Vec<ClientToolSpec>,
+    );
 
     /// The AHP-facing failure for a runtime failure.
     fn host_error(error: RuntimeError) -> HostError
@@ -372,7 +401,7 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// reaches subscribers through the runtime's MCP event stream, not
     /// through this call's return. The default is a refusal: a runtime
     /// without the MCP plane must not accept a start it can never honour.
-    fn mcp_start(&self, _session_id: &str, _id: &str) -> Result<(), RuntimeError> {
+    async fn mcp_start(&self, _session_id: &str, _id: &str) -> Result<(), RuntimeError> {
         Err(RuntimeError::new(
             "MCP start is not supported by this runtime",
         ))
@@ -381,7 +410,7 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// Stop an MCP server by registry key. See [`SessionRuntime::mcp_start`]
     /// for the acceptance/refusal split; the settled `stopped` (or `error`)
     /// state travels the same event stream.
-    fn mcp_stop(&self, _session_id: &str, _id: &str) -> Result<(), RuntimeError> {
+    async fn mcp_stop(&self, _session_id: &str, _id: &str) -> Result<(), RuntimeError> {
         Err(RuntimeError::new(
             "MCP stop is not supported by this runtime",
         ))
@@ -392,7 +421,7 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// start, creating the slot from the merged config when the server was
     /// filtered out at startup). The default is a refusal — a runtime
     /// without the MCP plane has nothing to enable.
-    fn mcp_set_enabled(
+    async fn mcp_set_enabled(
         &self,
         _session_id: &str,
         _id: &str,
