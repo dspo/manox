@@ -163,76 +163,54 @@ async fn attach_registry_displays_restores_sidecar_compact_forms() {
     assert_eq!(ui(4).as_deref(), Some("/healthz"));
 }
 
+/// A user row's authorship is an entry fact: the display rebuild reads it
+/// off `Event::Message::ui` — no sidecar, no ordinal count.
 #[tokio::test]
-async fn attach_user_attributions_restores_sidecar_authorship() {
-    let dir = tempfile::tempdir().unwrap();
-    let session = dir.path().join("sess-author.jsonl");
-    let meta = manox_harness::session_meta::SessionMeta {
-        user_attributions: [
-            (
-                0usize,
-                manox_harness::session_meta::UserAttributionMeta {
-                    author: "lead".into(),
-                    peer: false,
-                    display_text: None,
-                },
-            ),
-            (
-                1usize,
-                manox_harness::session_meta::UserAttributionMeta {
-                    author: "Sailor".into(),
-                    peer: true,
-                    display_text: Some("unwrapped body".into()),
-                },
-            ),
-            // Beyond the transcript's ordinals: tolerated, attaches nowhere.
-            (
-                5usize,
-                manox_harness::session_meta::UserAttributionMeta {
-                    author: "lead".into(),
-                    peer: false,
-                    display_text: None,
-                },
-            ),
-        ]
-        .into_iter()
-        .collect(),
-        ..Default::default()
+async fn the_display_rebuild_carries_the_rows_authorship() {
+    let user_row = |id: &str, text: &str, ui: Option<manox_harness::session::UserEntryUi>| {
+        manox_harness::session::Event::Message {
+            id: id.to_string(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            message: manox_harness::types::AgentMessage::user(text),
+            origin: None,
+            ui,
+        }
     };
-    manox_harness::session_meta::save(dir.path(), &session, &meta)
-        .await
-        .unwrap();
-
-    let attributions = load_user_attributions(dir.path(), &session).await;
-    // Same ordinal convention as the display forms: tool results and
-    // assistant turns never consume one.
-    let mut history: Vec<HistoryEntry> = vec![
-        Message::user("plan seed".to_string()), // ordinal 0
-        Message::assistant(vec![MessageContent::Text("ok".into())]),
-        Message::user_with_content(vec![MessageContent::ToolResult(
-            crate::language_model::LanguageModelToolResult {
-                tool_use_id: "tu_1".into(),
-                tool_name: "Read".into(),
-                is_error: false,
-                content: "ok".into(),
-            },
-        )]),
-        Message::user("[from Sailor]: wrapped".to_string()), // ordinal 1
-    ]
-    .into_iter()
-    .map(HistoryEntry::Message)
-    .collect();
-    attach_user_attributions(&mut history, &attributions);
-
-    let ui_at = |ix: usize| match &history[ix] {
+    let entries = vec![
+        user_row(
+            "m-0",
+            "plan seed",
+            Some(manox_harness::session::UserEntryUi {
+                author: "lead".into(),
+                peer: false,
+                display_text: None,
+            }),
+        ),
+        user_row("m-1", "a human prompt", None),
+        user_row(
+            "m-2",
+            "[from Sailor] wrapped",
+            Some(manox_harness::session::UserEntryUi {
+                author: "Sailor".into(),
+                peer: true,
+                display_text: Some("unwrapped body".into()),
+            }),
+        ),
+    ];
+    let (display, _notes) = adapt::entries_to_display(&entries);
+    let ui_at = |ix: usize| match &display[ix] {
         HistoryEntry::Message(m) => m.ui.clone(),
         _ => None,
     };
-    let seed = ui_at(0).expect("seed carries attribution");
+    let seed = ui_at(0).expect("the seed row carries attribution");
     assert_eq!(seed.author, Some(crate::message::MessageAuthor::Lead));
     assert!(!seed.peer);
-    assert!(ui_at(1).is_none(), "assistant turns stay unattributed");
-    let peer = ui_at(3).expect("peer delivery carries attribution");
+    assert!(
+        ui_at(1).is_none(),
+        "a human row stays human across the rebuild"
+    );
+    let peer = ui_at(2).expect("the peer row carries attribution");
     assert_eq!(
         peer.author,
         Some(crate::message::MessageAuthor::Agent("Sailor".into()))
@@ -241,11 +219,7 @@ async fn attach_user_attributions_restores_sidecar_authorship() {
     assert_eq!(
         peer.display_text.as_deref(),
         Some("unwrapped body"),
-        "the send-time display form survives the sidecar round-trip"
-    );
-    assert!(
-        ui_at(2).is_none(),
-        "tool results never consume an ordinal nor carry attribution"
+        "the send-time display form rides the row"
     );
 }
 
@@ -257,16 +231,6 @@ async fn clear_user_chrome_drops_sidecar_ordinals() {
         registry_displays: [(0usize, "/gitwork:deliver fast".to_string())]
             .into_iter()
             .collect(),
-        user_attributions: [(
-            0usize,
-            manox_harness::session_meta::UserAttributionMeta {
-                author: "lead".into(),
-                peer: false,
-                display_text: None,
-            },
-        )]
-        .into_iter()
-        .collect(),
         ..Default::default()
     };
     manox_harness::session_meta::save(dir.path(), &session, &meta)
@@ -279,11 +243,6 @@ async fn clear_user_chrome_drops_sidecar_ordinals() {
     assert!(
         displays.is_empty(),
         "a compaction clears the stale display ordinals"
-    );
-    let attributions = load_user_attributions(dir.path(), &session).await;
-    assert!(
-        attributions.is_empty(),
-        "a compaction clears the stale attributions"
     );
 }
 
@@ -2849,6 +2808,82 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
     assert_ne!(
         id, "stale-entry-id",
         "the surviving row is the middleware's fresh append, not the stale pin's id"
+    );
+}
+
+/// The authorship pin is consumed by the turn's own append: the journal row
+/// carries `ui` (the fact every fold reads), and no sidecar write records it.
+#[tokio::test]
+async fn an_attributed_turn_writes_its_author_on_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("proj");
+    tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+    let stream = Arc::new(ToolRoundsStream {
+        rounds: 0, // first call answers "done": the run completes
+        call: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let stream_for_resolver = Arc::clone(&stream);
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
+        Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+    });
+    let mut session = create_agent_session()
+        .with_cwd(&cwd)
+        .with_session_dir(dir.path().join("sessions"))
+        .with_model_runtime(ModelRuntime::new(resolver))
+        .with_model(test_model())
+        .with_system_prompt("You are a test assistant.")
+        .build()
+        .await
+        .unwrap();
+
+    // What the actor's Prompt-cmd handler does with an agent-authored
+    // prompt before the run announces its user message.
+    session.set_pending_user_ui(Some(manox_harness::session::UserEntryUi {
+        author: "harness".into(),
+        peer: false,
+        display_text: Some("[harness] the model switched".into()),
+    }));
+
+    let appender = session.journal_appender();
+    let mut rig = K5Rig::new(&dir, &session);
+    let mut turn = TurnCommit::open(&session, &rig.state, &rig.notice_tx, &cwd);
+    let drive = drive_run(
+        session.prompt("[harness] the model switched"),
+        &rig.handle,
+        &mut rig.cmd_rx,
+        &mut turn,
+        &mut rig.shutdown_after_run,
+        Arc::clone(&rig.live),
+        &rig.state,
+        &rig.notice_tx,
+        &mut rig.harness_model,
+        &rig.sessions_path,
+        &rig.active_session_path,
+    )
+    .await;
+    drive.result.unwrap();
+
+    let rows = appender.storage().journal_range(0, u64::MAX).await.unwrap();
+    let ui = rows
+        .iter()
+        .find_map(|record| match &record.entry {
+            manox_harness::session::Event::Message {
+                message: AgentMessage::User { .. },
+                ui,
+                ..
+            } => Some(ui.clone()),
+            _ => None,
+        })
+        .expect("the turn appended its user row");
+    assert_eq!(
+        ui,
+        Some(manox_harness::session::UserEntryUi {
+            author: "harness".into(),
+            peer: false,
+            display_text: Some("[harness] the model switched".into()),
+        }),
+        "the row itself carries the author"
     );
 }
 

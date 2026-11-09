@@ -383,6 +383,7 @@ mod tests {
             timestamp: ts,
             message: manox_harness::types::AgentMessage::user("hello"),
             origin: None,
+            ui: None,
         };
         let finish = |row_id: &str| E::TurnFinish {
             id: row_id.to_string(),

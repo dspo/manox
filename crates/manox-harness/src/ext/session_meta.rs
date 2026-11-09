@@ -72,29 +72,6 @@ pub struct SessionMeta {
     /// reload.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub registry_displays: HashMap<usize, String>,
-    /// Agent attribution for user-role messages the human did not type
-    /// (plan seeds, peer deliveries, member opening tasks), keyed by the
-    /// same user-prompt ordinal as `registry_displays`. The host resolves
-    /// `author` (a routing identity) to a display name at render time.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub user_attributions: HashMap<usize, UserAttributionMeta>,
-}
-
-/// One persisted attribution record (see `SessionMeta::user_attributions`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct UserAttributionMeta {
-    /// Routing identity of the originating agent: `"lead"` for the main
-    /// agent, the manifest / member name otherwise.
-    pub author: String,
-    /// The message entered via team peer delivery; the reload path
-    /// rebuilds it as a team bubble.
-    #[serde(default)]
-    pub peer: bool,
-    /// The send-time display form of the message (e.g. the unwrapped body of
-    /// a peer delivery whose model-facing text is a wrapped `[from …]` form).
-    /// The reload path re-attaches it so restored bubbles match the live view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_text: Option<String>,
 }
 
 /// The sidecar path for a session file.

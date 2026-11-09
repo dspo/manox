@@ -348,6 +348,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             message,
             origin: None,
+            ui: None,
         }
     }
 

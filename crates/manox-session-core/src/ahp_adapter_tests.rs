@@ -249,6 +249,7 @@ fn user(text: &str) -> E {
             id: None,
         },
         origin: Some("rpc-1".into()),
+        ui: None,
     }
 }
 
@@ -279,6 +280,7 @@ fn assistant(text: &str, input: u64, output: u64) -> E {
             timestamp: stamp(),
         },
         origin: None,
+        ui: None,
     }
 }
 
@@ -1967,6 +1969,7 @@ mod dispatch {
             content: Vec<manox_harness::types::ContentBlock>,
             origin: Option<String>,
             _accepted_entry: Option<String>,
+            _ui: Option<manox_harness::session::UserEntryUi>,
         ) {
             self.run_origins.lock().push(origin);
             self.run(prompt, content);

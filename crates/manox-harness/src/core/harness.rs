@@ -3846,6 +3846,10 @@ fn build_persistence_middleware<S: SessionStorage + 'static>(
                     let content_value =
                         serde_json::to_value(content).unwrap_or(serde_json::Value::Null);
                     if let Some(entry_id) = session.take_accepted_user_entry(&content_value) {
+                        // The row is already on disk, so the authorship pin
+                        // (if any) has no append left to ride: drop it here
+                        // rather than let it attribute a later row.
+                        let _ = session.take_pending_user_ui();
                         control
                             .message_entry_ids
                             .lock()
@@ -3855,12 +3859,16 @@ fn build_persistence_middleware<S: SessionStorage + 'static>(
                     }
                 }
                 // The host pinned this turn's origin RPC id (echo
-                // retirement, §F.2): drain it on exactly the first user
-                // message append; every other message appends with None.
-                let origin = if matches!(&*message, crate::types::AgentMessage::User { .. }) {
-                    session.take_pending_user_origin()
+                // retirement, §F.2) and authorship (the entry-level `ui`
+                // fact): drain both on exactly the first user message append;
+                // every other message appends with None.
+                let (origin, ui) = if matches!(&*message, crate::types::AgentMessage::User { .. }) {
+                    (
+                        session.take_pending_user_origin(),
+                        session.take_pending_user_ui(),
+                    )
                 } else {
-                    None
+                    (None, None)
                 };
                 // K9: bounded retries before the fail-fast propagation (K4
                 // symmetry) — each attempt re-clones the message/origin so a
@@ -3869,7 +3877,12 @@ fn build_persistence_middleware<S: SessionStorage + 'static>(
                     let session = Arc::clone(&session);
                     let message = (*message).clone();
                     let origin = origin.clone();
-                    async move { session.append_message_with_origin(message, origin).await }
+                    let ui = ui.clone();
+                    async move {
+                        session
+                            .append_message_with_origin_and_ui(message, origin, ui)
+                            .await
+                    }
                 })
                 .await?;
                 control.message_entry_ids.lock().unwrap().push(Some(id));
@@ -4497,6 +4510,62 @@ pub(crate) mod tests {
         let messages = result.unwrap();
         assert!(!messages.is_empty());
         assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
+    }
+
+    /// The authorship pin is consumed by exactly the turn's user row: the
+    /// journal entry carries it, the next turn's row does not.
+    #[tokio::test]
+    async fn the_prompt_row_carries_the_pinned_authorship_once() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        harness
+            .session()
+            .set_pending_user_ui(Some(crate::session::UserEntryUi {
+                author: "harness".into(),
+                peer: true,
+                display_text: Some("[harness] note".into()),
+            }));
+        harness.prompt("Hello").await.unwrap();
+        harness.prompt("Again").await.unwrap();
+
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
+        let users: Vec<Option<crate::session::UserEntryUi>> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Event::Message {
+                    message: AgentMessage::User { .. },
+                    ui,
+                    ..
+                } => Some(ui.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users.len(), 2, "two prompts, two rows: {entries:?}");
+        assert_eq!(
+            users[0],
+            Some(crate::session::UserEntryUi {
+                author: "harness".into(),
+                peer: true,
+                display_text: Some("[harness] note".into()),
+            }),
+            "the pinned row carries its author"
+        );
+        assert_eq!(
+            users[1], None,
+            "the one-shot pin never leaks into the next row"
+        );
     }
 
     #[tokio::test]

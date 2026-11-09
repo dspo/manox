@@ -206,19 +206,21 @@ pub trait ThreadEngine: Send + Sync {
     fn goal_gate(&self) {}
 
     /// `run` with the client's origin RPC id pinned onto this turn's first
-    /// user message (§F.2) and — K5 — the journal entry id the Submit was
-    /// accepted under ([`Self::persist_user_submission`] persisted it before
-    /// the receipt): the engine arms the middleware skip from it instead of
-    /// appending its own user entry. Engines without origin support ignore
-    /// both.
+    /// user message (§F.2), the entry-level authorship of that row
+    /// ([`manox_harness::session::UserEntryUi`]), and — K5 — the journal
+    /// entry id the Submit was accepted under
+    /// ([`Self::persist_user_submission`] persisted it before the receipt):
+    /// the engine arms the middleware skip from it instead of appending its
+    /// own user entry. Engines without origin support ignore all of it.
     fn run_with_origin(
         &self,
         prompt: String,
         images: Vec<manox_harness::types::ContentBlock>,
         origin: Option<String>,
         accepted_entry: Option<String>,
+        ui: Option<manox_harness::session::UserEntryUi>,
     ) {
-        let _ = (origin, accepted_entry);
+        let _ = (origin, accepted_entry, ui);
         self.run(prompt, images);
     }
 
