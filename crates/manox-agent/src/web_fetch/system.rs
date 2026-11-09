@@ -1,9 +1,10 @@
 //! System-level proxy configuration for `web_fetch`: what the OS publishes
-//! as its fetch proxy, read once per route decision (see [`super::proxy`]).
+//! as its fetch proxy, probed off the async worker and cached between route
+//! decisions (see [`super::proxy`]).
 //!
 //! Each platform adapter reduces its native store to one [`SystemProxy`]:
 //! static per-scheme proxy URLs (already scheme-prefixed and routable), the
-//! bypass list, and the simple-hostname flag. A PAC-only configuration is
+//! bypass list, and the simple-hostname flag. A PAC or WPAD configuration is
 //! deliberately reported as absent — script evaluation is out of scope, and
 //! inventing a static proxy would route around the user's declared policy.
 //!
@@ -36,6 +37,8 @@ impl SystemProxy {
 
 /// One `host`/`port` pair turned into a routable proxy URL. IPv6 literals
 /// take the bracket form `Url::parse` needs.
+// Dead only on targets without a system-proxy adapter; the shared tests still
+// compile and exercise it.
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "windows", target_os = "linux")),
     allow(dead_code)
@@ -126,13 +129,18 @@ mod macos {
     /// Reduces the merged proxy dictionary — the same one `scutil --proxy`
     /// prints — to the fetch-relevant fields.
     fn from_proxies_dict(dict: &CFDictionary<CFString, CFType>) -> Option<SystemProxy> {
-        // PAC governs every destination; honoring static entries alongside
-        // the script would route around the declared policy.
-        if dict
+        // PAC and WPAD both govern every destination (WPAD only discovers the
+        // script); honoring static entries alongside either would route
+        // around the declared policy.
+        let pac_enabled = dict
             .find(CFString::new("ProxyAutoConfigEnable"))
             .map(|value| flag(&value))
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        let wpad_enabled = dict
+            .find(CFString::new("ProxyAutoDiscoveryEnable"))
+            .map(|value| flag(&value))
+            .unwrap_or(false);
+        if pac_enabled || wpad_enabled {
             return None;
         }
         let enabled = |key: &str| {
@@ -151,9 +159,11 @@ mod macos {
             .flatten();
         let bypass =
             dict.find(CFString::new("ExceptionsList"))
+                // The dictionary is untyped: only a CFArray may be viewed as
+                // one. The type-ID check makes the cast below sound; each
+                // element is still downcast on its own.
+                .filter(|value| value.type_of() == CFArray::<CFType>::type_id())
                 .map(|value| {
-                    // SystemConfiguration stores this entry as an array of strings;
-                    // the cast restores the typed view the dictionary erased.
                     let array = unsafe {
                         CFArray::<CFType>::wrap_under_get_rule(
                             value.as_concrete_TypeRef() as CFArrayRef
@@ -244,6 +254,32 @@ mod macos {
                 ),
             ]);
             assert_eq!(from_proxies_dict(&dict), None);
+        }
+
+        #[test]
+        fn wpad_configuration_is_absent_even_with_static_listeners() {
+            let dict = proxies_dict(vec![
+                ("ProxyAutoDiscoveryEnable", number(1)),
+                ("HTTPEnable", number(1)),
+                ("HTTPProxy", string("127.0.0.1")),
+                ("HTTPPort", number(6152)),
+                ("HTTPSEnable", number(1)),
+                ("HTTPSProxy", string("127.0.0.1")),
+                ("HTTPSPort", number(6152)),
+            ]);
+            assert_eq!(from_proxies_dict(&dict), None);
+        }
+
+        #[test]
+        fn non_array_exceptions_are_ignored() {
+            let dict = proxies_dict(vec![
+                ("HTTPEnable", number(1)),
+                ("HTTPProxy", string("127.0.0.1")),
+                ("HTTPPort", number(6152)),
+                ("ExceptionsList", string("not-an-array")),
+            ]);
+            let proxy = from_proxies_dict(&dict).expect("static entry");
+            assert!(proxy.bypass.is_empty());
         }
 
         #[test]
@@ -347,21 +383,22 @@ mod linux {
         if get("org.gnome.system.proxy.http", "use-authentication").as_deref() == Some("true") {
             return None;
         }
-        let host_port = |schema: &str| -> Option<String> {
+        let host_port = |schema: &str, scheme: &str| -> Option<String> {
             let host = parse_gvariant_string(&get(schema, "host")?)?;
             let port = parse_gvariant_port(&get(schema, "port")?)?;
-            proxy_url("http", &host, port)
+            proxy_url(scheme, &host, port)
         };
-        let http = host_port("org.gnome.system.proxy.http");
+        let http = host_port("org.gnome.system.proxy.http", "http");
         // GLib semantics: an unset https entry inherits the http listener.
-        let https = host_port("org.gnome.system.proxy.https").or_else(|| http.clone());
+        let https = host_port("org.gnome.system.proxy.https", "http").or_else(|| http.clone());
+        let socks = host_port("org.gnome.system.proxy.socks", "socks5h");
         let bypass = get("org.gnome.system.proxy", "ignore-hosts")
             .map(|raw| parse_gvariant_string_array(&raw))
             .unwrap_or_default();
         let proxy = SystemProxy {
             http,
             https,
-            socks: None,
+            socks,
             bypass,
             exclude_simple_hostnames: false,
         };
@@ -371,6 +408,8 @@ mod linux {
 
 /// Windows `ProxyServer` forms: a bare `host:port` serving both web schemes,
 /// or a `;`-separated `protocol=host:port` map (`socks=` among them).
+// The Windows adapter's parser, kept compiled on every target so the single
+// Linux CI leg exercises it; dead in non-Windows production builds.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn parse_windows_proxy_server(value: &str) -> (Option<String>, Option<String>, Option<String>) {
     if !value.contains('=') {
@@ -402,6 +441,7 @@ fn parse_windows_proxy_server(value: &str) -> (Option<String>, Option<String>, O
 }
 
 /// One Windows `host:port` entry as a proxy URL; `None` when unparseable.
+// See `parse_windows_proxy_server`: cross-compiled for the shared tests.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn windows_host_port_url(scheme: &str, entry: &str) -> Option<String> {
     let entry = entry.trim();
@@ -412,6 +452,7 @@ fn windows_host_port_url(scheme: &str, entry: &str) -> Option<String> {
 }
 
 /// Windows `ProxyOverride` → bypass entries plus the `<local>` flag.
+// See `parse_windows_proxy_server`: cross-compiled for the shared tests.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn parse_windows_proxy_override(value: &str) -> (Vec<String>, bool) {
     let mut entries = Vec::new();
@@ -432,6 +473,8 @@ fn parse_windows_proxy_override(value: &str) -> (Vec<String>, bool) {
 
 /// A GVariant-printed string (`'manual'`) without its quoting; a bare
 /// unquoted token passes through. Empty values are absent.
+// The GNOME adapter's parser, kept compiled on every target so the macOS test
+// run still covers it; dead in non-Linux production builds.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_gvariant_string(raw: &str) -> Option<String> {
     let raw = raw.trim();
@@ -447,6 +490,7 @@ fn parse_gvariant_string(raw: &str) -> Option<String> {
 }
 
 /// A GVariant string array: `@as []` or `['localhost', '127.0.0.0/8']`.
+// See `parse_gvariant_string`: cross-compiled for the shared tests.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_gvariant_string_array(raw: &str) -> Vec<String> {
     let inner = raw.trim().trim_start_matches("@as").trim();
@@ -464,6 +508,7 @@ fn parse_gvariant_string_array(raw: &str) -> Vec<String> {
 
 /// A GVariant-printed integer port (`8080`, tolerating the `uint32 8080`
 /// spelling).
+// See `parse_gvariant_string`: cross-compiled for the shared tests.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_gvariant_port(raw: &str) -> Option<u16> {
     let token = raw.split_whitespace().last()?;

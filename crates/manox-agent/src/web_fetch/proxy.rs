@@ -20,7 +20,15 @@
 //! A value this tool cannot route abandons its source, not the chain: a
 //! garbage environment value leaves the environment's other fallbacks
 //! untouched (the user named that scheme explicitly) but the system proxy —
-//! a source the user also configured — still answers.
+//! a source the user also configured — still answers. A source's bypass list
+//! is its own: the OS exceptions govern the OS proxy, while `no_proxy` is the
+//! user's explicit exemption for either route.
+//!
+//! The OS lookup shells out on some desktops, so it runs on the blocking pool,
+//! is skipped when the environment already answers, and is cached briefly.
+
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use url::Url;
 
@@ -30,6 +38,26 @@ use super::system::SystemProxy;
 /// listed because a bare `::1` reads as host `:` port `1` to port-splitting
 /// matchers.
 const LOOPBACK_NO_PROXY: [&str; 4] = ["localhost", "127.0.0.1", "::1", "[::1]"];
+
+/// How long a system-proxy read stays authoritative. Desktop setting changes
+/// are expected to apply promptly, while one probe on Linux shells out to
+/// `gsettings` several times; one read per window is the compromise.
+const SYSTEM_PROXY_TTL: Duration = Duration::from_secs(30);
+
+/// How long one system-proxy probe may take before the route falls back to
+/// direct. The probe runs on the blocking pool, so a wedged D-Bus session must
+/// not hold the fetch itself.
+const SYSTEM_PROXY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cached result of the OS proxy probe, keyed by the instant it was read.
+type SystemProxyCache = Mutex<Option<(Instant, Option<SystemProxy>)>>;
+
+/// Which configuration source supplied the selected proxy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxySource {
+    Environment,
+    System,
+}
 
 /// Which transport mode a fetch runs under.
 pub(super) enum Route {
@@ -91,34 +119,63 @@ impl EnvLookup for ProcessEnv {
     }
 }
 
-/// What the OS-level lookup supplies; `None` where the platform publishes no
-/// usable static proxy (none configured, PAC-only, or the reader failed).
-pub(super) trait SystemLookup {
-    fn lookup(&self) -> Option<SystemProxy>;
-}
-
-struct ProcessSystem;
-
-impl SystemLookup for ProcessSystem {
-    fn lookup(&self) -> Option<SystemProxy> {
-        super::system::read()
+/// The OS proxy, read on the blocking pool and cached for [`SYSTEM_PROXY_TTL`].
+/// A probe that exceeds [`SYSTEM_PROXY_PROBE_TIMEOUT`] reads as absent; the
+/// blocking task stays on the blocking pool instead of pinning a runtime
+/// worker.
+async fn system_proxy() -> Option<SystemProxy> {
+    static CACHE: OnceLock<SystemProxyCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some((read_at, proxy)) = guard.as_ref()
+            && read_at.elapsed() < SYSTEM_PROXY_TTL
+        {
+            return proxy.clone();
+        }
     }
+    let probe = tokio::task::spawn_blocking(super::system::read);
+    let proxy = match tokio::time::timeout(SYSTEM_PROXY_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(proxy)) => proxy,
+        _ => None,
+    };
+    let mut guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+    *guard = Some((Instant::now(), proxy.clone()));
+    proxy
 }
 
 /// Decide the route for one URL under this process's environment and the
-/// system proxy.
-pub(super) fn route_for(url: &Url) -> Route {
-    resolve_route(url, &ProcessEnv, &ProcessSystem)
+/// system proxy. The OS probe is skipped when the environment already names a
+/// routable proxy for the scheme.
+pub(super) async fn route_for(url: &Url) -> Route {
+    let env_policy = resolve_env_policy(&ProcessEnv);
+    let system = if !matches!(url.scheme(), "http" | "https")
+        || env_candidate(url.scheme(), &env_policy).is_some()
+    {
+        None
+    } else {
+        system_proxy().await
+    };
+    resolve_route_with(url, &ProcessEnv, &env_policy, system.as_ref())
 }
 
-fn resolve_route(url: &Url, env: &dyn EnvLookup, system: &dyn SystemLookup) -> Route {
+#[cfg(test)]
+fn resolve_route(url: &Url, env: &dyn EnvLookup, system: Option<&SystemProxy>) -> Route {
     let env_policy = resolve_env_policy(env);
-    let system = system.lookup();
-    let Some(proxy) = select_proxy(url.scheme(), &env_policy, system.as_ref()) else {
+    resolve_route_with(url, env, &env_policy, system)
+}
+
+fn resolve_route_with(
+    url: &Url,
+    env: &dyn EnvLookup,
+    env_policy: &EnvPolicy,
+    system: Option<&SystemProxy>,
+) -> Route {
+    let Some((proxy, source)) = select_proxy(url.scheme(), env_policy, system) else {
         return Route::Direct;
     };
     let host = url.host_str().unwrap_or_default();
-    let (bypass, exclude_simple_hostnames) = bypass_list(env, system.as_ref());
+    let (bypass, exclude_simple_hostnames) = bypass_list(env, system, source);
     if is_loopback_host(host) || bypasses_proxy(&bypass, exclude_simple_hostnames, url) {
         return Route::Direct;
     }
@@ -152,41 +209,66 @@ fn resolve_env_policy(env: &dyn EnvLookup) -> EnvPolicy {
     }
 }
 
-/// The proxy the decision lands on: the environment chain first, then the
-/// system proxy's scheme-specific listener, the other web scheme's listener
-/// (an HTTPS fetch through the HTTP proxy matches the environment's own
-/// convention), and finally the system SOCKS listener. The first candidate
-/// that parses as a proxy URL wins.
-fn select_proxy(scheme: &str, env: &EnvPolicy, system: Option<&SystemProxy>) -> Option<String> {
-    let mut candidates: Vec<String> = Vec::new();
+/// The environment's one candidate for a scheme, if any.
+fn env_candidate(scheme: &str, env: &EnvPolicy) -> Option<String> {
     match scheme {
-        "http" => candidates.extend(env.http_chain()),
-        "https" => candidates.extend(env.https_chain()),
-        _ => return None,
+        "http" => env.http_chain(),
+        "https" => env.https_chain(),
+        _ => None,
+    }
+}
+
+/// The proxy the decision lands on, with the source that supplied it: the
+/// environment chain first, then the system proxy's scheme-specific listener,
+/// the other web scheme's listener (an HTTPS fetch through the HTTP proxy
+/// matches the environment's own convention), and finally the system SOCKS
+/// listener. The first candidate that parses as a proxy URL wins.
+fn select_proxy(
+    scheme: &str,
+    env: &EnvPolicy,
+    system: Option<&SystemProxy>,
+) -> Option<(String, ProxySource)> {
+    if !matches!(scheme, "http" | "https") {
+        return None;
+    }
+    let mut candidates: Vec<(String, ProxySource)> = Vec::new();
+    if let Some(proxy) = env_candidate(scheme, env) {
+        candidates.push((proxy, ProxySource::Environment));
     }
     if let Some(system) = system {
-        let order = match scheme {
-            "http" => [system.http.clone(), system.socks.clone()],
-            _ => [system.https.clone(), system.http.clone()],
+        let order: [Option<String>; 3] = match scheme {
+            "http" => [system.http.clone(), system.socks.clone(), None],
+            _ => [
+                system.https.clone(),
+                system.http.clone(),
+                system.socks.clone(),
+            ],
         };
-        candidates.extend(order.into_iter().flatten());
-        if scheme == "https" {
-            candidates.extend(system.socks.clone());
-        }
+        candidates.extend(
+            order
+                .into_iter()
+                .flatten()
+                .map(|proxy| (proxy, ProxySource::System)),
+        );
     }
     candidates
         .into_iter()
-        .find(|candidate| Url::parse(candidate).is_ok())
+        .find(|(candidate, _)| Url::parse(candidate).is_ok())
 }
 
-/// Classify one proxy candidate. Only URL-parseable `http:`/`https:`/`socks5:`
-/// / `socks5h:` proxy values can be routed; a SOCKS4 or PAC value is rejected
-/// rather than silently ignored.
+/// Classify one proxy candidate. Only URL-parseable `http:`/`https:`/`socks4:`/
+/// `socks4a:`/`socks5:`/`socks5h:` proxy values can be routed; a PAC value is
+/// rejected rather than silently ignored.
 fn candidate(env: &dyn EnvLookup, lower: &str) -> Candidate {
     match read_env(env, lower) {
         None => Candidate::Absent,
         Some(value) => match Url::parse(&value) {
-            Ok(parsed) if matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") => {
+            Ok(parsed)
+                if matches!(
+                    parsed.scheme(),
+                    "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
+                ) =>
+            {
                 Candidate::Accepted(value)
             }
             _ => Candidate::Rejected,
@@ -208,14 +290,23 @@ fn read_env(env: &dyn EnvLookup, lower: &str) -> Option<String> {
     None
 }
 
-/// The union of every source's bypass entries, plus the simple-hostname flag.
-/// The loopback constants join any list that is not the universal wildcard.
-fn bypass_list(env: &dyn EnvLookup, system: Option<&SystemProxy>) -> (Vec<String>, bool) {
+/// The bypass entries that apply to the selected source, plus the
+/// simple-hostname flag. `no_proxy` is the user's explicit exemption and
+/// applies to either source; the OS list describes exceptions to the OS proxy,
+/// so it applies only when the OS proxy is the selected route. The loopback
+/// constants join any list that is not the universal wildcard.
+fn bypass_list(
+    env: &dyn EnvLookup,
+    system: Option<&SystemProxy>,
+    source: ProxySource,
+) -> (Vec<String>, bool) {
     let mut entries = split_entries(&read_env(env, "no_proxy").unwrap_or_default());
     let mut exclude_simple_hostnames = false;
-    if let Some(system) = system {
+    if source == ProxySource::System
+        && let Some(system) = system
+    {
         entries.extend(system.bypass.iter().cloned());
-        exclude_simple_hostnames |= system.exclude_simple_hostnames;
+        exclude_simple_hostnames = system.exclude_simple_hostnames;
     }
     if !entries.iter().any(|entry| entry == "*") {
         for entry in LOOPBACK_NO_PROXY {
@@ -414,12 +505,6 @@ mod tests {
     #[derive(Default)]
     struct MapSystem(Option<SystemProxy>);
 
-    impl SystemLookup for MapSystem {
-        fn lookup(&self) -> Option<SystemProxy> {
-            self.0.clone()
-        }
-    }
-
     fn system(http: Option<&str>, https: Option<&str>, socks: Option<&str>) -> MapSystem {
         MapSystem(Some(SystemProxy {
             http: http.map(str::to_string),
@@ -434,7 +519,7 @@ mod tests {
     }
 
     fn proxied_with(env: &MapEnv, system: &MapSystem, input: &str) -> Option<String> {
-        match resolve_route(&url(input), env, system) {
+        match resolve_route(&url(input), env, system.0.as_ref()) {
             Route::Proxied(proxy) => Some(proxy.to_string()),
             Route::Direct => None,
         }
@@ -500,7 +585,12 @@ mod tests {
 
     #[test]
     fn socks_proxy_values_are_routable() {
-        for value in ["socks5://127.0.0.1:6153", "socks5h://127.0.0.1:6153"] {
+        for value in [
+            "socks4://127.0.0.1:6153",
+            "socks4a://127.0.0.1:6153",
+            "socks5://127.0.0.1:6153",
+            "socks5h://127.0.0.1:6153",
+        ] {
             let env = MapEnv::new(&[("all_proxy", value)]);
             assert_eq!(
                 proxied(&env, "https://example.com/").as_deref(),
@@ -513,7 +603,7 @@ mod tests {
     #[test]
     fn unroutable_value_abandons_the_environment_source() {
         let env = MapEnv::new(&[
-            ("http_proxy", "socks4://127.0.0.1:1080"),
+            ("http_proxy", "ftp://127.0.0.1:1080"),
             ("all_proxy", "http://all.test:1080"),
         ]);
         // The HTTP slot was named but cannot be routed: no fallback to ALL_PROXY.
@@ -550,6 +640,61 @@ mod tests {
         assert_eq!(
             proxied_with(&env, &system, "http://example.com/").as_deref(),
             Some("http://env.test:8080/")
+        );
+    }
+
+    #[test]
+    fn selected_proxy_reports_its_source() {
+        let env = MapEnv::new(&[("http_proxy", "http://env.test:8080")]);
+        let system = system(Some("http://sys.test:6152"), None, None);
+        let policy = resolve_env_policy(&env);
+        let (proxy, source) = select_proxy("http", &policy, system.0.as_ref()).unwrap();
+        assert_eq!(proxy, "http://env.test:8080");
+        assert_eq!(source, ProxySource::Environment);
+
+        let env = MapEnv::new(&[]);
+        let policy = resolve_env_policy(&env);
+        let (proxy, source) = select_proxy("http", &policy, system.0.as_ref()).unwrap();
+        assert_eq!(proxy, "http://sys.test:6152");
+        assert_eq!(source, ProxySource::System);
+    }
+
+    #[test]
+    fn system_bypass_is_scoped_to_the_system_proxy() {
+        let env = MapEnv::new(&[("https_proxy", "http://env.test:3128")]);
+        let system = MapSystem(Some(SystemProxy {
+            http: Some("http://sys.test:6152".to_string()),
+            https: Some("http://sys.test:6152".to_string()),
+            bypass: vec!["internal.corp".to_string()],
+            exclude_simple_hostnames: true,
+            ..SystemProxy::default()
+        }));
+        // The environment proxy was named explicitly: the OS exceptions and
+        // the OS single-label rule describe the OS proxy, not this route.
+        assert_eq!(
+            proxied_with(&env, &system, "https://internal.corp/").as_deref(),
+            Some("http://env.test:3128/")
+        );
+        assert_eq!(
+            proxied_with(&env, &system, "https://intranet/").as_deref(),
+            Some("http://env.test:3128/")
+        );
+    }
+
+    #[test]
+    fn system_bypass_applies_when_the_system_proxy_is_selected() {
+        let env = MapEnv::new(&[]);
+        let system = MapSystem(Some(SystemProxy {
+            http: Some("http://sys.test:6152".to_string()),
+            bypass: vec!["internal.corp".to_string()],
+            exclude_simple_hostnames: true,
+            ..SystemProxy::default()
+        }));
+        assert_eq!(proxied_with(&env, &system, "http://internal.corp/"), None);
+        assert_eq!(proxied_with(&env, &system, "http://intranet/"), None);
+        assert_eq!(
+            proxied_with(&env, &system, "http://example.com/").as_deref(),
+            Some("http://sys.test:6152/")
         );
     }
 
@@ -686,7 +831,7 @@ mod tests {
 
     #[test]
     fn simple_hostname_flag_bypasses_bare_names() {
-        let env = MapEnv::new(&[("http_proxy", "http://proxy.test:8080")]);
+        let env = MapEnv::new(&[]);
         let system = MapSystem(Some(SystemProxy {
             http: Some("http://proxy.test:8080".to_string()),
             exclude_simple_hostnames: true,
@@ -726,18 +871,18 @@ mod tests {
     #[test]
     fn loopback_entries_are_merged_into_every_bypass_list() {
         let env = MapEnv::new(&[("no_proxy", "example.com")]);
-        let (entries, _) = bypass_list(&env, None);
+        let (entries, _) = bypass_list(&env, None, ProxySource::Environment);
         assert!(entries.contains(&"example.com".to_string()));
         for entry in LOOPBACK_NO_PROXY {
             assert!(entries.contains(&entry.to_string()), "{entry} missing");
         }
 
         let wildcard = MapEnv::new(&[("no_proxy", "*")]);
-        let (entries, _) = bypass_list(&wildcard, None);
+        let (entries, _) = bypass_list(&wildcard, None, ProxySource::Environment);
         assert_eq!(entries, vec!["*"]);
 
         let system = system(Some("http://sys.test:1"), None, None);
-        let (merged, _) = bypass_list(&env, system.0.as_ref());
+        let (merged, _) = bypass_list(&env, system.0.as_ref(), ProxySource::System);
         assert!(merged.contains(&"example.com".to_string()));
         assert_eq!(
             split_entries("a.test,,  b.test  c.test"),
@@ -749,7 +894,7 @@ mod tests {
     fn non_http_schemes_are_direct() {
         let env = MapEnv::new(&[("all_proxy", "http://all.test:1080")]);
         assert!(matches!(
-            resolve_route(&url("ftp://example.com/"), &env, &MapSystem::default()),
+            resolve_route(&url("ftp://example.com/"), &env, None),
             Route::Direct
         ));
     }

@@ -167,7 +167,7 @@ pub(crate) async fn fetch(
     cancel: &CancellationToken,
 ) -> Result<WebFetchResult, WebFetchError> {
     let parsed = validate_url(url)?;
-    let (transport, proxy) = match proxy::route_for(&parsed) {
+    let (transport, proxy) = match proxy::route_for(&parsed).await {
         Route::Direct => (Transport::guarded(Arc::new(SystemResolver)), None),
         Route::Proxied(proxy) => (Transport::unguarded(Arc::new(SystemResolver)), Some(proxy)),
     };
