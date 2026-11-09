@@ -72,6 +72,7 @@ use ahp_types::state::{
     ToolCallResult, ToolCallState, ToolInput, ToolResultContent, ToolResultTextContent, UsageInfo,
 };
 use manox_harness::session::Event;
+use manox_harness::session::UserEntryUi;
 use manox_harness::types::{AgentMessage, ContentBlock};
 use serde_json::{Value, json};
 
@@ -654,6 +655,9 @@ struct MessageRow<'a> {
     usage: Option<&'a UsageRow>,
     origin_rpc: Option<&'a str>,
     display: Option<bool>,
+    /// Entry-level authorship of a user row (the journal fact the turn's
+    /// opening `_meta` surfaces).
+    ui: Option<&'a UserEntryUi>,
 }
 
 /// One transcript row decoded from the kernel's [`AgentMessage`] shape —
@@ -939,7 +943,10 @@ impl Translator {
         match entry {
             // ── transcript ───────────────────────────────────────────────
             Event::Message {
-                message, origin, ..
+                message,
+                origin,
+                ui,
+                ..
             } => {
                 let decoded = decode_message(message, origin.as_deref());
                 self.on_message(
@@ -951,6 +958,7 @@ impl Translator {
                         usage: decoded.usage.as_ref(),
                         origin_rpc: decoded.origin_rpc.as_deref(),
                         display: decoded.display,
+                        ui: ui.as_ref(),
                     },
                     &mut out,
                 );
@@ -1716,12 +1724,27 @@ impl Translator {
             usage,
             origin_rpc,
             display,
+            ui,
         } = row;
         match role {
             "user" => {
                 let mut row = json!({"role": role, "entryId": entry.id});
                 if let Some(rpc) = origin_rpc {
                     row["originRpc"] = json!(rpc);
+                }
+                // Authorship is the row's own fact: the fold surfaces it on
+                // the message that opens the turn — carried through
+                // `pending_user` untouched, or re-issued for the initiating /
+                // steer row — so live and replayed views agree without an
+                // ordinal count or a sidecar read.
+                if let Some(ui) = ui {
+                    row["author"] = json!(ui.author);
+                    if ui.peer {
+                        row["peer"] = json!(true);
+                    }
+                    if let Some(display_text) = &ui.display_text {
+                        row["displayText"] = json!(display_text);
+                    }
                 }
                 let message = Message {
                     text: blocks_text(content),
@@ -3930,6 +3953,7 @@ mod tests {
                     timestamp: chrono::Utc::now(),
                     message: (**message).clone(),
                     origin: None,
+                    ui: None,
                 });
                 seq += 1;
                 continue;
@@ -4048,6 +4072,158 @@ mod turn_message_tests {
             meta["x-manox"].get("turnOwner").is_none(),
             "the meta must not carry the owner: {meta:?}"
         );
+    }
+
+    /// A user row carrying its entry-level authorship.
+    fn attributed_user_row(id: &str, text: &str, ui: Value) -> Event {
+        let mut fields = json!({
+            "type": "message",
+            "id": id,
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        });
+        if !ui.is_null() {
+            fields["ui"] = ui;
+        }
+        kernel(fields)
+    }
+
+    fn turn_close(id: &str) -> Event {
+        kernel(json!({
+            "type": "turn_finish",
+            "id": id,
+            "cancelled": false,
+            "failed": false,
+            "strandedSteerIds": [],
+        }))
+    }
+
+    /// Every turn-opening message's `_meta["x-manox"]`, in emission order.
+    fn turn_opening_metas(rows: &[Event]) -> Vec<Value> {
+        let mut translator = Translator::new();
+        let mut metas = Vec::new();
+        for (seq, entry) in rows.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatTurnStarted(action) = emitted.action
+                    && let Some(meta) = action.message.meta
+                {
+                    metas.push(meta[ext::META_KEY].clone());
+                }
+            }
+        }
+        metas
+    }
+
+    /// The campaign fixture: one turn opened per authorship flavour.
+    fn authorship_fixture() -> Vec<Event> {
+        vec![
+            attributed_user_row("e-0", "seed the plan", json!({"author": "harness"})),
+            kernel(json!({"type": "agent_text_delta", "id": "e-1", "delta": "planning"})),
+            turn_close("e-2"),
+            attributed_user_row("e-3", "a human prompt", Value::Null),
+            kernel(json!({"type": "agent_text_delta", "id": "e-4", "delta": "working"})),
+            turn_close("e-5"),
+            attributed_user_row(
+                "e-6",
+                "[from Sailor] wrapped",
+                json!({"author": "Sailor", "peer": true, "displayText": "unwrapped body"}),
+            ),
+            kernel(json!({"type": "agent_text_delta", "id": "e-7", "delta": "peer reply"})),
+            turn_close("e-8"),
+            attributed_user_row("e-9", "lead seed", json!({"author": "lead"})),
+            kernel(json!({"type": "agent_text_delta", "id": "e-10", "delta": "leading"})),
+            turn_close("e-11"),
+        ]
+    }
+
+    /// The journal line is the only attribution channel: folding the live
+    /// records and folding their disk round-trip (a reopen replays exactly
+    /// these lines) yields the same `_meta.author` per opening turn.
+    #[test]
+    fn authorship_rides_the_turn_opening_meta_live_and_replayed() {
+        let live_rows = authorship_fixture();
+        let live = turn_opening_metas(&live_rows);
+        let replayed_rows: Vec<Event> = live_rows
+            .iter()
+            .map(|row| {
+                let line = serde_json::to_string(row).expect("a journal line serializes");
+                serde_json::from_str(&line).expect("a journal line reads back")
+            })
+            .collect();
+        let replayed = turn_opening_metas(&replayed_rows);
+        assert_eq!(
+            live, replayed,
+            "live and replayed folds read the same attribution off the row"
+        );
+        let authors: Vec<&str> = live
+            .iter()
+            .map(|meta| meta["author"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            authors,
+            vec!["harness", "", "Sailor", "lead"],
+            "harness / human / peer / lead: {live:?}"
+        );
+        assert!(
+            live[1].get("author").is_none(),
+            "a human row stays unattributed: {live:?}"
+        );
+    }
+
+    /// A harness-injected notice is a user row with authorship, not a plain
+    /// user row: the fold says who injected it.
+    #[test]
+    fn a_harness_injected_notice_folds_as_harness_authorship() {
+        let rows = vec![
+            attributed_user_row(
+                "e-0",
+                "[harness] the model switched",
+                json!({"author": "harness"}),
+            ),
+            kernel(json!({"type": "agent_text_delta", "id": "e-1", "delta": "ack"})),
+        ];
+        let metas = turn_opening_metas(&rows);
+        assert_eq!(metas.len(), 1, "one opening turn: {metas:?}");
+        assert_eq!(metas[0]["author"], json!("harness"));
+        assert!(
+            metas[0].get("peer").is_none(),
+            "a notice is not a peer delivery: {metas:?}"
+        );
+    }
+
+    /// Peer delivery keeps its display form and its peer flag on the opening
+    /// message, so the restored bubble matches the live one.
+    #[test]
+    fn a_peer_delivery_keeps_display_text_and_the_peer_flag() {
+        let rows = vec![
+            attributed_user_row(
+                "e-0",
+                "[from Sailor] wrapped",
+                json!({"author": "Sailor", "peer": true, "displayText": "unwrapped body"}),
+            ),
+            kernel(json!({"type": "agent_text_delta", "id": "e-1", "delta": "got it"})),
+        ];
+        let metas = turn_opening_metas(&rows);
+        assert_eq!(metas[0]["author"], json!("Sailor"));
+        assert_eq!(metas[0]["peer"], json!(true));
+        assert_eq!(metas[0]["displayText"], json!("unwrapped body"));
+    }
+
+    /// A steer row (a user row arriving on an open, content-carrying turn)
+    /// opens its own turn and carries its own authorship there.
+    #[test]
+    fn a_steer_row_carries_its_authorship_into_its_own_turn() {
+        let rows = vec![
+            attributed_user_row("e-0", "start", Value::Null),
+            kernel(json!({"type": "agent_text_delta", "id": "e-1", "delta": "running"})),
+            attributed_user_row("e-2", "inject", json!({"author": "harness"})),
+        ];
+        let metas = turn_opening_metas(&rows);
+        assert_eq!(metas.len(), 2, "the steer partitions the turn: {metas:?}");
+        assert!(
+            metas[0].get("author").is_none(),
+            "the human opening stays unattributed: {metas:?}"
+        );
+        assert_eq!(metas[1]["author"], json!("harness"));
     }
 }
 
