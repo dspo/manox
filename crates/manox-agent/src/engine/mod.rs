@@ -47,11 +47,13 @@ mod subagent_authority;
 #[cfg(test)]
 mod tests;
 mod tools_assembly;
+mod turn;
 use journal::*;
 use lifecycle::*;
 use run::*;
 use subagent_authority::*;
 use tools_assembly::*;
+use turn::*;
 // Public aliases: `BrowserSuite` and the two journal entry points are
 // addressed as `crate::engine::…` from other modules.
 pub(crate) use journal::{dispatch_store_journal_row, register_engine_route};
@@ -78,7 +80,8 @@ async fn close_held_turn(
     let Some(held) = state.held_settle.lock().unwrap().take() else {
         return;
     };
-    run::finish_held_settle(held, cancelled, session, state, cwd, notice_tx).await;
+    let appender = session.journal_appender();
+    run::finish_held_settle(held, cancelled, &appender, state, cwd, notice_tx).await;
     if !cancelled && !seeds.is_empty() {
         send_notice(
             notice_tx,
@@ -341,9 +344,10 @@ struct EngineState {
     question_gate: Arc<crate::questions::UserQuestionGate>,
     /// A run that ended on a delivered ask holds its turn open until the
     /// answer settles (the ahp reducer only settles input parts on the
-    /// ACTIVE turn): the settle path parks its turn-finish here, and the
-    /// settling cmd closes it. `None` whenever no run is held.
-    held_settle: Mutex<Option<run::HeldSettle>>,
+    /// ACTIVE turn): the commit parks its close here, and the settling cmd
+    /// (answer, dismiss, abort or a new submit) closes it. `None` whenever no
+    /// turn is held.
+    held_settle: Mutex<Option<HeldTurn>>,
     /// Ask cards re-parked at restore: their turn predates this process, so
     /// they never hold a turn or seed a run — a settle of theirs is a
     /// journal-only decision row.
@@ -399,6 +403,70 @@ struct EngineState {
     /// for the `SetThinkingLevel` arms, independent of the session's
     /// clamp-adjusted in-force level.
     journaled_thinking_level: Mutex<Option<String>>,
+    /// Detached-projection bookkeeping: at most one projection runs at a
+    /// time, and a request that lands while one runs only raises `dirty`
+    /// (the running pass reruns once).
+    projection: Mutex<ProjectionFlight>,
+    /// Test seam: the abort grace this state's drive loop enforces (`0` = the
+    /// production constant). The beyond-grace test cannot wait ten seconds.
+    #[cfg(test)]
+    abort_grace_ms: AtomicU64,
+    /// The run supervisor could not guarantee the harness's state: a run
+    /// future panicked, outlived its abort grace, or a turn was dropped
+    /// between open and commit. Only a process restart clears it; every
+    /// Prompt/Steer submit is refused with a readable error meanwhile.
+    degraded: AtomicBool,
+    degraded_reason: Mutex<Option<String>>,
+}
+
+impl EngineState {
+    /// Record that this session's harness state can no longer be trusted.
+    /// Idempotent: the first reason wins, so the original failure is the one
+    /// the refusal reports.
+    fn mark_degraded(&self, reason: &str) {
+        tracing::error!(
+            reason,
+            "session degraded: the turn supervisor lost control of its turn"
+        );
+        let mut slot = self.degraded_reason.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(reason.to_string());
+        }
+        self.degraded.store(true, Ordering::Release);
+    }
+
+    fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Acquire)
+    }
+
+    /// The abort grace in force for this state's turns.
+    fn abort_grace(&self) -> std::time::Duration {
+        #[cfg(test)]
+        {
+            let millis = self.abort_grace_ms.load(Ordering::Relaxed);
+            if millis > 0 {
+                return std::time::Duration::from_millis(millis);
+            }
+        }
+        ABORT_GRACE
+    }
+
+    /// The readable refusal a submit gets while degraded (`None` when the
+    /// session is healthy).
+    fn degraded_refusal(&self) -> Option<String> {
+        if !self.is_degraded() {
+            return None;
+        }
+        let reason = self
+            .degraded_reason
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "an unknown supervisor failure".to_string());
+        Some(format!(
+            "this session is degraded after a supervisor failure ({reason}); restart the process to continue"
+        ))
+    }
 }
 
 /// Live transcript snapshot maintained by the session listener so the engine
@@ -574,6 +642,11 @@ pub fn spawn_engine(
             granted
         },
         last_cwd_note: Mutex::new(None),
+        projection: Mutex::new(ProjectionFlight::default()),
+        #[cfg(test)]
+        abort_grace_ms: AtomicU64::new(0),
+        degraded: AtomicBool::new(false),
+        degraded_reason: Mutex::new(None),
     });
     // The actor's own copy of the declared roots: the prompt's project-root
     // section is seeded from this construction-time snapshot, never from a
@@ -1314,9 +1387,15 @@ async fn run_actor(
     // mirror and strand the thread on the loading screen. Unconditional so a
     // failed restore (fresh fallback session) also clears any preview the
     // display stream had written.
-    sync_history(&session, &sessions_dir, &state).await;
+    sync_history(
+        &session.journal_appender(),
+        &sessions_dir,
+        session.path(),
+        &state,
+    )
+    .await;
     if restored {
-        sync_usage(&session, &state).await;
+        sync_usage(&session.journal_appender(), &state, None).await;
     }
     // The active-tool set is authoritative for the composer chips; `None`
     // (never narrowed) reads as the full mounted set.
@@ -1375,7 +1454,7 @@ async fn run_actor(
         // session); drain before blocking on the next command.
         let parked = std::mem::take(&mut *state.pending_ui_notes.lock().unwrap());
         for record in parked {
-            let _ = persist_ui_note(&session, &state, &notice_tx, &record).await;
+            let _ = persist_ui_note(&session.journal_appender(), &state, &notice_tx, &record).await;
         }
         let parked_journal = std::mem::take(&mut *state.pending_journal.lock().unwrap());
         if !parked_journal.is_empty() {
@@ -1457,6 +1536,30 @@ async fn run_actor(
                 origin_rpc,
                 accepted_entry,
             } => {
+                // Ownership honesty, not a retry: after a supervisor failure
+                // the harness may be mid-state, so a submit is refused with a
+                // readable error until the process restarts. The `Settled`
+                // makes the facade converge the turn it optimistically opened.
+                if let Some(refusal) = state.degraded_refusal() {
+                    send_notice(
+                        &notice_tx,
+                        BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
+                            "{refusal}"
+                        )))),
+                        "degraded submit refusal",
+                    );
+                    send_notice(
+                        &notice_tx,
+                        BackendNotice::Settled {
+                            cancelled: false,
+                            failed: true,
+                            steered: Vec::new(),
+                            stranded: Vec::new(),
+                        },
+                        "degraded submit refusal",
+                    );
+                    continue;
+                }
                 // The user speaks while answers are pending: the open cards
                 // dismiss (their seeds drop — the message supersedes; the
                 // answered decisions stay journaled), the held turn closes,
@@ -1528,16 +1631,12 @@ async fn run_actor(
                         serde_json::json!({ "cwd": cwd.display().to_string() }),
                     );
                 }
-                state.running.store(true, Ordering::Relaxed);
                 let handle = session.handle();
-                let active_session_path = session.path().clone();
-                let journal_appender = session.journal_appender();
-                // Drive the run while still servicing mid-run commands
-                // (abort/steer) through the session handle, then chain
-                // automatic goal rounds until the goal stops or the user
-                // interrupts.
-                let (result, abort_requested) = drive_run(
-                    session.prompt_with_images(&text, images),
+                // Open -> drive -> commit -> project. The turn's close is
+                // durable before any derived work runs.
+                let settlement = run_turn(
+                    &mut session,
+                    TurnInput::Prompt { text, images },
                     &handle,
                     &mut cmd_rx,
                     &mut run_steers,
@@ -1547,25 +1646,19 @@ async fn run_actor(
                     &notice_tx,
                     &mut harness_model,
                     &sessions_dir,
-                    &active_session_path,
-                    &journal_appender,
-                )
-                .await;
-                settle_run(
-                    &result,
-                    abort_requested,
-                    &session,
-                    &state,
-                    &sessions_dir,
                     &cwd,
-                    &notice_tx,
-                    &mut run_steers,
                 )
                 .await;
                 if shutdown_after_run {
                     break;
                 }
-                goal_housekeeping(&result, abort_requested, &session, &state).await;
+                goal_housekeeping(
+                    &settlement.result,
+                    settlement.abort_requested,
+                    &session,
+                    &state,
+                )
+                .await;
                 if shutdown_after_run {
                     break;
                 }
@@ -1581,7 +1674,6 @@ async fn run_actor(
                     &mut harness_model,
                     &sessions_dir,
                     &cwd,
-                    &active_session_path,
                 )
                 .await;
                 if shutdown_after_run {
@@ -1659,6 +1751,20 @@ async fn run_actor(
                 }
             }
             SessionCmd::Steer { id, text, images } => {
+                if let Some(refusal) = state.degraded_refusal() {
+                    // A steer has no run to join and no turn to open; refuse
+                    // it loudly rather than letting it sit in a queue nothing
+                    // will ever drain.
+                    send_notice(
+                        &notice_tx,
+                        BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
+                            "{refusal}"
+                        )))),
+                        "degraded steer refusal",
+                    );
+                    let _ = id;
+                    continue;
+                }
                 // S1 (idle-steer): a steer that arrives while
                 // the actor is idle no longer waits for an unrelated next turn.
                 // Enqueue it under its command id (S4 retractable; S3 the same
@@ -1787,11 +1893,7 @@ async fn run_actor(
                 // Chain continuation rounds only when the gate actually owes
                 // one — no round, no run (continue_ with empty queues errors).
                 if !state.running.load(Ordering::Relaxed) {
-                    state.running.store(true, Ordering::Relaxed);
-                    let _ =
-                        notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
                     let handle = session.handle();
-                    let active_session_path = session.path().clone();
                     chain_goal_rounds(
                         &mut session,
                         &handle,
@@ -1804,7 +1906,6 @@ async fn run_actor(
                         &mut harness_model,
                         &sessions_dir,
                         &cwd,
-                        &active_session_path,
                     )
                     .await;
                     if shutdown_after_run {
@@ -1829,8 +1930,14 @@ async fn run_actor(
                         // otherwise attach the pre-compaction ordinals to the
                         // wrong prompts.
                         clear_user_chrome(&sessions_dir, session.path()).await;
-                        sync_history(&session, &sessions_dir, &state).await;
-                        sync_usage(&session, &state).await;
+                        sync_history(
+                            &session.journal_appender(),
+                            &sessions_dir,
+                            session.path(),
+                            &state,
+                        )
+                        .await;
+                        sync_usage(&session.journal_appender(), &state, None).await;
                         spawn_session_list_refresh(&sessions_dir, &state);
                     }
                     Err(err)
@@ -1918,8 +2025,14 @@ async fn run_actor(
                 // Opened sessions are resumed conversations: SessionStart
                 // already happened in a prior lifetime.
                 state.session_start_fired.store(true, Ordering::SeqCst);
-                sync_history(&session, &sessions_dir, &state).await;
-                sync_usage(&session, &state).await;
+                sync_history(
+                    &session.journal_appender(),
+                    &sessions_dir,
+                    session.path(),
+                    &state,
+                )
+                .await;
+                sync_usage(&session.journal_appender(), &state, None).await;
                 spawn_session_list_refresh(&sessions_dir, &state);
             }
             SessionCmd::SetCwd { path } => {
@@ -1929,7 +2042,7 @@ async fn run_actor(
                 // Persist at the leaf through the append queue and refresh
                 // the mirror so an idle switch-away sees the note before the
                 // next authoritative sync.
-                if persist_ui_note(&session, &state, &notice_tx, &record).await {
+                if persist_ui_note(&session.journal_appender(), &state, &notice_tx, &record).await {
                     mirror_ui_note(&state, record);
                 }
             }
@@ -2607,29 +2720,48 @@ async fn rebuild_restored_state(
     merged
 }
 
-/// Mirror the session's authoritative entry list (compaction-aware, every
-/// entry type) into engine state: the display sequence interleaves UI note
-/// entries at their persisted position, then re-attaches the sidecar's
-/// per-ordinal user-turn chrome (registry slash display forms + agent
-/// attributions) — the transcript stores only wire content, so the attach
-/// is what keeps a reloaded thread's bubbles send-time accurate.
-async fn sync_history(session: &AgentSession, sessions_dir: &Path, state: &Arc<EngineState>) {
-    let entries = match session.context_entries().await {
+/// Map the journal's active chain into the display sequence plus the
+/// positioned UI notes: the display interleaves the note entries at their
+/// persisted position, then re-attaches the sidecar's per-ordinal user-turn
+/// chrome (registry slash display forms + agent attributions) — the transcript
+/// stores only wire content, so the attach is what keeps a reloaded thread's
+/// bubbles send-time accurate.
+///
+/// Reads go through the journal handle, never a session borrow: the turn's
+/// projection runs detached from the run that produced the chain.
+async fn display_from_entries(
+    entries: &[manox_harness::session::Event],
+    sessions_dir: &Path,
+    session_path: &Path,
+) -> (Vec<HistoryEntry>, Vec<PositionedNote>) {
+    let (mut display, notes) = adapt::entries_to_display(entries);
+    attach_registry_displays(
+        &mut display,
+        &load_registry_displays(sessions_dir, session_path).await,
+    );
+    attach_user_attributions(
+        &mut display,
+        &load_user_attributions(sessions_dir, session_path).await,
+    );
+    (display, notes)
+}
+
+/// Mirror the session's authoritative entry list into engine state (the idle
+/// faces: `Ready`, `Open`, compaction).
+async fn sync_history(
+    appender: &Arc<JournalAppender>,
+    sessions_dir: &Path,
+    session_path: &Path,
+    state: &Arc<EngineState>,
+) {
+    let entries = match appender.build_context_entries().await {
         Ok(entries) => entries,
         Err(err) => {
             tracing::warn!(error = %err, "context entries unavailable; mirror left as-is");
             return;
         }
     };
-    let (mut display, notes) = adapt::entries_to_display(&entries);
-    attach_registry_displays(
-        &mut display,
-        &load_registry_displays(sessions_dir, session.path()).await,
-    );
-    attach_user_attributions(
-        &mut display,
-        &load_user_attributions(sessions_dir, session.path()).await,
-    );
+    let (display, notes) = display_from_entries(&entries, sessions_dir, session_path).await;
     *state.history.lock().unwrap() = display;
     *state.notes.lock().unwrap() = notes;
     state.notes_gen.fetch_add(1, Ordering::SeqCst);
@@ -3038,24 +3170,46 @@ async fn persist_initial_title(
     }
 }
 
-/// Mirror session usage into the engine state. Cumulative and per-model
-/// totals come from the kernel's stats over the full active branch —
-/// compacted history, tool results, and summarization usage included
-/// (totals reflect what was actually billed).
-/// Only the per-request attribution for the env card stays a thin
-/// presentation walk here.
-async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
-    let stats = match session.session_stats().await {
-        Ok(stats) => stats,
+/// Mirror session usage into the engine state, reading the journal handle
+/// only. Cumulative and per-model totals come from the kernel's stats over the
+/// full active branch — compacted history, tool results, and summarization
+/// usage included (totals reflect what was actually billed); the per-request
+/// attribution is a presentation walk over the kernel transcript alone (#920).
+///
+/// `since`, when given, is the journal seq the caller started from: a chain
+/// that moved on meanwhile supersedes this pass, so nothing is written.
+/// Returns whether the mirror was written.
+async fn sync_usage(
+    appender: &Arc<JournalAppender>,
+    state: &Arc<EngineState>,
+    since: Option<u64>,
+) -> bool {
+    let branch = match appender.get_branch().await {
+        Ok(branch) => branch,
         Err(err) => {
-            // Degrade to the assistant-only walk (the pre-stats mechanism)
-            // so a failing stats read never freezes UI usage at stale
-            // values. Loses tool-result/summary usage for this sync only.
-            tracing::warn!("session stats failed; falling back to message walk: {err:#}");
-            sync_usage_from_messages(session, state);
-            return;
+            tracing::warn!(error = %err, "session stats unavailable; usage mirror left as-is");
+            return false;
         }
     };
+    let entries = match appender.build_context_entries().await {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(error = %err, "context entries unavailable; usage mirror left as-is");
+            return false;
+        }
+    };
+    let stats = manox_harness::coding_agent::usage::session_stats_from_entries(&branch);
+    let messages: Vec<AgentMessage> = entries
+        .iter()
+        .flat_map(manox_harness::session::session_entry_to_context_messages)
+        .collect();
+    let (per_turn, per_model_last) = request_attribution(&messages);
+    if let Some(seq) = since
+        && journal_advanced(appender, seq).await
+    {
+        tracing::debug!("usage mirror discarded: the journal moved past the projection's cursor");
+        return false;
+    }
     let cumulative = token_usage_from_totals(&stats.tokens);
     let mut per_model = HashMap::new();
     let mut per_model_cost = HashMap::new();
@@ -3069,55 +3223,35 @@ async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
     *state.per_model.lock().unwrap() = per_model;
     *state.cumulative_cost.lock().unwrap() = stats.tokens.cost;
     *state.per_model_cost.lock().unwrap() = per_model_cost;
-    store_attribution(state, session);
-}
-
-/// Rebuild both attribution maps from the authoritative mapped history and
-/// the kernel transcript, then mirror them into engine state.
-fn store_attribution(state: &Arc<EngineState>, session: &AgentSession) {
-    let (per_turn, per_model_last) =
-        request_attribution(&state.history.lock().unwrap(), session.harness_messages());
     *state.request_usage.lock().unwrap() = per_turn;
     *state.per_model_last_usage.lock().unwrap() = per_model_last;
+    true
 }
 
-/// Presentation-layer attribution for the env card, walked in lockstep over
-/// the kernel transcript and the authoritative mapped history so per-turn
-/// keys are the facade's own message ids. Returns the per-turn totals (each
-/// assistant request accumulates under the user message that triggered its
-/// turn) and each model's latest single request (the context-budget
-/// numerator; summing requests would count the repeated prompt prefix once
-/// per tool-loop iteration).
+/// Presentation-layer attribution for the env card, walking the kernel
+/// transcript alone (#920) — no mirrored-history stream, no parity assert.
+/// The per-turn key is the user message's own stable id (S3: a client
+/// submit/steer id); a message built without one (an internally-driven prompt)
+/// keys its turn by its ordinal among the transcript's user messages, which is
+/// stable for a given chain.
+///
+/// Returns the per-turn totals (each assistant request accumulates under the
+/// user message that triggered its turn) and each model's latest single
+/// request (the context-budget numerator; summing requests would count the
+/// repeated prompt prefix once per tool-loop iteration).
 fn request_attribution(
-    history: &[HistoryEntry],
     messages: &[AgentMessage],
 ) -> (HashMap<String, TokenUsage>, HashMap<String, TokenUsage>) {
     let mut per_turn: HashMap<String, TokenUsage> = HashMap::new();
     let mut per_model_last: HashMap<String, TokenUsage> = HashMap::new();
-    let mut ids = history.iter().filter_map(|entry| match entry {
-        HistoryEntry::Message(message) => Some(message),
-        HistoryEntry::Note(_) => None,
-    });
     let mut turn_key: Option<String> = None;
-    let mut over_consumed = false;
-    for m in messages {
-        // Id-stream cardinality must mirror
-        // `adapt::harness_messages_to_messages`: hidden Custom messages
-        // produce no mapped row.
-        let id = match m {
-            AgentMessage::Custom {
-                display, content, ..
-            } if !*display || content.is_empty() => None,
-            _ => match ids.next() {
-                Some(id) => Some(id),
-                None => {
-                    over_consumed = true;
-                    None
-                }
-            },
-        };
-        match m {
-            AgentMessage::User { .. } => turn_key = id.map(|m| m.id.clone()),
+    let mut user_ordinal = 0usize;
+    for message in messages {
+        match message {
+            AgentMessage::User { id, .. } => {
+                turn_key = Some(id.clone().unwrap_or_else(|| format!("user-{user_ordinal}")));
+                user_ordinal += 1;
+            }
             AgentMessage::Assistant {
                 usage,
                 model,
@@ -3144,52 +3278,7 @@ fn request_attribution(
             _ => {}
         }
     }
-    // Cardinality backstop: the skip rules above manually mirror
-    // `adapt::harness_messages_to_messages`; a divergence shifts every later
-    // attribution, so trip loudly in debug builds.
-    debug_assert!(
-        !over_consumed && ids.next().is_none(),
-        "request_attribution id stream out of lockstep with the mapped history"
-    );
     (per_turn, per_model_last)
-}
-
-/// Fallback aggregation when `session_stats()` is unavailable: assistant
-/// usage only. Keys keep the stats path's "{provider}/{model}" shape so
-/// consumers can resolve the model regardless of which path produced them.
-fn sync_usage_from_messages(session: &AgentSession, state: &Arc<EngineState>) {
-    let mut cumulative = TokenUsage::default();
-    let mut per_model: HashMap<String, TokenUsage> = HashMap::new();
-    for m in session.harness_messages() {
-        let AgentMessage::Assistant {
-            usage,
-            model,
-            provider,
-            response_model,
-            ..
-        } = m
-        else {
-            continue;
-        };
-        let u = to_token_usage(usage);
-        if u.total_tokens() == 0 {
-            continue;
-        }
-        cumulative = cumulative + u;
-        let key = format!(
-            "{provider}/{}",
-            response_model.as_deref().unwrap_or(model.as_str())
-        );
-        per_model
-            .entry(key)
-            .and_modify(|acc| *acc = *acc + u)
-            .or_insert(u);
-    }
-    *state.cumulative.lock().unwrap() = cumulative;
-    *state.per_model.lock().unwrap() = per_model;
-    *state.cumulative_cost.lock().unwrap() = 0.0;
-    *state.per_model_cost.lock().unwrap() = HashMap::new();
-    store_attribution(state, session);
 }
 
 /// Kernel usage totals → the facade's token usage shape.

@@ -1493,7 +1493,7 @@ impl Thread {
     }
 
     pub fn run_turn(&mut self) {
-        if self.running || (self.pending_prompts.is_empty() && self.pending_images.is_empty()) {
+        if self.pending_prompts.is_empty() && self.pending_images.is_empty() {
             return;
         }
         self.ensure_engine(self.project.clone());
@@ -1503,7 +1503,11 @@ impl Thread {
         let accepted_entry = self.pending_turn_accepted_entry.take();
         self.running = true;
         self.note_store_running(true);
-        self.pending_events.push(ThreadEvent::TurnStarted);
+        // The engine owns the open edge: it emits `TurnStarted` when the run
+        // actually opens (`engine::run_turn`), which is also what journals the
+        // `turn_start` row. A submit that lands on an open turn is forwarded
+        // all the same — the actor orders it (a held turn is committed first,
+        // a running one queues it as its follow-up).
         self.engine
             .as_ref()
             .expect("ensure_engine materialized the engine")
