@@ -3,8 +3,7 @@
 //!
 //! This fold is the authority behind the engine's restore path (K2): every
 //! field a §C.2 state-change entry carries rebuilds from the chain, and the
-//! session sidecar is a derived cache that only fills fields the chain has
-//! never seen (legacy journals predate the decision-point entries). The
+//! chain is the only source — replay reads the journal and nothing else. The
 //! match below is exhaustive — a new kernel entry variant must classify
 //! here (state-bearing or ignored) before it compiles, mirroring the
 //! projection fold's coverage gate.
@@ -18,10 +17,9 @@ use manox_harness::session::SessionTreeEntry;
 use manox_harness::session::jsonl::JournalRecord;
 
 /// The journal-backed observable state of one thread, folded from its
-/// active chain. Every field is `None` while the chain carries no entry
-/// for it — the restore path falls back to the sidecar cache for exactly
-/// those fields (K2 migration window: old journals never saw the
-/// decision-point entries).
+/// active chain. Every field is `None` while the chain carries no entry for
+/// it — the journal is the only source of replay state, so a field with no
+/// entry has no journaled value.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReplayedThreadState {
     /// Display title from the last `title` entry.
@@ -347,17 +345,6 @@ mod tests {
         assert_eq!(state.title.as_deref(), Some("second"));
         assert_eq!(state.pinned, Some(false));
         assert_eq!(state.archived, Some(true));
-    }
-
-    #[test]
-    fn fields_without_entries_stay_none() {
-        // The K2 fallback contract: a legacy chain with no decision-point
-        // entries leaves every field `None` so the restore path reads the
-        // sidecar cache instead of overwriting it with defaults.
-        let state = replay_thread_state(&[]);
-        assert_eq!(state, ReplayedThreadState::default());
-        assert!(state.title.is_none() && state.pinned.is_none());
-        assert!(state.project.is_none());
     }
 
     #[test]
