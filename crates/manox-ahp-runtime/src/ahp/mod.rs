@@ -751,7 +751,7 @@ fn read_header(path: &Path) -> Option<manox_harness::session::jsonl::JsonlSessio
     let file = std::fs::File::open(path).ok()?;
     let mut line = String::new();
     std::io::BufReader::new(file).read_line(&mut line).ok()?;
-    let (header, _) = manox_harness::session::jsonl::parse_header_line(line.as_bytes()).ok()?;
+    let header = manox_harness::session::jsonl::parse_header_line(path, line.as_bytes()).ok()?;
     Some(header)
 }
 

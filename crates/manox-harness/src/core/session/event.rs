@@ -172,8 +172,8 @@ pub enum Event {
         data: Option<JsonValue>,
     },
     /// An extension message whose payload the harness does not interpret.
-    /// `content` is a plain string or an array of text/image blocks, matching
-    /// the v3 schema.
+    /// `content` is a plain string or an array of text/image blocks, the
+    /// flat wire shape.
     #[serde(rename = "custom_message", rename_all = "camelCase")]
     CustomMessage {
         id: String,

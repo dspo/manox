@@ -131,7 +131,7 @@ mod tests {
             .collect();
         write_session(
             &path,
-            r#"{"type":"session","version":3,"id":"s1"}"#,
+            r#"{"type":"session","version":4,"id":"s1"}"#,
             &entries.iter().map(String::as_str).collect::<Vec<_>>(),
         );
 
@@ -164,7 +164,7 @@ mod tests {
             .collect();
         write_session(
             &path,
-            r#"{"type":"session","version":3,"id":"s1"}"#,
+            r#"{"type":"session","version":4,"id":"s1"}"#,
             &entries.iter().map(String::as_str).collect::<Vec<_>>(),
         );
 
@@ -198,7 +198,7 @@ mod tests {
         let good = serde_json::to_string(&message_entry("m0", "hello")).unwrap();
         write_session(
             &path,
-            r#"{"type":"session","version":3,"id":"s1"}"#,
+            r#"{"type":"session","version":4,"id":"s1"}"#,
             &[&good, "not json at all", &good],
         );
         let mut stream = SessionTranscriptStream::open(&path).await.unwrap();
@@ -211,7 +211,7 @@ mod tests {
     async fn header_only_session_yields_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
-        write_session(&path, r#"{"type":"session","version":3,"id":"s1"}"#, &[]);
+        write_session(&path, r#"{"type":"session","version":4,"id":"s1"}"#, &[]);
         let mut stream = SessionTranscriptStream::open(&path).await.unwrap();
         assert!(stream.next_batch(usize::MAX, usize::MAX).await.is_none());
     }

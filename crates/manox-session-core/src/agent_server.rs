@@ -997,9 +997,7 @@ impl AgentServerInner {
     ) -> Option<manox_harness::session::jsonl::JsonlSessionMetadata> {
         let bytes = std::fs::read(path).ok()?;
         let line_end = bytes.iter().position(|b| *b == b'\n')?;
-        manox_harness::session::jsonl::parse_header_line(&bytes[..line_end])
-            .ok()
-            .map(|(meta, _)| meta)
+        manox_harness::session::jsonl::parse_header_line(path, &bytes[..line_end]).ok()
     }
 
     /// The durable facts one claim decision runs on: the live table, the

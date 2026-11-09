@@ -605,8 +605,8 @@ pub(super) async fn cold_journal_append(
     };
     // B3: the file-level serialization a fresh storage instance's own writer
     // cannot give — held across the open (leaf/seq view) AND the append
-    // (stamp + write + the v3 lazy migration), so concurrent cold appends to
-    // one file run strictly one after another. The live-engine path needs no
+    // (stamp + write), so concurrent cold appends to one file run strictly
+    // one after another. The live-engine path needs no
     // such lock: its actor owns the file.
     let path_lock = cold_append_lock(&path);
     let _guard = path_lock.lock().await;

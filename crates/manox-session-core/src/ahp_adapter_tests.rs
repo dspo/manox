@@ -1828,7 +1828,7 @@ mod dispatch {
         std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
         std::fs::write(
             &session_file,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"s-dispatch\",\
+            "{\"type\":\"session\",\"version\":4,\"id\":\"s-dispatch\",\
          \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
          \"metadata\":{\"host\":\"manox\"}}\n",
         )
@@ -2471,7 +2471,7 @@ mod dispatch {
         std::fs::write(
             &session_file,
             format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"{session_id}\",\
+                "{{\"type\":\"session\",\"version\":4,\"id\":\"{session_id}\",\
              \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
              \"metadata\":{{\"host\":\"manox\"}}}}\n"
             ),
