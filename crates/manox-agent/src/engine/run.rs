@@ -3,6 +3,8 @@
 
 use super::*;
 
+use futures::FutureExt;
+
 /// Land one live journal row inside the select. The writer serializes
 /// appends, so awaiting the reply here cannot deadlock the run branch.
 ///
@@ -47,10 +49,64 @@ async fn land_live_row(
     true
 }
 
+/// What one supervised run left behind.
+pub(super) struct DriveOutcome {
+    pub(super) result: anyhow::Result<Vec<AgentMessage>>,
+    /// An abort was requested (a user/system cancel, or the journal-loss
+    /// cancel `land_live_row` raises).
+    pub(super) abort_requested: bool,
+    /// The run future panicked; the payload's message.
+    pub(super) panic: Option<String>,
+    /// The abort grace expired and the run future was dropped without
+    /// resolving — the harness may be mid-state.
+    pub(super) abandoned: bool,
+}
+
+/// The readable form of a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "the run panicked with a non-string payload".to_string()
+    }
+}
+
+/// Fold one completed (or caught) run poll into its outcome.
+fn finish_run(
+    polled: Result<anyhow::Result<Vec<AgentMessage>>, Box<dyn std::any::Any + Send>>,
+    abort_requested: bool,
+) -> DriveOutcome {
+    match polled {
+        Ok(result) => DriveOutcome {
+            result,
+            abort_requested,
+            panic: None,
+            abandoned: false,
+        },
+        Err(payload) => {
+            let message = panic_message(payload.as_ref());
+            tracing::error!(panic = %message, "the run future panicked; closing the turn as failed");
+            DriveOutcome {
+                result: Err(anyhow::anyhow!("{message}")),
+                abort_requested,
+                panic: Some(message),
+                abandoned: false,
+            }
+        }
+    }
+}
+
 /// Drive one session run to completion while still servicing mid-run
 /// commands (abort/steer/cancel/shutdown) through the session handle.
-/// Shared by user prompts, idle-wakeups, and answer-seeded turns.
-/// Returns the run result and whether an abort was requested.
+/// Shared by every turn entry point (see `run_turn`).
+///
+/// The run future borrows `&mut AgentSession`, so it cannot be spawned: it is
+/// polled here, wrapped once in `catch_unwind` so a panic becomes a normal
+/// `Failed { cause: Panic }` close instead of an unwind through the actor. An
+/// abort gets [`ABORT_GRACE`] to resolve on its own; a future that outlives it
+/// is dropped and the turn closes `Aborted` with the session degraded.
 ///
 /// While the run is in flight, a periodic tick refreshes the engine's
 /// history mirror from the live transcript (`LiveHistory` notice) so a
@@ -60,7 +116,7 @@ pub(super) async fn drive_run<F>(
     run: F,
     handle: &manox_harness::harness::HarnessHandle,
     cmd_rx: &mut mpsc::UnboundedReceiver<SessionCmd>,
-    run_steers: &mut Vec<String>,
+    turn: &mut TurnCommit,
     shutdown_after_run: &mut bool,
     live: Arc<Mutex<LiveTranscript>>,
     state: &Arc<EngineState>,
@@ -68,12 +124,14 @@ pub(super) async fn drive_run<F>(
     harness_model: &mut HarnessModel,
     sessions_dir: &Path,
     session_path: &Path,
-    appender: &Arc<JournalAppender>,
-) -> (anyhow::Result<Vec<AgentMessage>>, bool)
+) -> DriveOutcome
 where
     F: std::future::Future<Output = anyhow::Result<Vec<AgentMessage>>>,
 {
+    // One wrap, once: the panic verdict is the turn's close, not an unwind.
+    let run = std::panic::AssertUnwindSafe(run).catch_unwind();
     tokio::pin!(run);
+    let appender = Arc::clone(turn.appender());
     // The journal writer serializes appends: this select may await an append
     // reply directly. The writer is a separate task that owns the write
     // order, and no caller holds a lock across file I/O, so a select handler
@@ -94,12 +152,38 @@ where
     // unmissable; it repeats every 2 minutes.
     let mut watchdog_cursor: Option<u64> = None;
     let mut watchdog_last_move = std::time::Instant::now();
-    let appender_for_watchdog = appender;
-    let result = loop {
+    let appender_for_watchdog = Arc::clone(&appender);
+    // Armed by the abort arm (a far deadline keeps the branch inert before
+    // that): an abort that the run does not act on within the grace costs the
+    // future its life.
+    let grace = tokio::time::sleep_until(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(24 * 3600),
+    );
+    tokio::pin!(grace);
+    loop {
         if !channel_open {
-            break run.await;
+            break finish_run(run.await, abort_requested);
         }
         tokio::select! {
+            _ = &mut grace => {
+                // The run did not resolve within the grace: drop it. Closure
+                // is still guaranteed (the commit runs below); only the
+                // harness's own state is now suspect, which the degraded flag
+                // records.
+                tracing::error!(
+                    session = ?session_path,
+                    grace_ms = state.abort_grace().as_millis() as u64,
+                    "the run future outlived the abort grace; dropping it"
+                );
+                break DriveOutcome {
+                    result: Err(anyhow::anyhow!(
+                        "the run was abandoned after the abort grace expired"
+                    )),
+                    abort_requested: true,
+                    panic: None,
+                    abandoned: true,
+                };
+            }
             _ = live_ticker.tick() => {
                 if sync_live_history(&live, state) {
                     send_notice(notice_tx, BackendNotice::LiveHistory, "live history refresh");
@@ -124,6 +208,9 @@ where
                 Some(SessionCmd::Abort) => {
                     abort_requested = true;
                     handle.abort();
+                    grace
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + state.abort_grace());
                 }
                 Some(SessionCmd::Steer { id, text, images }) => {
                     // S4: enqueue under the command id (== the client
@@ -132,7 +219,7 @@ where
                     // run aborts before draining it. S3: the same id rides the
                     // injected `user` row as its durable identity.
                     handle.steer_with_id(steer_message(id.clone(), text, images), id.clone());
-                    run_steers.push(id);
+                    turn.record_steer(id);
                 }
                 Some(SessionCmd::CancelSteer(id)) => {
                     handle.cancel_steer(&id);
@@ -176,7 +263,7 @@ where
                         != Some(wire.as_str())
                     {
                         if land_live_row(
-                            appender,
+                            &appender,
                             "thinking_level_change".into(),
                             thinking_level_row_payload(&wire),
                             state,
@@ -187,6 +274,9 @@ where
                         .await
                         {
                             abort_requested = true;
+                            grace
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + state.abort_grace());
                         }
                         *state.journaled_thinking_level.lock().unwrap() = Some(wire);
                     }
@@ -209,7 +299,7 @@ where
                 Some(SessionCmd::AppendUiNote(record)) => {
                     // A mid-run switch-back must already show the card:
                     // merge it into the mirror now and park persistence for
-                    // the idle loop (the run owns the `Session`; a second
+                    // the projection (the actor owns the session; a second
                     // writer could fork the leaf cursor).
                     mirror_ui_note(state, record.clone());
                     state.pending_ui_notes.lock().unwrap().push(record);
@@ -222,7 +312,7 @@ where
                     // Parking for settle would hide subagent/retry/background
                     // rows for the whole run (L5).
                     if land_live_row(
-                        appender,
+                        &appender,
                         kind,
                         payload,
                         state,
@@ -233,6 +323,9 @@ where
                     .await
                     {
                         abort_requested = true;
+                        grace
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + state.abort_grace());
                     }
                 }
                 Some(SessionCmd::JournalSnapshot { reply }) => {
@@ -240,7 +333,7 @@ where
                     // idle loop): parking froze GetConversationInfo and
                     // PageHistory — the Q face AND the follow streams' gap
                     // repair — for the entire duration of a running turn.
-                    reply_journal_snapshot(appender, reply).await;
+                    reply_journal_snapshot(&appender, reply).await;
                 }
                 Some(SessionCmd::SetBrowserSuite { suite, enable }) => {
                     // The run owns the session; park the toggle so the idle
@@ -258,22 +351,118 @@ where
                     if !abort_requested {
                         abort_requested = true;
                         handle.abort();
+                        grace
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + state.abort_grace());
                     }
                 }
             },
-            result = &mut run => break result,
+            res = &mut run => break finish_run(res, abort_requested),
         }
-    };
-    (result, abort_requested)
+    }
 }
 
-/// A run's parked settlement: the run ended cleanly on a delivered ask, so
-/// its turn-finish waits for the answers (see `settle_run`'s hold). A held
-/// close is always a clean one — the hold requires a non-aborted,
-/// non-failed run — so the close journals `failed: false` and no stranded
-/// steers by construction; only the steered list varies.
-pub(super) struct HeldSettle {
-    pub(super) steered: Vec<String>,
+/// How a turn ended, derived from the run result and the drive loop's own
+/// verdict. This — never `Result::is_err` — is what the durable close
+/// journals and what the `Settled` notice reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RunOutcome {
+    /// The run finished and its terminal assistant did not fail.
+    Completed,
+    /// The turn failed. `terminal` is the message a human reads (the run
+    /// error, the terminal assistant's `error_message`, or the panic
+    /// payload); `cause` names which of those it was.
+    Failed {
+        terminal: Option<String>,
+        cause: FailureCause,
+    },
+    /// The turn was aborted (user cancel, journal-loss cancel) and closed
+    /// cancelled rather than failed.
+    Aborted,
+}
+
+/// Why a turn failed: the provider/loop reported a terminal error, the run
+/// future panicked, or the run was lost (it errored while already aborted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FailureCause {
+    Terminal,
+    Panic,
+    Lost,
+}
+
+impl RunOutcome {
+    /// The `failed` flag the durable `turn_finish` row carries.
+    pub(super) fn failed(&self) -> bool {
+        matches!(self, RunOutcome::Failed { .. })
+    }
+
+    /// The `cancelled` flag the durable `turn_finish` row carries.
+    pub(super) fn cancelled(&self) -> bool {
+        matches!(self, RunOutcome::Aborted)
+    }
+}
+
+/// The run result's own failure story. An `Err` is one; so is an `Ok` run
+/// whose terminal assistant carries `stop_reason: Error` — the loop returned
+/// Ok because the partial assistant and its synthesized tool results are
+/// durable, not because the turn succeeded.
+pub(super) fn terminal_error(result: &anyhow::Result<Vec<AgentMessage>>) -> Option<String> {
+    match result {
+        Err(err) => Some(format!("{err:#}")),
+        Ok(messages) => {
+            let terminal = messages
+                .iter()
+                .rev()
+                .find(|message| matches!(message, AgentMessage::Assistant { .. }))?;
+            match terminal {
+                AgentMessage::Assistant {
+                    stop_reason,
+                    error_message,
+                    ..
+                } if *stop_reason == Some(manox_harness::types::StopReason::Error) => Some(
+                    error_message
+                        .clone()
+                        .filter(|text| !text.trim().is_empty())
+                        .unwrap_or_else(|| "the model turn failed".to_string()),
+                ),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Derive the turn's outcome. An aborted turn stays `Aborted` even when the
+/// run future errored on its way out (the abort is the closer); such an
+/// error is `Lost` rather than a terminal failure, but it still reads as
+/// `failed` exactly as `Result::is_err` did before.
+pub(super) fn derive_outcome(
+    result: &anyhow::Result<Vec<AgentMessage>>,
+    abort_requested: bool,
+) -> RunOutcome {
+    if abort_requested {
+        return match result {
+            Err(err) => RunOutcome::Failed {
+                terminal: Some(format!("{err:#}")),
+                cause: FailureCause::Lost,
+            },
+            Ok(_) => RunOutcome::Aborted,
+        };
+    }
+    match terminal_error(result) {
+        Some(terminal) => RunOutcome::Failed {
+            terminal: Some(terminal),
+            cause: FailureCause::Terminal,
+        },
+        None => RunOutcome::Completed,
+    }
+}
+
+/// The durable `turn_start` payload: the turn's open row stamps the owning
+/// process (§C.2 turnStart owner) — the journal is shared across processes, and
+/// a reader of an open turn needs the owner's liveness to settle a dead turn on
+/// its behalf without ever killing one another process is running.
+pub(super) fn turn_start_payload() -> serde_json::Value {
+    serde_json::json!({ "owner": manox_harness::session::TurnOwner::for_current_process() })
 }
 
 /// Whether any open ask card was delivered by a run of THIS process (a
@@ -286,185 +475,6 @@ pub(super) fn live_ask_pending(state: &Arc<EngineState>) -> bool {
         .pending_entries()
         .iter()
         .any(|(id, _)| !stale.contains(id))
-}
-
-/// Post-run settlement shared by user prompts and idle-wakeups:
-/// error notice, running flag, history/usage/session-list mirrors, steer
-/// accounting, title eligibility, and the `Settled` notice.
-///
-/// A run that ended cleanly on a delivered `AskUserQuestion` HOLDS instead:
-/// its turn stays open on the wire until the answer settles (the ahp
-/// reducer settles input parts on the ACTIVE turn only, so a `turn_finish`
-/// here would cancel the just-delivered card at its own boundary). The
-/// deferred tail lands in [`finish_held_settle`].
-#[allow(clippy::too_many_arguments)] // settlement plumbing: each input is a distinct sink
-pub(super) async fn settle_run(
-    result: &anyhow::Result<Vec<AgentMessage>>,
-    abort_requested: bool,
-    session: &AgentSession,
-    state: &Arc<EngineState>,
-    sessions_dir: &Path,
-    cwd: &Path,
-    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
-    run_steers: &mut Vec<String>,
-) {
-    let failed = result.is_err();
-    // K5: a pin no run consumed (one died before announcing its user
-    // message) must not leak the middleware skip into the next turn.
-    session.journal_appender().clear_accepted_user_entry();
-    if let Err(err) = result {
-        send_notice(
-            notice_tx,
-            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!("{err:#}")))),
-            "error notice",
-        );
-    }
-    // The hold: a clean run that still has an open ask keeps its turn (and
-    // the engine's running flag) until the answer settles. A dying run's
-    // open cards cancel here — no turn will ever hold for them, and a card
-    // whose turn is gone is unanswerable by construction (the journal
-    // decision row keeps the replay fold honest). Only cards this process
-    // delivered hold; restore-reparked cards are settled as journal-only
-    // rows (their turn predates the process).
-    let hold = !abort_requested && !failed && live_ask_pending(state);
-    state.running.store(hold, Ordering::Relaxed);
-    if !hold && !state.question_gate.pending_entries().is_empty() {
-        let appender = session.journal_appender();
-        for (id, meta) in state.question_gate.withdraw_all() {
-            journal_ask_decision(&appender, &id, &meta, "cancelled", state, notice_tx).await;
-        }
-    }
-    // The sticky cwd may have moved during the run (a tool call with an
-    // explicit `cwd`, or a `cd` inside a command): report one `CwdChanged`
-    // per durable move so the facade mirror and the UI track the session
-    // tail. The projected cwd comes from the session path — the flush has
-    // already made the move durable at this point.
-    let projected = session.projected_cwd().await;
-    let projected_str = projected.to_string_lossy().into_owned();
-    let last = state.last_cwd_note.lock().unwrap().clone();
-    if last.as_deref() != Some(projected_str.as_str()) {
-        *state.last_cwd_note.lock().unwrap() = Some(projected_str.clone());
-        send_notice(
-            notice_tx,
-            BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
-                path: projected_str,
-            })),
-            "cwd changed notice",
-        );
-    }
-    // Mid-run appends parked their persistence (the run owned the session);
-    // persist before the authoritative sync so the rebuilt mirror keeps them.
-    let parked = std::mem::take(&mut *state.pending_ui_notes.lock().unwrap());
-    for record in parked {
-        let _ = persist_ui_note(session, state, notice_tx, &record).await;
-    }
-    let parked_journal = std::mem::take(&mut *state.pending_journal.lock().unwrap());
-    if !parked_journal.is_empty() {
-        // K4: the settle drain runs the same fail-loud discipline as every
-        // typed-append face — bounded retries, then a durable loss record
-        // and one facade notice. The turn has already converged here, so
-        // there is nothing left to cancel; the record parks for the idle
-        // drain when the storage is still down (it lands after recovery).
-        let appender = session.journal_appender();
-        let mut loss_notified = false;
-        for (kind, payload) in parked_journal {
-            if let Err(err) = append_typed_resilient(&appender, &kind, payload).await {
-                if let Some(row) = record_journal_loss(&appender, &kind, &err).await {
-                    state.pending_journal.lock().unwrap().push(row);
-                }
-                if kind != "error" && !loss_notified {
-                    loss_notified = true;
-                    send_notice(
-                        notice_tx,
-                        BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
-                            "journal append permanently failed for `{kind}` at settle: {err:#}; the entry was dropped"
-                        )))),
-                        "error notice",
-                    );
-                }
-            }
-        }
-    }
-    sync_history(session, sessions_dir, state).await;
-    sync_usage(session, state).await;
-    spawn_session_list_refresh(sessions_dir, state);
-    // S4: the kernel steering queue survives runs, so a steer that never
-    // drained during an aborted/failed run would silently inject into the
-    // NEXT run (a duplicated user message if the client retries). Retract
-    // each queued steer by its command id; a steer whose cancel fails was
-    // already drained by THIS run, so it is genuinely steered (its row is
-    // on disk), not stranded. `abort_requested || failed` only retracts the
-    // still-queued tail (a pending steer is discarded/failed,
-    // never poured into a dying or later run).
-    let (steered, stranded) = if abort_requested || failed {
-        let mut steered = Vec::new();
-        let mut stranded = Vec::new();
-        for id in std::mem::take(run_steers) {
-            if session.cancel_steer(&id) {
-                stranded.push(id);
-            } else {
-                steered.push(id);
-            }
-        }
-        (steered, stranded)
-    } else {
-        (std::mem::take(run_steers), Vec::new())
-    };
-    if hold {
-        // Park the settlement tail: the turn stays open until a settling
-        // answer (or a dismiss/abort) closes it through `finish_held_settle`.
-        *state.held_settle.lock().unwrap() = Some(HeldSettle { steered });
-        state.awaiting_answers.store(true, Ordering::Relaxed);
-        return;
-    }
-    // §C.2 `turn_finish`: the settle verdict must ride the journal, not
-    // just the notice plane — v2 clients fold lifecycle facts from durable
-    // rows (the `ThreadEvent::TurnFinished` notice is `Skip`ped by
-    // translate), and the app's steer-card retirement keys off this row.
-    // Appended through the shared writer at the session's single append
-    // point (id/parent/timestamp assigned under the append lock, so the
-    // chain stays dense and the seq is the natural next one). The K4
-    // fail-loud discipline mirrors the parked drain above: bounded retry,
-    // durable loss record, one facade notice on permanent failure.
-    let turn_finish = serde_json::json!({
-        "cancelled": abort_requested,
-        "failed": failed,
-        "strandedSteerIds": stranded.clone(),
-    });
-    let appender = session.journal_appender();
-    if let Err(err) = append_typed_resilient(&appender, "turn_finish", turn_finish).await {
-        if let Some(row) = record_journal_loss(&appender, "turn_finish", &err).await {
-            state.pending_journal.lock().unwrap().push(row);
-        }
-        send_notice(
-            notice_tx,
-            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
-                "journal append permanently failed for `turn_finish` at settle: {err:#}; the entry was dropped"
-            )))),
-            "error notice",
-        );
-    }
-    send_notice(
-        notice_tx,
-        BackendNotice::Settled {
-            cancelled: abort_requested,
-            failed,
-            steered,
-            stranded,
-        },
-        "run settled",
-    );
-    // Plugin lifecycle: `Stop` fires on every settled turn (fail-open,
-    // detached) — after the `Settled` notice so observers see the turn's
-    // final state first.
-    crate::plugin_hooks::fire(
-        crate::plugin_hooks::HookEvent::Stop,
-        cwd.to_str(),
-        serde_json::json!({
-            "cancelled": abort_requested,
-            "failed": failed,
-        }),
-    );
 }
 
 /// Journal one settled ask's decision row at the caller's append point
@@ -499,15 +509,14 @@ pub(super) async fn journal_ask_decision(
     }
 }
 
-/// Close a held turn: the answers settled (or the user dismissed/aborted
-/// out), so the settlement `settle_run` parked lands now — the deferred
-/// `turn_finish` row, the `Settled` notice, and the Stop hook. `cancelled`
-/// is the close verdict: a normal answer settles complete; an abort while
-/// answers were pending settles cancelled.
+/// Close a held turn: the answers settled (or the user dismissed / aborted /
+/// submitted anew), so the parked close lands now through the same durable
+/// tail every settle uses. `cancelled` is the close verdict: a normal answer
+/// settles complete; an abort while answers were pending settles cancelled.
 pub(super) async fn finish_held_settle(
-    held: HeldSettle,
+    held: HeldTurn,
     cancelled: bool,
-    session: &AgentSession,
+    appender: &Arc<JournalAppender>,
     state: &Arc<EngineState>,
     cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
@@ -515,47 +524,23 @@ pub(super) async fn finish_held_settle(
     state.awaiting_answers.store(false, Ordering::Relaxed);
     state.awaiting_abort.store(false, Ordering::Relaxed);
     state.running.store(false, Ordering::Relaxed);
-    // A held close is always clean (see `HeldSettle`): `failed` is false
-    // and no steer stranded, by the hold's own precondition.
-    let turn_finish = serde_json::json!({
-        "cancelled": cancelled,
-        "failed": false,
-        "strandedSteerIds": Vec::<String>::new(),
-    });
-    let appender = session.journal_appender();
-    if let Err(err) = append_typed_resilient(&appender, "turn_finish", turn_finish).await {
-        // K4 fail-loud, same as `settle_run`'s own `turn_finish`: the row
-        // is the durable close every replay folds — losing it silently
-        // would leave a turn that never ends.
-        if let Some(row) = record_journal_loss(&appender, "turn_finish", &err).await {
-            state.pending_journal.lock().unwrap().push(row);
-        }
-        send_notice(
-            notice_tx,
-            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
-                "journal append permanently failed for `turn_finish` at settle: {err:#}; the entry was dropped"
-            )))),
-            "error notice",
-        );
-    }
-    send_notice(
+    let outcome = if cancelled {
+        RunOutcome::Aborted
+    } else {
+        held.outcome
+    };
+    land_turn_finish(
+        appender,
+        state,
         notice_tx,
-        BackendNotice::Settled {
-            cancelled,
-            failed: false,
-            steered: held.steered,
-            stranded: Vec::new(),
-        },
-        "held run settled",
-    );
-    crate::plugin_hooks::fire(
-        crate::plugin_hooks::HookEvent::Stop,
-        cwd.to_str(),
-        serde_json::json!({
-            "cancelled": cancelled,
-            "failed": false,
-        }),
-    );
+        cwd,
+        cancelled || outcome.cancelled(),
+        outcome.failed(),
+        None,
+        &held.steered,
+        &[],
+    )
+    .await;
 }
 
 /// Post-settle goal housekeeping shared by every run: disarm automatic
@@ -605,8 +590,12 @@ pub(super) async fn chain_goal_rounds(
     harness_model: &mut HarnessModel,
     sessions_dir: &Path,
     cwd: &Path,
-    session_path: &Path,
 ) {
+    // A degraded session starts no run: the harness may be mid-state, and
+    // every submit is refused until a restart.
+    if state.is_degraded() {
+        return;
+    }
     // A held turn (open ask awaiting answers) never chains: the next run
     // would stack onto a turn that is still open on the wire.
     if state.awaiting_answers.load(Ordering::Relaxed) {
@@ -629,9 +618,9 @@ pub(super) async fn chain_goal_rounds(
         if !queued {
             return;
         }
-        let journal_appender = session.journal_appender();
-        let (result, abort_requested) = drive_run(
-            session.continue_(),
+        let settlement = run_turn(
+            session,
+            TurnInput::Continue,
             handle,
             cmd_rx,
             run_steers,
@@ -641,28 +630,25 @@ pub(super) async fn chain_goal_rounds(
             notice_tx,
             harness_model,
             sessions_dir,
-            session_path,
-            &journal_appender,
-        )
-        .await;
-        settle_run(
-            &result,
-            abort_requested,
-            session,
-            state,
-            sessions_dir,
             cwd,
-            notice_tx,
-            run_steers,
         )
         .await;
         if *shutdown_after_run {
             return;
         }
-        goal_housekeeping(&result, abort_requested, session, state).await;
+        goal_housekeeping(
+            &settlement.result,
+            settlement.abort_requested,
+            session,
+            state,
+        )
+        .await;
         // A round that ended on a delivered ask holds its turn — chaining
         // another round would stack onto the still-open turn.
-        if state.awaiting_answers.load(Ordering::Relaxed) {
+        if settlement.held {
+            return;
+        }
+        if settlement.abort_requested || settlement.outcome.failed() || state.is_degraded() {
             return;
         }
     }
@@ -688,7 +674,7 @@ pub(super) async fn chain_goal_rounds(
 ///
 /// Abort/failed discipline (S2 settle-drain guard — never pour a steer into
 /// a dying or later run): a round
-/// that aborted or errored stops the chain immediately — `settle_run` already
+/// that aborted or errored stops the chain immediately — the commit already
 /// retracted the not-yet-drained steers from the queue (S4), so a stranded
 /// steer is never silently injected by a later run.
 #[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
@@ -704,26 +690,19 @@ pub(super) async fn resume_steering_queue(
     sessions_dir: &Path,
     cwd: &Path,
 ) {
-    // A held turn (open ask awaiting answers) never resumes into a run:
-    // the queued steer drains in the seeded (or next) run.
+    // Neither a degraded session nor a held turn resumes into a run: the
+    // queued steer drains in the seeded (or next) run.
+    if state.is_degraded() {
+        return;
+    }
     if state.awaiting_answers.load(Ordering::Relaxed) {
         return;
     }
     while !session.steering_messages().is_empty() {
         let handle = session.handle();
-        let active_session_path = session.path().clone();
-        let journal_appender = session.journal_appender();
-        // The facade learns the run started (`TurnStarted` sets its running
-        // flag) so a switch-away parks the thread instead of dropping it
-        // mid-run — identical to the wake branch this helper now subsumes.
-        state.running.store(true, Ordering::Relaxed);
-        send_notice(
-            notice_tx,
-            BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)),
-            "turn started notice",
-        );
-        let (result, abort_requested) = drive_run(
-            session.continue_(),
+        let settlement = run_turn(
+            session,
+            TurnInput::Continue,
             &handle,
             cmd_rx,
             run_steers,
@@ -733,37 +712,31 @@ pub(super) async fn resume_steering_queue(
             notice_tx,
             harness_model,
             sessions_dir,
-            &active_session_path,
-            &journal_appender,
+            cwd,
         )
         .await;
-        settle_run(
-            &result,
-            abort_requested,
+        if *shutdown_after_run {
+            return;
+        }
+        goal_housekeeping(
+            &settlement.result,
+            settlement.abort_requested,
             session,
             state,
-            sessions_dir,
-            cwd,
-            notice_tx,
-            run_steers,
         )
         .await;
         if *shutdown_after_run {
             return;
         }
-        goal_housekeeping(&result, abort_requested, session, state).await;
-        if *shutdown_after_run {
-            return;
-        }
-        // Abort or run error: stop chaining. `settle_run` already retracted the
-        // not-yet-drained steers (S4) and reported them stranded; an aborted
-        // run must not auto-resume.
-        if abort_requested || result.is_err() {
+        // Abort or run failure: stop chaining. The commit already retracted
+        // the not-yet-drained steers (S4) and reported them stranded; an
+        // aborted run must not auto-resume. A degraded session starts nothing.
+        if settlement.abort_requested || settlement.outcome.failed() || state.is_degraded() {
             return;
         }
         // A round that ended on a delivered ask holds its turn — resuming
         // another round would stack onto the still-open turn.
-        if state.awaiting_answers.load(Ordering::Relaxed) {
+        if settlement.held {
             return;
         }
         chain_goal_rounds(
@@ -778,7 +751,6 @@ pub(super) async fn resume_steering_queue(
             harness_model,
             sessions_dir,
             cwd,
-            &active_session_path,
         )
         .await;
         if *shutdown_after_run {

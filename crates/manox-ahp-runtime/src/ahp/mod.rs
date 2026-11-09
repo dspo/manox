@@ -718,16 +718,11 @@ async fn fold_extension_state(
 }
 
 fn session_stem_of(path: &Path) -> Option<String> {
-    // The core layout names the journal by the shared constant; a session's id is
-    // its PARENT directory's name. A legacy flat `<id>.jsonl` keeps the
-    // file stem.
-    if path.file_name().and_then(|n| n.to_str())
-        == Some(manox_harness::session::identity::JOURNAL_FILE)
-    {
-        return path.parent()?.file_name()?.to_str().map(str::to_string);
-    }
-    (path.extension()? == "jsonl")
-        .then(|| path.file_stem()?.to_str().map(str::to_string))
+    // The core layout names the journal by the shared constant; a session's id
+    // is its PARENT directory's name. Any other file is not a journal — the
+    // retired flat `<id>.jsonl` shape contributes nothing to a fold.
+    (path.file_name()?.to_str()? == manox_harness::session::identity::JOURNAL_FILE)
+        .then(|| path.parent()?.file_name()?.to_str().map(str::to_string))
         .flatten()
 }
 
@@ -1284,6 +1279,7 @@ mod baseline_tests {
                     cancelled: false,
                     failed: false,
                     stranded_steer_ids: vec![],
+                    reason: None,
                 })
                 .await
                 .unwrap();
@@ -1467,6 +1463,7 @@ mod baseline_tests {
                 cancelled: false,
                 failed: false,
                 stranded_steer_ids: Vec::new(),
+                reason: None,
             })
             .await
             .unwrap();

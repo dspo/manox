@@ -98,28 +98,35 @@ pub struct UserAttributionMeta {
 }
 
 /// The sidecar path for a session file.
+///
+/// The canonical journal (`<bucket>/<id>/session.jsonl`) holds the session
+/// directory (and its lease) alone — dsh's shape — so its sidecar is a cache
+/// row beside the bucket: `<bucket>/cache/<id>.json`. Any other path (a
+/// caller outside the store, a test fixture) resolves to the same cache shape
+/// under `session_dir`, keyed by its file stem; the retired beside-the-file
+/// `<id>.meta.json` derivation is gone with the flat journal tree.
 pub fn meta_path(session_dir: &Path, session_path: &Path) -> PathBuf {
-    // Core layout: the session directory holds the journal (and its lease)
-    // alone — dsh's shape — so the sidecar lives one level up as a cache
-    // row under `<core>/cache/<id>.json`. A legacy flat `<id>.jsonl` keeps
-    // the old beside-the-file derivation.
-    if session_path.file_name().and_then(|n| n.to_str())
-        == Some(crate::session::identity::JOURNAL_FILE)
-        && let Some(dir) = session_path.parent()
-        && let Some(core_root) = dir.parent()
-        && let Some(id) = dir.file_name().and_then(|n| n.to_str())
-    {
-        return core_root.join("cache").join(format!("{id}.json"));
-    }
-    let _ = session_dir;
-    let id = session_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    session_path
-        .parent()
-        .unwrap_or(session_dir)
-        .join(format!("{id}.meta.json"))
+    let is_journal = session_path.file_name().and_then(|name| name.to_str())
+        == Some(crate::session::identity::JOURNAL_FILE);
+    let parent = session_path.parent().unwrap_or(session_dir);
+    let (root, id) = if is_journal {
+        (
+            parent.parent().unwrap_or(session_dir),
+            parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+        )
+    } else {
+        (
+            session_dir,
+            session_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default(),
+        )
+    };
+    root.join("cache").join(format!("{id}.json"))
 }
 
 /// Read the sidecar; a missing file yields the default (fresh session).
@@ -165,8 +172,9 @@ pub async fn save(
 /// its sidecar is already addressable.
 async fn save_unlocked(path: &Path, meta: &SessionMeta) -> Result<(), anyhow::Error> {
     let bytes = serde_json::to_vec_pretty(meta)?;
-    // `<id>.meta.json.tmp`: `with_extension` would only replace the last
-    // extension (`json`), yielding a surprising `<id>.meta.meta.json.tmp`.
+    // `<cache>/<id>.json.tmp`: `with_extension` would only replace the last
+    // extension (`json`), yielding a surprising `<cache>/<id>.json.tmp` path
+    // that collides with the cache row of the same name.
     let tmp = path.with_file_name(format!(
         "{}.tmp",
         path.file_name()
@@ -375,13 +383,22 @@ mod tests {
         assert!(cleared.plan_snapshot.is_none());
     }
 
+    /// Write raw bytes at the sidecar's cache path, creating the directory
+    /// the cache row lives in (the canonical layout keeps sidecars out of the
+    /// session directory).
+    async fn write_raw_sidecar(dir: &std::path::Path, session: &std::path::Path, raw: &str) {
+        let path = meta_path(dir, session);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(path, raw).await.unwrap();
+    }
+
     #[tokio::test]
     async fn corrupt_sidecar_surfaces_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("abc.jsonl");
-        tokio::fs::write(meta_path(dir.path(), &session), "{not json")
-            .await
-            .unwrap();
+        write_raw_sidecar(dir.path(), &session, "{not json").await;
         assert!(load(dir.path(), &session).await.is_err());
     }
 
@@ -443,9 +460,7 @@ mod tests {
     async fn update_self_heals_corrupt_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("abc.jsonl");
-        tokio::fs::write(meta_path(dir.path(), &session), "{\"broken\":")
-            .await
-            .unwrap();
+        write_raw_sidecar(dir.path(), &session, "{\"broken\":").await;
         update(dir.path(), &session, |meta| meta.archived = true)
             .await
             .unwrap();

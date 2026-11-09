@@ -920,14 +920,8 @@ impl Thread {
         let loading = initial_path.is_some();
         let model = crate::provider_glue::default_model();
         let (sessions_dir, session_file) =
-            crate::paths::core_session_parts(project.as_deref(), &id.0).unwrap_or_else(|_| {
-                (
-                    crate::paths::manox_config_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join("sessions"),
-                    None,
-                )
-            });
+            crate::paths::core_session_parts(project.as_deref(), &id.0)
+                .unwrap_or_else(|_| crate::paths::unresolved_session_parts(&id.0));
         // The goal bridge is shared with the engine's goal tools; its
         // restore seed rides the Ready chain (seed_from_journal — the
         // journal is the goal authority; stage ③ retired the db leg and
@@ -1023,14 +1017,8 @@ impl Thread {
         // project bucket, the journal (`session.jsonl`) inside. The flat
         // `sessions/` tree is never written.
         let (sessions_dir, session_file) =
-            crate::paths::core_session_parts(project.as_deref(), &self.id.0).unwrap_or_else(|_| {
-                (
-                    crate::paths::manox_config_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join("sessions"),
-                    None,
-                )
-            });
+            crate::paths::core_session_parts(project.as_deref(), &self.id.0)
+                .unwrap_or_else(|_| crate::paths::unresolved_session_parts(&self.id.0));
         // A fresh spawn has nothing to restore: the default (already
         // ready) watch is the honest value, so the receiver is dropped.
         let SpawnedEngine {
@@ -1243,8 +1231,9 @@ impl Thread {
                     stranded_steer_ids: stranded,
                 });
                 // Re-fire: if peer messages arrived during the run
-                // (pending_prompts non-empty), start a follow-up turn.
-                // Mirrors manox-actor pending_submits drain.
+                // (pending_prompts non-empty), start a follow-up turn. Client
+                // submits need no drain here — they reach the engine directly
+                // and the actor orders them behind the open turn.
                 if !self.pending_prompts.is_empty() {
                     self.run_turn();
                 }
@@ -1493,7 +1482,7 @@ impl Thread {
     }
 
     pub fn run_turn(&mut self) {
-        if self.running || (self.pending_prompts.is_empty() && self.pending_images.is_empty()) {
+        if self.pending_prompts.is_empty() && self.pending_images.is_empty() {
             return;
         }
         self.ensure_engine(self.project.clone());
@@ -1503,7 +1492,11 @@ impl Thread {
         let accepted_entry = self.pending_turn_accepted_entry.take();
         self.running = true;
         self.note_store_running(true);
-        self.pending_events.push(ThreadEvent::TurnStarted);
+        // The engine owns the open edge: it emits `TurnStarted` when the run
+        // actually opens (`engine::run_turn`), which is also what journals the
+        // `turn_start` row. A submit that lands on an open turn is forwarded
+        // all the same — the actor orders it (a held turn is committed first,
+        // a running one queues it as its follow-up).
         self.engine
             .as_ref()
             .expect("ensure_engine materialized the engine")
@@ -1663,20 +1656,14 @@ impl Thread {
         &self.request_usage
     }
 
-    /// The current turn's total, keyed off the triggering user message; the
-    /// conversation footer stamps it onto the just-finished reply at `Stop`.
+    /// The current turn's total; the conversation footer stamps it onto the
+    /// just-finished reply at `Stop`. Asked of the engine key-free: the
+    /// per-turn map is keyed by the kernel's stable message ids (#920), which
+    /// the facade's display mirror does not carry.
     pub fn last_request_token_usage(&self) -> Option<TokenUsage> {
-        let id = self
-            .messages
-            .iter()
-            .rev()
-            .find(|m| {
-                matches!(m.role, crate::language_model::Role::User)
-                    && m.provenance == crate::message::MessageProvenance::User
-            })?
-            .id
-            .clone();
-        self.request_usage.get(&id).copied()
+        self.engine
+            .as_ref()
+            .and_then(|engine| engine.last_turn_token_usage())
     }
 
     pub fn per_model_last_request_usage(&self) -> HashMap<String, TokenUsage> {
@@ -1936,14 +1923,8 @@ impl Thread {
         let reasoning_effort = self.reasoning_effort;
         // A member works in its leader's project, so it shards there.
         let (sessions_dir, session_file) =
-            crate::paths::core_session_parts(self.project.as_deref(), &id.0).unwrap_or_else(|_| {
-                (
-                    crate::paths::manox_config_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join("sessions"),
-                    None,
-                )
-            });
+            crate::paths::core_session_parts(self.project.as_deref(), &id.0)
+                .unwrap_or_else(|_| crate::paths::unresolved_session_parts(&id.0));
         let SpawnedEngine {
             engine,
             events,
@@ -4280,8 +4261,14 @@ pub(crate) mod tests {
         let store = crate::thread_store::global();
         let dir = crate::thread_store::global_sessions_dir();
         std::fs::create_dir_all(&dir).unwrap();
+        // The canonical layout is the only shape the scan admits.
+        let journal = dir
+            .join("--thread-test--")
+            .join("dirty-scan")
+            .join(manox_harness::session::identity::JOURNAL_FILE);
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
         std::fs::write(
-            dir.join("dirty-scan.jsonl"),
+            &journal,
             "{\"type\":\"session\",\"version\":4,\"id\":\"dirty-scan\",\"timestamp\":\"\
              2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{\"host\":\"manox\",\
              \"thread\":\"dirty-scan\"}}\n{\"type\":\"message\",\"id\":\"m1\",\"parentId\"\
@@ -4337,7 +4324,12 @@ pub(crate) mod tests {
             session_path: Mutex::new(None),
         });
         let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("t-settle-stamp.jsonl");
+        let session = dir
+            .path()
+            .join("--thread-test--")
+            .join("t-settle-stamp")
+            .join(manox_harness::session::identity::JOURNAL_FILE);
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
         std::fs::write(&session, b"{}\n").unwrap();
         engine.set_session_path(session.clone());
         let thread = thread_with_engine_id(HistoryPhase::Ready, engine, "t-settle-stamp");

@@ -36,10 +36,6 @@ use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 struct ServerSession {
     thread: ThreadHandle,
     turn_active: Arc<AtomicBool>,
-    // parking_lot (round 4 §3.2): a panic inside a lock holder must not
-    // poison the queue into a permanent cascade — the std .unwrap() locks
-    // turned one panic into every subsequent submit/steer/drain panicking.
-    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
     /// The settle watcher's cancellation token. The watcher owns an `Arc` of
     /// the entry's state, so dropping the entry alone would not end it.
     settle_cancel: tokio_util::sync::CancellationToken,
@@ -55,17 +51,16 @@ impl Drop for ServerSession {
     }
 }
 
-/// Drains one session's parked submissions when its turn settles.
+/// Tracks whether a session has a turn in flight.
 ///
-/// A submit that arrives mid-turn is parked rather than refused (the user
-/// typed it; refusing would lose it), and this is what turns the parked batch
-/// into the follow-up turn. It watches the thread's own event stream, so it
-/// sees the same settle edge the kernel emitted — there is no polling and no
-/// second source of truth about whether a turn is running.
+/// The engine owns turn ordering now: a submit is forwarded to the actor even
+/// while a turn is open (the actor commits a held turn before starting the new
+/// one, and queues a mid-run one as its follow-up), so the gateway only mirrors
+/// the edge — it parks nothing (`dspo/manox#899`: a held turn cleared this flag
+/// never, and every later submit was stranded in a queue nothing drained).
 fn spawn_settle_watcher(
     session_id: String,
     thread: ThreadHandle,
-    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
     turn_active: Arc<AtomicBool>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -84,50 +79,12 @@ fn spawn_settle_watcher(
             };
             match &*event {
                 ThreadEvent::TurnStarted => turn_active.store(true, Ordering::SeqCst),
-                ThreadEvent::TurnFinished { cancelled, .. } => {
-                    turn_active.store(false, Ordering::SeqCst);
-                    // A cancelled turn settles the queue too: its text was not
-                    // run, and leaving it parked would strand it forever.
-                    let _ = cancelled;
-                    let drained: Vec<QueuedSubmit> = pending_submits.lock().drain(..).collect();
-                    if drained.is_empty() {
-                        continue;
-                    }
-                    let mut batch_origin: Option<String> = None;
-                    thread.with_mut(|t| {
-                        for queued in drained {
-                            if queued.origin.is_some() {
-                                batch_origin = queued.origin.clone();
-                            }
-                            let content = to_message_content(queued.text, queued.images);
-                            t.insert_user_message_with_content_and_ui_metadata(
-                                content,
-                                Some(queued.ui),
-                            );
-                        }
-                    });
-                    thread.with_mut(|t| {
-                        t.set_pending_turn_origin(batch_origin);
-                        t.run_turn();
-                    });
-                }
+                ThreadEvent::TurnFinished { .. } => turn_active.store(false, Ordering::SeqCst),
                 _ => {}
             }
         }
         tracing::debug!(session = %session_id, "settle watcher stopped");
     })
-}
-
-/// A submission parked while a turn runs; drained into one follow-up turn when
-/// the turn settles, mirroring the legacy host's queued-follow-up behavior.
-struct QueuedSubmit {
-    client_id: String,
-    text: String,
-    images: Vec<(String, String)>,
-    ui: MessageUiMetadata,
-    /// The Submit's origin RPC id (echo retirement, §F.2). A drained batch
-    /// merges into one turn, so the last non-None origin wins.
-    origin: Option<String>,
 }
 
 /// How often the catalogue-serving process stat-sweeps the store for
@@ -644,7 +601,6 @@ pub(crate) async fn open_session_with_roots(
         let mut sessions = inner.sessions.lock();
         if !sessions.contains_key(session_id) {
             let turn_active = Arc::new(AtomicBool::new(false));
-            let pending_submits = Arc::new(Mutex::new(Vec::new()));
             let settle_cancel = tokio_util::sync::CancellationToken::new();
             // The watcher's handle is deliberately dropped: the entry owns the
             // cancellation token, so the task ends when the entry does, and a
@@ -653,7 +609,6 @@ pub(crate) async fn open_session_with_roots(
             let _watcher = spawn_settle_watcher(
                 session_id.to_string(),
                 thread.clone(),
-                Arc::clone(&pending_submits),
                 Arc::clone(&turn_active),
                 settle_cancel.clone(),
             );
@@ -662,7 +617,6 @@ pub(crate) async fn open_session_with_roots(
                 ServerSession {
                     thread: thread.clone(),
                     turn_active,
-                    pending_submits,
                     settle_cancel,
                 },
             );
@@ -1378,7 +1332,6 @@ impl AgentServerInner {
             }
         });
         let turn_active = Arc::new(AtomicBool::new(false));
-        let pending_submits = Arc::new(Mutex::new(Vec::new()));
         // The insert is a single-lock recheck: a racing same-id create/open
         // that won the race since the live check above has its entry adopted
         // and ours dropped — never clobbered, so the loser's intent seeds
@@ -1387,7 +1340,6 @@ impl AgentServerInner {
         let _watcher = spawn_settle_watcher(
             session_id.clone(),
             thread.clone(),
-            Arc::clone(&pending_submits),
             Arc::clone(&turn_active),
             settle_cancel.clone(),
         );
@@ -1396,7 +1348,6 @@ impl AgentServerInner {
             ServerSession {
                 thread: thread.clone(),
                 turn_active,
-                pending_submits,
                 settle_cancel,
             },
         );
@@ -1450,7 +1401,7 @@ impl AgentServerInner {
         session_id: &str,
         text: String,
         images: Vec<ImageAttachment>,
-        client_id: Option<String>,
+        _client_id: Option<String>,
         origin_rpc: Option<String>,
     ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
         let receipt = |accepted: bool, message_id: Option<String>| {
@@ -1480,32 +1431,19 @@ impl AgentServerInner {
         if !self.sessions.lock().contains_key(session_id) {
             open_session(self, owner, session_id).await?;
         }
-        let Some(session) = self.sessions.lock().get(session_id).map(|s| {
-            (
-                s.thread.clone(),
-                s.turn_active.clone(),
-                s.pending_submits.clone(),
-            )
-        }) else {
+        let Some(thread) = self
+            .sessions
+            .lock()
+            .get(session_id)
+            .map(|s| s.thread.clone())
+        else {
             return Err(unknown_session(session_id));
         };
-        let (thread, turn_active, pending_submits) = session;
-        let client_id = client_id.unwrap_or_else(|| owner.to_string());
-        if turn_active.load(Ordering::SeqCst) && slash.is_none() {
-            let ui = thread.read(|t| MessageUiMetadata {
-                model_id: t.model().map(|m| m.id.clone()),
-                access_mode: Some(t.access_mode().as_i64()),
-                ..Default::default()
-            });
-            pending_submits.lock().push(QueuedSubmit {
-                client_id,
-                text,
-                images,
-                ui,
-                origin: origin_rpc,
-            });
-            return receipt(true, None);
-        }
+        // A submit lands even while a turn is open: the engine's actor owns
+        // the ordering (a held turn is committed first, a running one queues
+        // the submit as its follow-up). No client text is parked outside the
+        // engine — `dspo/manox#899` was exactly that parking outliving the
+        // turn it waited for.
         // Slash resolution first (its handlers mutate the facade): a slash
         // hit keeps the legacy transcript semantics and never takes the
         // accept-time persist path. The origin pin lands here, as before —
@@ -1620,17 +1558,14 @@ impl AgentServerInner {
             .into_iter()
             .map(|i| (base64_bytes::encode(&i.data), i.mime_type))
             .collect();
-        let Some((thread, pending_submits)) = self
+        let Some(thread) = self
             .sessions
             .lock()
             .get(session_id)
-            .map(|s| (s.thread.clone(), s.pending_submits.clone()))
+            .map(|s| s.thread.clone())
         else {
             return Err(unknown_session(session_id));
         };
-        // A steer removes its own parked follow-up so the turn-end drain does
-        // not resend the same text as a plain follow-up.
-        pending_submits.lock().retain(|q| q.client_id != message_id);
         let injected = thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
@@ -1678,11 +1613,9 @@ impl AgentServerInner {
         }))
     }
 
-    pub(crate) fn drop_queued(&self, session_id: &str, client_id: String) {
-        if let Some(session) = self.sessions.lock().get(session_id) {
-            let pending = session.pending_submits.clone();
-            pending.lock().retain(|q| q.client_id != client_id);
-        }
+    pub(crate) fn drop_queued(&self, _session_id: &str, _client_id: String) {
+        // Nothing is parked outside the engine: a removed pending message is
+        // a client-side bookkeeping echo (`dspo/manox#899`).
     }
 
     /// Validate a model pick WITHOUT landing it: resolve the id, then check

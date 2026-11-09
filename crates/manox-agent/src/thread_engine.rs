@@ -61,8 +61,17 @@ pub trait ThreadEngine: Send + Sync {
         rx
     }
 
-    /// Token usage keyed by user-message id, as the env card renders it.
+    /// Token usage keyed by the kernel user message's stable id (S3), as the
+    /// env card renders it. A prompt message built without one keys its turn
+    /// by its ordinal among the transcript's user messages.
     fn request_token_usage(&self) -> HashMap<String, TokenUsage>;
+
+    /// Usage of the turn that just ended — the accumulated requests of the
+    /// last user turn. Key-free, so a reader that stamps the just-finished
+    /// reply never has to know how the map is keyed.
+    fn last_turn_token_usage(&self) -> Option<TokenUsage> {
+        None
+    }
 
     /// Usage of each model's most recent request — the context-budget
     /// numerator per model row (a single request's prompt size, never a

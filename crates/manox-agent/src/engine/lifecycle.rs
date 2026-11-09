@@ -54,8 +54,10 @@ pub(super) fn mirror_ui_note(state: &Arc<EngineState>, record: UiNoteRecord) {
 }
 
 /// Serialize and append one UI note as a `custom` entry at the session leaf.
+/// Takes the journal handle, not the session: the projection persists parked
+/// notes detached from the run that produced them.
 pub(super) async fn persist_ui_note(
-    session: &AgentSession,
+    appender: &Arc<JournalAppender>,
     state: &EngineState,
     notice_tx: &tokio::sync::mpsc::UnboundedSender<BackendNotice>,
     record: &UiNoteRecord,
@@ -78,7 +80,7 @@ pub(super) async fn persist_ui_note(
     // so its loss never voids the turn.
     let mut last_err = None;
     for attempt in 1..=TYPED_APPEND_ATTEMPTS {
-        match session
+        match appender
             .append_custom(UI_NOTE_CUSTOM_TYPE, data.clone())
             .await
         {
@@ -93,8 +95,7 @@ pub(super) async fn persist_ui_note(
         }
     }
     let err = last_err.expect("the attempt loop ran at least once");
-    let appender = session.journal_appender();
-    if let Some(row) = record_journal_loss(&appender, "ui_note", &err).await {
+    if let Some(row) = record_journal_loss(appender, "ui_note", &err).await {
         state.pending_journal.lock().unwrap().push(row);
     }
     send_notice(
