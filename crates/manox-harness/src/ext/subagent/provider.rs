@@ -87,7 +87,7 @@ pub struct ContinuableCreateRequest {
 pub struct ContinuableCreateSpec {
     /// Completed-turn prefix of the parent's history to seed the child with,
     /// or `None` for a fresh child.
-    pub seed: Option<Vec<crate::core::session::SessionTreeEntry>>,
+    pub seed: Option<Vec<crate::core::session::Event>>,
 }
 
 /// The host-side observer bridge. The ext run loop calls these at the same

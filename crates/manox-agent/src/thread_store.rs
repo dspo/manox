@@ -1050,7 +1050,7 @@ impl ThreadStore {
     ///
     /// Three legs, and a rename needs all three:
     ///
-    /// - **the journal** ([`Self::journal_title`]) carries `SessionTreeEntry::Title`,
+    /// - **the journal** ([`Self::journal_title`]) carries `Event::Title`,
     ///   which the v2 title projection folds (`projections.rs`) and the AHP
     ///   translator reads (`translate/actions.rs`). It is the only route
     ///   either takes: the live `ThreadEvent::TitleChanged` is on
@@ -2546,7 +2546,7 @@ mod tests {
     /// sidecar.
     ///
     /// The row is the only route the two protocol faces take — the v2
-    /// projection folds `SessionTreeEntry::Title` and the AHP translator reads
+    /// projection folds `Event::Title` and the AHP translator reads
     /// the journal, while the live `TitleChanged` event is on `translate.rs`'s
     /// `Skip` list. A store-side rename that skipped this would be invisible to
     /// every client following the session, which is exactly the cross-protocol
@@ -2594,7 +2594,7 @@ mod tests {
                 })
                 .into_iter()
                 .filter_map(|record| match record.entry {
-                    manox_harness::session::SessionTreeEntry::Title { title, .. } => Some(title),
+                    manox_harness::session::Event::Title { title, .. } => Some(title),
                     _ => None,
                 })
                 .collect()
@@ -3980,10 +3980,8 @@ mod tests {
                 })
                 .into_iter()
                 .filter_map(|record| match record.entry {
-                    manox_harness::session::SessionTreeEntry::PinnedArchived {
-                        pinned,
-                        archived,
-                        ..
+                    manox_harness::session::Event::PinnedArchived {
+                        pinned, archived, ..
                     } => Some((pinned, archived)),
                     _ => None,
                 })
@@ -4068,10 +4066,8 @@ mod tests {
                 })
                 .into_iter()
                 .filter_map(|record| match record.entry {
-                    manox_harness::session::SessionTreeEntry::PinnedArchived {
-                        pinned,
-                        archived,
-                        ..
+                    manox_harness::session::Event::PinnedArchived {
+                        pinned, archived, ..
                     } => Some((pinned, archived)),
                     _ => None,
                 })

@@ -15,7 +15,7 @@ use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
 use crate::harness::{AgentHarness, HarnessResources, NavigateTreeOptions};
-use crate::session::SessionTreeEntry;
+use crate::session::Event;
 use crate::session::jsonl::JsonlSessionMetadata;
 use crate::session::repository::SessionRepository;
 use crate::tool::AgentTool;
@@ -566,12 +566,12 @@ impl AgentSession {
         let branch = self.harness.session().get_branch().await?;
         let latest_compaction = branch
             .iter()
-            .rposition(|e| matches!(e, SessionTreeEntry::Compaction { .. }));
+            .rposition(|e| matches!(e, Event::Compaction { .. }));
         if let Some(boundary) = latest_compaction {
             let trusted = branch[boundary + 1..].iter().any(|e| {
                 matches!(
                     e,
-                    SessionTreeEntry::Message {
+                    Event::Message {
                         message: AgentMessage::Assistant { stop_reason, usage, .. },
                         ..
                     } if !matches!(
@@ -736,9 +736,7 @@ impl AgentSession {
 
     /// The compaction-aware active entry list (every entry type, in tree
     /// order) — the display projection source for host UI mirrors.
-    pub async fn context_entries(
-        &self,
-    ) -> Result<Vec<crate::session::SessionTreeEntry>, anyhow::Error> {
+    pub async fn context_entries(&self) -> Result<Vec<crate::session::Event>, anyhow::Error> {
         self.harness.session().build_context_entries().await
     }
 
@@ -1488,7 +1486,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .filter_map(|entry| match entry {
-                    SessionTreeEntry::ModelChange { model_id, .. } => Some(model_id),
+                    Event::ModelChange { model_id, .. } => Some(model_id),
                     _ => None,
                 })
                 .collect()
@@ -1964,7 +1962,7 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .filter(|e| matches!(e, SessionTreeEntry::CwdChange { cwd, .. } if cwd.as_str() == work.to_string_lossy()))
+            .filter(|e| matches!(e, Event::CwdChange { cwd, .. } if cwd.as_str() == work.to_string_lossy()))
             .count();
         assert_eq!(
             cwd_changes, 1,
@@ -2665,7 +2663,7 @@ mod tests {
         assert!(
             !entries
                 .iter()
-                .any(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. })),
+                .any(|e| matches!(e, Event::ThinkingLevelChange { .. })),
             "a thinking-level change must not be journaled: {entries:?}"
         );
     }
@@ -2762,7 +2760,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .any(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. })),
+                .any(|e| matches!(e, Event::ThinkingLevelChange { .. })),
             "no thinking entry is written at all"
         );
 

@@ -37,7 +37,7 @@ use manox_ahp::channels::terminal;
 use manox_ahp::channels::{chat, root, session};
 use manox_ahp::error::HostError;
 use manox_ahp::resource::ResourcePlane;
-use manox_harness::session::SessionTreeEntry;
+use manox_harness::session::Event;
 use manox_harness::types::AgentMessage;
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -141,14 +141,14 @@ impl Cursor {
 /// no other repair path), and both are lifecycle/state-transition rows, not
 /// per-chunk floods — dropping one leaves the task or agent frozen at its
 /// previous status for every live subscriber.
-fn is_state_bearing(event: &SessionTreeEntry) -> bool {
+fn is_state_bearing(event: &Event) -> bool {
     !matches!(
         event,
-        SessionTreeEntry::AgentTextDelta { .. }
-            | SessionTreeEntry::AgentThinkingDelta { .. }
-            | SessionTreeEntry::ToolOutputChunk { .. }
-            | SessionTreeEntry::Stop { .. }
-            | SessionTreeEntry::SubagentChild { .. }
+        Event::AgentTextDelta { .. }
+            | Event::AgentThinkingDelta { .. }
+            | Event::ToolOutputChunk { .. }
+            | Event::Stop { .. }
+            | Event::SubagentChild { .. }
     )
 }
 
@@ -1033,13 +1033,13 @@ impl RuntimeBackend {
         session_id: &str,
         translator: &mut Translator,
         seq: u64,
-        entry: &SessionTreeEntry,
+        entry: &Event,
     ) {
         // A finished turn is when the agent's file changes settle: recompute
         // the changeset so subscribers watch one stream instead of polling.
         // Detached — the scan is synchronous and cheap, but it must not stall
         // the journal pump.
-        if matches!(entry, SessionTreeEntry::TurnFinish { .. })
+        if matches!(entry, Event::TurnFinish { .. })
             && let Some(backend) = self.me()
         {
             let session = session_id.to_string();
@@ -1095,11 +1095,11 @@ impl RuntimeBackend {
         // id.
         if matches!(
             entry,
-            SessionTreeEntry::Message {
+            Event::Message {
                 message: AgentMessage::User { .. },
                 ..
             }
-        ) || matches!(entry, SessionTreeEntry::TurnStart { .. })
+        ) || matches!(entry, Event::TurnStart { .. })
         {
             return;
         }
@@ -1133,7 +1133,7 @@ impl RuntimeBackend {
         // v2 `GetConversationInfo` contract, now push).
         if matches!(
             entry,
-            SessionTreeEntry::Message {
+            Event::Message {
                 message: AgentMessage::Assistant { .. },
                 ..
             }
@@ -4392,7 +4392,7 @@ mod turn_cancel_ask_settlement_tests {
     use super::*;
     use ahp_types::state::ResponsePart;
 
-    fn kernel_entry(mut fields: serde_json::Value) -> SessionTreeEntry {
+    fn kernel_entry(mut fields: serde_json::Value) -> Event {
         let mut base = serde_json::json!({
             "id": "e-1",
             "parentId": serde_json::Value::Null,

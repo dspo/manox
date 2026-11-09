@@ -17,7 +17,7 @@ turn id 方案。结论如下，三条证据相互印证：
 ### 结论
 
 1. **steer 不占独立 entry 种类，落盘形态就是一条普通的 user `message` 条目**，与开启 turn 的
-   那条 user 消息同形。`SessionTreeEntry` 只有 `Message { .. }` 与 `Compaction { .. }` 两种
+   那条 user 消息同形。`Event` 只有 `Message { .. }` 与 `Compaction { .. }` 两种
    条目族（`crates/manox-harness/src/core/session/mod.rs:26,40`），没有任何 steer 专属变体。
 2. **「user 行已落盘」这一事实是 client 从 journal fold 出来的，不是 server 在线上推的**：
    `ThreadEvent::UserRowLanded` 在 `crates/manox-session-core/src/translate.rs:96-99` 被显式注释为
@@ -58,9 +58,9 @@ turn id 方案。结论如下，三条证据相互印证：
 > wire 上的名称（v2 设计期提案、已删除行），所在行必须带 `not-on-wire` 标记。
 > 扩展 action 的实际通道以 `manox-ahp-runtime/src/ahp/projection.rs` 的发射臂为准。
 
-### §2.1 会话记录词汇（kernel `SessionTreeEntry`；行键沿用 v2 wire 名）
+### §2.1 会话记录词汇（kernel `Event`；行键沿用 v2 wire 名）
 
-> #879 删除了内存 wire 词汇（`manox-journal` crate）。下表左列沿用各行的历史 §C.2 wire 名作行键；代码对照面是 `manox-harness::session::SessionTreeEntry`（磁盘 jsonl 的 `type` 标签为 snake_case，如 `turn_start` ↔ `TurnStart`、`thinking_level_change` ↔ `ReasoningEffortChange`）。
+> #879 删除了内存 wire 词汇（`manox-journal` crate）。下表左列沿用各行的历史 §C.2 wire 名作行键；代码对照面是 `manox-harness::session::Event`（磁盘 jsonl 的 `type` 标签为 snake_case，如 `turn_start` ↔ `TurnStart`、`thinking_level_change` ↔ `ReasoningEffortChange`）。
 
 | v2 条目 | AHP 落点 | 类别 |
 |---|---|---|

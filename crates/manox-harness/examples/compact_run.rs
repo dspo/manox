@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use manox_harness::compaction::SUMMARIZATION_SYSTEM_PROMPT;
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
-use manox_harness::session::{Session, SessionStorage, SessionTreeEntry};
+use manox_harness::session::{Event, Session, SessionStorage};
 use manox_harness::types::{AgentEvent, ContentBlock, Model, StopReason, ThinkingKind, Usage};
 use manox_harness::{AgentContext, AgentHarness, AgentMessage, StreamFn};
 
@@ -133,7 +133,7 @@ async fn main() {
         .await
         .expect("entries")
     {
-        if let SessionTreeEntry::Compaction {
+        if let Event::Compaction {
             first_kept_entry_id,
             tokens_before,
             usage,

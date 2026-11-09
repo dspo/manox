@@ -40,7 +40,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::session::journal::{JournalError, JournalWrite};
-use crate::session::{SessionStorage, SessionTreeEntry};
+use crate::session::{Event, SessionStorage};
 use serde_json::Value as JsonValue;
 
 /// Current on-disk session format version (v4: chain-dense `seq` on every
@@ -59,14 +59,14 @@ const JOURNAL_BROADCAST_CAPACITY: usize = 4096;
 pub struct JournalEvent {
     /// Chain depth of the appended entry (dense 0-based along its chain).
     pub seq: u64,
-    pub entry: std::sync::Arc<SessionTreeEntry>,
+    pub entry: std::sync::Arc<Event>,
 }
 
 /// One record of a chain read ([`JsonlSessionStorage::journal_range`]).
 #[derive(Debug, Clone)]
 pub struct JournalRecord {
     pub seq: u64,
-    pub entry: SessionTreeEntry,
+    pub entry: Event,
 }
 
 /// Session metadata written once as the file header and read back on reopen.
@@ -111,7 +111,7 @@ struct SessionHeader {
 pub struct JsonlSessionStorage {
     jsonl_path: PathBuf,
     /// All entries after the header, cached in memory.
-    entries: Mutex<Vec<SessionTreeEntry>>,
+    entries: Mutex<Vec<Event>>,
     /// Current leaf cursor. For a `leaf` entry this is its `targetId`;
     /// otherwise it is the last appended entry's id.
     leaf_id: Mutex<Option<String>>,
@@ -317,7 +317,7 @@ impl JsonlSessionStorage {
     /// order.
     pub async fn append_entries_batch(
         &self,
-        entries: &[SessionTreeEntry],
+        entries: &[Event],
         _write: JournalWrite,
     ) -> Result<(), anyhow::Error> {
         if *self.deferred.lock().await {
@@ -428,7 +428,7 @@ impl JsonlSessionStorage {
     /// happens before any assistant message materializes the file).
     async fn append_entry_fenced(
         &self,
-        entry: &SessionTreeEntry,
+        entry: &Event,
         force_materialize: bool,
     ) -> Result<u64, anyhow::Error> {
         if entry.id().is_empty() {
@@ -508,7 +508,7 @@ impl JsonlSessionStorage {
         // invisible to the scan forever.
         let is_assistant = matches!(
             entry,
-            SessionTreeEntry::Message {
+            Event::Message {
                 message: crate::types::AgentMessage::Assistant { .. },
                 ..
             }
@@ -682,9 +682,9 @@ impl JsonlSessionStorage {
             // records; `None` cursor means empty.
             _ => return Ok(Vec::new()),
         };
-        let mut index: std::collections::HashMap<&str, &SessionTreeEntry> =
+        let mut index: std::collections::HashMap<&str, &Event> =
             entries.iter().map(|e| (e.id(), e)).collect();
-        let mut chain: Vec<&SessionTreeEntry> = Vec::new();
+        let mut chain: Vec<&Event> = Vec::new();
         let mut current_id: Option<&str> = Some(&target_id);
         while let Some(id) = current_id {
             let entry = match index.remove(id) {
@@ -710,7 +710,7 @@ impl JsonlSessionStorage {
 /// Serialize one entry as a v4 journal line: the entry's own fields plus the
 /// stamped `seq` (§C.1). The envelope keys are exclusive (§C.1 rule), so
 /// inserting `seq` cannot collide with a payload field.
-fn v4_line(entry: &SessionTreeEntry, seq: u64) -> Result<String, anyhow::Error> {
+fn v4_line(entry: &Event, seq: u64) -> Result<String, anyhow::Error> {
     let mut value = serde_json::to_value(entry)?;
     if let Some(obj) = value.as_object_mut() {
         obj.insert("seq".into(), JsonValue::from(seq));
@@ -756,7 +756,7 @@ fn reject_unsupported_format(path: &Path, version: u32) -> Result<(), anyhow::Er
 /// Everything [`JsonlSessionStorage::load`] derives from one file's bytes.
 struct ParsedFile {
     metadata: JsonlSessionMetadata,
-    entries: Vec<SessionTreeEntry>,
+    entries: Vec<Event>,
     seq_index: std::collections::HashMap<String, u64>,
     leaf_id: Option<String>,
 }
@@ -812,7 +812,7 @@ fn parse_file(path: &Path, bytes: &[u8]) -> Result<ParsedFile, anyhow::Error> {
     // Order-sensitive checks are deferred to pass 2 so a recoverable
     // write-order inversion cannot condemn the whole session.
     let entry_lines: Vec<&[u8]> = lines.collect();
-    let mut entries: Vec<SessionTreeEntry> = Vec::with_capacity(entry_lines.len());
+    let mut entries: Vec<Event> = Vec::with_capacity(entry_lines.len());
     let mut wire_seq: Vec<Option<u64>> = Vec::with_capacity(entry_lines.len());
     let mut seen_ids = std::collections::HashSet::new();
     for (index, line) in entry_lines.iter().enumerate() {
@@ -837,7 +837,7 @@ fn parse_file(path: &Path, bytes: &[u8]) -> Result<ParsedFile, anyhow::Error> {
         // `parentId`/`targetId` is an invalid entry).
         validate_entry_wire(&value)?;
         let seq = value.get("seq").and_then(JsonValue::as_u64);
-        let entry: SessionTreeEntry = serde_json::from_value(value)?;
+        let entry: Event = serde_json::from_value(value)?;
         // A duplicate id would make the walk index silently overwrite one
         // entry with the other — reject the file instead of restoring a
         // wrong ancestry.
@@ -933,7 +933,7 @@ fn parse_file(path: &Path, bytes: &[u8]) -> Result<ParsedFile, anyhow::Error> {
     }
     // The cursor follows the chain tail: a trailing `leaf` entry redirects
     // to its `targetId`, otherwise the tail entry's own id.
-    let leaf_id = entries.last().and_then(SessionTreeEntry::leaf_cursor_after);
+    let leaf_id = entries.last().and_then(Event::leaf_cursor_after);
 
     Ok(ParsedFile {
         metadata,
@@ -1053,10 +1053,7 @@ async fn flock_shared(path: &Path, file: &File) -> Result<(), anyhow::Error> {
 /// Re-point an entry at a new parent — the stale-leaf recovery of the
 /// fenced append. Round-trips through JSON so new entry variants need no
 /// case-by-case handling on this rare path.
-fn reparent_entry(
-    entry: &SessionTreeEntry,
-    parent: Option<&str>,
-) -> Result<SessionTreeEntry, anyhow::Error> {
+fn reparent_entry(entry: &Event, parent: Option<&str>) -> Result<Event, anyhow::Error> {
     let mut value = serde_json::to_value(entry)?;
     if let Some(obj) = value.as_object_mut() {
         let parent = match parent {
@@ -1142,7 +1139,7 @@ impl SessionStorage for JsonlSessionStorage {
 
     async fn append_entry(
         &self,
-        entry: &SessionTreeEntry,
+        entry: &Event,
         _write: JournalWrite,
     ) -> Result<u64, anyhow::Error> {
         self.append_entry_fenced(entry, false).await
@@ -1150,7 +1147,7 @@ impl SessionStorage for JsonlSessionStorage {
 
     async fn append_entry_durable(
         &self,
-        entry: &SessionTreeEntry,
+        entry: &Event,
         _write: JournalWrite,
     ) -> Result<u64, anyhow::Error> {
         self.append_entry_fenced(entry, true).await
@@ -1158,13 +1155,13 @@ impl SessionStorage for JsonlSessionStorage {
 
     async fn append_batch(
         &self,
-        entries: &[SessionTreeEntry],
+        entries: &[Event],
         write: JournalWrite,
     ) -> Result<(), anyhow::Error> {
         self.append_entries_batch(entries, write).await
     }
 
-    async fn get_entry(&self, id: &str) -> Result<Option<SessionTreeEntry>, anyhow::Error> {
+    async fn get_entry(&self, id: &str) -> Result<Option<Event>, anyhow::Error> {
         let entries = self.entries.lock().await;
         Ok(entries.iter().find(|e| e.id() == id).cloned())
     }
@@ -1196,7 +1193,7 @@ impl SessionStorage for JsonlSessionStorage {
         }
         let parent_id = self.leaf_id.lock().await.clone();
         let id = self.create_entry_id(write).await?;
-        let entry = SessionTreeEntry::Leaf {
+        let entry = Event::Leaf {
             id,
             parent_id,
             timestamp: chrono::Utc::now(),
@@ -1211,7 +1208,7 @@ impl SessionStorage for JsonlSessionStorage {
     async fn get_entries(
         &self,
         cursor: crate::session::SessionEntryCursor,
-    ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+    ) -> Result<Vec<Event>, anyhow::Error> {
         let entries = self.entries.lock().await;
         let tail = entries.iter().skip(cursor.after_entry_seq);
         Ok(match cursor.limit {
@@ -1223,7 +1220,7 @@ impl SessionStorage for JsonlSessionStorage {
     async fn find_entries(
         &self,
         entry_type: crate::session::EntryType,
-    ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+    ) -> Result<Vec<Event>, anyhow::Error> {
         Ok(self
             .entries
             .lock()
@@ -1241,7 +1238,7 @@ impl SessionStorage for JsonlSessionStorage {
             .await
             .iter()
             .filter_map(|e| match e {
-                SessionTreeEntry::Label {
+                Event::Label {
                     target_id, label, ..
                 } if target_id == id => Some(label.as_deref().unwrap_or("").trim()),
                 _ => None,
@@ -1259,9 +1256,7 @@ impl SessionStorage for JsonlSessionStorage {
             .await
             .iter()
             .filter_map(|e| match e {
-                SessionTreeEntry::SessionInfo { name, .. } => {
-                    Some(name.as_deref().unwrap_or("").trim())
-                }
+                Event::SessionInfo { name, .. } => Some(name.as_deref().unwrap_or("").trim()),
                 _ => None,
             })
             .next_back()
@@ -1274,15 +1269,16 @@ impl SessionStorage for JsonlSessionStorage {
         let mut stats = crate::session::SessionStats::default();
         for entry in entries.iter() {
             let usage = match entry {
-                SessionTreeEntry::Message { message, .. } => {
+                Event::Message { message, .. } => {
                     stats.message_count += 1;
                     match message {
                         crate::types::AgentMessage::Assistant { usage, .. } => Some(&**usage),
                         _ => None,
                     }
                 }
-                SessionTreeEntry::Compaction { usage, .. }
-                | SessionTreeEntry::BranchSummary { usage, .. } => usage.as_ref(),
+                Event::Compaction { usage, .. } | Event::BranchSummary { usage, .. } => {
+                    usage.as_ref()
+                }
                 _ => None,
             };
             // An entry recorded before cost accounting reports no cost; its
@@ -1305,10 +1301,7 @@ impl SessionStorage for JsonlSessionStorage {
         Ok(stats)
     }
 
-    async fn get_path(
-        &self,
-        leaf_id: Option<&str>,
-    ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+    async fn get_path(&self, leaf_id: Option<&str>) -> Result<Vec<Event>, anyhow::Error> {
         let entries = self.entries.lock().await;
 
         let target_id = match leaf_id {
@@ -1320,10 +1313,10 @@ impl SessionStorage for JsonlSessionStorage {
             Some(id) => anyhow::bail!("entry {id} not found"),
         };
 
-        let mut index: std::collections::HashMap<&str, &SessionTreeEntry> =
+        let mut index: std::collections::HashMap<&str, &Event> =
             entries.iter().map(|e| (e.id(), e)).collect();
 
-        let mut path: Vec<&SessionTreeEntry> = Vec::new();
+        let mut path: Vec<&Event> = Vec::new();
         let mut current_id: Option<&str> = Some(&target_id);
         while let Some(id) = current_id {
             // `remove` doubles as cycle protection: each entry is visited at
@@ -1361,7 +1354,7 @@ impl TestStorage {
         TestStorage { storage, journal }
     }
 
-    async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<u64, anyhow::Error> {
+    async fn append_entry(&self, entry: &Event) -> Result<u64, anyhow::Error> {
         Ok(self
             .journal
             .append_verbatim(entry.clone(), false)
@@ -1371,7 +1364,7 @@ impl TestStorage {
 
     /// The writer's durable face: a deferred session materializes on this row
     /// (the K5 acceptance-time contract).
-    async fn append_entry_durable(&self, entry: &SessionTreeEntry) -> Result<u64, anyhow::Error> {
+    async fn append_entry_durable(&self, entry: &Event) -> Result<u64, anyhow::Error> {
         Ok(self.journal.append_verbatim(entry.clone(), true).await?.seq)
     }
 
@@ -1380,7 +1373,7 @@ impl TestStorage {
         Ok(())
     }
 
-    async fn append_entries(&self, entries: &[SessionTreeEntry]) -> Result<(), anyhow::Error> {
+    async fn append_entries(&self, entries: &[Event]) -> Result<(), anyhow::Error> {
         self.journal.append_batch(entries.to_vec()).await?;
         Ok(())
     }
@@ -1481,7 +1474,7 @@ mod tests {
             .unwrap();
         let storage = TestStorage::new(storage);
 
-        let entry = SessionTreeEntry::Message {
+        let entry = Event::Message {
             id: "test-1".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -1499,8 +1492,8 @@ mod tests {
     }
 
     /// An assistant entry whose usage is priced, so it counts toward stats.
-    fn priced_assistant(id: &str, input: u64, output: u64, cache_read: u64) -> SessionTreeEntry {
-        SessionTreeEntry::Message {
+    fn priced_assistant(id: &str, input: u64, output: u64, cache_read: u64) -> Event {
+        Event::Message {
             id: id.into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -1544,7 +1537,7 @@ mod tests {
             .unwrap();
         // A user message counts toward the message total but carries no usage.
         storage
-            .append_entry(&SessionTreeEntry::Message {
+            .append_entry(&Event::Message {
                 id: "u1".into(),
                 parent_id: Some("a1".into()),
                 timestamp: chrono::Utc::now(),
@@ -1555,7 +1548,7 @@ mod tests {
             .unwrap();
         // A compaction is a model call the session paid for too.
         storage
-            .append_entry(&SessionTreeEntry::Compaction {
+            .append_entry(&Event::Compaction {
                 id: "c1".into(),
                 parent_id: Some("u1".into()),
                 timestamp: chrono::Utc::now(),
@@ -1598,7 +1591,7 @@ mod tests {
             .unwrap();
         let storage = TestStorage::new(storage);
         let mut entry = priced_assistant("a1", 10, 5, 3);
-        if let SessionTreeEntry::Message {
+        if let Event::Message {
             message: crate::types::AgentMessage::Assistant { usage, .. },
             ..
         } = &mut entry
@@ -1621,7 +1614,7 @@ mod tests {
             .unwrap();
         let storage = TestStorage::new(storage);
         let mut entry = priced_assistant("a1", 60, 30, 10);
-        if let SessionTreeEntry::Message {
+        if let Event::Message {
             message: crate::types::AgentMessage::Assistant { usage, .. },
             ..
         } = &mut entry
@@ -1642,7 +1635,7 @@ mod tests {
         let path = dir.path().join("s.jsonl");
         let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
         let storage = TestStorage::new(storage);
-        let target = SessionTreeEntry::Message {
+        let target = Event::Message {
             id: "m1".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -1657,7 +1650,7 @@ mod tests {
             ("l4", Some("final")),
         ] {
             storage
-                .append_entry(&SessionTreeEntry::Label {
+                .append_entry(&Event::Label {
                     id: id.into(),
                     parent_id: None,
                     timestamp: chrono::Utc::now(),
@@ -1691,7 +1684,7 @@ mod tests {
             .unwrap();
         let storage = TestStorage::new(storage);
         storage
-            .append_entry(&SessionTreeEntry::Label {
+            .append_entry(&Event::Label {
                 id: "l1".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -1713,7 +1706,7 @@ mod tests {
         assert_eq!(storage.get_session_name().await.unwrap(), None);
         for (id, name) in [("s1", Some("old")), ("s2", Some("  new  "))] {
             storage
-                .append_entry(&SessionTreeEntry::SessionInfo {
+                .append_entry(&Event::SessionInfo {
                     id: id.into(),
                     parent_id: None,
                     timestamp: chrono::Utc::now(),
@@ -1736,7 +1729,7 @@ mod tests {
             .unwrap();
         let storage = TestStorage::new(storage);
         storage
-            .append_entry(&SessionTreeEntry::Message {
+            .append_entry(&Event::Message {
                 id: "m1".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -1746,7 +1739,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .append_entry(&SessionTreeEntry::SessionInfo {
+            .append_entry(&Event::SessionInfo {
                 id: "s1".into(),
                 parent_id: Some("m1".into()),
                 timestamp: chrono::Utc::now(),
@@ -1790,7 +1783,7 @@ mod tests {
         let storage = TestStorage::new(storage);
         for i in 0..5 {
             storage
-                .append_entry(&SessionTreeEntry::Message {
+                .append_entry(&Event::Message {
                     id: format!("m{i}"),
                     parent_id: (i > 0).then(|| format!("m{}", i - 1)),
                     timestamp: chrono::Utc::now(),
@@ -1839,7 +1832,7 @@ mod tests {
         let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
         let storage = TestStorage::new(storage);
         storage
-            .append_entry(&SessionTreeEntry::Message {
+            .append_entry(&Event::Message {
                 id: "b1".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -1862,7 +1855,7 @@ mod tests {
         let reopened = JsonlSessionStorage::open(&path).await.unwrap();
         let reopened = TestStorage::new(reopened);
         let entry = reopened.get_entry("b1").await.unwrap().unwrap();
-        let SessionTreeEntry::Message { message, .. } = entry else {
+        let Event::Message { message, .. } = entry else {
             panic!("expected a message entry");
         };
         match message {
@@ -1899,7 +1892,7 @@ mod tests {
 
         assert!(storage.get_leaf_id().await.unwrap().is_none());
 
-        let msg = SessionTreeEntry::Message {
+        let msg = Event::Message {
             id: "m1".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -1952,7 +1945,7 @@ mod tests {
                 .await
                 .unwrap();
             let storage = TestStorage::new(storage);
-            let msg = SessionTreeEntry::Message {
+            let msg = Event::Message {
                 id: "m1".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -2201,21 +2194,21 @@ mod tests {
             .unwrap();
         let storage = TestStorage::new(storage);
 
-        let root = SessionTreeEntry::Message {
+        let root = Event::Message {
             id: "root".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("root"),
             origin: None,
         };
-        let child = SessionTreeEntry::Message {
+        let child = Event::Message {
             id: "child".into(),
             parent_id: Some("root".into()),
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("child"),
             origin: None,
         };
-        let leaf = SessionTreeEntry::Message {
+        let leaf = Event::Message {
             id: "leaf".into(),
             parent_id: Some("child".into()),
             timestamp: chrono::Utc::now(),
@@ -2247,14 +2240,14 @@ mod tests {
             .unwrap();
         let storage = TestStorage::new(storage);
 
-        let pre = SessionTreeEntry::Message {
+        let pre = Event::Message {
             id: "pre".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("pre-compaction"),
             origin: None,
         };
-        let compaction = SessionTreeEntry::Compaction {
+        let compaction = Event::Compaction {
             id: "comp".into(),
             parent_id: Some("pre".into()),
             timestamp: chrono::Utc::now(),
@@ -2266,7 +2259,7 @@ mod tests {
             details: None,
             from_hook: None,
         };
-        let post = SessionTreeEntry::Message {
+        let post = Event::Message {
             id: "post".into(),
             parent_id: Some("comp".into()),
             timestamp: chrono::Utc::now(),
@@ -2304,7 +2297,7 @@ mod tests {
             .unwrap();
         let storage = TestStorage::new(storage);
         let base = chrono::Utc::now();
-        let compaction = |id: &str, parent: &str, secs: i64| SessionTreeEntry::Compaction {
+        let compaction = |id: &str, parent: &str, secs: i64| Event::Compaction {
             id: id.into(),
             parent_id: Some(parent.into()),
             timestamp: base + chrono::Duration::seconds(secs),
@@ -2316,7 +2309,7 @@ mod tests {
             details: None,
             from_hook: None,
         };
-        let message = |id: &str, parent: &str, secs: i64| SessionTreeEntry::Message {
+        let message = |id: &str, parent: &str, secs: i64| Event::Message {
             id: id.into(),
             parent_id: Some(parent.into()),
             timestamp: base + chrono::Duration::seconds(secs),
@@ -2324,7 +2317,7 @@ mod tests {
             origin: None,
         };
 
-        let root = SessionTreeEntry::Message {
+        let root = Event::Message {
             id: "root".into(),
             parent_id: None,
             timestamp: base,
@@ -2373,14 +2366,14 @@ mod tests {
             .unwrap();
         let storage = TestStorage::new(storage);
 
-        let root = SessionTreeEntry::Message {
+        let root = Event::Message {
             id: "root".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("root"),
             origin: None,
         };
-        let child = SessionTreeEntry::Message {
+        let child = Event::Message {
             id: "child".into(),
             parent_id: Some("root".into()),
             timestamp: chrono::Utc::now(),
@@ -2448,13 +2441,13 @@ mod tests {
         // The model_change and thinking_level_change deserialized with their
         // camelCase fields mapped.
         match &entries[0] {
-            SessionTreeEntry::ModelChange { model_id, .. } => {
+            Event::ModelChange { model_id, .. } => {
                 assert_eq!(model_id, "claude-opus-4-7");
             }
             other => panic!("expected ModelChange, got {other:?}"),
         }
         match &entries[1] {
-            SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => {
+            Event::ThinkingLevelChange { thinking_level, .. } => {
                 assert_eq!(thinking_level, "medium");
             }
             other => panic!("expected ThinkingLevelChange, got {other:?}"),
@@ -2462,7 +2455,7 @@ mod tests {
         // The message entry's inner message carried an epoch-millis timestamp
         // and a text content block.
         match &entries[2] {
-            SessionTreeEntry::Message {
+            Event::Message {
                 id,
                 parent_id,
                 message,
@@ -2518,7 +2511,7 @@ mod tests {
         assert_eq!(entries.len(), 2);
 
         match &entries[0] {
-            SessionTreeEntry::Custom {
+            Event::Custom {
                 id,
                 parent_id,
                 custom_type,
@@ -2533,7 +2526,7 @@ mod tests {
             other => panic!("expected Custom (string data), got {other:?}"),
         }
         match &entries[1] {
-            SessionTreeEntry::Custom {
+            Event::Custom {
                 id,
                 parent_id,
                 custom_type,
@@ -2606,7 +2599,7 @@ mod tests {
         assert_eq!(entries.len(), 7);
 
         match &entries[0] {
-            SessionTreeEntry::BranchSummary {
+            Event::BranchSummary {
                 from_id,
                 summary,
                 details,
@@ -2623,7 +2616,7 @@ mod tests {
             other => panic!("expected BranchSummary, got {other:?}"),
         }
         match &entries[1] {
-            SessionTreeEntry::Label {
+            Event::Label {
                 target_id, label, ..
             } => {
                 assert_eq!(target_id, "b1");
@@ -2632,7 +2625,7 @@ mod tests {
             other => panic!("expected Label, got {other:?}"),
         }
         match &entries[2] {
-            SessionTreeEntry::CustomMessage {
+            Event::CustomMessage {
                 content, display, ..
             } => {
                 assert_eq!(content.len(), 1);
@@ -2642,7 +2635,7 @@ mod tests {
             other => panic!("expected CustomMessage (string), got {other:?}"),
         }
         match &entries[3] {
-            SessionTreeEntry::CustomMessage { content, .. } => {
+            Event::CustomMessage { content, .. } => {
                 assert_eq!(content.len(), 2);
                 assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "see"));
                 assert!(
@@ -2652,19 +2645,19 @@ mod tests {
             other => panic!("expected CustomMessage (array), got {other:?}"),
         }
         match &entries[4] {
-            SessionTreeEntry::SessionInfo { name, .. } => {
+            Event::SessionInfo { name, .. } => {
                 assert!(name.is_none());
             }
             other => panic!("expected SessionInfo, got {other:?}"),
         }
         match &entries[5] {
-            SessionTreeEntry::Custom { data, .. } => {
+            Event::Custom { data, .. } => {
                 assert!(data.is_none());
             }
             other => panic!("expected Custom, got {other:?}"),
         }
         match &entries[6] {
-            SessionTreeEntry::Leaf { target_id, .. } => {
+            Event::Leaf { target_id, .. } => {
                 assert_eq!(target_id.as_deref(), Some("b1"));
             }
             other => panic!("expected Leaf, got {other:?}"),
@@ -2680,7 +2673,7 @@ mod tests {
             .await
             .unwrap();
         let storage = TestStorage::new(storage);
-        let entry = SessionTreeEntry::Label {
+        let entry = Event::Label {
             id: "lab1".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -2751,7 +2744,9 @@ mod tests {
         assert!(entries.iter().any(|e| e.id() == m1));
         assert!(entries.iter().any(|e| e.id() == m2));
         assert!(
-            entries.iter().any(|e| matches!(e, SessionTreeEntry::Leaf { target_id, .. } if target_id.as_deref() == Some(&m1))),
+            entries.iter().any(
+                |e| matches!(e, Event::Leaf { target_id, .. } if target_id.as_deref() == Some(&m1))
+            ),
             "no leaf entry redirecting to m1 was persisted"
         );
 
@@ -2777,8 +2772,7 @@ mod tests {
         assert_eq!(ctx[0].id(), m1);
         assert_eq!(ctx[1].id(), m2);
         assert!(
-            !ctx.iter()
-                .any(|e| matches!(e, SessionTreeEntry::Leaf { .. })),
+            !ctx.iter().any(|e| matches!(e, Event::Leaf { .. })),
             "leaf entry leaked into the walked context"
         );
 
@@ -2944,13 +2938,13 @@ mod tests {
         let entries = storage.get_entries(Default::default()).await.unwrap();
         assert_eq!(entries.len(), 2);
         match &entries[0] {
-            SessionTreeEntry::AccessModeChange { mode, .. } => {
+            Event::AccessModeChange { mode, .. } => {
                 assert_eq!(mode, "sandbox");
             }
             other => panic!("expected AccessModeChange, got {other:?}"),
         }
         match &entries[1] {
-            SessionTreeEntry::AccessModeChange {
+            Event::AccessModeChange {
                 id,
                 parent_id,
                 mode,
@@ -2973,7 +2967,7 @@ mod tests {
         let entries = reopened.get_entries(Default::default()).await.unwrap();
         let last = entries.last().unwrap();
         match last {
-            SessionTreeEntry::AccessModeChange { mode, .. } => {
+            Event::AccessModeChange { mode, .. } => {
                 assert_eq!(mode, "sandbox", "the appended row round-trips");
             }
             other => panic!("expected AccessModeChange, got {other:?}"),
@@ -3010,8 +3004,8 @@ mod tests {
     }
 
     /// A user message entry for batch tests.
-    fn message_entry(id: &str, parent: Option<&str>, text: &str) -> SessionTreeEntry {
-        SessionTreeEntry::Message {
+    fn message_entry(id: &str, parent: Option<&str>, text: &str) -> Event {
+        Event::Message {
             id: id.into(),
             parent_id: parent.map(str::to_string),
             timestamp: chrono::Utc::now(),
@@ -3110,9 +3104,9 @@ mod tests {
     }
 
     /// The text of a user message entry, for chain-order assertions.
-    fn user_text(entry: &SessionTreeEntry) -> &str {
+    fn user_text(entry: &Event) -> &str {
         match entry {
-            SessionTreeEntry::Message {
+            Event::Message {
                 message: AgentMessage::User { content, .. },
                 ..
             } => content
@@ -3341,7 +3335,7 @@ mod tests {
             .await
             .unwrap();
         let storage = TestStorage::new(storage);
-        let entry = SessionTreeEntry::Message {
+        let entry = Event::Message {
             id: "m1".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -3349,7 +3343,7 @@ mod tests {
             origin: None,
         };
         storage.append_entry(&entry).await.unwrap();
-        let dup = SessionTreeEntry::Message {
+        let dup = Event::Message {
             id: "m1".into(),
             parent_id: Some("m1".into()),
             timestamp: chrono::Utc::now(),
@@ -3376,7 +3370,7 @@ mod tests {
             .await
             .unwrap();
         let storage = TestStorage::new(storage);
-        let entry = SessionTreeEntry::Message {
+        let entry = Event::Message {
             id: String::new(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -3520,8 +3514,8 @@ mod tests {
     mod v4 {
         use super::*;
 
-        fn user_message(id: &str, parent: Option<&str>, text: &str) -> SessionTreeEntry {
-            SessionTreeEntry::Message {
+        fn user_message(id: &str, parent: Option<&str>, text: &str) -> Event {
+            Event::Message {
                 id: id.into(),
                 parent_id: parent.map(str::to_string),
                 timestamp: chrono::Utc::now(),
@@ -3530,8 +3524,8 @@ mod tests {
             }
         }
 
-        fn turn_start(id: &str, parent: &str) -> SessionTreeEntry {
-            SessionTreeEntry::TurnStart {
+        fn turn_start(id: &str, parent: &str) -> Event {
+            Event::TurnStart {
                 id: id.into(),
                 parent_id: Some(parent.into()),
                 timestamp: chrono::Utc::now(),
@@ -3539,8 +3533,8 @@ mod tests {
             }
         }
 
-        fn tool_call(id: &str, parent: &str, call_id: &str) -> SessionTreeEntry {
-            SessionTreeEntry::ToolCall {
+        fn tool_call(id: &str, parent: &str, call_id: &str) -> Event {
+            Event::ToolCall {
                 id: id.into(),
                 parent_id: Some(parent.into()),
                 timestamp: chrono::Utc::now(),
@@ -3588,7 +3582,7 @@ mod tests {
             // Envelope-key exclusivity (§C.1): the tool handle rides as
             // callId, never as id.
             assert!(
-                matches!(&range[2].entry, SessionTreeEntry::ToolCall { call_id, .. } if call_id == "call-9")
+                matches!(&range[2].entry, Event::ToolCall { call_id, .. } if call_id == "call-9")
             );
 
             // Reopen: v4 header, dense stamped lines, same chain.
@@ -3940,7 +3934,7 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|e| match e {
-                SessionTreeEntry::Message { origin, .. } => Some(origin.clone()),
+                Event::Message { origin, .. } => Some(origin.clone()),
                 _ => None,
             })
             .collect();
@@ -3959,7 +3953,7 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|e| match e {
-                SessionTreeEntry::Message { origin, .. } => Some(origin.clone()),
+                Event::Message { origin, .. } => Some(origin.clone()),
                 _ => None,
             })
             .collect();
@@ -4042,7 +4036,7 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|e| match e {
-                SessionTreeEntry::Message { origin, .. } => Some(origin.clone()),
+                Event::Message { origin, .. } => Some(origin.clone()),
                 _ => None,
             })
             .collect();
@@ -4079,7 +4073,7 @@ mod deferred_probe_tests {
         .unwrap();
         let storage = TestStorage::new(storage);
         storage
-            .append_entry(&SessionTreeEntry::ModelChange {
+            .append_entry(&Event::ModelChange {
                 id: "m0".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -4109,8 +4103,8 @@ mod append_entries_tests {
         }
     }
 
-    fn chain_entry(id: &str, parent: Option<&str>) -> SessionTreeEntry {
-        SessionTreeEntry::Message {
+    fn chain_entry(id: &str, parent: Option<&str>) -> Event {
+        Event::Message {
             id: id.into(),
             parent_id: parent.map(str::to_string),
             timestamp: chrono::Utc::now(),
@@ -4225,7 +4219,7 @@ mod append_entries_tests {
                 .unwrap();
             let storage = TestStorage::new(storage);
             storage
-                .append_entry(&SessionTreeEntry::ModelChange {
+                .append_entry(&Event::ModelChange {
                     id: "m0".into(),
                     parent_id: None,
                     timestamp: chrono::Utc::now(),

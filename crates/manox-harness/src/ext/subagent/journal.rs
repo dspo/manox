@@ -17,7 +17,7 @@ use crate::types::{AgentEvent, AgentMessage, AssistantMessageEvent, ContentBlock
 use serde_json::{Value, json};
 
 /// The journal rows one child event contributes, in append order. Kinds are
-/// the wire names [`crate::session::SessionTreeEntry::from_kind_payload`]
+/// the wire names [`crate::session::Event::from_kind_payload`]
 /// accepts; payload keys are the variants' camelCase serde names.
 pub fn child_journal_rows(event: &AgentEvent) -> Vec<(&'static str, Value)> {
     match event {

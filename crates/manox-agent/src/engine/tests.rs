@@ -329,7 +329,7 @@ async fn user_row_ids(session: &AgentSession) -> Vec<String> {
         .unwrap();
     rows.iter()
         .filter_map(|r| match &r.entry {
-            manox_harness::session::SessionTreeEntry::Message {
+            manox_harness::session::Event::Message {
                 id,
                 message: AgentMessage::User { .. },
                 ..
@@ -616,7 +616,7 @@ async fn turn_finish_row(
         .iter()
         .rev()
         .find_map(|r| match &r.entry {
-            manox_harness::session::SessionTreeEntry::TurnFinish {
+            manox_harness::session::Event::TurnFinish {
                 id,
                 parent_id,
                 cancelled,
@@ -643,7 +643,7 @@ async fn turn_finish_row(
         rows.iter()
             .rev()
             .find_map(|r| match r.entry {
-                manox_harness::session::SessionTreeEntry::TurnFinish { .. } => Some(r.seq),
+                manox_harness::session::Event::TurnFinish { .. } => Some(r.seq),
                 _ => None,
             })
             .expect("turn_finish row present"),
@@ -945,7 +945,7 @@ fn durable_journal_mapping_round_trips_every_journaled_event() {
     for event in &events {
         let (kind, payload) = durable_journal_payload(event)
             .unwrap_or_else(|| panic!("{event:?} must map to a journal kind"));
-        let entry = manox_harness::session::SessionTreeEntry::from_kind_payload(
+        let entry = manox_harness::session::Event::from_kind_payload(
             &kind,
             "e-test".into(),
             None,
@@ -1014,7 +1014,7 @@ async fn journal_relay_feeds_storage_appends_in_seq_order() {
     spawn_journal_relay_rx(storage.subscribe_journal(), state.journal_tx.clone());
     let mut feed = state.journal_tx.subscribe();
 
-    use manox_harness::session::SessionTreeEntry;
+    use manox_harness::session::Event;
     for i in 0..3 {
         let parent = if i == 0 {
             None
@@ -1023,7 +1023,7 @@ async fn journal_relay_feeds_storage_appends_in_seq_order() {
         };
         let parent = parent.as_deref();
         session
-            .append_verbatim(SessionTreeEntry::TurnStart {
+            .append_verbatim(Event::TurnStart {
                 id: format!("e{i}"),
                 parent_id: parent.map(str::to_string),
                 timestamp: chrono::Utc::now(),
@@ -1654,32 +1654,29 @@ async fn parallel_tool_rounds_land_every_result() {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     });
-    let (result, _aborted) = match tokio::time::timeout(std::time::Duration::from_secs(60), driven)
-        .await
-    {
-        Ok(pair) => pair,
-        Err(_) => {
-            let rows = appender_for_dump
-                .storage()
-                .journal_range(0, u64::MAX)
-                .await
-                .unwrap_or_default();
-            let kinds: Vec<String> = rows
-                .iter()
-                .map(|r| match &r.entry {
-                    manox_harness::session::SessionTreeEntry::ToolCall { name, status, .. } => {
-                        format!("tool_call:{name}:{status}")
-                    }
-                    manox_harness::session::SessionTreeEntry::ToolResult { .. } => {
-                        "tool_result".into()
-                    }
-                    manox_harness::session::SessionTreeEntry::Message { .. } => "message".into(),
-                    other => format!("{:?}", std::mem::discriminant(other)),
-                })
-                .collect();
-            panic!("drive_run stalled mid-turn; journal tail: {kinds:?}");
-        }
-    };
+    let (result, _aborted) =
+        match tokio::time::timeout(std::time::Duration::from_secs(60), driven).await {
+            Ok(pair) => pair,
+            Err(_) => {
+                let rows = appender_for_dump
+                    .storage()
+                    .journal_range(0, u64::MAX)
+                    .await
+                    .unwrap_or_default();
+                let kinds: Vec<String> = rows
+                    .iter()
+                    .map(|r| match &r.entry {
+                        manox_harness::session::Event::ToolCall { name, status, .. } => {
+                            format!("tool_call:{name}:{status}")
+                        }
+                        manox_harness::session::Event::ToolResult { .. } => "tool_result".into(),
+                        manox_harness::session::Event::Message { .. } => "message".into(),
+                        other => format!("{:?}", std::mem::discriminant(other)),
+                    })
+                    .collect();
+                panic!("drive_run stalled mid-turn; journal tail: {kinds:?}");
+            }
+        };
     result.unwrap();
     snapshot_storm.abort();
 
@@ -1704,19 +1701,14 @@ async fn parallel_tool_rounds_land_every_result() {
     // persisted ToolResult messages.
     let tool_results = rows
         .iter()
-        .filter(|r| {
-            matches!(
-                &r.entry,
-                manox_harness::session::SessionTreeEntry::ToolResult { .. }
-            )
-        })
+        .filter(|r| matches!(&r.entry, manox_harness::session::Event::ToolResult { .. }))
         .count();
     let result_messages = rows
         .iter()
         .filter(|r| {
             matches!(
                 &r.entry,
-                manox_harness::session::SessionTreeEntry::Message {
+                manox_harness::session::Event::Message {
                     message: AgentMessage::ToolResult { .. },
                     ..
                 }
@@ -1726,11 +1718,11 @@ async fn parallel_tool_rounds_land_every_result() {
     let kinds: Vec<String> = rows
         .iter()
         .map(|r| match &r.entry {
-            manox_harness::session::SessionTreeEntry::ToolCall { name, status, .. } => {
+            manox_harness::session::Event::ToolCall { name, status, .. } => {
                 format!("tool_call:{name}:{status:?}")
             }
-            manox_harness::session::SessionTreeEntry::ToolResult { .. } => "tool_result".into(),
-            manox_harness::session::SessionTreeEntry::Message { .. } => "message".to_string(),
+            manox_harness::session::Event::ToolResult { .. } => "tool_result".into(),
+            manox_harness::session::Event::Message { .. } => "message".to_string(),
             other => format!("{:?}", std::mem::discriminant(other)),
         })
         .collect();
@@ -1830,7 +1822,7 @@ async fn mid_run_journal_append_lands_immediately() {
             let found = rows.iter().any(|r| {
                 matches!(
                     &r.entry,
-                    manox_harness::session::SessionTreeEntry::SubagentProgress {
+                    manox_harness::session::Event::SubagentProgress {
                         agent_id, status, ..
                     }
                         if agent_id == "review-kernel"
@@ -1863,7 +1855,7 @@ async fn mid_run_journal_append_lands_immediately() {
         .position(|r| {
             matches!(
                 &r.entry,
-                manox_harness::session::SessionTreeEntry::SubagentProgress { agent_id, .. }
+                manox_harness::session::Event::SubagentProgress { agent_id, .. }
                     if agent_id == "review-kernel"
             )
         })
@@ -1873,12 +1865,7 @@ async fn mid_run_journal_append_lands_immediately() {
     // mid-run interleaving.
     let done_ix = rows
         .iter()
-        .rposition(|r| {
-            matches!(
-                &r.entry,
-                manox_harness::session::SessionTreeEntry::Message { .. }
-            )
-        })
+        .rposition(|r| matches!(&r.entry, manox_harness::session::Event::Message { .. }))
         .expect("the run's settled message rows present");
     assert!(
         foreign_ix < done_ix,
@@ -2284,7 +2271,7 @@ async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
     assert!(
         !rows.iter().any(|r| matches!(
             &r.entry,
-            manox_harness::session::SessionTreeEntry::SubagentProgress { agent_id, .. }
+            manox_harness::session::Event::SubagentProgress { agent_id, .. }
                 if agent_id == "k4-loss-probe"
         )),
         "the permanently lost row must not appear in the journal"
@@ -2317,7 +2304,7 @@ fn k5_user_entries(
 ) -> Vec<(String, Option<String>)> {
     rows.iter()
         .filter_map(|r| match &r.entry {
-            manox_harness::session::SessionTreeEntry::Message {
+            manox_harness::session::Event::Message {
                 message: AgentMessage::User { content, .. },
                 origin,
                 ..
@@ -2470,7 +2457,7 @@ async fn accepted_user_entry_persists_before_the_run_and_the_middleware_skips_th
         rows.iter()
             .filter(|r| matches!(
                 &r.entry,
-                manox_harness::session::SessionTreeEntry::Message {
+                manox_harness::session::Event::Message {
                     message: AgentMessage::Assistant { .. },
                     ..
                 }
@@ -2653,7 +2640,7 @@ async fn queued_submit_persists_at_drain_before_the_run() {
         .filter(|r| {
             matches!(
                 &r.entry,
-                manox_harness::session::SessionTreeEntry::Message {
+                manox_harness::session::Event::Message {
                     message: AgentMessage::User { .. },
                     ..
                 }
@@ -2744,7 +2731,7 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
         .find(|r| {
             matches!(
                 &r.entry,
-                manox_harness::session::SessionTreeEntry::Message {
+                manox_harness::session::Event::Message {
                     message: AgentMessage::User { .. },
                     ..
                 }
@@ -3596,7 +3583,7 @@ const REPLAY_COVERAGE_KINDS: &[&str] = &[
     "active_tools_change",
 ];
 
-fn entry_type_tag(entry: &manox_harness::session::SessionTreeEntry) -> String {
+fn entry_type_tag(entry: &manox_harness::session::Event) -> String {
     serde_json::to_value(entry)
         .ok()
         .and_then(|value| {
@@ -4059,10 +4046,9 @@ async fn set_thinking_level_lands_one_row_and_a_restate_lands_none() {
             .unwrap()
             .into_iter()
             .filter_map(|record| match record.entry {
-                manox_harness::session::SessionTreeEntry::ThinkingLevelChange {
-                    thinking_level,
-                    ..
-                } => Some(thinking_level),
+                manox_harness::session::Event::ThinkingLevelChange { thinking_level, .. } => {
+                    Some(thinking_level)
+                }
                 _ => None,
             })
             .collect()
@@ -4151,7 +4137,7 @@ async fn store_journal_rows_route_to_the_actor_and_the_shutdown_claim_lands_them
     assert!(
         rows.iter().any(|record| matches!(
             &record.entry,
-            manox_harness::session::SessionTreeEntry::PinnedArchived { pinned, archived, .. }
+            manox_harness::session::Event::PinnedArchived { pinned, archived, .. }
                 if !*pinned && *archived
         )),
         "the claimed row must land in the journal"
@@ -4227,7 +4213,7 @@ async fn project_binding_journals_project_change_entry() {
     assert!(
         rows.iter().any(|record| matches!(
             &record.entry,
-            manox_harness::session::SessionTreeEntry::ProjectChange { path, .. }
+            manox_harness::session::Event::ProjectChange { path, .. }
                 if path.as_deref() == Some("/bound/project")
         )),
         "the binding must journal a project_change entry; chain kinds: {:?}",
@@ -4263,9 +4249,7 @@ async fn access_mode_decision_lands_one_row_and_restates_land_none() {
         let modes: Vec<_> = records
             .iter()
             .filter_map(|record| match &record.entry {
-                manox_harness::session::SessionTreeEntry::AccessModeChange { mode, .. } => {
-                    Some(mode.as_str())
-                }
+                manox_harness::session::Event::AccessModeChange { mode, .. } => Some(mode.as_str()),
                 _ => None,
             })
             .collect();
@@ -4303,7 +4287,7 @@ async fn access_mode_decision_lands_one_row_and_restates_land_none() {
         .filter(|record| {
             matches!(
                 &record.entry,
-                manox_harness::session::SessionTreeEntry::AccessModeChange { .. }
+                manox_harness::session::Event::AccessModeChange { .. }
             )
         })
         .count();
@@ -4331,7 +4315,7 @@ async fn establishment_journals_one_cwd_witness() {
         .filter(|record| {
             matches!(
                 &record.entry,
-                manox_harness::session::SessionTreeEntry::CwdChange { cwd, .. }
+                manox_harness::session::Event::CwdChange { cwd, .. }
                     if *cwd == projected_str
             )
         })
@@ -4379,7 +4363,7 @@ async fn bind_order_leaves_exactly_one_cwd_witness_on_the_new_chain() {
         .filter(|record| {
             matches!(
                 &record.entry,
-                manox_harness::session::SessionTreeEntry::CwdChange { .. }
+                manox_harness::session::Event::CwdChange { .. }
             )
         })
         .count();
@@ -4392,7 +4376,7 @@ async fn bind_order_leaves_exactly_one_cwd_witness_on_the_new_chain() {
     handle_set_cwd(&mut session, &state, &notice_tx, &other).await;
     let rows = session.journal_range(0, u64::MAX).await.unwrap();
     let tail = rows.iter().rev().find_map(|record| match &record.entry {
-        manox_harness::session::SessionTreeEntry::CwdChange { cwd, .. } => Some(cwd.clone()),
+        manox_harness::session::Event::CwdChange { cwd, .. } => Some(cwd.clone()),
         _ => None,
     });
     assert_eq!(
@@ -4496,7 +4480,7 @@ async fn initial_title_decision_journals_through_the_tap() {
     assert!(
         rows.iter().any(|record| matches!(
             &record.entry,
-            manox_harness::session::SessionTreeEntry::Title { title, .. }
+            manox_harness::session::Event::Title { title, .. }
                 if title == "initial title"
         )),
         "the decision must land a title entry"
@@ -4929,9 +4913,7 @@ async fn session_model_changes(session: &AgentSession) -> Vec<String> {
         .unwrap()
         .iter()
         .filter_map(|r| match &r.entry {
-            manox_harness::session::SessionTreeEntry::ModelChange { model_id, .. } => {
-                Some(model_id.clone())
-            }
+            manox_harness::session::Event::ModelChange { model_id, .. } => Some(model_id.clone()),
             _ => None,
         })
         .collect()
@@ -5424,7 +5406,7 @@ async fn parent_mode_rows(session: &manox_harness::coding_agent::AgentSession) -
         .expect("context entries read")
         .into_iter()
         .filter_map(|entry| match entry {
-            manox_harness::session::SessionTreeEntry::AccessModeChange { mode, .. } => Some(mode),
+            manox_harness::session::Event::AccessModeChange { mode, .. } => Some(mode),
             _ => None,
         })
         .collect()
@@ -5616,9 +5598,7 @@ async fn child_journal_opens_with_the_inherited_mode_and_follows_a_live_flip() {
     let replayed_modes: Vec<&str> = replayed
         .iter()
         .filter_map(|record| match &record.entry {
-            manox_harness::session::SessionTreeEntry::AccessModeChange { mode, .. } => {
-                Some(mode.as_str())
-            }
+            manox_harness::session::Event::AccessModeChange { mode, .. } => Some(mode.as_str()),
             _ => None,
         })
         .collect();

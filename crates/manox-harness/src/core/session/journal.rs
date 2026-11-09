@@ -349,7 +349,7 @@ async fn write_one<S: SessionStorage>(
 mod tests {
     use super::*;
     use crate::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
-    use crate::session::{Session, SessionTreeEntry};
+    use crate::session::{Event, Session};
     use crate::types::AgentMessage;
     use std::time::{Duration, Instant};
 
@@ -458,7 +458,7 @@ mod tests {
         let journal = Journal::new(Arc::clone(&storage));
         let first = journal
             .append_verbatim(
-                SessionTreeEntry::Message {
+                Event::Message {
                     id: "m1".into(),
                     parent_id: None,
                     timestamp: chrono::Utc::now(),
@@ -487,7 +487,7 @@ mod tests {
             async move {
                 journal
                     .append_verbatim(
-                        SessionTreeEntry::Message {
+                        Event::Message {
                             id: "m2".into(),
                             parent_id: None,
                             timestamp: chrono::Utc::now(),
@@ -515,7 +515,7 @@ mod tests {
         let started = Instant::now();
         let later = journal
             .append_verbatim(
-                SessionTreeEntry::Message {
+                Event::Message {
                     id: "m3".into(),
                     parent_id: None,
                     timestamp: chrono::Utc::now(),
@@ -556,7 +556,7 @@ mod tests {
         let started = Instant::now();
         let result = journal
             .append_verbatim(
-                SessionTreeEntry::Message {
+                Event::Message {
                     id: "m1".into(),
                     parent_id: None,
                     timestamp: chrono::Utc::now(),

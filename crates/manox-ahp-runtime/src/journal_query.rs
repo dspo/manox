@@ -142,7 +142,7 @@ fn fold_conversation_info(
     records: &[manox_harness::session::jsonl::JournalRecord],
     cursor: u64,
 ) -> Value {
-    use manox_harness::session::SessionTreeEntry as E;
+    use manox_harness::session::Event as E;
     use manox_harness::types::AgentMessage as M;
 
     let mut turns: u64 = 0;
@@ -287,7 +287,7 @@ mod cold_write_read_probe {
         )
         .await
         .unwrap();
-        let entry = manox_harness::session::SessionTreeEntry::CustomMessage {
+        let entry = manox_harness::session::Event::CustomMessage {
             id: "e0".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),

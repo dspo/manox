@@ -63,7 +63,7 @@ use ahp_types::state::{
 };
 use manox_ahp::channels::{chat, session};
 use manox_harness::sandbox::{AccessMode, NetworkAccess};
-use manox_harness::session::SessionTreeEntry;
+use manox_harness::session::Event;
 use serde_json::Value;
 
 pub(crate) mod baseline_cache;
@@ -495,7 +495,7 @@ pub(crate) async fn fold_journal_snapshot(
         // carries provider and model id separately, and the session fold
         // reads the provider out of the composed value when the store row
         // has none.
-        if let SessionTreeEntry::ModelChange {
+        if let Event::ModelChange {
             provider, model_id, ..
         } = &record.entry
         {
@@ -556,10 +556,10 @@ pub(crate) async fn open_turn_owner(chat_id: &str) -> Option<manox_harness::sess
     let mut owner = None;
     for record in &snapshot.records {
         match &record.entry {
-            manox_harness::session::SessionTreeEntry::TurnStart { owner: stamped, .. } => {
+            manox_harness::session::Event::TurnStart { owner: stamped, .. } => {
                 owner = *stamped;
             }
-            manox_harness::session::SessionTreeEntry::TurnFinish { .. } => owner = None,
+            manox_harness::session::Event::TurnFinish { .. } => owner = None,
             _ => {}
         }
     }
@@ -1138,7 +1138,7 @@ mod baseline_tests {
             .unwrap();
             let storage = manox_harness::session::Session::new(storage);
             storage
-                .append_verbatim(manox_harness::session::SessionTreeEntry::Label {
+                .append_verbatim(manox_harness::session::Event::Label {
                     id: format!("e-{id}"),
                     parent_id: None,
                     timestamp: chrono::Utc::now() - ago,
@@ -1166,7 +1166,7 @@ mod baseline_tests {
         .unwrap();
         let active_storage = manox_harness::session::Session::new(active_storage);
         active_storage
-            .append_verbatim(manox_harness::session::SessionTreeEntry::CustomMessage {
+            .append_verbatim(manox_harness::session::Event::CustomMessage {
                 id: "e-act".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -1226,7 +1226,7 @@ mod baseline_tests {
         .unwrap();
         let storage = manox_harness::session::Session::new(storage);
         storage
-            .append_verbatim(manox_harness::session::SessionTreeEntry::Label {
+            .append_verbatim(manox_harness::session::Event::Label {
                 id: format!("e-{id}"),
                 parent_id: None,
                 timestamp: at,
@@ -1277,7 +1277,7 @@ mod baseline_tests {
             .unwrap();
         if finish {
             storage
-                .append_verbatim(manox_harness::session::SessionTreeEntry::TurnFinish {
+                .append_verbatim(manox_harness::session::Event::TurnFinish {
                     id: format!("f-{id}"),
                     parent_id: Some(format!("e-{id}")),
                     timestamp: chrono::Utc::now(),
@@ -1389,7 +1389,7 @@ mod baseline_tests {
         .unwrap();
         let storage = manox_harness::session::Session::new(storage);
         storage
-            .append_verbatim(manox_harness::session::SessionTreeEntry::Label {
+            .append_verbatim(manox_harness::session::Event::Label {
                 id: "e-v2".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -1438,7 +1438,7 @@ mod baseline_tests {
         .unwrap();
         let storage = manox_harness::session::Session::new(storage);
         storage
-            .append_verbatim(manox_harness::session::SessionTreeEntry::TurnStart {
+            .append_verbatim(manox_harness::session::Event::TurnStart {
                 id: "e-ts".into(),
                 parent_id: None,
                 timestamp: at,
@@ -1460,7 +1460,7 @@ mod baseline_tests {
             .unwrap();
         let storage = manox_harness::session::Session::new(storage);
         storage
-            .append_verbatim(manox_harness::session::SessionTreeEntry::TurnFinish {
+            .append_verbatim(manox_harness::session::Event::TurnFinish {
                 id: "e-tf".into(),
                 parent_id: Some("e-ts".into()),
                 timestamp: chrono::Utc::now(),
@@ -1525,7 +1525,7 @@ mod baseline_tests {
         .unwrap();
         let storage = manox_harness::session::Session::new(storage);
         storage
-            .append_verbatim(manox_harness::session::SessionTreeEntry::Label {
+            .append_verbatim(manox_harness::session::Event::Label {
                 id: "e-v2".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
