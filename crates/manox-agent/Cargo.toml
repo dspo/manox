@@ -66,6 +66,15 @@ seccompiler.workspace = true
 # recvmsg ancillary buffers).
 rustix = { workspace = true, features = ["net"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = "0.8"
+# Reads the SystemConfiguration proxy dictionary (the adapter, and the
+# dictionary-building extraction tests).
+core-foundation = "0.10"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-registry = "0.5"
+
 [dev-dependencies]
 # Self-reference with `test-support`: integration tests (`tests/`) compile the
 # lib without `cfg(test)`, so the test seams (`init_for_test` /

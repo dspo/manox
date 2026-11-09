@@ -10,10 +10,14 @@
 //! Content-Type header, and binary refusal. A non-2xx status is part of the
 //! result, not an error.
 //!
-//! A configured environment proxy replaces the DNS-level guard, because the
-//! proxy resolves the origin and is usually a local listener the address policy
-//! would refuse; URL validation, the IP-literal check, the redirect policy, and
-//! every cap stay in force (see [`proxy`]). Presentation lives in [`html`]:
+//! A configured proxy route — environment variables first, then the OS-level
+//! system proxy where the platform publishes one — replaces the DNS-level
+//! guard, because the proxy resolves the origin and is usually a local listener
+//! the address policy would refuse; URL validation, the IP-literal check, the
+//! redirect policy, and every cap stay in force (see [`proxy`]). An answer set
+//! made entirely of fake-IP placeholders — the benchmark range a transparent
+//! proxy/TUN hands out — is diagnosed as such rather than as a generic
+//! refusal. Presentation lives in [`html`]:
 //! HTML is converted to Markdown, with non-content and hidden elements dropped
 //! and deeply nested markup refused rather than converted.
 //!
@@ -26,6 +30,7 @@ mod core;
 mod html;
 mod proxy;
 mod resolver;
+mod system;
 #[cfg(test)]
 mod test_server;
 
