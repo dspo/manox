@@ -39,15 +39,23 @@ pub(crate) async fn handle(inner: &Arc<Inner>, conn: &Arc<Conn>, msg: JsonRpcMes
     match msg {
         JsonRpcMessage::Request(request) => {
             let id = request.id;
-            match dispatch_request(inner, conn, &request).await {
-                Ok(result) => conn.send(wire::success(id, result)),
+            let reply = match dispatch_request(inner, conn, &request).await {
+                Ok(result) => wire::success(id, result),
                 Err(err) => {
                     tracing::debug!(method = %request.method, "request failed: {err}");
-                    conn.send(wire::error(
-                        id,
-                        ahp_types::messages::JsonRpcError::from(err),
-                    ));
+                    wire::error(id, ahp_types::messages::JsonRpcError::from(err))
                 }
+            };
+            // The caller claimed this id before dispatching; a claim that is
+            // already gone means the dispatch deadline answered first, so the
+            // handler's late reply is discarded rather than sent twice.
+            if !conn.reply_once(id, reply) {
+                tracing::debug!(
+                    connection = conn.id(),
+                    id = id,
+                    method = %request.method,
+                    "late reply discarded: the request was already answered"
+                );
             }
         }
         JsonRpcMessage::Notification(note) => dispatch_notification(inner, conn, &note).await,

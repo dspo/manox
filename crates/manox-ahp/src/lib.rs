@@ -42,6 +42,7 @@ pub mod error;
 pub mod ext;
 pub mod host;
 pub mod jsonrpc;
+pub mod lanes;
 pub mod resource;
 pub mod router;
 pub mod sequencer;
