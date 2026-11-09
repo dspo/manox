@@ -2151,7 +2151,7 @@ async fn stat_session_files(dir: &std::path::Path) -> Vec<Stat> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
         // The core root is two-deep: project buckets over per-session
-        // directories, the journal (`log.v1.jsonl`) inside each. A flat
+        // directories, the journal (`session.jsonl`) inside each. A flat
         // `*.jsonl` beside the buckets (the pre-core layout a test store
         // still uses) stays visible — both shapes scan.
         fn walk(dir: &std::path::Path, depth: u8, out: &mut Vec<Stat>) {

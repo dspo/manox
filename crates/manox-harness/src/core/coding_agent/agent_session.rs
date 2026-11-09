@@ -921,7 +921,7 @@ impl AgentSessionBuilder {
     }
 
     /// Pin the exact journal file (the v1.0.0 core layout writes
-    /// `<core>/<slug>/<id>/log.v1.jsonl`; the per-session directory is the
+    /// `<core>/<slug>/<id>/session.jsonl`; the per-session directory is the
     /// parent). When set, `build()` creates at this path and `open()` is
     /// the caller's path resolution.
     pub fn with_session_file(mut self, file: impl Into<PathBuf>) -> Self {

@@ -344,7 +344,7 @@ impl SubagentProvider for SpawnProvider {
             // An explicit dir (tests) keeps the legacy flat layout.
             Some(dir) => (dir.clone(), None, None),
             // Production: the v1.0.0 core layout — one directory per
-            // child under its project bucket, `log.v1.jsonl` inside.
+            // child under its project bucket, `session.jsonl` inside.
             None => {
                 let dir = crate::session::identity::core_session_dir_for(
                     &child_cwd.to_string_lossy(),

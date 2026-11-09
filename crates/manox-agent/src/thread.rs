@@ -1020,8 +1020,8 @@ impl Thread {
         };
         let model = self.model.clone();
         // The v1.0.0 core layout: one directory per session under its
-        // project bucket, the journal (`log.v1.jsonl`) inside. The legacy
-        // flat `sessions/` tree is never written again.
+        // project bucket, the journal (`session.jsonl`) inside. The flat
+        // `sessions/` tree is never written.
         let (sessions_dir, session_file) =
             crate::paths::core_session_parts(project.as_deref(), &self.id.0).unwrap_or_else(|_| {
                 (

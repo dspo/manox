@@ -54,9 +54,9 @@ pub fn agents_dir() -> Result<PathBuf> {
 }
 
 /// The v1.0.0 state root: every session lives in its own directory under a
-/// project bucket (`<root>/<project-slug>/<session-id>/log.v1.jsonl`), the
-/// immutable identity beside it (`header.json`). The legacy `sessions/`
-/// flat tree is never read again — no import, no fallback.
+/// project bucket (`<root>/<project-slug>/<session-id>/session.jsonl`), the
+/// immutable identity beside it (`header.json`). The flat `sessions/` tree is
+/// never read — no import, no fallback.
 pub fn core_root() -> Result<PathBuf> {
     // The store owns the sessions root (a test store points at its own
     // temp tree; the production store builds from this same function).

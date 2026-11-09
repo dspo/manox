@@ -26,40 +26,13 @@ pub use reducer::{Outcome as ExtOutcome, XManoxState};
 /// `_meta` key carrying the declaration on both `initialize` params and result.
 pub const META_KEY: &str = "x-manox";
 
-/// Extension surface version. Bump when an extension is renamed or removed.
+/// Extension surface version: the shape of the `x-manox/*` declaration a
+/// client may cache.
 ///
-/// 2: the v2 gateway's deletion took `x-manox-modelchat:/` and the
-/// `fetchEntries`/`modelChat`/`modelChatCancel`/`cancelDelivery`/`shutdown`
-/// commands off the surface. A client that caches version 1's declaration would
-/// otherwise keep offering names this build answers `unsupported` to.
-///
-/// 4: the thread rows (`pinnedChanged` / `labelChanged` / `sessionInfoChanged`
-/// / `leafChanged`) moved from `ahp-session:/<id>` — where no fold ever ran
-/// and no baseline could carry them — to the dedicated [`channels::THREAD`]
-/// channel; the never-folded `compaction` bag field went with them. A client
-/// caching version 3 lost nothing it could read: those envelopes were
-/// unfollable there.
-///
-/// 5: `backgroundTaskStopped` left the declaration. It never had a dispatch
-/// arm (every client dispatch was rejected with "no runtime intent") and never
-/// had a host producer (the stop signal already reaches clients through
-/// `backgroundTasksChanged`'s `status: "Stopped"`), so a client caching
-/// version 4 kept only a name that was rejected either way.
-///
-/// 6: the sub-agent rows left this surface. `subagent_progress` is retired —
-/// the swarm's `run/started` + `run/settled` rows are the only durable
-/// background-work truth — and both halves of the sub-agent view are standard
-/// AHP state now: the roster rides the parent chat's `ChatBackgroundWorkSet` /
-/// `ChatBackgroundWorkRemoved` (each entry naming the child's channel) and the
-/// child's transcript is that channel, `ahp-chat:/<run-id>`, read-only with a
-/// `ChatOrigin::Tool` naming the spawning call. A client that keyed its
-/// sub-agent view off this channel's rows reads those instead.
-///
-/// The version advances only on a REMOVING or RE-SHAPING change — the
-/// changelog above is that history, and every entry is a removal. Additive
-/// evolution (a new action kind, a new optional field) bumps nothing: a
-/// caching client's baseline never loses a fact it could read. Keep that
-/// policy — no bump for additions alone.
+/// A change that removes or re-shapes a declared name bumps it, so a cached
+/// declaration never outlives the surface it describes. Additive evolution (a
+/// new action kind, a new optional field) never bumps: a caching client's
+/// baseline loses no fact it could read.
 pub const VERSION: u32 = 6;
 
 /// State-bearing extension channel prefixes, in declaration order.

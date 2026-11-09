@@ -84,7 +84,7 @@ impl SessionRepository {
     }
 
     /// Create a session at an exact file path (the v1.0.0 core layout:
-    /// `<core>/<slug>/<id>/log.v1.jsonl`). Same deferred-materialization
+    /// `<core>/<slug>/<id>/session.jsonl`). Same deferred-materialization
     /// contract as [`Self::create`]: nothing touches disk until the first
     /// append.
     pub async fn create_at(
