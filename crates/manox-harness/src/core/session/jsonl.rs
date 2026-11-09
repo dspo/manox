@@ -331,9 +331,9 @@ impl JsonlSessionStorage {
     /// Constraints (the fork path always satisfies them): the file must
     /// be materialized and on the current format version — a deferred or
     /// v3 file is rejected rather than silently materialized/migrated
-    /// mid-batch; route those through [`Self::append_entry`]. Index,
-    /// cursor, and journal-broadcast updates mirror `append_entry` per
-    /// entry, in batch order, under the same lock.
+    /// mid-batch; route those through [`SessionStorage::append_entry`].
+    /// Index, cursor, and journal-broadcast updates mirror a single append
+    /// per entry, in batch order.
     pub async fn append_entries_batch(
         &self,
         entries: &[SessionTreeEntry],
@@ -371,8 +371,8 @@ impl JsonlSessionStorage {
             // single multi-line append cannot lay the healed order down.
             // Drop the fence FIRST: `append_entry_fenced` acquires its own,
             // and flock counts per open file description — a second fd's
-            // blocking LOCK_EX out of this process would wait forever on
-            // the one still held here (self-deadlock).
+            // LOCK_EX out of this process would spin against the one still
+            // held here until its budget expired.
             drop(fence);
             for entry in entries {
                 self.append_entry_fenced(entry, false).await?;
@@ -411,8 +411,8 @@ impl JsonlSessionStorage {
             depths.insert(id.to_string(), seq);
             seqs.push(seq);
         }
-        // Phase 2: ONE fenced write; then index/cursor/broadcast under the
-        // same lock hold, mirroring append_entry_fenced's post-write order.
+        // Phase 2: ONE fenced write; then index/cursor/broadcast, mirroring
+        // append_entry_fenced's post-write order.
         // A fence-less non-deferred append means the file vanished beneath
         // a live session (external deletion): recover by whole-file rewrite
         // — header + history + batch — exactly the single-entry path's
@@ -426,8 +426,8 @@ impl JsonlSessionStorage {
                 // has them. Flush waits for the in-flight write, so the row
                 // this call reports is visible to a cold reader (a sibling
                 // storage, the sidebar scan, another process) before the
-                // lock is released, and two appends can never hit the file
-                // out of the order their locks were held in.
+                // fence is released, and the writer's FIFO order keeps two
+                // appends from hitting the file out of order.
                 fenced.file.flush().await?;
                 *self.disk_size.lock().await += lines.len() as u64;
             }
@@ -2976,9 +2976,10 @@ mod tests {
 
     /// append_entries on a line-order-inverted file routes through the
     /// per-entry heal path — which must drop the fence first: flock counts
-    /// per open file description, so a second blocking LOCK_EX out of this
-    /// process on the still-held file self-deadlocks. The timeout turns a
-    /// regression back into a test failure instead of a hung suite.
+    /// per open file description, so a second LOCK_EX out of this process
+    /// against the still-held file would burn the write budget and fail as
+    /// Busy. The timeout turns a regression back into a test failure instead
+    /// of a hung suite.
     #[tokio::test]
     async fn append_entries_heals_an_inverted_file_without_self_deadlock() {
         use crate::session::Session;
