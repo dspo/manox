@@ -344,8 +344,8 @@ async fn user_row_ids(session: &AgentSession) -> Vec<String> {
 /// the injected `user` journal row is keyed by the client message id.
 #[tokio::test]
 async fn idle_steer_starts_its_own_run_and_lands_the_client_row_id() {
-    // settle_run fires the detached plugin `Stop` hook through the global
-    // runtime handle; init it hermetically like every settle-exercising test.
+    // The commit fires the detached plugin `Stop` hook through the global
+    // runtime handle; init it hermetically like every commit-exercising test.
     crate::runtime::init_hermetic_for_test();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().join("proj");
@@ -528,7 +528,7 @@ async fn settle_drains_a_steer_left_queued_at_run_end() {
 /// duplicate the message.
 #[tokio::test]
 async fn aborted_run_retracts_stranded_steers_from_the_kernel_queue() {
-    // settle_run fires the Stop hook; init the hermetic runtime handle.
+    // The commit fires the Stop hook; init the hermetic runtime handle.
     crate::runtime::init_hermetic_for_test();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().join("proj");
@@ -555,8 +555,8 @@ async fn aborted_run_retracts_stranded_steers_from_the_kernel_queue() {
     );
     let mut run_steers = vec![stranded_id.clone()];
 
-    // Abort path: settle_run with abort_requested must retract every still-
-    // queued steer id and report the retracted ones as stranded.
+    // Abort path: the commit with abort_requested must retract every
+    // still-queued steer id and report the retracted ones as stranded.
     commit_for_test(
         &session,
         &Ok(Vec::new()),
@@ -618,8 +618,8 @@ async fn commit_for_test(
         .await
 }
 
-/// The last `turn_finish` journal row (settle delivery probe): the entry
-/// id, parent id, and the §C.2 flags, as `settle_run` appended them.
+/// The last `turn_finish` journal row (close delivery probe): the entry
+/// id, parent id, and the §C.2 flags, as the turn's commit appended them.
 async fn turn_finish_row(
     session: &AgentSession,
 ) -> (String, Option<String>, bool, bool, Vec<String>) {
@@ -2152,7 +2152,7 @@ async fn ui_note_permanent_append_failure_fails_loud() {
 async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
     use std::os::unix::fs::PermissionsExt;
 
-    // settle_run fires the (detached) plugin `Stop` hook through the
+    // The commit fires the (detached) plugin `Stop` hook through the
     // global runtime handle.
     crate::runtime::init_hermetic_for_test();
     let dir = tempfile::tempdir().unwrap();

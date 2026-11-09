@@ -1243,8 +1243,9 @@ impl Thread {
                     stranded_steer_ids: stranded,
                 });
                 // Re-fire: if peer messages arrived during the run
-                // (pending_prompts non-empty), start a follow-up turn.
-                // Mirrors manox-actor pending_submits drain.
+                // (pending_prompts non-empty), start a follow-up turn. Client
+                // submits need no drain here — they reach the engine directly
+                // and the actor orders them behind the open turn.
                 if !self.pending_prompts.is_empty() {
                     self.run_turn();
                 }
