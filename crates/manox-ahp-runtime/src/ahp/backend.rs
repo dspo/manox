@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use crate::ahp::projection::Translator;
 use crate::ahp::projection::config_keys;
-use crate::error::RuntimeError;
+use crate::error::{RuntimeError, RuntimeErrorKind};
 use ahp_types::actions::{
     ActionOrigin, ChatChangesetsChangedAction, ChatInputCompletedAction,
     ChatPendingMessageRemovedAction, PartialChatSummary, SessionChatUpdatedAction, StateAction,
@@ -261,6 +261,11 @@ impl RuntimeBackend {
 
     fn me(&self) -> Option<Arc<Self>> {
         self.me.get().and_then(Weak::upgrade)
+    }
+
+    /// The AHP-facing failure for a runtime refusal at this adapter seam.
+    fn host_error(error: RuntimeError) -> HostError {
+        crate::runtime_trait::to_host_error(error)
     }
 
     pub fn attach_host(&self, host: &Arc<manox_ahp::Host>) {
@@ -578,16 +583,16 @@ impl RuntimeBackend {
     ///
     /// A restored session serves folded state without an engine, so the
     /// command face would otherwise refuse work the dispatch actions accept.
-    /// The not-found code keeps its host-level shape rather than degrading to
-    /// `Backend`: a client that branches on the code cannot tell a cold miss
-    /// from an unknown id.
+    /// The not-found kind keeps its host-level shape rather than degrading to
+    /// `Backend`: a client that branches on the AHP code cannot tell a cold
+    /// miss from an unknown id.
     async fn ensure_command_session(&self, session_id: &str) -> Result<(), HostError> {
         match self.server.ensure_live("ahp", session_id).await {
             Ok(()) => Ok(()),
-            Err(error) if error.code.as_deref() == Some(crate::error::codes::SESSION_NOT_FOUND) => {
+            Err(error) if error.kind == RuntimeErrorKind::NotFound => {
                 Err(HostError::SessionNotFound(session_id.to_string()))
             }
-            Err(error) => Err(HostError::Backend(error.message)),
+            Err(error) => Err(Self::host_error(error)),
         }
     }
 
@@ -1238,7 +1243,7 @@ impl RuntimeBackend {
     /// its clients' claims an answer, so it is opened first — the same
     /// cold-open the submit/cancel/settle paths take — and only a genuinely
     /// unknown id (the open answers it not-found) or a failed open keeps the
-    /// refusal, in the `message [code]` shape the dispatch refusals use.
+    /// refusal, with the runtime's message as the rejection text.
     async fn register_client_tools(
         &self,
         session_id: &str,
@@ -1248,10 +1253,7 @@ impl RuntimeBackend {
             return Err("an active client needs a clientId".to_string());
         }
         if let Err(error) = self.server.ensure_live("ahp", session_id).await {
-            return Err(match &error.code {
-                Some(code) => format!("{} [{code}]", error.message),
-                None => error.message,
-            });
+            return Err(error.message);
         }
         let mut specs = Vec::with_capacity(client.tools.len());
         for tool in &client.tools {
@@ -1526,13 +1528,8 @@ impl RuntimeBackend {
                 ));
             }
         }
-        // Validate everything, land nothing — then apply everything. The
-        // refusal text carries the runtime error's code so clients can
-        // branch on it without string-matching the message.
-        let refusal = |error: RuntimeError| match &error.code {
-            Some(code) => format!("{} [{code}]", error.message),
-            None => error.message,
-        };
+        // Validate everything, land nothing — then apply everything. A
+        // refusal is the runtime's message; the kind is not a wire code.
         if let Err(error) = self
             .server
             .preflight_config(
@@ -1548,7 +1545,7 @@ impl RuntimeBackend {
             )
             .await
         {
-            return DispatchOutcome::Rejected(refusal(error));
+            return DispatchOutcome::Rejected(error.message);
         }
         // The picks are awaited one at a time, in declaration order, and the
         // first refusal answers — the same sequence the sync seam ran.
@@ -1572,7 +1569,7 @@ impl RuntimeBackend {
         ];
         for outcome in applied.into_iter().flatten() {
             if let Err(error) = outcome.await {
-                return DispatchOutcome::Rejected(refusal(error));
+                return DispatchOutcome::Rejected(error.message);
             }
         }
         DispatchOutcome::Accepted
@@ -2052,14 +2049,9 @@ impl Backend for RuntimeBackend {
         self.server
             .create_session(&owner, intent)
             .await
-            // The refusal carries its stable code in the message when one
-            // applies (`[model-unresolvable]`, …), the same vocabulary
-            // `apply_session_config` puts on the wire — a create refused on
-            // its config must be as branchable as a mid-session switch.
-            .map_err(|error| match &error.code {
-                Some(code) => HostError::Backend(format!("{} [{code}]", error.message)),
-                None => HostError::Backend(error.message),
-            })?;
+            // A create refused on its config is as branchable as a mid-session
+            // switch: the runtime's kind becomes the AHP error variant.
+            .map_err(Self::host_error)?;
         super::create_intent::note(session_id, recorded);
         // Seed and bridge the new session now, so a client that subscribes after
         // creating it gets a snapshot and then live actions.
@@ -3186,11 +3178,10 @@ impl Backend for RuntimeBackend {
                         .teardown_container("ahp", id, mode)
                         .await
                         .map_err(|error| {
-                            if error.code.as_deref() == Some(crate::error::codes::SESSION_NOT_FOUND)
-                            {
+                            if error.kind == RuntimeErrorKind::NotFound {
                                 HostError::SessionNotFound(id.clone())
                             } else {
-                                HostError::Backend(error.message)
+                                Self::host_error(error)
                             }
                         })?;
                     let mut entry = serde_json::Map::new();
@@ -4728,5 +4719,58 @@ mod summary_live_bits_tests {
             status & SessionStatus::IsArchived.bits() != 0,
             "a journalled archive survives the overlay"
         );
+    }
+}
+
+/// The runtime's refusal kind is what the adapter maps onto AHP. Pinning each
+/// branch keeps a new kind from silently degrading to `Backend`.
+#[cfg(test)]
+mod refusal_kind_tests {
+    use super::mcp_dispatch_tests::McpOnlyRuntime;
+    use crate::error::{RuntimeError, RuntimeErrorKind};
+    use crate::runtime_trait::SessionRuntime;
+    use manox_ahp::error::HostError;
+
+    #[test]
+    fn every_refusal_kind_maps_to_its_host_error_variant() {
+        let mapped = |kind| McpOnlyRuntime::host_error(RuntimeError::new("boom").with_kind(kind));
+        assert_eq!(
+            mapped(RuntimeErrorKind::Backend),
+            HostError::Backend("boom".into())
+        );
+        assert_eq!(
+            mapped(RuntimeErrorKind::NotFound),
+            HostError::NotFound("boom".into())
+        );
+        assert_eq!(
+            mapped(RuntimeErrorKind::AlreadyOwned),
+            HostError::Conflict("boom".into())
+        );
+        assert_eq!(
+            mapped(RuntimeErrorKind::BadRequest),
+            HostError::InvalidParams("boom".into())
+        );
+    }
+
+    #[test]
+    fn constructors_set_the_kind_and_display_is_the_message() {
+        assert_eq!(RuntimeError::new("x").kind, RuntimeErrorKind::Backend);
+        assert_eq!(
+            RuntimeError::not_found("x").kind,
+            RuntimeErrorKind::NotFound
+        );
+        assert_eq!(
+            RuntimeError::already_owned("x").kind,
+            RuntimeErrorKind::AlreadyOwned
+        );
+        assert_eq!(
+            RuntimeError::bad_request("x").kind,
+            RuntimeErrorKind::BadRequest
+        );
+        assert_eq!(
+            RuntimeError::bad_request("only the message").to_string(),
+            "only the message"
+        );
+        assert_eq!(RuntimeErrorKind::default(), RuntimeErrorKind::Backend);
     }
 }

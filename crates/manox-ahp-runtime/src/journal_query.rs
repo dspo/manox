@@ -40,7 +40,7 @@ impl ConversationInfoCache {
 /// indexing, never a write) and `journal_cursor`/`journal_range` (the same
 /// §C.3 read seam the engine actor answers from). `None` when the session
 /// has no persisted file (or it is unreadable — a corrupt journal is the
-/// caller's `session/not-found`-class answer, never a silent empty page).
+/// caller's not-found-class answer, never a silent empty page).
 ///
 /// Cross-domain note: the harness read face is whole-chain (`journal_range`
 /// from seq 0); a bounded seq-range disk read would avoid loading long
@@ -55,7 +55,7 @@ impl ConversationInfoCache {
 /// corruption loudly (a `RuntimeError` / a `StreamEnd::Failure`).
 pub enum ColdRead {
     /// No persisted file for the id (or the id fails the B5 shape gate) —
-    /// the `session/not-found` class.
+    /// the not-found class.
     NotFound,
     /// The file exists but the load failed — surface it; never an empty
     /// page. The string carries the load error for the client-facing
@@ -116,10 +116,10 @@ pub async fn conversation_info(
     thread: &ThreadHandle,
     session_id: &str,
 ) -> Result<Value, crate::error::RuntimeError> {
-    let snapshot = thread.journal_snapshot().await.ok_or_else(|| {
-        crate::error::RuntimeError::new("journal engine is not materialized")
-            .with_code(crate::error::codes::GATEWAY_INTERNAL)
-    })?;
+    let snapshot = thread
+        .journal_snapshot()
+        .await
+        .ok_or_else(|| crate::error::RuntimeError::new("journal engine is not materialized"))?;
     {
         let guard = cache.lock().unwrap();
         if let Some(hit) = guard.get(session_id, snapshot.cursor) {

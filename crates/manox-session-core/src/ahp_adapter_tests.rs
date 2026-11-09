@@ -3142,7 +3142,7 @@ mod dispatch {
 
     /// A cold session's `session/configChanged` must open it instead of
     /// refusing: the desktop's first model/approval change on a restored
-    /// session died as `unknown session [session/not-found]` while the client
+    /// session died as `unknown session` while the client
     /// had already folded the change into its chips (real-device round).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cold_restored_sessions_config_write_opens_it_instead_of_refusing() {
@@ -3362,8 +3362,8 @@ mod dispatch {
         {
             DispatchOutcome::Rejected(reason) => {
                 assert!(
-                    reason.contains("session/not-found"),
-                    "the refusal carries the stable code: {reason}"
+                    reason.contains("unknown session"),
+                    "the refusal names the missing session: {reason}"
                 );
             }
             other => panic!("an id unknown on disk must stay not-found, got {other:?}"),
@@ -5163,10 +5163,13 @@ mod create_intent {
             )
             .await
             .expect_err("an unresolvable model refuses the create");
-        let message = format!("{err:?}");
         assert!(
-            message.contains("unknown model") && message.contains("model/unresolvable"),
-            "the refusal uses the model-unresolvable vocabulary: {err:?}"
+            matches!(
+                &err,
+                manox_ahp::error::HostError::InvalidParams(message)
+                    if message.contains("unknown model")
+            ),
+            "an unresolvable model is a bad request: {err:?}"
         );
         assert!(
             !journal_of(&unresolvable, None).exists(),
