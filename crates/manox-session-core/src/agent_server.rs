@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use manox_ahp_runtime::base64_bytes;
+use manox_ahp_runtime::error::RuntimeErrorKind;
 use manox_ahp_runtime::runtime_trait::{ClientToolSpec, ImageAttachment};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -628,11 +629,12 @@ pub(crate) async fn open_session_with_roots(
         .with_mut(|s| s.load_thread_with_roots(session_id, declared_roots))
         .map_err(|error| {
             // Another process drives this session: its engine actor holds
-            // the per-session write lease. Fail fast — the client surfaces
-            // the stable code and can retry after the holder exits.
+            // the per-session write lease. Fail fast — the refusal carries
+            // the AlreadyOwned kind so the client can retry after the holder
+            // exits.
             tracing::warn!(session_id, %error, "session open blocked by a foreign write lease");
             manox_ahp_runtime::error::RuntimeError::new(error.to_string())
-                .with_code(manox_ahp_runtime::error::codes::SESSION_ALREADY_OWNED)
+                .with_kind(RuntimeErrorKind::AlreadyOwned)
         })?
         .ok_or_else(|| unknown_session(session_id))?;
     // Phase 3: recheck–insert under ONE lock hold. The loser finds the
@@ -670,10 +672,6 @@ pub(crate) async fn open_session_with_roots(
     Ok(())
 }
 
-/// No such live session.
-///
-/// Shared by the runtime intents that refuse with `session/notFound`, so the
-/// code a client matches on does not depend on which intent refused.
 /// The project a conversation belongs to, as its path, resolved through the
 /// object store — the one place belonging lives. `None` covers both "no
 /// project" (the special project) and "no row yet"; both shard into the
@@ -684,9 +682,12 @@ fn object_project_of(session_id: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// No such live session.
+///
+/// Shared by the runtime intents that refuse a missing session, so the kind a
+/// caller sees does not depend on which intent refused.
 fn unknown_session(session_id: &str) -> manox_ahp_runtime::error::RuntimeError {
-    manox_ahp_runtime::error::RuntimeError::new(format!("unknown session: {session_id}"))
-        .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)
+    manox_ahp_runtime::error::RuntimeError::not_found(format!("unknown session: {session_id}"))
 }
 
 /// The synthetic owner [`AgentServer::ensure_opened_for_settle`] mints when
@@ -695,15 +696,15 @@ pub(crate) const SETTLE_OWNER: &str = "settle";
 
 /// No registered model answers to this id.
 fn unresolvable_model(id: &str) -> manox_ahp_runtime::error::RuntimeError {
-    manox_ahp_runtime::error::RuntimeError::new(format!("unknown model: {id}"))
-        .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE)
+    manox_ahp_runtime::error::RuntimeError::bad_request(format!("unknown model: {id}"))
 }
 
 /// A resolved model the session's own runtime cannot serve (missing
 /// endpoint, unresolvable credential reference, unwired api).
 fn unservable_model(id: &str, reason: &str) -> manox_ahp_runtime::error::RuntimeError {
-    manox_ahp_runtime::error::RuntimeError::new(format!("model {id} cannot be served: {reason}"))
-        .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE)
+    manox_ahp_runtime::error::RuntimeError::bad_request(format!(
+        "model {id} cannot be served: {reason}"
+    ))
 }
 
 /// Parse strictly: an unparseable mode must not settle on the default
@@ -717,7 +718,7 @@ pub(crate) fn parse_access_mode(
         manox_ahp_runtime::error::RuntimeError::new(format!(
             "unknown access mode: {mode} (expected sandbox or full-access)"
         ))
-        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
+        .with_kind(RuntimeErrorKind::BadRequest)
     })
 }
 
@@ -730,7 +731,7 @@ pub(crate) fn parse_network_access(
         manox_ahp_runtime::error::RuntimeError::new(format!(
             "unknown network access: {access} (expected off or on)"
         ))
-        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
+        .with_kind(RuntimeErrorKind::BadRequest)
     })
 }
 
@@ -745,7 +746,7 @@ pub(crate) fn parse_reasoning_effort(
         _ => Err(manox_ahp_runtime::error::RuntimeError::new(
             "set_reasoning_effort requires effort: high|max",
         )
-        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)),
+        .with_kind(RuntimeErrorKind::BadRequest)),
     }
 }
 
@@ -776,8 +777,7 @@ fn publish_root_agents(host: &Arc<manox_ahp::Host>, agents: Vec<ahp_types::state
 /// (threads.db is not on the session-creation path). The source is read
 /// straight off its persisted file (the cold path): appends are durable at
 /// write time, so this is correct for live and cold sources alike, and a
-/// deferred (never-materialized) source has no file and answers
-/// `session/not-found`.
+/// deferred (never-materialized) source has no file and answers `NotFound`.
 ///
 /// The intent fields override the inherited state ONLY when explicitly
 /// given — absent fields inherit from the copied journal (unlike
@@ -817,7 +817,7 @@ pub(crate) async fn fork_session(
                         "unknown model: {}",
                         m
                     ))
-                    .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
+                    .with_kind(RuntimeErrorKind::BadRequest));
                 }
             }
         }
@@ -830,7 +830,7 @@ pub(crate) async fn fork_session(
                 return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                     "unknown access mode: {s} (expected sandbox or full-access)"
                 ))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                .with_kind(RuntimeErrorKind::BadRequest));
             }
         },
     };
@@ -842,7 +842,7 @@ pub(crate) async fn fork_session(
             return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                 "unknown reasoning effort: {other}"
             ))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+            .with_kind(RuntimeErrorKind::BadRequest));
         }
     };
 
@@ -852,24 +852,22 @@ pub(crate) async fn fork_session(
     else {
         return Err(
             manox_ahp_runtime::error::RuntimeError::new("thread not found")
-                .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND),
+                .with_kind(RuntimeErrorKind::NotFound),
         );
     };
     if !source_path.exists() {
         return Err(
             manox_ahp_runtime::error::RuntimeError::new("thread not found")
-                .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND),
+                .with_kind(RuntimeErrorKind::NotFound),
         );
     }
     let source = JsonlSessionStorage::open(&source_path)
         .await
         .map_err(|err| {
             manox_ahp_runtime::error::RuntimeError::new(format!("journal corrupt: {err}"))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
         })?;
     let records = source.journal_range(0, u64::MAX).await.map_err(|err| {
         manox_ahp_runtime::error::RuntimeError::new(format!("journal corrupt: {err}"))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
     })?;
     let through = records
         .iter()
@@ -878,7 +876,7 @@ pub(crate) async fn fork_session(
             manox_ahp_runtime::error::RuntimeError::new(format!(
                 "entry {through_entry_id} is not on the source's active chain"
             ))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
+            .with_kind(RuntimeErrorKind::BadRequest)
         })?;
 
     // Materialize the fork file immediately (never deferred — a non-empty
@@ -892,8 +890,7 @@ pub(crate) async fn fork_session(
     else {
         return Err(manox_ahp_runtime::error::RuntimeError::new(
             "minted fork id failed the path gate",
-        )
-        .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+        ));
     };
     // A caller-chosen id must not silently overwrite an existing journal: the
     // fork file is created below, and `create` truncates. Refuse instead, so a
@@ -902,7 +899,7 @@ pub(crate) async fn fork_session(
         return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
             "session {session_id} already exists"
         ))
-        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+        .with_kind(RuntimeErrorKind::BadRequest));
     }
     let fork_cwd = cwd.clone().unwrap_or_else(|| source.metadata.cwd.clone());
     let target = JsonlSessionStorage::create(
@@ -925,7 +922,6 @@ pub(crate) async fn fork_session(
     .await
     .map_err(|err| {
         manox_ahp_runtime::error::RuntimeError::new(format!("fork file creation failed: {err}"))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
     })?;
     let prefix: Vec<manox_harness::session::Event> = records[..=through]
         .iter()
@@ -934,7 +930,6 @@ pub(crate) async fn fork_session(
     let target = manox_harness::session::Session::new(target);
     target.append_entries(prefix).await.map_err(|err| {
         manox_ahp_runtime::error::RuntimeError::new(format!("fork row copy failed: {err}"))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
     })?;
     drop(target);
 
@@ -985,7 +980,7 @@ impl AgentServerInner {
     /// no orphaned pre-project file), else `new_fresh`; `initial_model`
     /// resolves through the single convergence point
     /// `resolve_model_ref` (L8) *before* anything is created — an
-    /// unresolvable canonical ref answers `model/unresolvable` without a
+    /// unresolvable canonical ref answers `BadRequest` without a
     /// side effect.
     ///
     /// A session journal's header line: id, origin cwd, and the lineage
@@ -1067,8 +1062,7 @@ impl AgentServerInner {
         let Some(path) = manox_ahp_runtime::paths::persisted_session_file(id) else {
             return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                 "session {id} has no journal to restore"
-            ))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+            )));
         };
         manox_agent::thread_store::global().with_mut(|state| state.note_session_path(id, &path));
         open_session(inner, owner, id).await?;
@@ -1096,7 +1090,7 @@ impl AgentServerInner {
                             "unknown model: {}",
                             m
                         ))
-                        .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
+                        .with_kind(RuntimeErrorKind::BadRequest));
                     }
                 }
             }
@@ -1109,7 +1103,7 @@ impl AgentServerInner {
                     return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                         "unknown access mode: {s} (expected sandbox or full-access)"
                     ))
-                    .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                    .with_kind(RuntimeErrorKind::BadRequest));
                 }
             },
         };
@@ -1121,7 +1115,7 @@ impl AgentServerInner {
                 return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                     "unknown reasoning effort: {other}"
                 ))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                .with_kind(RuntimeErrorKind::BadRequest));
             }
         };
         // Seed blocks are kernel content blocks: validate the vocabulary
@@ -1140,7 +1134,7 @@ impl AgentServerInner {
                             return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                                 "seed block {i} is not a valid content block: {e}"
                             ))
-                            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                            .with_kind(RuntimeErrorKind::BadRequest));
                         }
                     }
                 }
@@ -1181,13 +1175,13 @@ impl AgentServerInner {
                         return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                             "session {id} lives in {existing_cwd}; the create named {requested_cwd}"
                         ))
-                        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                        .with_kind(RuntimeErrorKind::BadRequest));
                     }
                     ClaimOutcome::SubagentOwned { id } => {
                         return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                             "session {id} belongs to its parent's run and cannot be claimed"
                         ))
-                        .with_code(manox_ahp_runtime::error::codes::SESSION_ALREADY_OWNED));
+                        .with_kind(RuntimeErrorKind::AlreadyOwned));
                     }
                 }
             }
@@ -1226,8 +1220,7 @@ impl AgentServerInner {
             else {
                 return Err(manox_ahp_runtime::error::RuntimeError::new(
                     "minted session id failed the path gate",
-                )
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+                ));
             };
             let storage = JsonlSessionStorage::create(
                 &path,
@@ -1247,7 +1240,6 @@ impl AgentServerInner {
                 manox_ahp_runtime::error::RuntimeError::new(format!(
                     "seeded session file creation failed: {err}"
                 ))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
             })?;
             let seed_rows: Vec<manox_harness::session::Event> = seed_blocks
                 .into_iter()
@@ -1271,7 +1263,6 @@ impl AgentServerInner {
                 manox_ahp_runtime::error::RuntimeError::new(format!(
                     "seed row append failed: {err}"
                 ))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
             })?;
             drop(storage);
             // Path note + open are two steps, deliberately (review #778):
@@ -1588,8 +1579,7 @@ impl AgentServerInner {
                     // and tell the client why.
                     thread.with_mut(|t| t.set_pending_turn_origin(None));
                     let message = format!("submit persistence failed: {err}");
-                    return Err(manox_ahp_runtime::error::RuntimeError::new(message)
-                        .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+                    return Err(manox_ahp_runtime::error::RuntimeError::new(message));
                 }
             }
         }
@@ -1893,7 +1883,7 @@ impl AgentServerInner {
             return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                 "unknown goal action: {action}"
             ))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+            .with_kind(RuntimeErrorKind::BadRequest));
         }
         let Some(thread) = self.session_thread(session_id) else {
             return Err(unknown_session(session_id));
@@ -1920,7 +1910,7 @@ impl AgentServerInner {
         });
         result.map_err(|error| {
             manox_ahp_runtime::error::RuntimeError::new(error.to_string())
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
+                .with_kind(RuntimeErrorKind::BadRequest)
         })
     }
 
@@ -1982,7 +1972,7 @@ impl AgentServerInner {
             return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                 "teardown mode `{mode}` is not a known value; expected \"stop-all\" or \"archive\""
             ))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+            .with_kind(RuntimeErrorKind::BadRequest));
         }
         if mode == "archive" {
             // The cascade reads parent edges; the edges are only as fresh

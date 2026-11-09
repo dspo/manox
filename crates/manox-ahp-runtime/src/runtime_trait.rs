@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use manox_ahp::error::HostError;
 use serde_json::Value;
 
-use crate::error::RuntimeError;
+use crate::error::{RuntimeError, RuntimeErrorKind};
 
 /// One client-contributed tool.
 ///
@@ -133,6 +133,21 @@ pub struct TerminalSnapshot {
     pub exit_code: Option<i64>,
     /// The session this terminal belongs to.
     pub session_id: String,
+}
+
+/// Map a runtime refusal onto the AHP error variant a client sees.
+///
+/// The kind is the branch a client needs: a missing session is `NotFound`, a
+/// held write lease is `Conflict`, and a malformed request is `InvalidParams`.
+/// Everything else is a backend failure. A caller that knows the session id
+/// maps `NotFound` to `SessionNotFound` itself, so the refusal names the id.
+pub fn to_host_error(error: RuntimeError) -> HostError {
+    match error.kind {
+        RuntimeErrorKind::Backend => HostError::Backend(error.message),
+        RuntimeErrorKind::NotFound => HostError::NotFound(error.message),
+        RuntimeErrorKind::AlreadyOwned => HostError::Conflict(error.message),
+        RuntimeErrorKind::BadRequest => HostError::InvalidParams(error.message),
+    }
 }
 
 /// The session runtime behind the AHP adapter.
@@ -387,11 +402,13 @@ pub trait SessionRuntime: Send + Sync + 'static {
     );
 
     /// The AHP-facing failure for a runtime failure.
+    ///
+    /// The kind is the branch a client needs; see [`to_host_error`].
     fn host_error(error: RuntimeError) -> HostError
     where
         Self: Sized,
     {
-        HostError::Backend(error.message)
+        to_host_error(error)
     }
 
     /// Start (or restart) an MCP server by registry key.

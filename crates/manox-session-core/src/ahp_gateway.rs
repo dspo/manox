@@ -194,8 +194,9 @@ impl SessionRuntime for GatewayRuntime {
                 thread.with_mut(|t| t.cancel());
                 Ok(())
             }
-            None => Err(RuntimeError::new(format!("unknown session {session_id}"))
-                .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)),
+            None => Err(RuntimeError::not_found(format!(
+                "unknown session {session_id}"
+            ))),
         }
     }
 
