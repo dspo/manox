@@ -3154,6 +3154,19 @@ async fn a_panicking_stream_closes_the_turn_failed() {
         })
         .collect();
     assert_eq!(finishes, vec![(false, true)], "one failed close");
+    let starts = rows
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.entry,
+                manox_harness::session::Event::TurnStart { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        starts, 1,
+        "the turn's open edge lands exactly once, before the run"
+    );
 }
 
 /// The run future itself panicking: the supervisor's `catch_unwind` turns it
