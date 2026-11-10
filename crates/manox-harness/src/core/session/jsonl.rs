@@ -921,19 +921,23 @@ fn parse_file(path: &Path, bytes: &[u8]) -> Result<ParsedFile, anyhow::Error> {
         }
         seq_index.insert(entry.id().to_string(), depth[i]);
     }
+    // The live cursor follows the last row WRITTEN, not the deepest one: a
+    // navigation stamps a `leaf` row with the pre-navigation tip as parent
+    // (so it carries the maximum depth), while rows appended afterwards hang
+    // off the navigation target and are shallower. Capture the file-order
+    // tail before memory is reordered for chain reads.
+    let written_tail = entries.last().and_then(Event::leaf_cursor_after);
     // Memory takes the chain's order (depth, then file position as the
-    // deterministic tie-break), so the cursor tail, `get_entries` windowing
-    // and `journal_range` all read the reconciled sequence whatever order
-    // the lines landed in. A file already in chain order keeps its
-    // allocation; only an inverted one is rebuilt.
+    // deterministic tie-break), so `get_entries` windowing and `journal_range`
+    // read the reconciled sequence whatever order the lines landed in.
     let mut order: Vec<usize> = (0..entries.len()).collect();
     order.sort_by_key(|&i| (depth[i], i));
     if order.iter().enumerate().any(|(position, &i)| position != i) {
         entries = order.into_iter().map(|i| entries[i].clone()).collect();
     }
-    // The cursor follows the chain tail: a trailing `leaf` entry redirects
-    // to its `targetId`, otherwise the tail entry's own id.
-    let leaf_id = entries.last().and_then(Event::leaf_cursor_after);
+    // The cursor is the written tail's cursor: a trailing `leaf` entry
+    // redirects to its `targetId`, every other row becomes the cursor.
+    let leaf_id = written_tail;
 
     Ok(ParsedFile {
         metadata,
@@ -1943,6 +1947,59 @@ mod tests {
         assert!(err.to_string().contains("not found"), "{}", err);
     }
 
+    /// A navigation writes a `leaf` row at the pre-navigation tip's depth;
+    /// rows appended afterwards hang off the navigation target and are
+    /// shallower. Reopening must resume at the last WRITTEN row, not at the
+    /// chain sort's deepest row.
+    #[tokio::test]
+    async fn a_navigation_then_append_reopens_at_the_appended_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+        let storage = TestStorage::new(storage);
+
+        let message = |id: &str, parent: Option<&str>| Event::Message {
+            id: id.into(),
+            parent_id: parent.map(str::to_string),
+            timestamp: chrono::Utc::now(),
+            message: AgentMessage::user(id),
+            origin: None,
+            ui: None,
+        };
+        storage.append_entry(&message("u", None)).await.unwrap();
+        storage
+            .append_entry(&message("a1", Some("u")))
+            .await
+            .unwrap();
+        storage
+            .append_entry(&message("a2", Some("a1")))
+            .await
+            .unwrap();
+        storage.set_leaf_id(Some("a1")).await.unwrap();
+        storage
+            .append_entry(&message("f", Some("a1")))
+            .await
+            .unwrap();
+        assert_eq!(storage.get_leaf_id().await.unwrap(), Some("f".into()));
+
+        drop(storage);
+        let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+        let reopened = TestStorage::new(reopened);
+        assert_eq!(
+            reopened.get_leaf_id().await.unwrap(),
+            Some("f".into()),
+            "restore resumes at the last written row, not the navigation row"
+        );
+        let path_ids: Vec<String> = reopened
+            .get_path(Some("f"))
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| entry.id().to_string())
+            .collect();
+        assert_eq!(path_ids, ["u", "a1", "f"]);
+    }
+
     #[tokio::test]
     async fn test_reopen_restores_entries_and_leaf() {
         let dir = tempfile::tempdir().unwrap();
@@ -2093,7 +2150,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_rejects_wrong_version() {
         let dir = tempfile::tempdir().unwrap();
-        for version in [2u32, 3] {
+        for version in [2u32, 3, 5] {
             let path = dir.path().join(format!("v{version}.jsonl"));
             let header = serde_json::json!({
                 "type": "session",
@@ -2125,11 +2182,25 @@ mod tests {
             );
             let message = err.to_string();
             assert!(
-                message.contains(&format!("format v{version}"))
-                    && message.contains("predates the current format")
-                    && message.contains("one-time operator migration"),
-                "the error says what to do about it: {message}"
+                message.contains(&format!("format v{version}")),
+                "the error names the found version: {message}"
             );
+            if version < FORMAT_VERSION {
+                assert!(
+                    message.contains("predates the current format")
+                        && message.contains("one-time operator migration"),
+                    "an older file says to convert it: {message}"
+                );
+            } else {
+                assert!(
+                    message.contains("newer build") && message.contains("Upgrade the binary"),
+                    "a future file says to upgrade, not convert: {message}"
+                );
+                assert!(
+                    !message.contains("one-time operator migration"),
+                    "a future file must not be sent to the down-migration: {message}"
+                );
+            }
         }
     }
 

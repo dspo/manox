@@ -166,11 +166,18 @@ journal 的每一行都是持久事实：消息、工具、turn 边界、配置�
 ### C.3 v4 读面
 
 - 磁盘只有一个格式版本（`FORMAT_VERSION = 4`）；别的版本在 open 时以可操作的错误拒绝，
-  文件原样不动（转换是一次性 operator migration，运行时从不重写）。
+  文件原样不动（转换是一次性 operator migration，运行时从不重写）。旧版本用
+  `python3 script/migrate-journals.py`（默认 dry-run，`--apply` 执行，`--backup` 指定备份；
+  同时把平铺 `sessions/` 归位到 core 布局、把命令文件里的 `$ARGUMENTS` 改写为
+  `{{ arguments }}`）。脚本默认 dry-run，替换前逐文件备份，对每个 journal 取非阻塞
+  `flock`：有活写者时显式跳过该文件而不是与其竞争；平铺副本比 core 新时报告冲突并保持
+  原样。未来版本（`found > 4`）不给转换建议，要求升级二进制。脚本属于格式所有者（本仓）
+  的一次性工具，桌面发行版需要在发布物/发布说明中提供或链接它。
 - 打开校验：header 必须合法；每条链的 parent 必须存在、无环、`seq` 等于链深；坏文件报错而不是
   猜一种修复。
-- 读接口：`journal_range` 以链序返回记录，最后一条即活动 leaf；header-only 文件可被列表扫描
-  有界读取（不加载 transcript）。
+- 读接口：`journal_range` 以链序返回记录；活动 leaf 是**最后写入行**的 cursor（通常是文件序
+  最后一行），导航后再 append 时它会与链序最后一行不同——恢复必须按写入尾而不是链深尾取
+  cursor。header-only 文件可被列表扫描有界读取（不加载 transcript）。
 
 ## §D x-manox 扩展面（单一事实源，随 `initialize` 协商）
 
@@ -281,7 +288,8 @@ AHP 快照 = 该 fold 的输出。
 ### F.1 journal 追加与 leaf
 
 - 单一 append 点在链上分配 dense `seq`；并发写者由文件 fence（flock + stale-view reload）
-  线性化。行序可以与链序不同，读回按链排序，`journal_range` 的最后一条就是活动 leaf。
+  线性化。行序可以与链序不同，读回按链排序；活动 leaf 取最后写入行的 cursor（§C.3），链序
+  最后一条在导航后可能不是它。
 - 新格式只加行类型，不改 envelope；旧格式文件在 open 时拒绝（§C.3），不做运行时转换。
 - 追加失败不改变内存链；durable 行先于对外广播（客户端看到的动作都以已落盘行为前提）。
 
