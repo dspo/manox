@@ -8,6 +8,7 @@
 //! monotone by journal seq. A projection that never finishes leaves the
 //! mirrors stale, never the turn open.
 
+use futures::FutureExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -29,8 +30,8 @@ pub(super) const ABORT_GRACE: std::time::Duration = std::time::Duration::from_se
 /// running only raises the dirty flag (single-flight, rerun once).
 #[derive(Default)]
 pub(super) struct ProjectionFlight {
-    running: bool,
-    dirty: bool,
+    pub(super) running: bool,
+    pub(super) dirty: bool,
 }
 
 /// What a committed turn reported, mirroring `BackendNotice::Settled`.
@@ -260,7 +261,7 @@ pub(super) async fn land_turn_finish(
     // would leave a turn that never ends.
     if let Err(err) = append_typed_resilient(appender, "turn_finish", turn_finish).await {
         if let Some(row) = record_journal_loss(appender, "turn_finish", &err).await {
-            state.pending_journal.lock().unwrap().push(row);
+            lock_mirror(&state.pending_journal).push(row);
         }
         send_notice(
             notice_tx,
@@ -477,7 +478,7 @@ async fn land_turn_start(
 ) {
     if let Err(err) = append_typed_resilient(appender, "turn_start", turn_start_payload()).await {
         if let Some(row) = record_journal_loss(appender, "turn_start", &err).await {
-            state.pending_journal.lock().unwrap().push(row);
+            lock_mirror(&state.pending_journal).push(row);
         }
         send_notice(
             notice_tx,
@@ -546,7 +547,7 @@ pub(super) fn spawn_projection(projection: Projection) {
     }
     let state = Arc::clone(&projection.state);
     {
-        let mut flight = state.projection.lock().unwrap();
+        let mut flight = lock_mirror(&state.projection);
         if flight.running {
             flight.dirty = true;
             return;
@@ -555,8 +556,23 @@ pub(super) fn spawn_projection(projection: Projection) {
     }
     crate::runtime::handle().spawn(async move {
         loop {
-            project_turn(&projection).await;
-            let mut flight = state.projection.lock().unwrap();
+            // A panicked pass is a skipped refresh, never a dead slot: the
+            // flight flag is cleared below whatever the pass did, so the next
+            // commit re-runs it. The mirror locks may be poisoned by the same
+            // panic, hence `into_inner`.
+            let pass = std::panic::AssertUnwindSafe(project_turn(&projection))
+                .catch_unwind()
+                .await;
+            if let Err(payload) = pass {
+                tracing::error!(
+                    payload = %panic_message(&payload),
+                    "turn projection pass panicked; the slot stays usable"
+                );
+            }
+            let mut flight = state
+                .projection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !flight.dirty {
                 flight.running = false;
                 return;
@@ -566,12 +582,47 @@ pub(super) fn spawn_projection(projection: Projection) {
     });
 }
 
+/// A panic payload as text, for the projection's error line.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Test seam: the next projection pass panics before touching any mirror, so
+/// a test can prove the slot recovers.
+#[cfg(test)]
+pub(super) static PROJECTION_PANIC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) static PROJECTION_PANIC_MID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) fn panic_next_projection() {
+    PROJECTION_PANIC.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(super) fn panic_next_projection_mid_pass() {
+    PROJECTION_PANIC_MID.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// One projection pass: derived state only, discardable at any point.
 ///
 /// Monotone by journal seq: the pass records the chain's cursor when it starts
 /// reading and drops any mirror it derived if the chain moved on meanwhile —
 /// derived data never rolls back authority.
 pub(super) async fn project_turn(projection: &Projection) {
+    #[cfg(test)]
+    if PROJECTION_PANIC.swap(false, Ordering::SeqCst) {
+        panic!("projection test panic");
+    }
     let appender = &projection.appender;
     let state = &projection.state;
     let sessions_dir = &projection.sessions_dir;
@@ -580,6 +631,13 @@ pub(super) async fn project_turn(projection: &Projection) {
     // is about to build, and their appends would otherwise look like foreign
     // progress to the monotone guard below.
     drain_parked_ui_notes(projection).await;
+    #[cfg(test)]
+    if PROJECTION_PANIC_MID.swap(false, Ordering::SeqCst) {
+        // Poison `notes` by panicking while holding its guard: the next pass
+        // must recover through `lock_mirror`, not panic again.
+        let _guard = lock_mirror(&projection.state.notes);
+        panic!("projection mid-pass test panic");
+    }
     drain_parked_journal(projection).await;
     let seq = appender.storage().journal_cursor().await;
     let entries = match appender.build_context_entries().await {
@@ -601,9 +659,9 @@ pub(super) async fn project_turn(projection: &Projection) {
         })
         .unwrap_or_else(|| projection.fallback_cwd.clone());
     let projected_str = projected.to_string_lossy().into_owned();
-    let last = state.last_cwd_note.lock().unwrap().clone();
+    let last = lock_mirror(&state.last_cwd_note).clone();
     if last.as_deref() != Some(projected_str.as_str()) {
-        *state.last_cwd_note.lock().unwrap() = Some(projected_str.clone());
+        *lock_mirror(&state.last_cwd_note) = Some(projected_str.clone());
         send_notice(
             &projection.notice_tx,
             BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
@@ -618,8 +676,8 @@ pub(super) async fn project_turn(projection: &Projection) {
         tracing::debug!("history mirror discarded: the journal moved past the projection's cursor");
         return;
     }
-    *state.history.lock().unwrap() = display;
-    *state.notes.lock().unwrap() = notes;
+    *lock_mirror(&state.history) = display;
+    *lock_mirror(&state.notes) = notes;
     state.notes_gen.fetch_add(1, Ordering::SeqCst);
     // ── usage mirror ────────────────────────────────────────────────────
     if !sync_usage(appender, state, Some(seq)).await {
@@ -640,7 +698,7 @@ pub(super) async fn journal_advanced(appender: &Arc<JournalAppender>, seq: u64) 
 /// through the shared journal writer (the writer serializes appends, so this
 /// cannot fork the chain).
 async fn drain_parked_ui_notes(projection: &Projection) {
-    let parked = std::mem::take(&mut *projection.state.pending_ui_notes.lock().unwrap());
+    let parked = std::mem::take(&mut *lock_mirror(&projection.state.pending_ui_notes));
     for record in parked {
         let _ = persist_ui_note(
             &projection.appender,
@@ -656,7 +714,7 @@ async fn drain_parked_ui_notes(projection: &Projection) {
 /// K4 fail-loud discipline as every typed-append face: bounded retries, then a
 /// durable loss record and one facade notice.
 async fn drain_parked_journal(projection: &Projection) {
-    let parked = std::mem::take(&mut *projection.state.pending_journal.lock().unwrap());
+    let parked = std::mem::take(&mut *lock_mirror(&projection.state.pending_journal));
     if parked.is_empty() {
         return;
     }
@@ -665,7 +723,7 @@ async fn drain_parked_journal(projection: &Projection) {
         let kind_label = kind.clone();
         if let Err(err) = append_typed_resilient(&projection.appender, &kind, payload).await {
             if let Some(row) = record_journal_loss(&projection.appender, &kind, &err).await {
-                projection.state.pending_journal.lock().unwrap().push(row);
+                lock_mirror(&projection.state.pending_journal).push(row);
             }
             if kind_label != "error" && !loss_notified {
                 loss_notified = true;
