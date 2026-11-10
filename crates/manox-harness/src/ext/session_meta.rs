@@ -30,10 +30,12 @@ pub struct SessionMeta {
     /// fence keeps admitting them. Empty (the default) = single-cwd.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub working_directories: Vec<String>,
-    /// Note: a sidecar may still carry `plan_mode` / `plan_file` keys and
-    /// older access-mode / reasoning-effort picks. `SessionMeta` ignores
-    /// unknown keys, so those values are inert — never read them as state
-    /// (the session-mutable config picks live in the journal's own rows).
+    /// Note: a sidecar may still carry `plan_mode` / `plan_file` keys,
+    /// older access-mode / reasoning-effort picks, and a `user_attributions`
+    /// map written before attribution moved onto the journal row.
+    /// `SessionMeta` ignores unknown keys, so those values are inert — never
+    /// read them as state (the config picks live in the journal's own rows;
+    /// authorship lives on `Event::Message.ui`).
     /// Last execution plan the model published via `UpdatePlan`, persisted so
     /// it survives compaction (the transcript's tool calls are summarized
     /// away) and restarts. Serialized `manox_agent::plan::PlanSnapshot`; `None`

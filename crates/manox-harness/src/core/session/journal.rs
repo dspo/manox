@@ -114,13 +114,25 @@ impl std::fmt::Display for JournalError {
                 path,
                 found,
                 supported,
-            } => write!(
-                f,
-                "session journal {} is on format v{found}; this build reads only v{supported}. \
-                 The file predates the current format and must be converted by the one-time \
-                 operator migration",
-                path.display()
-            ),
+            } => {
+                if *found > *supported {
+                    write!(
+                        f,
+                        "session journal {} is on format v{found}, written by a newer build; \
+                         this binary reads up to v{supported}. Upgrade the binary to open it",
+                        path.display()
+                    )
+                } else {
+                    write!(
+                        f,
+                        "session journal {} is on format v{found}; this build reads only \
+                         v{supported}. The file predates the current format and must be \
+                         converted by the one-time operator migration \
+                         (`script/migrate-journals.py`)",
+                        path.display()
+                    )
+                }
+            }
             JournalError::Failed(err) => write!(f, "{err:#}"),
         }
     }
@@ -204,7 +216,19 @@ impl<S: SessionStorage + 'static> Journal<S> {
                     *self.writer_task.lock().unwrap() = Some(task);
                 }
                 #[cfg(not(test))]
-                drop(task);
+                {
+                    // A panicked writer kills the journal, and the JoinHandle
+                    // is the only place tokio exposes that panic. Keep a
+                    // detached monitor so the root cause is logged instead of
+                    // every later append reporting only `Closed`.
+                    runtime.spawn(async move {
+                        if let Err(err) = task.await
+                            && err.is_panic()
+                        {
+                            tracing::error!("journal writer panicked: {err}");
+                        }
+                    });
+                }
                 Ok(tx)
             })
             .await
@@ -580,5 +604,97 @@ mod tests {
             "the append must give up on its budget, took {elapsed:?}"
         );
         drop(holder);
+    }
+
+    /// A writer that panics on its first append dies like any task: the
+    /// pending append resolves `Closed` and later appends fail fast. (In
+    /// production the detached monitor logs the panic; the contract here is
+    /// the caller-visible one.)
+    #[tokio::test]
+    async fn a_panicking_writer_closes_pending_and_later_appends() {
+        struct PanicStorage;
+
+        #[async_trait::async_trait]
+        impl SessionStorage for PanicStorage {
+            async fn create_entry_id(&self, _: JournalWrite) -> Result<String, anyhow::Error> {
+                Ok(uuid::Uuid::new_v4().to_string())
+            }
+
+            async fn append_entry(&self, _: &Event, _: JournalWrite) -> Result<u64, anyhow::Error> {
+                panic!("writer exploded");
+            }
+
+            async fn get_entry(&self, _: &str) -> Result<Option<Event>, anyhow::Error> {
+                unreachable!("not used by this test")
+            }
+
+            async fn get_leaf_id(&self) -> Result<Option<String>, anyhow::Error> {
+                Ok(None)
+            }
+
+            async fn set_leaf_id(
+                &self,
+                _: Option<&str>,
+                _: JournalWrite,
+            ) -> Result<(), anyhow::Error> {
+                unreachable!("not used by this test")
+            }
+
+            async fn get_entries(
+                &self,
+                _: crate::session::SessionEntryCursor,
+            ) -> Result<Vec<Event>, anyhow::Error> {
+                unreachable!("not used by this test")
+            }
+
+            async fn find_entries(
+                &self,
+                _: crate::session::EntryType,
+            ) -> Result<Vec<Event>, anyhow::Error> {
+                unreachable!("not used by this test")
+            }
+
+            async fn get_label(&self, _: &str) -> Result<Option<String>, anyhow::Error> {
+                unreachable!("not used by this test")
+            }
+
+            async fn get_session_name(&self) -> Result<Option<String>, anyhow::Error> {
+                unreachable!("not used by this test")
+            }
+
+            async fn get_session_stats(
+                &self,
+            ) -> Result<crate::session::SessionStats, anyhow::Error> {
+                unreachable!("not used by this test")
+            }
+
+            async fn get_path(&self, _: Option<&str>) -> Result<Vec<Event>, anyhow::Error> {
+                unreachable!("not used by this test")
+            }
+        }
+
+        let session = Session::new(PanicStorage);
+        let err = session
+            .append_label("e", Some("boom".into()))
+            .await
+            .expect_err("the panicking writer cannot answer");
+        assert!(
+            matches!(
+                err.downcast_ref::<JournalError>(),
+                Some(JournalError::Closed)
+            ),
+            "the pending append resolves Closed: {err:#}"
+        );
+        let err = session
+            .append_label("e2", Some("boom".into()))
+            .await
+            .expect_err("a dead writer fails fast");
+        assert!(
+            matches!(
+                err.downcast_ref::<JournalError>(),
+                Some(JournalError::Closed)
+            ),
+            "later appends resolve Closed: {err:#}"
+        );
     }
 }
