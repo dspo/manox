@@ -15,8 +15,9 @@ use manox_harness::types::StopReason;
 pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
     match event {
         AgentEvent::AgentStart | AgentEvent::AgentEnd { .. } => Vec::new(),
-        // `TurnStarted` is emitted once by the facade (matching `Thread`
-        // semantics); the kernel's per-round `TurnStart` must not duplicate it.
+        // The turn's open edge is journaled once by `run_turn` (the engine's
+        // `TurnStarted`); the kernel's per-round `TurnStart` must not
+        // duplicate it or land it after the close.
         AgentEvent::TurnStart => Vec::new(),
         AgentEvent::MessageStart { .. } => Vec::new(),
         AgentEvent::MessageUpdate {

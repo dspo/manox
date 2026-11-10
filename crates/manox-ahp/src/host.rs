@@ -147,10 +147,12 @@ impl Host {
                     }
                 }
             }
-            // Drop the lanes first so no lane keeps dispatching into a
-            // connection that is being torn down.
-            drop(lanes);
+            // Kill the connection FIRST: dropping the lane registry only
+            // closes its senders, and `async_channel` receivers still drain
+            // buffered messages. `run_one` checks `conn.alive()`, so the
+            // drained work is skipped instead of running into a dead conn.
             drop(teardown);
+            drop(lanes);
         });
     }
 
@@ -415,6 +417,12 @@ async fn dispatch_inbound(
     lanes: &crate::lanes::Lanes,
     msg: JsonRpcMessage,
 ) {
+    // A killed connection may still have frames in flight; they are not
+    // dispatched (the lane path checks the same flag, so buffered work
+    // drained after teardown is skipped too).
+    if !conn.alive() {
+        return;
+    }
     match &msg {
         // Completing a waiter is bookkeeping, not application work: queueing it
         // behind a lane would let a busy channel starve the reply the host
@@ -427,8 +435,49 @@ async fn dispatch_inbound(
         JsonRpcMessage::Request(request)
             if matches!(request.method.as_str(), "initialize" | "reconnect") =>
         {
-            if crate::lanes::claim(conn, request.id) {
-                crate::router::handle(inner, conn, msg).await;
+            if !crate::lanes::claim(conn, request.id) {
+                return;
+            }
+            let id = request.id;
+            let method = request.method.clone();
+            let handler_inner = inner.clone();
+            let handler_conn = conn.clone();
+            let mut handler = tokio::spawn(async move {
+                crate::router::handle(&handler_inner, &handler_conn, msg).await;
+            });
+            tokio::select! {
+                joined = &mut handler => {
+                    crate::lanes::finish(conn, "handshake", &method, Some(id), joined);
+                }
+                _ = tokio::time::sleep(crate::lanes::DISPATCH_DEADLINE) => {
+                    // A handshake that cannot complete leaves the connection's
+                    // identity and subscription set indeterminate; answer it
+                    // and retire the connection instead of letting every lane
+                    // and waiter queue behind it. The handler is detached: its
+                    // late reply is refused by the claim and its mutations land
+                    // on a dead conn.
+                    let answered = conn.reply_once(
+                        id,
+                        wire::error(
+                            id,
+                            JsonRpcError {
+                                code: crate::codes::X_MANOX_TIMEOUT,
+                                message: format!(
+                                    "{method} did not complete the handshake within {}s",
+                                    crate::lanes::DISPATCH_DEADLINE.as_secs()
+                                ),
+                                data: None,
+                            },
+                        ),
+                    );
+                    tracing::warn!(
+                        connection = conn.id(),
+                        method = %method,
+                        answered = answered,
+                        "handshake exceeded the dispatch deadline; retiring the connection"
+                    );
+                    conn.kill();
+                }
             }
         }
         _ => lanes.dispatch(crate::lanes::target_channel(&msg), msg),

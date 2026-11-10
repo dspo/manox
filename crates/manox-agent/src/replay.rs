@@ -56,6 +56,11 @@ pub struct ReplayedThreadState {
     /// a host that died mid-turn there. `None` means the last turn closed and
     /// the restore has nothing to reconcile.
     pub open_turn: Option<String>,
+    /// The owner stamp of the open turn, when its `turn_start` carried one.
+    /// A restore consults it before closing the turn: an owner in another
+    /// live process keeps the turn (the lease normally blocks this case, but
+    /// the check is cheap and makes the reconcile safe on its own).
+    pub open_turn_owner: Option<manox_harness::session::TurnOwner>,
 }
 
 /// An approval or question request the chain never answered.
@@ -192,11 +197,13 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             // A turn opens on its `turn_start` row and — on a chain with no
             // `turn_start` — on the user row that begins it; a `turn_finish`
             // closes whichever was open.
-            Event::TurnStart { id, .. } => {
+            Event::TurnStart { id, owner, .. } => {
                 state.open_turn = Some(id.clone());
+                state.open_turn_owner = *owner;
             }
             Event::TurnFinish { .. } => {
                 state.open_turn = None;
+                state.open_turn_owner = None;
             }
             // ── transcript + display domain (rebuilt by the kernel's own
             //    transcript projection, not by this fold) ────────────────
@@ -370,6 +377,40 @@ mod tests {
     }
 
     /// The fold's open-turn fact, in both journal shapes: the chains with a
+    /// The open turn's owner stamp rides the replay so a restore can leave a
+    /// turn another live process owns alone.
+    #[test]
+    fn the_open_turn_owner_reads_the_turn_start_stamp() {
+        let ts = Utc::now();
+        let owner = manox_harness::session::TurnOwner { pid: 4242 };
+        let open = vec![record(E::TurnStart {
+            id: "ts-1".into(),
+            parent_id: None,
+            timestamp: ts,
+            owner: Some(owner),
+        })];
+        assert_eq!(replay_thread_state(&open).open_turn_owner, Some(owner));
+
+        let closed = vec![
+            record(E::TurnStart {
+                id: "ts-2".into(),
+                parent_id: None,
+                timestamp: ts,
+                owner: Some(owner),
+            }),
+            record(E::TurnFinish {
+                id: "tf-2".into(),
+                parent_id: None,
+                timestamp: ts,
+                cancelled: false,
+                failed: false,
+                stranded_steer_ids: Vec::new(),
+                reason: None,
+            }),
+        ];
+        assert_eq!(replay_thread_state(&closed).open_turn_owner, None);
+    }
+
     /// `turn_start` row (engine-owned turns) and those carrying only the user
     /// row (a prompt turn whose writer did not stamp the open edge).
     #[test]

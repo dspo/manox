@@ -535,16 +535,15 @@ pub(super) async fn wait_then_cold_journal_append(
     cold_journal_append(session_path, kind, payload).await;
 }
 
-/// B3 (review round 3): the cold-append serialization locks, keyed by
-/// journal path. Each cold append opens a FRESH storage instance whose
-/// writer/leaf/seq views are instance-scoped — two spawned
-/// decisions on one engine-less thread (pin + archive is the canonical
-/// pair, and a retiring actor's `Fate::Wait` queue funnels several)
-/// raced: same parent, self-stamped seqs, a forked chain the load
-/// validator accepts (sibling rows are legal) while the cursor keeps
-/// only the file-last branch — the earlier decision silently left the
-/// chain. Entries are never evicted: one small map entry per distinct
-/// cold-appended session, process-lifetime.
+/// Cold appends serialize per journal path before a storage writer exists.
+///
+/// This is the append path's one sanctioned lock held across file I/O. It is
+/// not a correctness carrier: the storage's write fence plus stale-view reload
+/// already linearize two instances appending one file (a stale-parented `Tail`
+/// append is re-pointed under the fence). The lock only bounds the
+/// open+append window so two cold callers do not both stand up a view of the
+/// same file at once. Entries are never evicted: one small map entry per
+/// distinct cold-appended session, process-lifetime.
 pub(super) static COLD_APPEND_LOCKS: std::sync::OnceLock<
     std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 > = std::sync::OnceLock::new();

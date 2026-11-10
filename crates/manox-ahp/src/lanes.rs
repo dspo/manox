@@ -41,6 +41,13 @@ pub const DISPATCH_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 /// drain.
 pub const LANE_CAPACITY: usize = 256;
 
+/// One message waiting in (or running from) a lane, stamped when the reader
+/// accepted it: the request deadline covers queue time, not just handler time.
+pub(crate) struct Queued {
+    msg: JsonRpcMessage,
+    at: tokio::time::Instant,
+}
+
 /// One connection's lane registry, owned by its reader task.
 ///
 /// Dropping the registry drops every sender, which closes every lane channel and
@@ -48,7 +55,7 @@ pub const LANE_CAPACITY: usize = 256;
 pub(crate) struct Lanes {
     inner: Arc<Inner>,
     conn: Arc<Conn>,
-    lanes: Mutex<HashMap<String, async_channel::Sender<JsonRpcMessage>>>,
+    lanes: Mutex<HashMap<String, async_channel::Sender<Queued>>>,
 }
 
 impl Lanes {
@@ -62,8 +69,20 @@ impl Lanes {
     }
 
     /// Hand one message to its channel's lane without ever blocking.
+    ///
+    /// A request claims its one-answer slot HERE, before it can sit in a
+    /// queue: a duplicate id sent while the first copy is parked must be
+    /// dropped at the door, not executed twice once both dequeue.
     pub(crate) fn dispatch(&self, lane: String, msg: JsonRpcMessage) {
-        let mut carry = msg;
+        if let JsonRpcMessage::Request(request) = &msg
+            && !claim(&self.conn, request.id)
+        {
+            return;
+        }
+        let mut carry = Queued {
+            msg,
+            at: tokio::time::Instant::now(),
+        };
         let mut retried = false;
         loop {
             let (tx, fresh) = self.sender(&lane);
@@ -72,21 +91,21 @@ impl Lanes {
             }
             match tx.try_send(carry) {
                 Ok(()) => return,
-                Err(async_channel::TrySendError::Full(msg)) => {
-                    self.overloaded(&lane, msg);
+                Err(async_channel::TrySendError::Full(queued)) => {
+                    self.overloaded(&lane, queued);
                     return;
                 }
-                Err(async_channel::TrySendError::Closed(msg)) => {
+                Err(async_channel::TrySendError::Closed(queued)) => {
                     // The lane task died without the registry noticing. Retire
                     // the dead sender, open a fresh lane and retry once, so a
                     // dead lane cannot silently swallow a request.
                     self.retire(&lane, &tx);
                     if retried {
-                        self.overloaded(&lane, msg);
+                        self.overloaded(&lane, queued);
                         return;
                     }
                     retried = true;
-                    carry = msg;
+                    carry = queued;
                 }
             }
         }
@@ -98,8 +117,8 @@ impl Lanes {
         &self,
         lane: &str,
     ) -> (
-        async_channel::Sender<JsonRpcMessage>,
-        Option<async_channel::Receiver<JsonRpcMessage>>,
+        async_channel::Sender<Queued>,
+        Option<async_channel::Receiver<Queued>>,
     ) {
         let mut lanes = self.lock();
         if let Some(tx) = lanes.get(lane) {
@@ -114,7 +133,7 @@ impl Lanes {
     }
 
     /// Start the task that drains one lane, one handler at a time.
-    fn spawn_lane(&self, lane: &str, rx: async_channel::Receiver<JsonRpcMessage>) {
+    fn spawn_lane(&self, lane: &str, rx: async_channel::Receiver<Queued>) {
         let inner = self.inner.clone();
         let conn = self.conn.clone();
         let lane = lane.to_string();
@@ -126,7 +145,7 @@ impl Lanes {
     }
 
     /// Forget a sender whose lane task ended.
-    fn retire(&self, lane: &str, dead: &async_channel::Sender<JsonRpcMessage>) {
+    fn retire(&self, lane: &str, dead: &async_channel::Sender<Queued>) {
         let mut lanes = self.lock();
         if lanes.get(lane).is_some_and(|tx| tx.same_channel(dead)) {
             lanes.remove(lane);
@@ -134,16 +153,12 @@ impl Lanes {
     }
 
     /// Report a message the lane could not take, without blocking the reader.
-    fn overloaded(&self, lane: &str, msg: JsonRpcMessage) {
-        match msg {
+    ///
+    /// The request already holds its claim (taken at dispatch), so the
+    /// overload answer is its one reply and releases it.
+    fn overloaded(&self, lane: &str, queued: Queued) {
+        match queued.msg {
             JsonRpcMessage::Request(request) => {
-                // An overload answer is still the request's one reply, so it
-                // goes through the same claim as a handler's would: a duplicate
-                // id cannot produce a second frame for a request already in
-                // flight.
-                if !claim(&self.conn, request.id) {
-                    return;
-                }
                 tracing::warn!(
                     connection = self.conn.id(),
                     lane = lane,
@@ -182,9 +197,7 @@ impl Lanes {
     /// The registry lock is held only across the map operations, and a poisoned
     /// lock is still usable: a panic elsewhere must not take the connection's
     /// lanes with it.
-    fn lock(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<String, async_channel::Sender<JsonRpcMessage>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, async_channel::Sender<Queued>>> {
         self.lanes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -220,13 +233,46 @@ pub(crate) fn target_channel(msg: &JsonRpcMessage) -> String {
         .to_string()
 }
 
+/// The timeout frame for a request that outlived its deadline (queued or
+/// running).
+fn timeout_frame(id: u64, method: &str, why: &str) -> JsonRpcMessage {
+    wire::error(
+        id,
+        JsonRpcError {
+            code: codes::X_MANOX_TIMEOUT,
+            message: format!("{method} {why} within {}s", DISPATCH_DEADLINE.as_secs()),
+            data: None,
+        },
+    )
+}
+
 /// Run one lane message in its order slot.
-async fn run_one(inner: &Arc<Inner>, conn: &Arc<Conn>, lane: &str, msg: JsonRpcMessage) {
+async fn run_one(inner: &Arc<Inner>, conn: &Arc<Conn>, lane: &str, queued: Queued) {
+    // A lane drains its buffer after teardown drops the registry; the
+    // connection is already dead by then, so the buffered work must not run.
+    if !conn.alive() {
+        return;
+    }
+    let Queued { msg, at } = queued;
+    let deadline = at + DISPATCH_DEADLINE;
     match msg {
         JsonRpcMessage::Request(request) => {
             let id = request.id;
             let method = request.method.clone();
-            if !claim(conn, id) {
+            // The claim was taken at dispatch; a request that sat past its
+            // deadline in the queue is answered here, without running.
+            if tokio::time::Instant::now() >= deadline {
+                let answered = conn.reply_once(
+                    id,
+                    timeout_frame(id, &method, "expired in the lane queue before starting"),
+                );
+                tracing::warn!(
+                    connection = conn.id(),
+                    lane = lane,
+                    method = %method,
+                    answered = answered,
+                    "request expired in the lane queue"
+                );
                 return;
             }
             let handler_inner = inner.clone();
@@ -243,15 +289,11 @@ async fn run_one(inner: &Arc<Inner>, conn: &Arc<Conn>, lane: &str, msg: JsonRpcM
                 joined = &mut handler => {
                     finish(conn, lane, &method, Some(id), joined);
                 }
-                _ = tokio::time::sleep(DISPATCH_DEADLINE) => {
-                    let answered = conn.reply_once(id, wire::error(id, JsonRpcError {
-                        code: codes::X_MANOX_TIMEOUT,
-                        message: format!(
-                            "{method} did not answer within {}s",
-                            DISPATCH_DEADLINE.as_secs()
-                        ),
-                        data: None,
-                    }));
+                _ = tokio::time::sleep_until(deadline) => {
+                    let answered = conn.reply_once(
+                        id,
+                        timeout_frame(id, &method, "did not answer"),
+                    );
                     tracing::warn!(
                         connection = conn.id(),
                         lane = lane,
@@ -282,7 +324,7 @@ async fn run_one(inner: &Arc<Inner>, conn: &Arc<Conn>, lane: &str, msg: JsonRpcM
                 joined = &mut handler => {
                     finish(conn, lane, &method, None, joined);
                 }
-                _ = tokio::time::sleep(DISPATCH_DEADLINE) => {
+                _ = tokio::time::sleep_until(deadline) => {
                     tracing::warn!(
                         connection = conn.id(),
                         lane = lane,
@@ -323,7 +365,7 @@ pub(crate) fn claim(conn: &Conn, id: u64) -> bool {
 /// A panicking handler would otherwise leave its request unanswered forever, so
 /// it is answered [`codes::rpc::INTERNAL_ERROR`] unless the deadline already
 /// answered it.
-fn finish(
+pub(crate) fn finish(
     conn: &Arc<Conn>,
     lane: &str,
     method: &str,

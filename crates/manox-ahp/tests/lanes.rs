@@ -219,6 +219,84 @@ async fn a_deadline_answers_once_and_discards_the_late_reply() {
     assert_success(frame, 8);
 }
 
+/// A request that spends its whole deadline queued behind another channel
+/// handler is answered without being executed: the deadline covers queue
+/// time, not only handler time.
+#[tokio::test(start_paused = true)]
+async fn a_request_that_expires_in_the_queue_is_answered_without_running() {
+    let backend = ParkingBackend::new();
+    let host = Host::new(backend.clone() as Arc<dyn Backend>);
+    let gate = backend.park("s-2");
+    let (host_side, client_side) = inproc::pair();
+    host.accept(host_side);
+    let mut client = RawClient::new(client_side);
+
+    // The first request parks the lane's handler.
+    client.send(subscribe(11, "ahp-session:/s-2")).await;
+    gate.wait_started().await;
+    // The second queues behind it.
+    client.send(subscribe(12, "ahp-session:/s-2")).await;
+    tokio::task::yield_now().await;
+
+    // Past the deadline, the parked handler is answered by the timeout.
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let frame = client.recv().await;
+    let JsonRpcMessage::ErrorResponse(response) = frame else {
+        panic!("expected the deadline's error reply, got {frame:?}");
+    };
+    assert_eq!(response.id, 11);
+    assert_eq!(response.error.code, codes::X_MANOX_TIMEOUT);
+
+    gate.release_one();
+    gate.wait_completed().await;
+
+    // The queued request is answered too, without running: if it had run it
+    // would have parked on the same gate and sent no frame.
+    let frame = client.recv().await;
+    let JsonRpcMessage::ErrorResponse(response) = frame else {
+        panic!("expected the queued request's timeout, got {frame:?}");
+    };
+    assert_eq!(response.id, 12);
+    assert_eq!(response.error.code, codes::X_MANOX_TIMEOUT);
+}
+
+/// A handshake whose cold seed never returns is answered with a timeout and
+/// the connection is retired: it must not stall the reader for every lane.
+#[tokio::test(start_paused = true)]
+async fn a_handshake_that_cannot_complete_is_retired() {
+    let backend = ParkingBackend::new();
+    let host = Host::new(backend.clone() as Arc<dyn Backend>);
+    let gate = backend.park("s-2");
+    let (host_side, client_side) = inproc::pair();
+    host.accept(host_side);
+    let mut client = RawClient::new(client_side);
+
+    client
+        .send(wire::request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "channel": ROOT_RESOURCE_URI,
+                "clientId": "wedge",
+                "protocolVersions": [PROTOCOL_VERSION],
+                "initialSubscriptions": ["ahp-session:/s-2"],
+            }),
+        ))
+        .await;
+    // The handshake's cold seed parks; its deadline answers and retires the
+    // connection.
+    let frame = client.recv().await;
+    let JsonRpcMessage::ErrorResponse(response) = frame else {
+        panic!("expected the handshake timeout, got {frame:?}");
+    };
+    assert_eq!(response.id, 1);
+    assert_eq!(response.error.code, codes::X_MANOX_TIMEOUT);
+
+    // Let the detached handler finish so the task does not outlive the suite.
+    gate.release_one();
+    gate.wait_completed().await;
+}
+
 /// A full lane answers overload instead of blocking the reader, and other
 /// channels keep being served while it stays full.
 #[tokio::test(flavor = "multi_thread")]

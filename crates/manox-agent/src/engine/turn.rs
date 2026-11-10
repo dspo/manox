@@ -8,6 +8,7 @@
 //! monotone by journal seq. A projection that never finishes leaves the
 //! mirrors stale, never the turn open.
 
+use futures::FutureExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -29,8 +30,8 @@ pub(super) const ABORT_GRACE: std::time::Duration = std::time::Duration::from_se
 /// running only raises the dirty flag (single-flight, rerun once).
 #[derive(Default)]
 pub(super) struct ProjectionFlight {
-    running: bool,
-    dirty: bool,
+    pub(super) running: bool,
+    pub(super) dirty: bool,
 }
 
 /// What a committed turn reported, mirroring `BackendNotice::Settled`.
@@ -555,8 +556,23 @@ pub(super) fn spawn_projection(projection: Projection) {
     }
     crate::runtime::handle().spawn(async move {
         loop {
-            project_turn(&projection).await;
-            let mut flight = state.projection.lock().unwrap();
+            // A panicked pass is a skipped refresh, never a dead slot: the
+            // flight flag is cleared below whatever the pass did, so the next
+            // commit re-runs it. The mirror locks may be poisoned by the same
+            // panic, hence `into_inner`.
+            let pass = std::panic::AssertUnwindSafe(project_turn(&projection))
+                .catch_unwind()
+                .await;
+            if let Err(payload) = pass {
+                tracing::error!(
+                    payload = %panic_message(&payload),
+                    "turn projection pass panicked; the slot stays usable"
+                );
+            }
+            let mut flight = state
+                .projection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !flight.dirty {
                 flight.running = false;
                 return;
@@ -566,12 +582,38 @@ pub(super) fn spawn_projection(projection: Projection) {
     });
 }
 
+/// A panic payload as text, for the projection's error line.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Test seam: the next projection pass panics before touching any mirror, so
+/// a test can prove the slot recovers.
+#[cfg(test)]
+pub(super) static PROJECTION_PANIC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(super) fn panic_next_projection() {
+    PROJECTION_PANIC.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// One projection pass: derived state only, discardable at any point.
 ///
 /// Monotone by journal seq: the pass records the chain's cursor when it starts
 /// reading and drops any mirror it derived if the chain moved on meanwhile —
 /// derived data never rolls back authority.
 pub(super) async fn project_turn(projection: &Projection) {
+    #[cfg(test)]
+    if PROJECTION_PANIC.swap(false, Ordering::SeqCst) {
+        panic!("projection test panic");
+    }
     let appender = &projection.appender;
     let state = &projection.state;
     let sessions_dir = &projection.sessions_dir;

@@ -2680,6 +2680,19 @@ async fn reconcile_open_turn(
     if replayed.open_turn.is_none() {
         return (records, replayed);
     }
+    // Another live process may own the turn (the per-session lease normally
+    // prevents this, but the check is cheap). Our own pid is never a reason to
+    // skip: this process just started, so its previous run is gone.
+    if let Some(owner) = replayed.open_turn_owner
+        && owner.pid != std::process::id()
+        && owner.is_alive()
+    {
+        tracing::debug!(
+            owner_pid = owner.pid,
+            "restore leaves the open turn to its live owner"
+        );
+        return (records, replayed);
+    }
     let appender = session.journal_appender();
     let payload = serde_json::json!({
         "cancelled": true,
@@ -2846,7 +2859,10 @@ async fn load_registry_displays(
 /// every persisted ordinal; the stale records would otherwise attach to the
 /// wrong user prompt on the next `sync_history`. New turns after the
 /// compaction persist fresh ordinals over the rebuilt sequence. Attribution
-/// needs no clearing — it rides the row and is retained with it.
+/// needs no sidecar clearing — it rides the original row. The engine mirror's
+/// retained-tail rebuild (`Vec<AgentMessage>`) cannot carry it, so a compacted
+/// thread's mirrored prompts lose their author; the AHP fold, which folds the
+/// pre-boundary rows, keeps it.
 async fn clear_user_chrome(sessions_dir: &Path, session_path: &Path) {
     // Probe first: clearing an empty map would only churn the sidecar.
     let meta = manox_harness::session_meta::load(sessions_dir, session_path)

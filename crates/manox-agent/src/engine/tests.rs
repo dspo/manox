@@ -3206,6 +3206,28 @@ async fn a_panicking_stream_closes_the_turn_failed() {
         starts, 1,
         "the turn's open edge lands exactly once, before the run"
     );
+    let start_at = rows
+        .iter()
+        .position(|record| {
+            matches!(
+                record.entry,
+                manox_harness::session::Event::TurnStart { .. }
+            )
+        })
+        .expect("the open edge is on the chain");
+    let finish_at = rows
+        .iter()
+        .position(|record| {
+            matches!(
+                record.entry,
+                manox_harness::session::Event::TurnFinish { .. }
+            )
+        })
+        .expect("the close is on the chain");
+    assert!(
+        start_at < finish_at,
+        "the open edge must land before the close (start {start_at}, finish {finish_at})"
+    );
 }
 
 /// The run future itself panicking: the supervisor's `catch_unwind` turns it
@@ -3454,6 +3476,92 @@ async fn the_close_does_not_depend_on_the_projection() {
     assert_eq!(finishes, 1, "the projection never appends a close");
 }
 
+/// A panicked projection pass frees the single-flight slot: the next commit
+/// can schedule another pass instead of freezing the mirrors for the session.
+#[tokio::test]
+async fn a_panicked_projection_pass_does_not_wedge_the_slot() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let session = steer_test_session(&dir).await;
+    let state = test_engine_state();
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
+    let projection = Projection {
+        appender: session.journal_appender(),
+        state: Arc::clone(&state),
+        sessions_dir: dir.path().join("sessions"),
+        session_path: session.path().clone(),
+        notice_tx,
+        fallback_cwd: dir.path().to_path_buf(),
+    };
+    panic_next_projection();
+    spawn_projection(projection);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let running = state
+                .projection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .running;
+            if !running {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a panicked pass must free the slot");
+}
+
+/// The last-resort close: a `TurnCommit` dropped between open and commit still
+/// lands exactly one failed `turn_finish` and marks the session degraded.
+#[tokio::test]
+async fn a_dropped_turn_commit_closes_its_turn_failed() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let session = steer_test_session(&dir).await;
+    let cwd = dir.path().join("proj");
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
+    let state = test_engine_state();
+    drop(TurnCommit::open(&session, &state, &notice_tx, &cwd));
+
+    // `Drop` spawns the detached close; wait for its durable row.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let rows = session
+            .journal_appender()
+            .storage()
+            .journal_range(0, u64::MAX)
+            .await
+            .unwrap();
+        let finishes: Vec<(bool, bool)> = rows
+            .iter()
+            .filter_map(|record| match &record.entry {
+                manox_harness::session::Event::TurnFinish {
+                    cancelled, failed, ..
+                } => Some((*cancelled, *failed)),
+                _ => None,
+            })
+            .collect();
+        if !finishes.is_empty() {
+            assert_eq!(
+                finishes,
+                vec![(false, true)],
+                "exactly one failed close, no duplicate"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the drop's close never landed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        state.is_degraded(),
+        "a turn dropped before its commit marks the session degraded"
+    );
+}
+
 // ── restore reconciliation ──────────────────────────────────────────────────
 
 /// The last durable close: `(cancelled, failed, reason)`.
@@ -3644,6 +3752,40 @@ async fn restore_closes_an_interrupted_turn_start_chain() {
     assert_eq!(
         last_turn_finish(&session).await,
         Some((true, false, Some("host exited".to_string())))
+    );
+}
+
+/// A turn another live process owns is left alone: the restore's owner check
+/// says the lease is normally the backstop, but the reconcile must not close
+/// a turn a live process is driving.
+#[tokio::test]
+async fn restore_leaves_a_turn_its_live_owner_is_running() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = steer_test_session(&dir).await;
+    let sessions = dir.path().join("sessions");
+    session
+        .append_message(AgentMessage::user("hello"))
+        .await
+        .unwrap();
+    // pid 1 is alive (init/launchd) and is never this process, so the owner
+    // reads as a live foreign process.
+    session
+        .journal_appender()
+        .append_typed("turn_start", serde_json::json!({ "owner": { "pid": 1 } }))
+        .await
+        .unwrap();
+
+    let records = session.journal_range(0, u64::MAX).await.unwrap();
+    let replayed = crate::replay::replay_thread_state(&records);
+    assert!(replayed.open_turn.is_some());
+    assert_eq!(replayed.open_turn_owner.map(|owner| owner.pid), Some(1));
+
+    let _ = rebuild_restored_state(&session, &sessions).await;
+    assert_eq!(
+        last_turn_finish(&session).await,
+        None,
+        "restore must not close a live owner's turn"
     );
 }
 
