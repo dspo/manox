@@ -28,11 +28,11 @@ async fn land_live_row(
         return false;
     };
     if *loss_signaled {
-        state.pending_journal.lock().unwrap().push((kind, payload));
+        lock_mirror(&state.pending_journal).push((kind, payload));
         return false;
     }
     if let Some(row) = record_journal_loss(appender, &kind, &err).await {
-        state.pending_journal.lock().unwrap().push(row);
+        lock_mirror(&state.pending_journal).push(row);
     }
     if kind == "error" {
         return false;
@@ -302,7 +302,7 @@ where
                     // the projection (the actor owns the session; a second
                     // writer could fork the leaf cursor).
                     mirror_ui_note(state, record.clone());
-                    state.pending_ui_notes.lock().unwrap().push(record);
+                    lock_mirror(&state.pending_ui_notes).push(record);
                 }
                 Some(SessionCmd::AppendJournal { kind, payload }) => {
                     // Rows append LIVE through the shared session handle in
@@ -497,7 +497,7 @@ pub(super) async fn journal_ask_decision(
     });
     if let Err(err) = append_typed_resilient(appender, "question", payload).await {
         if let Some(row) = record_journal_loss(appender, "question", &err).await {
-            state.pending_journal.lock().unwrap().push(row);
+            lock_mirror(&state.pending_journal).push(row);
         }
         send_notice(
             notice_tx,
@@ -876,7 +876,7 @@ pub(super) fn sync_live_history(
         .map(HistoryEntry::Message)
         .collect();
     let notes_gen = state.notes_gen.load(Ordering::SeqCst);
-    let mut history = state.history.lock().unwrap();
+    let mut history = lock_mirror(&state.history);
     if live_fingerprint(&history) == live_fingerprint(&display)
         && notes_gen == state.notes_gen.load(Ordering::SeqCst)
     {
@@ -884,7 +884,7 @@ pub(super) fn sync_live_history(
     }
     // The live transcript carries no custom entries: re-merge the positioned
     // notes so a mid-run switch-back keeps the cards at their position.
-    let notes = state.notes.lock().unwrap().clone();
+    let notes = lock_mirror(&state.notes).clone();
     merge_positioned_notes(&mut display, &notes);
     *history = display;
     true

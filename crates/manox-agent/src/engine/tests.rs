@@ -3562,6 +3562,63 @@ async fn a_dropped_turn_commit_closes_its_turn_failed() {
     );
 }
 
+/// A panic that poisons a mirror lock must not become a panic loop: the next
+/// pass recovers through the unpoisoning lock and rebuilds the mirror.
+#[tokio::test]
+async fn a_poisoned_mirror_does_not_panic_loop_the_projection() {
+    crate::runtime::init_hermetic_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let session = steer_test_session(&dir).await;
+    let state = test_engine_state();
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
+    let projection = Projection {
+        appender: session.journal_appender(),
+        state: Arc::clone(&state),
+        sessions_dir: dir.path().join("sessions"),
+        session_path: session.path().clone(),
+        notice_tx,
+        fallback_cwd: dir.path().to_path_buf(),
+    };
+    panic_next_projection_mid_pass();
+    spawn_projection(projection.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !lock_mirror(&state.projection).running {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first (panicking) pass frees the slot");
+    assert!(
+        state.notes.lock().is_err(),
+        "the mid-pass panic poisons the notes mirror"
+    );
+
+    let before = state.notes_gen.load(Ordering::SeqCst);
+    spawn_projection(projection);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !lock_mirror(&state.projection).running {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a poisoned mirror must not wedge the next pass");
+    assert!(
+        state.notes_gen.load(Ordering::SeqCst) > before,
+        "the recovering pass rebuilt the mirror"
+    );
+    let notes = lock_mirror(&state.notes);
+    assert!(
+        notes.is_empty(),
+        "the poisoned lock stays readable through the unpoisoning guard"
+    );
+}
+
 // ── restore reconciliation ──────────────────────────────────────────────────
 
 /// The last durable close: `(cancelled, failed, reason)`.

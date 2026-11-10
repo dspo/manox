@@ -269,6 +269,18 @@ async fn reply_journal_snapshot(
     let _ = reply.send(JournalSnapshotData { cursor, records });
 }
 
+/// Lock a derived-state mutex even if a panic poisoned it.
+///
+/// A projected mirror is discardable and rebuilt by the next pass; a poisoned
+/// lock must therefore degrade to "the next writer recovers", never to a
+/// permanent panic loop (or a panic on the run path, which pushes parked rows
+/// while the projection is broken).
+fn lock_mirror<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Authoritative state the actor writes and the facade mirrors.
 struct EngineState {
     running: AtomicBool,

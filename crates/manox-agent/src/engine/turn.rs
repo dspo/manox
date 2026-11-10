@@ -261,7 +261,7 @@ pub(super) async fn land_turn_finish(
     // would leave a turn that never ends.
     if let Err(err) = append_typed_resilient(appender, "turn_finish", turn_finish).await {
         if let Some(row) = record_journal_loss(appender, "turn_finish", &err).await {
-            state.pending_journal.lock().unwrap().push(row);
+            lock_mirror(&state.pending_journal).push(row);
         }
         send_notice(
             notice_tx,
@@ -478,7 +478,7 @@ async fn land_turn_start(
 ) {
     if let Err(err) = append_typed_resilient(appender, "turn_start", turn_start_payload()).await {
         if let Some(row) = record_journal_loss(appender, "turn_start", &err).await {
-            state.pending_journal.lock().unwrap().push(row);
+            lock_mirror(&state.pending_journal).push(row);
         }
         send_notice(
             notice_tx,
@@ -547,7 +547,7 @@ pub(super) fn spawn_projection(projection: Projection) {
     }
     let state = Arc::clone(&projection.state);
     {
-        let mut flight = state.projection.lock().unwrap();
+        let mut flight = lock_mirror(&state.projection);
         if flight.running {
             flight.dirty = true;
             return;
@@ -600,8 +600,17 @@ pub(super) static PROJECTION_PANIC: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
+pub(super) static PROJECTION_PANIC_MID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
 pub(super) fn panic_next_projection() {
     PROJECTION_PANIC.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(super) fn panic_next_projection_mid_pass() {
+    PROJECTION_PANIC_MID.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// One projection pass: derived state only, discardable at any point.
@@ -622,6 +631,13 @@ pub(super) async fn project_turn(projection: &Projection) {
     // is about to build, and their appends would otherwise look like foreign
     // progress to the monotone guard below.
     drain_parked_ui_notes(projection).await;
+    #[cfg(test)]
+    if PROJECTION_PANIC_MID.swap(false, Ordering::SeqCst) {
+        // Poison `notes` by panicking while holding its guard: the next pass
+        // must recover through `lock_mirror`, not panic again.
+        let _guard = lock_mirror(&projection.state.notes);
+        panic!("projection mid-pass test panic");
+    }
     drain_parked_journal(projection).await;
     let seq = appender.storage().journal_cursor().await;
     let entries = match appender.build_context_entries().await {
@@ -643,9 +659,9 @@ pub(super) async fn project_turn(projection: &Projection) {
         })
         .unwrap_or_else(|| projection.fallback_cwd.clone());
     let projected_str = projected.to_string_lossy().into_owned();
-    let last = state.last_cwd_note.lock().unwrap().clone();
+    let last = lock_mirror(&state.last_cwd_note).clone();
     if last.as_deref() != Some(projected_str.as_str()) {
-        *state.last_cwd_note.lock().unwrap() = Some(projected_str.clone());
+        *lock_mirror(&state.last_cwd_note) = Some(projected_str.clone());
         send_notice(
             &projection.notice_tx,
             BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
@@ -660,8 +676,8 @@ pub(super) async fn project_turn(projection: &Projection) {
         tracing::debug!("history mirror discarded: the journal moved past the projection's cursor");
         return;
     }
-    *state.history.lock().unwrap() = display;
-    *state.notes.lock().unwrap() = notes;
+    *lock_mirror(&state.history) = display;
+    *lock_mirror(&state.notes) = notes;
     state.notes_gen.fetch_add(1, Ordering::SeqCst);
     // ── usage mirror ────────────────────────────────────────────────────
     if !sync_usage(appender, state, Some(seq)).await {
@@ -682,7 +698,7 @@ pub(super) async fn journal_advanced(appender: &Arc<JournalAppender>, seq: u64) 
 /// through the shared journal writer (the writer serializes appends, so this
 /// cannot fork the chain).
 async fn drain_parked_ui_notes(projection: &Projection) {
-    let parked = std::mem::take(&mut *projection.state.pending_ui_notes.lock().unwrap());
+    let parked = std::mem::take(&mut *lock_mirror(&projection.state.pending_ui_notes));
     for record in parked {
         let _ = persist_ui_note(
             &projection.appender,
@@ -698,7 +714,7 @@ async fn drain_parked_ui_notes(projection: &Projection) {
 /// K4 fail-loud discipline as every typed-append face: bounded retries, then a
 /// durable loss record and one facade notice.
 async fn drain_parked_journal(projection: &Projection) {
-    let parked = std::mem::take(&mut *projection.state.pending_journal.lock().unwrap());
+    let parked = std::mem::take(&mut *lock_mirror(&projection.state.pending_journal));
     if parked.is_empty() {
         return;
     }
@@ -707,7 +723,7 @@ async fn drain_parked_journal(projection: &Projection) {
         let kind_label = kind.clone();
         if let Err(err) = append_typed_resilient(&projection.appender, &kind, payload).await {
             if let Some(row) = record_journal_loss(&projection.appender, &kind, &err).await {
-                projection.state.pending_journal.lock().unwrap().push(row);
+                lock_mirror(&projection.state.pending_journal).push(row);
             }
             if kind_label != "error" && !loss_notified {
                 loss_notified = true;
