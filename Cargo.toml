@@ -59,6 +59,10 @@ manox-ahp = { path = "crates/manox-ahp" }
 # manox-ahp-runtime —— AHP 宿主的运行时半边（与传输无关的 manox-ahp 分离）。
 manox-ahp-runtime = { path = "crates/manox-ahp-runtime", default-features = false }
 manox-harness = { path = "crates/manox-harness" }
+# manox-codemode —— QuickJS 脚本沙箱与工具桥（零 manox-harness 依赖；消费者
+# 把自己的工具类型适配成它的 CodemodeTool trait）。唯一消费者：manox-harness
+# 的 core/tools/codemode.rs（CodemodeTool 的 AgentTool 薄壳）。
+manox-codemode = { path = "crates/manox-codemode" }
 # manox-providers —— provider 配置解析的单一事实来源（原 github.com/dspo/cx
 # 仓库并入；cx 启动器本体已随拆分移至 dspo/manox-app）。
 manox-providers = { path = "crates/manox-providers" }

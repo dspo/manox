@@ -6678,3 +6678,195 @@ async fn steer_surface_drives_the_full_run_lifecycle() {
         "the abort landed the durable settlement row"
     );
 }
+
+// ── Codemode: the script tool's host-side contract ─────────────────────────
+//
+// D4/D18: the tool itself is ungated (it mutates nothing — every nested call
+// rides the wrapped sibling instance, so the gate sees the nested call like
+// any top-level call), and the escalation round trip — the one park this
+// channel keeps — works from inside a script under the nested
+// `<parent>:<script id>` call id.
+
+/// A mutating probe whose execution records itself: the stand-in for a
+/// gated tool a script may only reach through the host's verdict.
+struct CodemodeProbeTool {
+    ran: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl manox_harness::tool::AgentTool for CodemodeProbeTool {
+    fn name(&self) -> &str {
+        "Probe"
+    }
+    fn description(&self) -> &str {
+        "mutating probe; reachable only through the host's verdict"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        _params: serde_json::Value,
+        _signal: tokio_util::sync::CancellationToken,
+        _ctx: &dyn manox_harness::tool::ToolContext,
+    ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
+        self.ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(manox_harness::tool::AgentToolResult::text("probe-ran"))
+    }
+}
+
+#[tokio::test]
+async fn codemode_nested_escalation_round_trip_inherits_the_gate() {
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
+    let model_slot = Arc::new(Mutex::new(None));
+    let gate = Arc::new(ApprovalGate::new(
+        notice_tx.clone(),
+        Arc::clone(&model_slot),
+    ));
+    // Sandbox is the standing default; the script's nested call carries
+    // `require_escalated` and must park a card on THIS gate under the
+    // nested id before anything runs.
+    assert_eq!(gate.mode(), AccessMode::default());
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let approver = Arc::new(crate::approval::GateEscalationApprover::new(Arc::clone(
+        &gate,
+    )));
+    let standing_gate = Arc::clone(&gate);
+    let standing: Arc<dyn Fn() -> AccessMode + Send + Sync> =
+        Arc::new(move || standing_gate.mode());
+    let gated = crate::approval::ApprovalGatedTool::new(
+        Arc::new(CodemodeProbeTool {
+            ran: Arc::clone(&ran),
+        }),
+        Arc::clone(&gate),
+    )
+    .with_escalation(approver, standing);
+    let codemode = manox_harness::tools::codemode::CodemodeTool::new(
+        vec![Arc::new(gated) as Arc<dyn HarnessAgentTool>],
+        Default::default(),
+    );
+    let ctx = manox_harness::tool::LocalToolContext::new(
+        Arc::new(manox_harness::env::TokioExecutionEnv::new(
+            std::env::temp_dir(),
+        )),
+        std::env::temp_dir(),
+        Arc::new(manox_harness::tool::ToolState::new()),
+    );
+
+    let code = "const r = await tools.Probe({ require_escalated: true, \
+                justification: 'the probe needs full access' }); text(r.output);";
+    // The execution runs as a real task: the runtime must keep polling the
+    // script (a local pinned future would starve while this test polls the
+    // gate) so the nested call actually reaches the gate.
+    let codemode = Arc::new(codemode);
+    let execution = {
+        let codemode = Arc::clone(&codemode);
+        tokio::spawn(async move {
+            codemode
+                .execute(
+                    "parent-call-1",
+                    serde_json::json!({ "code": code }),
+                    tokio_util::sync::CancellationToken::new(),
+                    &ctx,
+                )
+                .await
+                .unwrap()
+        })
+    };
+
+    // The park arrives with the nested id: <parent>:<script call id>.
+    let mut nested_id = None;
+    for _ in 0..400 {
+        if let Some((id, _meta)) = gate.pending_entries().first() {
+            nested_id = Some(id.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let nested_id = nested_id.expect("the nested escalation parked an approval card");
+    assert_eq!(nested_id, "parent-call-1:1", "{nested_id}");
+
+    // The verdict releases the parked future and the script continues.
+    gate.respond(
+        &nested_id,
+        crate::permission::ToolAuthorizationResponse::Decision(
+            crate::permission::PermissionDecision::AllowOnce,
+        ),
+    );
+    let result = execution.await.unwrap();
+    assert!(!result.is_error, "{result:?}");
+    let manox_harness::types::ContentBlock::Text { text, .. } = &result.content[1] else {
+        panic!("expected the script body block: {:?}", result.content);
+    };
+    assert_eq!(text, "probe-ran");
+    assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(gate.pending_entries().is_empty(), "the card settled");
+}
+
+#[tokio::test]
+async fn codemode_mounts_ungated_exactly_once_and_excludes_itself() {
+    // build_tools reads the process provider registry snapshot; tests run
+    // without a full `manox_agent::init`, so seed the empty registry.
+    crate::provider_glue::init_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
+    let model_slot = Arc::new(Mutex::new(None));
+    let gate = Arc::new(ApprovalGate::new(
+        notice_tx.clone(),
+        Arc::clone(&model_slot),
+    ));
+    let question_gate = Arc::new(crate::questions::UserQuestionGate::new(notice_tx.clone()));
+    let bus = crate::steer_bus::AgentBus::new("codemode-assembly".into(), notice_tx.clone());
+    let granted = crate::granted_roots::GrantedRoots::new(cwd.clone());
+    let resolver: manox_harness::agent_loop::StreamResolver =
+        Arc::new(|_m: &HarnessModel| Err(anyhow::anyhow!("assembly smoke; nothing streams")));
+    let runtime = ModelRuntime::new(resolver);
+    let (tools, _background, _observer) = build_tools(
+        &cwd,
+        &runtime,
+        Some(&test_model()),
+        "codemode-assembly",
+        &gate,
+        &question_gate,
+        &notice_tx,
+        None,
+        &granted,
+        &bus,
+        Default::default(),
+    );
+
+    assert_eq!(
+        tools
+            .iter()
+            .filter(|t| t.name() == crate::tools::CODEMODE)
+            .count(),
+        1,
+        "Codemode mounts exactly once"
+    );
+    let codemode = tools
+        .iter()
+        .find(|t| t.name() == crate::tools::CODEMODE)
+        .unwrap();
+    // The ungated proof, behaviorally: an ApprovalGatedTool around a
+    // mutating tool answers `needs_gate` (requires_approval || !read_only)
+    // — a wrapped Codemode would answer true. The mounted tool answers
+    // false, so it is the bare tool, not a wrapped one.
+    assert!(!codemode.requires_approval(&serde_json::json!({})));
+    // The sibling exclusion is visible in the rendered declarations: a
+    // `Codemode(` member would mean the tool nested itself.
+    assert!(
+        !codemode.description().contains("Codemode("),
+        "Codemode must not appear among the script-callable declarations"
+    );
+    // The mounted table's gated built-ins are all script-callable: spot one
+    // wrapped instance the sandbox surface exposes.
+    assert!(
+        codemode.description().contains("Write("),
+        "the gated Write sibling must be script-callable"
+    );
+}

@@ -782,6 +782,7 @@ pub(super) fn build_tools(
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     granted_roots: &crate::granted_roots::GrantedRoots,
     bus: &Arc<crate::steer_bus::AgentBus>,
+    codemode_store: std::collections::BTreeMap<String, String>,
 ) -> (
     Vec<Arc<dyn HarnessAgentTool>>,
     Arc<BackgroundManager>,
@@ -1304,6 +1305,22 @@ pub(super) fn build_tools(
         Arc::clone(&subagent_runtime),
         Arc::clone(&subagent_observer),
         Arc::clone(&catalog),
+    )));
+    // Codemode: a JS script (QuickJS sandbox) orchestrating the mounted
+    // tools. Joins ungated like AskUserQuestion — it writes nothing itself
+    // (the script's own store map is session runtime state), and every
+    // nested call carries its own gate/lock/fence on the wrapped sibling
+    // instances, so no approval surface is bypassed. The sibling list is the
+    // FULL mounted table cloned here at the tail — Codemode excluded by
+    // construction (the clone precedes the push), which also keeps a script
+    // from invoking itself recursively. Mounted only in this main-session
+    // assembly: the child snapshot (D11) strips the codemode surface, and a
+    // later embedder registration (refresh_embedder_tools) reaches the top
+    // level but not the script's list until the next assembly.
+    let codemode_siblings = tools.clone();
+    tools.push(Arc::new(manox_harness::tools::codemode::CodemodeTool::new(
+        codemode_siblings,
+        codemode_store,
     )));
     (tools, manager, subagent_observer)
 }

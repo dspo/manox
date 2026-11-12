@@ -17,6 +17,10 @@ test-support = []
 
 [dependencies]
 manox-harness.workspace = true
+# The codemode sandbox's protocol types: the store replay folds the same
+# `StoreWrites` rows the harness-side tool journals (one deserializer, no
+# second wire shape).
+manox-codemode.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 async-trait = "0.1"
