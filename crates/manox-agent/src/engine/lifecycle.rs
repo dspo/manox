@@ -324,6 +324,7 @@ pub(super) fn session_builder(
     thread_id: &str,
     parent_session: Option<&str>,
     bus: &Arc<crate::steer_bus::AgentBus>,
+    codemode_store: std::collections::BTreeMap<String, String>,
 ) -> (
     manox_harness::coding_agent::AgentSessionBuilder,
     Arc<BackgroundManager>,
@@ -340,6 +341,7 @@ pub(super) fn session_builder(
         goal_bridge,
         granted_roots,
         bus,
+        codemode_store,
     );
     // One observer wiring per session: the host task center sees
     // every producer lifecycle from this session (card snapshots + stop
@@ -528,7 +530,9 @@ pub(super) async fn rebuild_session(
         .unwrap_or_else(|| fallback_cwd.to_path_buf());
     // Like the startup restore, a session swap passes no model override so
     // the opened session's own persisted model wins; the actor adopts it
-    // right after the open.
+    // right after the open. The codemode store replays the target journal's
+    // tool rows before assembly hands the snapshot to the tool (D8).
+    let codemode_store = crate::codemode::codemode_store_from_journal(Some(path)).await;
     let (builder, background, subagent_observer) = session_builder(
         &cwd,
         sessions_dir,
@@ -544,6 +548,7 @@ pub(super) async fn rebuild_session(
         thread_id,
         None,
         bus,
+        codemode_store,
     );
     // Published per assembly like the acceptance-time writer: the actor's
     // access-mode apply propagates a mid-turn flip through this observer to

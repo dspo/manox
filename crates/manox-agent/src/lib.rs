@@ -8,6 +8,7 @@ pub mod agent_defs;
 pub mod background_task;
 pub mod capability;
 pub mod claude_md;
+pub mod codemode;
 pub mod command;
 pub mod conversation_config;
 pub mod db;
