@@ -31,6 +31,7 @@ members = [
 	"crates/manox-ahp-runtime",
 	"crates/hyperlinks",
 	"crates/manox-workspace",
+	"crates/manox-codemode",
 ]
 resolver = "2"
 
@@ -62,6 +63,16 @@ manox-harness = { path = "crates/manox-harness" }
 # 仓库并入；cx 启动器本体已随拆分移至 dspo/manox-app）。
 manox-providers = { path = "crates/manox-providers" }
 hyperlinks = { path = "crates/hyperlinks" }
+# rquickjs — the codemode sandbox's QuickJS bindings (bundled backend is
+# quickjs-ng, compiled from vendored C via cc, no extra toolchain). Exact pin:
+# 0.14.x is the post-overhaul line whose API and feature surface still breaks
+# between minors, so upgrading is an explicit task, not drive-by. Features are
+# `std` only: `loader`/`dyn-load` are exactly the module loading the sandbox
+# must not have, `futures` couples the VM's driving to the host executor via
+# AsyncRuntime, and `rust-alloc` swaps in a custom allocator that silently
+# disables `set_memory_limit` — the engine keeps QuickJS's own allocator and
+# accounting.
+rquickjs = { version = "=0.14.0", default-features = false, features = ["std"] }
 
 anyhow = "1"
 async-channel = "2"
