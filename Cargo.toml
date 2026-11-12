@@ -31,6 +31,7 @@ members = [
 	"crates/manox-ahp-runtime",
 	"crates/hyperlinks",
 	"crates/manox-workspace",
+	"crates/manox-codemode",
 ]
 resolver = "2"
 
@@ -62,6 +63,13 @@ manox-harness = { path = "crates/manox-harness" }
 # 仓库并入；cx 启动器本体已随拆分移至 dspo/manox-app）。
 manox-providers = { path = "crates/manox-providers" }
 hyperlinks = { path = "crates/hyperlinks" }
+# rquickjs —— codemode 沙箱的 QuickJS 引擎绑定（内建后端即 quickjs-ng，经 cc 编译
+# C，无额外工具链）。精确 pin：rquickjs 0.14.x 已完成 1.0 前的大重构（API 与
+# feature 面在 minor 间仍会破坏），升级是显式任务而非顺手之举。features 只开
+# `std`：loader/dyn-load（模块加载 = 沙箱明确不做的事）、futures（AsyncRuntime
+# 会把 VM 驱动耦合进宿主 executor）、rust-alloc（自带分配器会让 memory limit
+# 失效）等全部禁用，沙箱用 QuickJS 自己的分配器与账本。
+rquickjs = { version = "=0.14.0", default-features = false, features = ["std"] }
 
 anyhow = "1"
 async-channel = "2"
