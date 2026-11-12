@@ -679,7 +679,7 @@ pub(super) fn fence_roots(
 }
 
 /// The one fs containment verdict every enforcing surface shares: the host
-/// gate's `Write`/`Edit`/`Py` check and the subagent snapshot's fence. `deny`
+/// gate's `Write`/`Edit` check and the subagent snapshot's fence. `deny`
 /// is the caller's refusal text — the host gate teaches the escalation retry,
 /// the subagent fence reports a blocker instead (it has no channel). Either
 /// way the refusal carries the authorized root set the verdict judged

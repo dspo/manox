@@ -516,9 +516,6 @@ pub(super) fn subagent_bash_tool(
 /// - Write/Edit carry the process write lock (`fence(FileLocked(tool))`, so
 ///   the fence judges before the lock is taken) and the same fs containment
 ///   verdict.
-/// - Py is deliberately absent: the interpreter runs in-process with no OS
-///   sandbox, so its only fence would be the host-side escalation round
-///   trip, which the child snapshot does not carry.
 ///
 /// This is the shared fallback shape (no escalation channel); the child
 /// authority arms each run at spawn with per-run replacements carrying the
