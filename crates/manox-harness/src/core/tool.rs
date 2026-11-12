@@ -201,6 +201,14 @@ pub trait ToolContext: Send + Sync {
     fn tool_state_handle(&self) -> Option<std::sync::Arc<ToolState>> {
         None
     }
+    /// The execution environment as an owned handle when the context owns
+    /// one — together with [`Self::tool_state_handle`] this lets a tool
+    /// rebuild an owned context and carry it across `tokio::spawn` boundaries
+    /// (the codemode bridge runs every nested tool call on a spawned task).
+    /// Contexts that borrow rather than own return `None`.
+    fn env_handle(&self) -> Option<std::sync::Arc<dyn crate::env::ExecutionEnv>> {
+        None
+    }
 }
 
 /// Production `ToolContext` shared across an entire session.
@@ -240,6 +248,9 @@ impl ToolContext for LocalToolContext {
     }
     fn tool_state_handle(&self) -> Option<std::sync::Arc<ToolState>> {
         Some(std::sync::Arc::clone(&self.tool_state))
+    }
+    fn env_handle(&self) -> Option<std::sync::Arc<dyn crate::env::ExecutionEnv>> {
+        Some(std::sync::Arc::clone(&self.env))
     }
 }
 
@@ -1021,6 +1032,14 @@ mod tests {
         }
         fn tool_state(&self) -> &ToolState {
             &self.state
+        }
+        // Owned handles, so tools that rebuild a context for spawned nested
+        // executions (codemode) work against the mock unchanged.
+        fn env_handle(&self) -> Option<Arc<dyn ExecutionEnv>> {
+            Some(Arc::new(MockEnv))
+        }
+        fn tool_state_handle(&self) -> Option<Arc<ToolState>> {
+            Some(std::sync::Arc::new(ToolState::new()))
         }
     }
 

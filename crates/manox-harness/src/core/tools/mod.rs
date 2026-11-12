@@ -4,6 +4,7 @@
 // ExecutionEnv abstraction, making them runtime-agnostic.
 
 pub mod bash;
+pub mod codemode;
 pub mod edit;
 pub mod edit_diff;
 pub mod file_mutation_queue;

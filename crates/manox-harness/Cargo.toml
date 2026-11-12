@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+manox-codemode.workspace = true
 rustpython.workspace = true
 # Pin-only companions of `rustpython` (see the workspace manifest): pulled in
 # so the parser-crate version constraint lives in a manifest, not the lock.
