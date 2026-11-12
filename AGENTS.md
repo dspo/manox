@@ -11,6 +11,8 @@ manox 是**自研 agent runtime 库仓**（gpui-free、headless）：内核（ha
 ```
 crates/                    # Rust workspace 成员（全部 gpui-free）
   manox-agent/             # 核心 agent 逻辑（宿主层）
+  manox-codemode/          # QuickJS 脚本沙箱 + 工具桥（零 manox-harness 依赖；
+                           #   唯一消费者是 harness 的 CodemodeTool 薄壳，见 core/tools/codemode.rs）
   manox-providers/         # LLM provider 配置与路由
   manox-harness/           # Trait agent 内核（core/ + ext/ 两子模块）
     src/core/              # 通用 agent 内核（纯内核，无业务逻辑）
