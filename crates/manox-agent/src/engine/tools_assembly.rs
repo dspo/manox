@@ -516,9 +516,6 @@ pub(super) fn subagent_bash_tool(
 /// - Write/Edit carry the process write lock (`fence(FileLocked(tool))`, so
 ///   the fence judges before the lock is taken) and the same fs containment
 ///   verdict.
-/// - Py is deliberately absent: the interpreter runs in-process with no OS
-///   sandbox, so its only fence would be the host-side escalation round
-///   trip, which the child snapshot does not carry.
 ///
 /// This is the shared fallback shape (no escalation channel); the child
 /// authority arms each run at spawn with per-run replacements carrying the
@@ -910,13 +907,6 @@ pub(super) fn build_tools(
         Arc::new(manox_harness::tools::grep::GrepTool),
         Arc::new(manox_harness::tools::glob::GlobTool),
         Arc::new(manox_harness::tools::ls::LsTool),
-        // Py: a short Python script on the embedded interpreter. It is not a
-        // file tool — the prompt sends ordinary reads/writes/searches to
-        // Read/Write/Edit/Grep/Glob/Ls — and it owns no sandbox: unlike
-        // sandbox-confined Bash it has no OS fence to ride, so the gate
-        // fails it closed under sandbox and an approved escalation is
-        // its only wider road.
-        Arc::new(manox_harness::tools::py::PyTool),
         Arc::new(bash),
         Arc::new(BashOutputTool::new(background.clone())),
         Arc::new(HostTaskList {
@@ -954,10 +944,7 @@ pub(super) fn build_tools(
             }
             if matches!(
                 name.as_str(),
-                crate::tools::WRITE
-                    | crate::tools::EDIT
-                    | crate::tools::TASK_STOP
-                    | crate::tools::PY
+                crate::tools::WRITE | crate::tools::EDIT | crate::tools::TASK_STOP
             ) {
                 wrapper = wrapper.with_escalation(
                     Arc::clone(&escalation_approver),
