@@ -306,9 +306,11 @@ pub trait AgentTool: Send + Sync {
         true
     }
 
-    /// Preferred execution mode for this tool.
-    /// When any tool in a batch returns `Sequential`, the entire batch runs
-    /// sequentially.
+    /// Preferred execution mode for this tool. A call on a `Sequential` tool
+    /// is ordered against every other call in the batch (edges to and from it
+    /// in the scheduling DAG), so it runs strictly between its batch
+    /// neighbors — the rest of the batch still runs concurrently among
+    /// itself, on both sides of that barrier.
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Parallel
     }
