@@ -538,6 +538,7 @@ mod tests {
         delay_ms: u64,
         response: Result<JsonValue, String>,
         trace: Arc<StdMutex<Vec<String>>>,
+        schema: JsonValue,
     }
 
     #[async_trait::async_trait]
@@ -549,7 +550,7 @@ mod tests {
             "fake sibling"
         }
         fn parameters_schema(&self) -> JsonValue {
-            serde_json::json!({"type": "object"})
+            self.schema.clone()
         }
         fn execution_mode(&self) -> ExecutionMode {
             if self.sequential {
@@ -604,12 +605,31 @@ mod tests {
         response: Result<JsonValue, String>,
         trace: &Arc<StdMutex<Vec<String>>>,
     ) -> Arc<dyn AgentTool> {
+        fake_with_schema(
+            name,
+            sequential,
+            delay_ms,
+            response,
+            trace,
+            serde_json::json!({"type": "object"}),
+        )
+    }
+
+    fn fake_with_schema(
+        name: &str,
+        sequential: bool,
+        delay_ms: u64,
+        response: Result<JsonValue, String>,
+        trace: &Arc<StdMutex<Vec<String>>>,
+        schema: JsonValue,
+    ) -> Arc<dyn AgentTool> {
         Arc::new(FakeSibling {
             name: name.to_string(),
             sequential,
             delay_ms,
             response,
             trace: Arc::clone(trace),
+            schema,
         })
     }
 
@@ -867,6 +887,55 @@ mod tests {
         assert!(description.contains("async function body"), "prose present");
         assert!(description.contains("Echo("), "declaration present");
         assert!(!description.contains("too large to declare"));
+    }
+
+    /// The description's third part: a sibling whose sample blows the
+    /// declaration budget is dropped to a named hint (still callable,
+    /// discoverable via `ALL_TOOLS` / `describeTool`), and its declaration is
+    /// absent from the listing while the smaller sibling's stays.
+    #[test]
+    fn an_oversized_sibling_drops_to_the_named_discovery_hint() {
+        let trace = Arc::new(StdMutex::new(Vec::new()));
+        let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
+        // 13k chars of property description: the rendered type stays under
+        // the schema renderer's own 16k degradation ceiling (which would
+        // collapse it to `unknown` and hide the size) while the description +
+        // declaration sample blows the 3000-token budget in both the tagged
+        // and the untagged render.
+        let oversized = fake_with_schema(
+            "Huge",
+            false,
+            0,
+            Ok(serde_json::json!(1)),
+            &trace,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "data": {"type": "string", "description": "x".repeat(13_000)}
+                }
+            }),
+        );
+        let tool = CodemodeTool::new(vec![echo, oversized], BTreeMap::new());
+        // A dropped sibling stays script-callable — only its inline
+        // declaration is gone.
+        assert_eq!(
+            tool.script_tool_names(),
+            vec!["Echo".to_string(), "Huge".to_string()]
+        );
+        let description = tool.description();
+        assert!(
+            !description.contains("Huge("),
+            "no declaration: {description}"
+        );
+        assert!(
+            description.contains("Echo("),
+            "the fitting sibling declares"
+        );
+        assert!(
+            description.contains("still callable"),
+            "the hint: {description}"
+        );
+        assert!(description.contains("Huge"), "named in the hint");
     }
 
     /// A duplicate sibling name degrades to an unavailable tool with the
