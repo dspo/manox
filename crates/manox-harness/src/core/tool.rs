@@ -1772,6 +1772,88 @@ mod tests {
         assert!(idx("end:Bash") < idx("start:ReadC"), "{t:?}");
     }
 
+    /// Test 3b: a batch containing the real Codemode tool. Codemode declares
+    /// `Sequential` (its nested calls are invisible to this scheduler), so it
+    /// must run strictly between its batch neighbors: the read before it
+    /// completes first, the read after it waits for the script.
+    #[tokio::test]
+    async fn test_codemode_batch_is_sequential() {
+        let trace: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mk = |id: &'static str, name: &'static str, ro: bool| {
+            std::sync::Arc::new(FakeTool {
+                name: name.to_string(),
+                is_read_only: ro,
+                execution_mode: ExecutionMode::Parallel,
+                barrier: None,
+                gate: None,
+                trace: std::sync::Arc::clone(&trace),
+                trace_id: id.to_string(),
+            })
+        };
+        let codemode = std::sync::Arc::new(crate::tools::codemode::CodemodeTool::new(
+            Vec::new(),
+            Default::default(),
+        ));
+        let tools: Vec<std::sync::Arc<dyn AgentTool>> = vec![
+            mk("ReadA", "ReadA", true),
+            mk("ReadC", "ReadC", true),
+            codemode,
+        ];
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let calls = [
+            call("c1", "ReadA", Some("/a")),
+            (
+                "c2",
+                "Codemode",
+                serde_json::json!({"code": "text('script ran');"}),
+            ),
+            call("c3", "ReadC", Some("/c")),
+        ];
+        let (executed, _) = execute_tool_calls(
+            &calls,
+            &tools,
+            CancellationToken::new(),
+            &ctx,
+            &AgentLoopConfig::default(),
+            &RecordingSink(std::sync::Mutex::new(Vec::new())),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(executed.len(), 3);
+        assert!(
+            executed.iter().all(|e| !e.result.is_error),
+            "every call succeeds: {executed:?}"
+        );
+        // The script's own output reached its result.
+        assert!(
+            executed[1]
+                .result
+                .content
+                .iter()
+                .any(|b| matches!(b, crate::types::ContentBlock::Text { text, .. } if text.contains("script ran"))),
+            "the script output must reach the result: {:?}",
+            executed[1].result.content
+        );
+        let t = trace.lock().unwrap();
+        let idx = |tag: &str| {
+            t.iter()
+                .position(|e| e == tag)
+                .unwrap_or_else(|| panic!("{tag} missing: {t:?}"))
+        };
+        assert!(
+            idx("end:ReadA") < idx("start:ReadC"),
+            "Codemode barriers the batch: {t:?}"
+        );
+        assert!(
+            idx("end:ReadA") < idx("end:ReadC"),
+            "both reads must have completed: {t:?}"
+        );
+    }
+
     /// Test 4: Emission order determinism.
     ///
     /// Results must be returned in the original call order regardless of
