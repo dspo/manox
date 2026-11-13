@@ -73,7 +73,11 @@ instead.
   (`tokio::time::sleep_until` in the relay `select!`); firing takes the same
   terminal path and cancels the in-flight calls too. Ends as `timeout`.
 - First terminal wins: a `done` that races the deadline still reports the
-  script's own outcome; after any terminal, the VM thread exits promptly
+  script's own outcome. The one exception is the caller's cancellation: a
+  cancelled nested call rejects the script's promise, so the script can
+  report a `failed` done before the relay loop observes the cancel — both
+  orders end as `aborted`, because the rejection came from the stop itself.
+  After any terminal, the VM thread exits promptly
   (interrupt polls + recv steps) and is joined with a 3 s budget — a thread
   that misses it detaches and cleans up its own runtime, which the host never
   touches.

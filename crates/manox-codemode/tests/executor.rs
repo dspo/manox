@@ -366,6 +366,10 @@ async fn cancellation_aborts_a_script_awaiting_a_tool_result() {
     // the call has actually entered the tool: under the process-wide slot cap
     // the execution may queue for a while first, and an abort during the
     // queue wait is a different outcome (no calls recorded at all).
+    //
+    // The verdict is race-independent: whether the relay loop observes the
+    // cancel first or the script reports the cancellation-induced rejection
+    // first, the result is `aborted` (see `bridge::run`).
     let entered = Arc::new(tokio::sync::Notify::new());
     let entered_for_tool = Arc::clone(&entered);
     let parking = Arc::new(FnTool {

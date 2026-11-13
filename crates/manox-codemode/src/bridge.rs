@@ -10,8 +10,11 @@
 //!   each with a derived cancellation token. The global in-flight cap rejects
 //!   overflow calls immediately rather than queueing them.
 //! - The first terminal wins: `Done`, `Crash`, the deadline, or the caller's
-//!   cancellation. Every terminal cancels the in-flight calls and raises the
-//!   VM interrupt flag; records of calls that never completed stay `cancelled`.
+//!   cancellation. A caller cancellation overrides a `Done::Err` that raced
+//!   it — the rejection the script reported was the cancellation itself, so
+//!   the verdict must be `Aborted`, not a scheduling-dependent script error.
+//!   Every terminal cancels the in-flight calls and raises the VM interrupt
+//!   flag; records of calls that never completed stay `cancelled`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -167,6 +170,18 @@ pub(crate) async fn run(
         }
     }
 
+    // The caller's cancellation is the verdict, not the failure it causes: a
+    // cancelled nested call rejects the promise, so a script can report its
+    // own "failed" done before the relay loop observes the cancel. Both
+    // orders mean the user stopped the run, and the result must say so —
+    // otherwise the outcome depends on a scheduling race. A run that
+    // completed (`Done::Ok`) keeps its own verdict, and the deadline race is
+    // unchanged (first terminal wins).
+    let terminal = match terminal.expect("terminal set above") {
+        Terminal::Done(DoneMessage::Err { .. }) if cancel.is_cancelled() => Terminal::Aborted,
+        terminal => terminal,
+    };
+
     // First terminal closes the execution: raise the interrupt flag so the VM
     // thread unwinds, and cancel every in-flight call via its derived token.
     interrupt.store(true, Ordering::Relaxed);
@@ -185,7 +200,7 @@ pub(crate) async fn run(
     ExecutionOutcome {
         output: std::mem::take(&mut output.lock().expect("output lock")),
         calls: std::mem::take(&mut calls.lock().expect("calls lock")),
-        terminal: terminal.expect("terminal set above"),
+        terminal,
     }
 }
 
