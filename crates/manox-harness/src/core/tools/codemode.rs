@@ -115,16 +115,40 @@ impl manox_codemode::CodemodeTool for SiblingAdapter {
         // (`toolu_01:3`); the script-side id is the bridge's call counter.
         let nested_id = format!("{parent_call_id}:{script_call_id}");
         let run = self.tool.execute(&nested_id, args, signal, &*ctx);
+        // A sibling's panic must reach the script as a rejected call, not kill
+        // the spawned bridge task: an unreported task death leaves the prelude's
+        // pendingCount above zero and the script hangs until some outer
+        // deadline (or the user's Stop). The bridge discards its JoinHandles,
+        // so this is the only place the panic can be folded into the result.
         let outcome = match &self.serial {
             Some(serial) => {
                 let _guard = serial.lock().await;
-                run.await
+                catch_panic(run).await
             }
-            None => run.await,
+            None => catch_panic(run).await,
         };
         outcome
             .map_err(|error| error.to_string())
             .map(|result| tool_result_value(&result))
+    }
+}
+
+/// Catch a sibling execution's panic and fold it into the bridge's error
+/// channel. The panic payload is best-effort extracted (string payloads are
+/// common; anything else keeps only the fact of the panic).
+async fn catch_panic(
+    run: impl std::future::Future<Output = Result<AgentToolResult, ToolError>>,
+) -> Result<AgentToolResult, String> {
+    match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run)).await {
+        Ok(outcome) => outcome.map_err(|error| error.to_string()),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_owned());
+            Err(format!("tool panicked: {message}"))
+        }
     }
 }
 
@@ -372,25 +396,25 @@ impl AgentTool for CodemodeTool {
             text: header,
             signature: None,
         });
+        // The inline text is the crate's rendered output — body text items in
+        // order plus the trailing `<console_output>` block, soft-truncated to
+        // the script's budget. This block (not the raw `output` items) is what
+        // bounds what the model sees; the untruncated text travels via
+        // `full_output` when the budget fired.
+        if !result.text.is_empty() {
+            content.push(ContentBlock::Text {
+                text: result.text.clone(),
+                signature: None,
+            });
+        }
+        // Images cannot join the text block: they stay independent blocks,
+        // preserving their relative output order, after the text.
         for item in &result.output {
-            match item {
-                manox_codemode::OutputItem::Text { text, console } => {
-                    let text = if *console {
-                        format!("<console_output>\n{text}\n</console_output>")
-                    } else {
-                        text.clone()
-                    };
-                    content.push(ContentBlock::Text {
-                        text,
-                        signature: None,
-                    });
-                }
-                manox_codemode::OutputItem::Image { data, mime_type } => {
-                    content.push(ContentBlock::Image {
-                        data: data.clone(),
-                        mime_type: mime_type.clone(),
-                    });
-                }
+            if let manox_codemode::OutputItem::Image { data, mime_type } = item {
+                content.push(ContentBlock::Image {
+                    data: data.clone(),
+                    mime_type: mime_type.clone(),
+                });
             }
         }
         if let Some(value) = &result.value {
@@ -443,6 +467,8 @@ impl AgentTool for CodemodeTool {
         };
         let details = serde_json::json!({
             "calls": result.calls,
+            "totalCalls": result.total_calls,
+            "callsTruncated": result.calls.len() < result.total_calls,
             "storeWrites": store_writes,
             "options": options,
             "wallTimeMs": u64::try_from(result.wall_time.as_millis()).unwrap_or(u64::MAX),
@@ -484,9 +510,11 @@ fn owned_context(ctx: &dyn ToolContext) -> Result<Arc<dyn ToolContext>, ToolErro
     }
 }
 
-/// Persist the untruncated output next to the session's other scratch: a
-/// temp file named for the call, so a script's too-large answer stays
-/// recoverable through the file tools.
+/// Persist the untruncated output to a file under `std::env::temp_dir()`,
+/// named for the call plus a nanosecond suffix (a same-call re-entry writes a
+/// fresh file instead of clobbering the first). Nothing ever deletes these
+/// files — their lifecycle is the system's temp-dir reclamation; the reported
+/// path is what keeps the content recoverable through the file tools.
 fn write_full_output(tool_call_id: &str, full_output: &str) -> std::io::Result<std::path::PathBuf> {
     let safe: String = tool_call_id
         .chars()
@@ -498,7 +526,11 @@ fn write_full_output(tool_call_id: &str, full_output: &str) -> std::io::Result<s
             }
         })
         .collect();
-    let path = std::env::temp_dir().join(format!("manox-codemode-{safe}.txt"));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!("manox-codemode-{safe}-{nanos}.txt"));
     std::fs::write(&path, full_output)?;
     Ok(path)
 }
@@ -725,6 +757,58 @@ mod tests {
         );
     }
 
+    /// A sibling's panic reaches the script as a rejected call, not a stranded
+    /// execution: the bridge discards its JoinHandles, so a panic that escapes
+    /// the adapter would kill the spawned task silently, leave the prelude's
+    /// pendingCount above zero, and hang the script until an outer deadline.
+    #[tokio::test]
+    async fn panicking_sibling_rejects_the_call_and_the_script_completes() {
+        struct Panics;
+        #[async_trait::async_trait]
+        impl AgentTool for Panics {
+            fn name(&self) -> &str {
+                "Flip"
+            }
+            fn description(&self) -> &str {
+                "panics"
+            }
+            fn parameters_schema(&self) -> JsonValue {
+                serde_json::json!({"type": "object"})
+            }
+            fn execution_mode(&self) -> ExecutionMode {
+                ExecutionMode::Parallel
+            }
+            async fn execute(
+                &self,
+                _: &str,
+                _: JsonValue,
+                _: CancellationToken,
+                _: &dyn ToolContext,
+            ) -> Result<AgentToolResult, ToolError> {
+                panic!("deliberate boom");
+            }
+        }
+        let tool = CodemodeTool::new(vec![Arc::new(Panics)], BTreeMap::new());
+        let result = run_script(
+            &tool,
+            "call-1",
+            "try { await tools.Flip({}); } catch (e) { text('caught:' + (e.message ?? e)); }",
+        )
+        .await;
+        assert!(
+            result.error.is_none(),
+            "the script must complete normally: {:?}",
+            result.error
+        );
+        assert_eq!(result.calls.len(), 1);
+        assert_eq!(result.calls[0].status, manox_codemode::CallStatus::Error);
+        assert_eq!(
+            result.calls[0].error.as_deref(),
+            Some("tool panicked: deliberate boom")
+        );
+        assert!(body_texts(&result)[0].contains("caught:tool panicked: deliberate boom"));
+    }
+
     /// The `details` row the journal replays: stable camelCase keys, writes
     /// only on success, the call records, and the truncation path when the
     /// soft budget fired.
@@ -758,6 +842,8 @@ mod tests {
         );
         assert_eq!(details["options"]["timeoutMs"], JsonValue::Null);
         assert_eq!(details["calls"].as_array().map(Vec::len), Some(1));
+        assert_eq!(details["totalCalls"], serde_json::json!(1));
+        assert_eq!(details["callsTruncated"], serde_json::json!(false));
         assert!(details["wallTimeMs"].is_u64());
 
         // A failed script omits the writes entirely.
@@ -938,6 +1024,51 @@ mod tests {
         assert!(description.contains("Huge"), "named in the hint");
     }
 
+    /// The shared total declaration budget bounds the assembled description no
+    /// matter how many sizable siblings mount: later tools drop whole to the
+    /// name-only hint while earlier ones keep their declarations (first come,
+    /// first served). Ten ~2k-char samples would stack past 20k chars without
+    /// the cap; the shared pool is 3000 est-tokens (12k chars).
+    #[test]
+    fn many_sizable_siblings_keep_the_description_bounded() {
+        let trace = Arc::new(StdMutex::new(Vec::new()));
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"data": {"type": "string", "description": "x".repeat(2000)}}
+        });
+        let siblings: Vec<Arc<dyn AgentTool>> = (0..10)
+            .map(|i| {
+                fake_with_schema(
+                    &format!("Tool{i}"),
+                    false,
+                    0,
+                    Ok(serde_json::json!(1)),
+                    &trace,
+                    schema.clone(),
+                )
+            })
+            .collect();
+        let tool = CodemodeTool::new(siblings, BTreeMap::new());
+        let description = tool.description();
+        let total = description.chars().count();
+        assert!(
+            total < PROMPT.chars().count() + 12_000 + 2_000,
+            "the description must stay near the shared budget, got {total}"
+        );
+        assert!(
+            description.contains("Tool0("),
+            "the first tool keeps its declaration"
+        );
+        assert!(
+            !description.contains("Tool9("),
+            "a late tool drops whole: {description}"
+        );
+        assert!(
+            description.contains("Tool9"),
+            "the dropped tool is still named in the hint"
+        );
+    }
+
     /// A duplicate sibling name degrades to an unavailable tool with the
     /// reason in the description and an error result on execute — the
     /// assembly never dies for it.
@@ -1026,7 +1157,10 @@ mod tests {
     }
 
     /// Soft-truncated output lands in a temp file named after the call and
-    /// the path is reported both in the details and in the result text.
+    /// the path is reported both in the details and in the result text. The
+    /// inline text block is the crate's truncated rendering (omission marker
+    /// present, near the budget), not the raw 80k-char output — the default
+    /// budget actually bounds what reaches the model.
     #[tokio::test]
     async fn truncated_full_output_reaches_a_temp_file() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
@@ -1045,16 +1179,67 @@ mod tests {
         let details = result.details.expect("details row");
         let path =
             std::path::PathBuf::from(details["fullOutputPath"].as_str().expect("path reported"));
-        assert_eq!(
-            path,
-            std::env::temp_dir().join("manox-codemode-call_big_1.txt")
+        // The sanitized call id names the file; the nanosecond suffix keeps a
+        // same-call re-entry from clobbering it.
+        assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf8 file name")
+            .to_owned();
+        assert!(
+            name.starts_with("manox-codemode-call_big_1-") && name.ends_with(".txt"),
+            "unique per-write name: {name}"
         );
         let persisted = std::fs::read_to_string(&path).expect("full output persisted");
         assert_eq!(persisted.chars().count(), 80_000);
+        // The inline body is truncated in place: marker inside, size near the
+        // 10k-token (40k chars) budget — never the full 80k chars.
+        let ContentBlock::Text { text, .. } = &result.content[1] else {
+            panic!("the body text block follows the header");
+        };
+        assert!(text.contains("characters omitted"), "{text}");
+        assert!(
+            text.chars().count() < 50_000,
+            "inline text must be truncated, got {}",
+            text.chars().count()
+        );
         let ContentBlock::Text { text, .. } = &result.content[result.content.len() - 1] else {
             panic!("the truncation note is the last text block");
         };
         assert!(text.contains(&path.display().to_string()), "{text}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The session-facing content folds the crate's rendered text: body items
+    /// in order, one trailing `<console_output>` block, images as independent
+    /// blocks after the text — never per-item console blocks inline.
+    #[tokio::test]
+    async fn inline_content_is_rendered_text_plus_image_blocks() {
+        let trace = Arc::new(StdMutex::new(Vec::new()));
+        let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
+        let tool = CodemodeTool::new(vec![echo], BTreeMap::new());
+        let code = "text('a'); console.log('c1'); text('b'); \
+                    image('data:image/png;base64,iVBORw0KGgo=');";
+        let result = tool
+            .execute(
+                "call-1",
+                serde_json::json!({"code": code}),
+                CancellationToken::new(),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        // header, single rendered text block, one image block.
+        assert_eq!(result.content.len(), 3, "{:?}", result.content);
+        let ContentBlock::Text { text, .. } = &result.content[1] else {
+            panic!("second block is the rendered text");
+        };
+        assert_eq!(
+            text, "a\nb\n<console_output>\nc1\n</console_output>",
+            "console folds into the trailing block"
+        );
+        assert!(matches!(&result.content[2], ContentBlock::Image { .. }));
     }
 }

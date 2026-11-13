@@ -353,11 +353,20 @@ async fn cancellation_aborts_a_pure_js_loop() {
 #[tokio::test]
 async fn cancellation_aborts_a_script_awaiting_a_tool_result() {
     // The tool parks until its signal fires, so the only way out is the
-    // cancellation path through the recv loop.
+    // cancellation path through the recv loop. The canceller fires only once
+    // the call has actually entered the tool: under the process-wide slot cap
+    // the execution may queue for a while first, and an abort during the
+    // queue wait is a different outcome (no calls recorded at all).
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_for_tool = Arc::clone(&entered);
     let parking = Arc::new(FnTool {
         name: "park".to_owned(),
         f: move |_call_id: String, _args: Value, signal: CancellationToken| {
+            let entered = Arc::clone(&entered_for_tool);
             Box::pin(async move {
+                // notify_one parks a permit when nobody waits yet, so the
+                // canceller never misses the signal.
+                entered.notify_one();
                 signal.cancelled().await;
                 Err("cancelled".to_owned()) as Result<Value, String>
             }) as ToolFuture
@@ -367,7 +376,7 @@ async fn cancellation_aborts_a_script_awaiting_a_tool_result() {
     let cancel = CancellationToken::new();
     let canceller = cancel.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        entered.notified().await;
         canceller.cancel();
     });
     let result = executor
@@ -913,4 +922,97 @@ async fn declarations_render_into_describe_tool() {
     assert!(sample.contains("answer(args:"));
     let _ = DEFAULT_DECLARATION_BUDGET_TOKENS;
     let _ = to_js_identifier;
+}
+
+/// D9: the process-wide slot cap. Two real executions overlap (their tools
+/// meet at a two-party barrier, passable only while both hold a slot at
+/// once), and a third acquire queued behind a full quota fails at the
+/// (shortened) queue deadline as a sandbox-class error — a host resource, not
+/// a script fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn process_slot_cap_admits_two_and_fails_a_queued_third() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let meet = |name: &str, barrier: Arc<tokio::sync::Barrier>| {
+        Arc::new(FnTool {
+            name: name.to_owned(),
+            f: move |_call_id: String, _args: Value, _signal: CancellationToken| {
+                let barrier = Arc::clone(&barrier);
+                Box::pin(async move {
+                    // Only passable when both executions run concurrently.
+                    barrier.wait().await;
+                    Ok(json!({"met": true})) as Result<Value, String>
+                }) as ToolFuture
+            },
+        }) as Arc<dyn CodemodeTool>
+    };
+    let executor_a = executor_with(vec![meet("meet_a", Arc::clone(&barrier))]);
+    let executor_b = executor_with(vec![meet("meet_b", barrier)]);
+    let (result_a, result_b) = tokio::join!(
+        run(&executor_a, "await tools.meet_a({});"),
+        run(&executor_b, "await tools.meet_b({});")
+    );
+    assert!(
+        result_a.error.is_none(),
+        "the first execution must hold a slot: {:?}",
+        result_a.error
+    );
+    assert!(
+        result_b.error.is_none(),
+        "the second execution must hold a slot concurrently: {:?}",
+        result_b.error
+    );
+
+    // The queue deadline: hold the full quota directly (waiting out any
+    // parallel test's in-flight execution), then a queued acquire must time
+    // out without running.
+    let mut held = Vec::new();
+    for _ in 0..manox_codemode::MAX_CONCURRENT_EXECUTIONS {
+        loop {
+            match manox_codemode::execution_slots().try_acquire() {
+                Ok(permit) => {
+                    held.push(permit);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    }
+    let queued = manox_codemode::acquire_execution_slot(Duration::from_millis(250)).await;
+    let error = queued.expect_err("a full quota must time out the queued acquire");
+    assert_eq!(error.kind, CodemodeErrorKind::Sandbox);
+    assert!(
+        error.message.contains("process-wide slot") && error.message.contains("waited"),
+        "the queue timeout explains itself: {}",
+        error.message
+    );
+    drop(held);
+}
+
+/// The record list caps at the crate exit: details travel into the journal, so
+/// a fan-out script must not append unbounded rows. An over-cap script keeps
+/// the first records in issue order while the true count travels alongside;
+/// under the cap the count matches the list.
+#[tokio::test]
+async fn call_records_cap_with_total_count_at_the_crate_exit() {
+    let executor = echo_executor();
+    let source = "for (let i = 0; i < 120; i++) await tools.echo({ index: i });";
+    let result = run(&executor, source).await;
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(
+        result.calls.len(),
+        manox_codemode::types::MAX_RECORDED_CALLS,
+        "the list keeps only the first records"
+    );
+    assert_eq!(result.total_calls, 120, "the true count survives the cap");
+    assert!(
+        result
+            .calls
+            .iter()
+            .all(|call| call.name == "echo" && call.status == CallStatus::Ok),
+        "kept records stay in issue order with their status"
+    );
+
+    let small = run(&executor, "await tools.echo({}); await tools.echo({});").await;
+    assert_eq!(small.calls.len(), 2);
+    assert_eq!(small.total_calls, 2, "no phantom truncation under the cap");
 }

@@ -26,9 +26,10 @@ pub mod store;
 pub mod types;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::bridge::{DoneMessage, ExecutionOutcome, Terminal};
@@ -43,6 +44,40 @@ pub use crate::types::{
 
 /// The prelude evaluated inside every VM: the environment contract.
 pub(crate) const PRELUDE: &str = include_str!("prelude.js");
+
+/// Process-wide cap on concurrently running executions. One process hosts many
+/// sessions (windows), and each VM can reserve its memory budget — the slot
+/// cap bounds how far those reservations can stack. Arrival order queues.
+pub const MAX_CONCURRENT_EXECUTIONS: usize = 2;
+/// How long an execution may wait in line for a process-wide slot before it
+/// fails without running.
+pub const EXECUTION_QUEUE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The process-wide execution slots. One semaphore per process (tests can
+/// hold permits directly to pin queueing behavior).
+pub fn execution_slots() -> &'static Arc<Semaphore> {
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_EXECUTIONS)))
+}
+
+/// Acquire one process-wide execution slot, queueing in arrival order up to
+/// `timeout`. A timeout is a host-resource failure, not a script error, so it
+/// classifies as [`CodemodeErrorKind::Sandbox`].
+pub async fn acquire_execution_slot(
+    timeout: Duration,
+) -> Result<tokio::sync::OwnedSemaphorePermit, CodemodeError> {
+    let acquire = Semaphore::acquire_owned(Arc::clone(execution_slots()));
+    match tokio::time::timeout(timeout, acquire).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(CodemodeError::sandbox(
+            "the codemode execution slot semaphore is closed; this is a runtime bug",
+        )),
+        Err(_) => Err(CodemodeError::sandbox(format!(
+            "another codemode execution holds the process-wide slot; waited {}s",
+            timeout.as_secs()
+        ))),
+    }
+}
 
 /// A tool a codemode script can call via `tools.<name>(args)`. The crate has
 /// no harness dependency: the caller adapts its own tool type to this surface.
@@ -152,6 +187,11 @@ impl CodemodeExecutor {
     /// writes, a failed one returns none. Cancelling `cancel` ends the
     /// execution with [`CodemodeErrorKind::Aborted`].
     ///
+    /// Executions are admitted through the process-wide slot cap
+    /// ([`MAX_CONCURRENT_EXECUTIONS`]): arrivals queue in order and a wait
+    /// past [`EXECUTION_QUEUE_TIMEOUT`] fails as a sandbox-class result. The
+    /// slot is held for the whole run and released on completion.
+    ///
     /// Requires a tokio runtime context. Never returns `Err`: script failures
     /// are results, and every result carries the output produced before the
     /// failure.
@@ -165,6 +205,25 @@ impl CodemodeExecutor {
         let ParsedSource { code, options } = match source::parse_source(source) {
             Ok(parsed) => parsed,
             Err(error) => return self.empty_result(started, CodemodeError::script(error.message)),
+        };
+        // The slot acquire is async and must stay on the tokio side, before
+        // the VM thread starts (the bridge runs that thread blocking). A
+        // caller cancel during the queue wait aborts without running.
+        let _slot = tokio::select! {
+            slot = acquire_execution_slot(EXECUTION_QUEUE_TIMEOUT) => match slot {
+                Ok(permit) => permit,
+                Err(error) => return self.empty_result(started, error),
+            },
+            _ = cancel.cancelled() => {
+                return self.empty_result(
+                    started,
+                    CodemodeError {
+                        kind: CodemodeErrorKind::Aborted,
+                        message: "Execution aborted".into(),
+                        stack: None,
+                    },
+                );
+            }
         };
         let tools_json = self.tools_json();
         let store_json = serde_json::to_string(store).expect("a map of strings always serializes");
@@ -202,6 +261,7 @@ impl CodemodeExecutor {
             full_output: None,
             value: None,
             calls: Vec::new(),
+            total_calls: 0,
             store_writes: StoreWrites::default(),
             error: Some(error),
             wall_time: started.elapsed(),
@@ -209,7 +269,7 @@ impl CodemodeExecutor {
     }
 
     /// Fold the bridge outcome into the result: decode the terminal, render
-    /// the output text under the soft limit.
+    /// the output text under the soft limit, cap the call records.
     fn assemble(
         &self,
         started: Instant,
@@ -255,12 +315,20 @@ impl CodemodeExecutor {
             }
         }
         let (text, full_output) = types::render_output(&outcome.output, options.max_output_tokens);
+        // The record list is capped at the crate exit: details.travel into the
+        // journal, so a fan-out script must not append unbounded rows. The
+        // first records in issue order are kept; the true count travels
+        // alongside.
+        let total_calls = outcome.calls.len();
+        let mut calls = outcome.calls;
+        calls.truncate(types::MAX_RECORDED_CALLS);
         CodemodeResult {
             output: outcome.output,
             text,
             full_output,
             value,
-            calls: outcome.calls,
+            calls,
+            total_calls,
             store_writes: writes,
             error,
             wall_time: started.elapsed(),

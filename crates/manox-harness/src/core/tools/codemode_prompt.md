@@ -30,7 +30,8 @@ Environment contract:
 - `image(v)` — attach an image (base64 data URL, or `{ data, mimeType }`).
 - `store(key, value)` / `load(key)` — a small persistent JSON map carried by
   the session across Codemode calls; `store(key, undefined)` deletes.
-  Compressed sessions drop it.
+  The map survives compression: compaction rewrites only the conversation
+  context, and the stored data replays from the raw journal rows.
 - First line `// @options: {"max_output_tokens": N, "timeout_ms": N}` —
   optional output budget (default 10000 tokens) and a hard wall-clock
   deadline for the whole script including nested calls.

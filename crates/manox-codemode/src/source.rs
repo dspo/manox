@@ -7,11 +7,13 @@
 //! text(pkg.name);
 //! ```
 //!
-//! Only the first line may carry the directive; one appearing anywhere else
-//! would silently change options at a distance, so it is rejected before the
-//! script runs. The returned code keeps the original line numbering (the
-//! options line becomes an empty line) so error stacks point at the source as
-//! the model wrote it.
+//! Only the first line may carry the directive, and only the first line is
+//! ever inspected: line-level parsing cannot tell a real directive from an
+//! `// @options:`-prefixed line inside the script's own content (a template
+//! string, say), so lines beyond the first are left alone — to this parser
+//! they are ordinary comments and change nothing. The returned code keeps the
+//! original line numbering (the options line becomes an empty line) so error
+//! stacks point at the source as the model wrote it.
 
 use crate::types::DEFAULT_MAX_OUTPUT_TOKENS;
 
@@ -68,16 +70,6 @@ pub fn parse_source(input: &str) -> Result<ParsedSource, SourceError> {
                       `// @options: {\"max_output_tokens\": 1000}`."
                 .into(),
         });
-    }
-    for (index, line) in input.lines().enumerate().skip(1) {
-        if line.trim_start().starts_with(OPTIONS_PREFIX) {
-            return Err(SourceError {
-                message: format!(
-                    "The {OPTIONS_PREFIX} line must be the first line of the input; found one on line {}",
-                    index + 1
-                ),
-            });
-        }
     }
     let Some(newline) = input.find('\n') else {
         // Single line: either plain code or an options line with no body.
@@ -209,11 +201,15 @@ mod tests {
     }
 
     #[test]
-    fn misplaced_options_line_is_rejected() {
-        let error = parse_source("const a = 1;\n// @options: {}\ntext(a);\n")
-            .expect_err("misplaced options");
-        assert!(error.message.contains("must be the first line"));
-        assert!(error.message.contains("line 2"));
+    fn options_prefix_on_a_later_line_is_an_ordinary_comment() {
+        // Line-level parsing cannot distinguish a directive from an
+        // options-prefixed line inside the script's own content (a template
+        // string, say), so only the first line is inspected: a later
+        // options-prefixed line changes nothing and never fails the parse.
+        let source = "const a = 1;\n// @options: {\"timeout_ms\": 5}\ntext(a);\n";
+        let parsed = parse_source(source).expect("parses");
+        assert_eq!(parsed.options, SourceOptions::default());
+        assert_eq!(parsed.code, source, "the line stays verbatim in the code");
     }
 
     #[test]

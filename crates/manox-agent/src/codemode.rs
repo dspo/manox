@@ -5,10 +5,13 @@
 //! carries the writes a successful script made (`set` overrides, `delete`
 //! removes; failed scripts never produce writes). Folding those rows in chain
 //! order rebuilds the snapshot the next execution starts from — the same
-//! replay shape the UpdatePlan snapshot uses (`replay_thread_state`), with
-//! the same compression exposure: compaction drops the tool rows, so the
-//! store evaporates with them exactly like the plan snapshot does. No
-//! sidecar, no extra journal row type, no compat read.
+//! raw-row replay shape the journal-backed thread state uses
+//! (`replay_thread_state` folds `PlanUpdate` rows the same way). The journal
+//! is append-only: compaction only projects the context surface (an
+//! `Event::Compaction` row appended to the same chain), so the original tool
+//! rows persist and this replay reads them through `journal_range(0,
+//! u64::MAX)` — the store survives compaction. No sidecar, no extra journal
+//! row type, no compat read.
 //!
 //! Branch semantics follow for free: each branch's active chain folds only
 //! its own writes.

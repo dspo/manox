@@ -120,6 +120,8 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`）�
 - **crates/manox-harness/src/ext 扩展**：只经内核拓展点扩展业务能力（provider 自治注册、bash 编排、子代理、session sidecar、model_ref 等），不反向依赖宿主。
 - **manox-agent 宿主**：装配 + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、内建 skills 等）。manox-harness 是唯一 harness 后端。
 
+**内建脚本工具的权威模型**（Py + RustPython 已随 D16/D17 下线，此段是唯一权威表述）：内建脚本工具只有 **`Codemode`**（`manox-codemode` + `core/tools/codemode.rs`）——**零权威沙箱**：本体 ungated 装配（与 AskUserQuestion/UpdatePlan 同类），脚本唯一的出界能力是嵌套调用本会话已装配的工具实例，每个嵌套调用继承各自的审批门 / FileLock / 围栏，沙箱不加旁路；仓内**不存在**任何带进程内权威（进程内任意代码 + 自带 IO）的脚本工具，也不要再造一个（D16 结论）。需要真实 python3 的场景走 **Bash + 系统 python3**。
+
 ### 能力定层判定（每条新能力开工前必做）
 
 按三分法定层：
