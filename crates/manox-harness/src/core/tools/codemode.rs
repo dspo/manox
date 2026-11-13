@@ -115,16 +115,40 @@ impl manox_codemode::CodemodeTool for SiblingAdapter {
         // (`toolu_01:3`); the script-side id is the bridge's call counter.
         let nested_id = format!("{parent_call_id}:{script_call_id}");
         let run = self.tool.execute(&nested_id, args, signal, &*ctx);
+        // A sibling's panic must reach the script as a rejected call, not kill
+        // the spawned bridge task: an unreported task death leaves the prelude's
+        // pendingCount above zero and the script hangs until some outer
+        // deadline (or the user's Stop). The bridge discards its JoinHandles,
+        // so this is the only place the panic can be folded into the result.
         let outcome = match &self.serial {
             Some(serial) => {
                 let _guard = serial.lock().await;
-                run.await
+                catch_panic(run).await
             }
-            None => run.await,
+            None => catch_panic(run).await,
         };
         outcome
             .map_err(|error| error.to_string())
             .map(|result| tool_result_value(&result))
+    }
+}
+
+/// Catch a sibling execution's panic and fold it into the bridge's error
+/// channel. The panic payload is best-effort extracted (string payloads are
+/// common; anything else keeps only the fact of the panic).
+async fn catch_panic(
+    run: impl std::future::Future<Output = Result<AgentToolResult, ToolError>>,
+) -> Result<AgentToolResult, String> {
+    match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run)).await {
+        Ok(outcome) => outcome.map_err(|error| error.to_string()),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_owned());
+            Err(format!("tool panicked: {message}"))
+        }
     }
 }
 
@@ -723,6 +747,58 @@ mod tests {
             trace.iter().any(|line| line == "id:call-2:1"),
             "nested id must be <parent>:<script id>: {trace:?}"
         );
+    }
+
+    /// A sibling's panic reaches the script as a rejected call, not a stranded
+    /// execution: the bridge discards its JoinHandles, so a panic that escapes
+    /// the adapter would kill the spawned task silently, leave the prelude's
+    /// pendingCount above zero, and hang the script until an outer deadline.
+    #[tokio::test]
+    async fn panicking_sibling_rejects_the_call_and_the_script_completes() {
+        struct Panics;
+        #[async_trait::async_trait]
+        impl AgentTool for Panics {
+            fn name(&self) -> &str {
+                "Flip"
+            }
+            fn description(&self) -> &str {
+                "panics"
+            }
+            fn parameters_schema(&self) -> JsonValue {
+                serde_json::json!({"type": "object"})
+            }
+            fn execution_mode(&self) -> ExecutionMode {
+                ExecutionMode::Parallel
+            }
+            async fn execute(
+                &self,
+                _: &str,
+                _: JsonValue,
+                _: CancellationToken,
+                _: &dyn ToolContext,
+            ) -> Result<AgentToolResult, ToolError> {
+                panic!("deliberate boom");
+            }
+        }
+        let tool = CodemodeTool::new(vec![Arc::new(Panics)], BTreeMap::new());
+        let result = run_script(
+            &tool,
+            "call-1",
+            "try { await tools.Flip({}); } catch (e) { text('caught:' + (e.message ?? e)); }",
+        )
+        .await;
+        assert!(
+            result.error.is_none(),
+            "the script must complete normally: {:?}",
+            result.error
+        );
+        assert_eq!(result.calls.len(), 1);
+        assert_eq!(result.calls[0].status, manox_codemode::CallStatus::Error);
+        assert_eq!(
+            result.calls[0].error.as_deref(),
+            Some("tool panicked: deliberate boom")
+        );
+        assert!(body_texts(&result)[0].contains("caught:tool panicked: deliberate boom"));
     }
 
     /// The `details` row the journal replays: stable camelCase keys, writes
