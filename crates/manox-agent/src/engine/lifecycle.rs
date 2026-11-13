@@ -130,11 +130,14 @@ pub(super) fn toggle_browser_suite_names(
 
 /// Toggle a browser tool suite against the session's authoritative active-tool
 /// set. Reads the current set from the session, merges or strips the suite's
-/// names, and persists via `set_active_tools`.
+/// names, and persists via `set_active_tools`. The mirror follows
+/// unconditionally (a rejected toggle changes nothing, and the sync re-reads
+/// the truth either way).
 pub(super) async fn apply_browser_suite(
     session: &mut AgentSession,
     suite: BrowserSuite,
     enable: bool,
+    mirror: &ActiveToolMirror,
 ) {
     // `None` means the full mounted set is active.
     let current = session
@@ -144,6 +147,9 @@ pub(super) async fn apply_browser_suite(
     if let Err(err) = session.set_active_tools(names).await {
         tracing::warn!(error = %err, "failed to toggle browser tool suite");
     }
+    // Codemode's nested-call admission reads this mirror per call, so the
+    // suite toggle must govern the very next script.
+    mirror.sync_from(session);
 }
 
 /// The opt-in suites whose tool names are all present in a resolved
@@ -332,6 +338,7 @@ pub(super) fn session_builder(
     parent_session: Option<&str>,
     bus: &Arc<crate::steer_bus::AgentBus>,
     codemode_store: std::collections::BTreeMap<String, String>,
+    active_tool_mirror: &ActiveToolMirror,
 ) -> (
     manox_harness::coding_agent::AgentSessionBuilder,
     Arc<BackgroundManager>,
@@ -349,6 +356,7 @@ pub(super) fn session_builder(
         granted_roots,
         bus,
         codemode_store,
+        active_tool_mirror.getter(),
     );
     // One observer wiring per session: the host task center sees
     // every producer lifecycle from this session (card snapshots + stop
@@ -556,6 +564,7 @@ pub(super) async fn rebuild_session(
         None,
         bus,
         codemode_store,
+        &state.active_tool_mirror,
     );
     // Published per assembly like the acceptance-time writer: the actor's
     // access-mode apply propagates a mid-turn flip through this observer to
@@ -572,6 +581,10 @@ pub(super) async fn rebuild_session(
             attach_prefix_gate(&mut s, notice_tx, thread_id);
             adopt_session_model(&mut s, harness_model, state).await;
             *session = s;
+            // The mirror follows the swapped session before the actor serves
+            // any command: Codemode's nested-call admission reads it, and the
+            // restored selection may differ from the assembly default.
+            state.active_tool_mirror.sync_from(session);
             // The rebuilt session owns a new storage: its own journal relay.
             spawn_journal_relay(session, &state.journal_tx);
             // K5: the rebuilt session is the acceptance-time writer.

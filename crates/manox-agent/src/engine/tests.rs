@@ -1158,6 +1158,7 @@ fn test_engine_state() -> Arc<EngineState> {
         sessions: Mutex::new(Vec::new()),
         active_path: Mutex::new(None),
         pending_browser_suite: Mutex::new(None),
+        active_tool_mirror: ActiveToolMirror::default(),
         pending_session_cmds: Mutex::new(Vec::new()),
         current_appender: Mutex::new(None),
         current_resources: Mutex::new(None),
@@ -5636,7 +5637,13 @@ async fn embedder_tool_registered_after_assembly_reaches_schema_and_dispatch() {
     registered.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // What the actor does at the start of every `Prompt`.
-    refresh_embedder_tools(&mut session, "embedder-after", &state.gate).await;
+    refresh_embedder_tools(
+        &mut session,
+        "embedder-after",
+        &state.gate,
+        &state.active_tool_mirror,
+    )
+    .await;
     assert!(
         session.tools().iter().any(|n| n == "probe"),
         "refresh must surface the late registration in the tool table: {:?}",
@@ -5719,7 +5726,13 @@ async fn late_registration_lands_in_the_active_selection_of_a_narrowed_session()
     registered.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let state = test_engine_state();
-    refresh_embedder_tools(&mut session, "embedder-narrowed", &state.gate).await;
+    refresh_embedder_tools(
+        &mut session,
+        "embedder-narrowed",
+        &state.gate,
+        &state.active_tool_mirror,
+    )
+    .await;
 
     assert!(
         session.tools().iter().any(|n| n == "probe"),
@@ -5792,7 +5805,13 @@ async fn withdrawn_registration_leaves_the_table_and_the_active_selection() {
 
     registered.store(true, std::sync::atomic::Ordering::SeqCst);
     let state = test_engine_state();
-    refresh_embedder_tools(&mut session, "embedder-withdraw", &state.gate).await;
+    refresh_embedder_tools(
+        &mut session,
+        "embedder-withdraw",
+        &state.gate,
+        &state.active_tool_mirror,
+    )
+    .await;
     assert!(
         session.tools().iter().any(|n| n == "probe"),
         "the registration must mount: {:?}",
@@ -5805,7 +5824,13 @@ async fn withdrawn_registration_leaves_the_table_and_the_active_selection() {
         .unwrap();
 
     registered.store(false, std::sync::atomic::Ordering::SeqCst);
-    refresh_embedder_tools(&mut session, "embedder-withdraw", &state.gate).await;
+    refresh_embedder_tools(
+        &mut session,
+        "embedder-withdraw",
+        &state.gate,
+        &state.active_tool_mirror,
+    )
+    .await;
 
     assert!(
         !session.tools().iter().any(|n| n == "probe"),
@@ -5822,6 +5847,76 @@ async fn withdrawn_registration_leaves_the_table_and_the_active_selection() {
         invocations.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "the probe was never dispatched in this test"
+    );
+
+    crate::embedder_tools::drop_provider_for_test();
+}
+
+/// The refresh's rewritten selection must reach the CodemodeTool's
+/// nested-call admission source in the same breath: after the embedder
+/// refresh widens a narrowed selection, the engine's [`ActiveToolMirror`]
+/// reads exactly what `session.active_tool_names()` reports. Seeding the
+/// mirror with the PRE-refresh set pins that the sync lives inside the
+/// refresh itself — a caller-side or absent sync would leave the stale
+/// narrowed set in the mirror and let the gap reopen.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn embedder_refresh_syncs_the_active_tool_mirror() {
+    let _slot = EMBEDDER_SLOT_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("proj");
+    tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+    let registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    crate::embedder_tools::set_provider(Arc::new(ProbeProvider {
+        registered: Arc::clone(&registered),
+        tool: ProbeClientTool {
+            invocations: Arc::clone(&invocations),
+        },
+        session_id: "embedder-mirror",
+    }));
+
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &HarnessModel| {
+        Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+    });
+    let mut session = create_agent_session()
+        .with_cwd(&cwd)
+        .with_session_dir(dir.path().join("sessions"))
+        .with_model_runtime(ModelRuntime::new(resolver))
+        .with_model(test_model())
+        .with_system_prompt("You are a test assistant.")
+        .build()
+        .await
+        .unwrap();
+    // Narrowed selection with no client tool in it — the browser-suite
+    // toggle shape — and the mirror seeded from that pre-refresh truth
+    // (the actor's post-open sync shape).
+    session.set_active_tools(vec![]).await.unwrap();
+    let mirror = ActiveToolMirror::default();
+    mirror.sync_from(&session);
+    assert_eq!(
+        mirror.getter()(),
+        session.active_tool_names(),
+        "precondition: the mirror tracks the narrowed selection"
+    );
+
+    // The registration lands and the refresh widens the authoritative set.
+    registered.store(true, std::sync::atomic::Ordering::SeqCst);
+    let state = test_engine_state();
+    refresh_embedder_tools(&mut session, "embedder-mirror", &state.gate, &mirror).await;
+
+    let active = session.active_tool_names().expect("selection stays Some");
+    assert!(
+        active.iter().any(|n| n == "probe"),
+        "the refresh widened the authoritative set: {active:?}"
+    );
+    assert_eq!(
+        mirror.getter()(),
+        session.active_tool_names(),
+        "the mirror must read exactly the session's authoritative selection \
+         after the refresh: mirror={:?} session={active:?}",
+        mirror.getter()()
     );
 
     crate::embedder_tools::drop_provider_for_test();
@@ -7688,6 +7783,7 @@ async fn codemode_nested_escalation_round_trip_inherits_the_gate() {
     let codemode = manox_harness::tools::codemode::CodemodeTool::new(
         vec![Arc::new(gated) as Arc<dyn HarnessAgentTool>],
         Default::default(),
+        std::sync::Arc::new(|| None::<Vec<String>>),
     );
     let ctx = manox_harness::tool::LocalToolContext::new(
         Arc::new(manox_harness::env::TokioExecutionEnv::new(
@@ -7778,6 +7874,7 @@ async fn codemode_mounts_ungated_exactly_once_and_excludes_itself() {
         &granted,
         &bus,
         Default::default(),
+        ActiveToolMirror::default().getter(),
     );
 
     assert_eq!(
@@ -7809,11 +7906,27 @@ async fn codemode_mounts_ungated_exactly_once_and_excludes_itself() {
         codemode.description().contains("Write("),
         "the gated Write sibling must be script-callable"
     );
-    // The dormant browser suite is a consent control, so it is not part of
-    // the script surface at all: the description neither declares its tools
-    // nor names them in the dropped-tools hint.
+    // The mounted order keeps Glob/Ls ahead of Bash: the Bash hoist is the
+    // script surface's declaration-pool priority only.
+    let position = |needle: &str| {
+        tools
+            .iter()
+            .position(|t| t.name() == needle)
+            .unwrap_or_else(|| panic!("{needle} must mount"))
+    };
+    assert!(position(crate::tools::GLOB) < position(crate::tools::BASH));
+    // The script surface declares Bash first among the file helpers: the
+    // shared 3000-token pool is first come, first served, and the bash
+    // fan-out scenario must not lose Bash's declaration to the tools that
+    // mount earlier.
+    let description = codemode.description();
+    let bash_declaration = description
+        .find("Bash(")
+        .expect("the hoisted Bash sibling must keep its declaration");
     assert!(
-        !codemode.description().contains("WebExplore"),
-        "the opt-in browser suite must not be advertised to scripts"
+        description
+            .find("Glob(")
+            .is_none_or(|at| bash_declaration < at),
+        "Bash must declare ahead of Glob when both fit"
     );
 }

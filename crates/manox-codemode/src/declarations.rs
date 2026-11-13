@@ -54,14 +54,7 @@ pub const DEFAULT_DECLARATION_BUDGET_TOKENS: usize = 3000;
 /// Shared budget across every tool's sample combined, in estimated tokens:
 /// the declaration listing must stay bounded no matter how wide the tool
 /// surface grows (MCP servers add tools and schema bulk linearly).
-///
-/// 4000 admits the core shell/file surface of the main assembly — Read,
-/// Write, Edit, Bash, BashOutput, Grep, Glob, Ls — as inline declarations
-/// (~18.4k characters, ~4.6k est-tokens including the prompt); the per-tool
-/// budget alone would let the listing grow to ~8.8k est-tokens on the same
-/// surface, and a narrower 3000-token pool pushed Bash into the name-only
-/// list.
-pub const DEFAULT_TOTAL_DECLARATION_BUDGET_TOKENS: usize = 4000;
+pub const DEFAULT_TOTAL_DECLARATION_BUDGET_TOKENS: usize = 3000;
 /// Largest rendered input type, in characters, before it degrades (`unknown`
 /// at the schema level, tag-drop and tool-drop at the budget level).
 const SCHEMA_MAX_CHARS: usize = 16_000;

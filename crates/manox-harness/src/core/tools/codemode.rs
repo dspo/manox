@@ -5,7 +5,11 @@
 // The tool carries no authority of its own: the sibling tool instances it
 // nests into are the exact wrapped instances the top-level surface mounts
 // (approval gating, file locks, fences), so every nested call is judged like
-// the equivalent top-level call — the sandbox adds no bypass. The bridge
+// the equivalent top-level call — the sandbox adds no bypass. The session's
+// active-tool selection governs nested calls the same way it filters the
+// top-level dispatch: a sibling outside the live selection is rejected per
+// call (`None` = never narrowed = full set, the session's own semantics).
+// The bridge
 // (`manox-codemode`) runs nested calls on spawned tasks, so this side owns
 // two seams the bridge cannot: an owned `ToolContext` (reinstalled per
 // execution from the incoming call's context) and the sequential-execution
@@ -28,12 +32,19 @@ use crate::types::ContentBlock;
 /// TypeScript declarations) is appended at construction.
 const PROMPT: &str = include_str!("codemode_prompt.md");
 
+/// A synchronous read of the session's authoritative active-tool selection,
+/// evaluated per nested call. `Some(names)` is the allowlist in force; `None`
+/// means the session never narrowed and the full mounted set plays. Erased so
+/// this harness-core module stays decoupled from the host session type.
+pub type ActiveToolSelection = Arc<dyn Fn() -> Option<Vec<String>> + Send + Sync>;
+
 /// One sibling adapted to the bridge's tool trait. The adapter holds the
 /// per-execution call environment (parent call id + owned context) in a
-/// mutex cell. Two guarantees keep that cell single-writer: the tool declares
-/// `Sequential` (so the batch scheduler never overlaps it with another call)
-/// and `CodemodeTool::execute` holds a per-instance execution mutex, so even
-/// a caller that bypasses the scheduler cannot cross-wire two runs.
+/// mutex cell: a `CodemodeTool` never runs two executions concurrently —
+/// the top-level scheduler honors its `Sequential` declaration, and
+/// `AgentTool::execute` enforces the same exclusion locally with its run
+/// lock — so the cell has a single writer per execution and every nested
+/// call of that execution reads the same environment.
 struct SiblingAdapter {
     tool: Arc<dyn AgentTool>,
     /// Present exactly when the sibling declares `ExecutionMode::Sequential`:
@@ -45,6 +56,9 @@ struct SiblingAdapter {
     /// per instance.
     serial: Option<Arc<tokio::sync::Mutex<()>>>,
     call_env: std::sync::Mutex<CallEnv>,
+    /// The live active-tool selection, read per nested call (see
+    /// [`ActiveToolSelection`]).
+    active_tool_set: ActiveToolSelection,
 }
 
 /// The environment one execution's nested calls run under.
@@ -60,7 +74,11 @@ struct CallEnv {
 }
 
 impl SiblingAdapter {
-    fn new(tool: Arc<dyn AgentTool>, serial_slot: &Arc<tokio::sync::Mutex<()>>) -> Self {
+    fn new(
+        tool: Arc<dyn AgentTool>,
+        serial_slot: &Arc<tokio::sync::Mutex<()>>,
+        active_tool_set: ActiveToolSelection,
+    ) -> Self {
         let serial =
             (tool.execution_mode() == ExecutionMode::Sequential).then(|| Arc::clone(serial_slot));
         SiblingAdapter {
@@ -70,6 +88,7 @@ impl SiblingAdapter {
                 parent_call_id: String::new(),
                 ctx: None,
             }),
+            active_tool_set,
         }
     }
 
@@ -100,6 +119,20 @@ impl manox_codemode::CodemodeTool for SiblingAdapter {
         args: JsonValue,
         signal: CancellationToken,
     ) -> Result<JsonValue, String> {
+        // Admission runs against the LIVE selection per call, before any
+        // context install: the session can narrow or widen it while this
+        // instance is mounted (composer suite toggles), so two nested calls
+        // of one script may legitimately see different sets. `None` is the
+        // session's own "never narrowed" shape — the full mounted set plays.
+        if let Some(active) = (self.active_tool_set)()
+            && !active.iter().any(|name| name == self.tool.name())
+        {
+            return Err(format!(
+                "\"{}\" is not in the session's active tool selection; the user \
+                 can toggle tools from the composer",
+                self.tool.name()
+            ));
+        }
         let (parent_call_id, ctx) = {
             let env = self.call_env.lock().unwrap_or_else(|e| e.into_inner());
             match &env.ctx {
@@ -193,12 +226,15 @@ pub struct CodemodeTool {
     /// continuity is separate — the journal replay folds the same writes out
     /// of the transcript at assembly (manox-agent `codemode` module).
     store: std::sync::Mutex<BTreeMap<String, String>>,
-    /// One execution at a time per instance. The sibling adapters carry the
-    /// running execution's context in a shared cell, so overlapping runs
-    /// would cross-wire their nested calls; `Sequential` keeps the batch
-    /// scheduler from doing that, and this mutex keeps the invariant local.
-    executions: tokio::sync::Mutex<()>,
     description: String,
+    /// Per-instance execution mutex, held across install → run → store fold.
+    /// The adapters' shared call-env cell is correct only under "one
+    /// execution per instance at a time"; the top-level DAG already
+    /// guarantees that (the tool declares `Sequential`), and this lock makes
+    /// the guarantee local so the tool never depends on its caller's
+    /// scheduling. Nested sibling calls do not take it — concurrency inside
+    /// one script is unaffected.
+    run_lock: tokio::sync::Mutex<()>,
 }
 
 impl CodemodeTool {
@@ -208,15 +244,18 @@ impl CodemodeTool {
     /// seeds the session's `store`/`load` map (the journal replay's fold; an
     /// empty map for a fresh session). The map type is the bridge's own
     /// snapshot type (key -> serialized JSON), so the replay's fold lands
-    /// verbatim.
+    /// verbatim. `active_tool_set` is the session's authoritative active
+    /// selection read fresh on every nested call — a sibling outside it is
+    /// rejected (`None` = never narrowed = full set).
     pub fn new(
         siblings: Vec<Arc<dyn AgentTool>>,
         initial_store: std::collections::BTreeMap<String, String>,
+        active_tool_set: ActiveToolSelection,
     ) -> Self {
         let serial_slot = Arc::new(tokio::sync::Mutex::new(()));
         let adapters: Vec<Arc<SiblingAdapter>> = siblings
             .into_iter()
-            .map(|tool| SiblingAdapter::new(tool, &serial_slot))
+            .map(|tool| SiblingAdapter::new(tool, &serial_slot, Arc::clone(&active_tool_set)))
             .map(Arc::new)
             .collect();
         let bridge_tools: Vec<Arc<dyn manox_codemode::CodemodeTool>> = adapters
@@ -238,8 +277,8 @@ impl CodemodeTool {
                 description.push_str("```\n");
                 if !rendered.dropped.is_empty() {
                     description.push_str(&format!(
-                        "\n{} tool{} ({} too large to declare) {} still callable — discover \
-                         {} with `ALL_TOOLS` / `describeTool`.\n",
+                        "\n{} tool{} ({} too large to declare) {} still callable when active \
+                         — discover {} with `ALL_TOOLS` / `describeTool`.\n",
                         rendered.dropped.len(),
                         if rendered.dropped.len() == 1 { "" } else { "s" },
                         rendered.dropped.join(", "),
@@ -266,8 +305,8 @@ impl CodemodeTool {
             executor,
             adapters,
             store: std::sync::Mutex::new(initial_store),
-            executions: tokio::sync::Mutex::new(()),
             description,
+            run_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -354,9 +393,11 @@ impl AgentTool for CodemodeTool {
                     .into(),
             ));
         };
-        // The adapter cell carries one execution's environment: serialize here
-        // so a caller outside the batch scheduler cannot cross-wire two runs.
-        let _execution = self.executions.lock().await;
+        // One execution per instance at a time (see `run_lock`): the guard
+        // spans the context install, the run, and the store fold, so a
+        // concurrent second execute cannot re-stamp the adapters' call env
+        // mid-run or interleave its writes into the fold.
+        let _run = self.run_lock.lock().await;
         let owned_ctx = owned_context(ctx)?;
         for adapter in &self.adapters {
             adapter.install(tool_call_id, Arc::clone(&owned_ctx));
@@ -563,6 +604,12 @@ mod tests {
     use crate::tool::ToolState;
     use std::sync::Mutex as StdMutex;
 
+    /// A getter that always reports "never narrowed" (`None` — the full
+    /// mounted set plays) for tests that don't exercise the admission.
+    fn unnarrowed() -> ActiveToolSelection {
+        Arc::new(|| None::<Vec<String>>)
+    }
+
     fn ctx() -> LocalToolContext {
         LocalToolContext::new(
             Arc::new(TokioExecutionEnv::new(std::env::temp_dir())),
@@ -723,7 +770,7 @@ mod tests {
             Err("the file does not exist".to_string()),
             &trace,
         );
-        let tool = CodemodeTool::new(vec![echo, failing], BTreeMap::new());
+        let tool = CodemodeTool::new(vec![echo, failing], BTreeMap::new(), unnarrowed());
 
         // The happy path: the script sees the adapted result object —
         // output text, error flag, details — not the raw block list.
@@ -798,7 +845,7 @@ mod tests {
                 panic!("deliberate boom");
             }
         }
-        let tool = CodemodeTool::new(vec![Arc::new(Panics)], BTreeMap::new());
+        let tool = CodemodeTool::new(vec![Arc::new(Panics)], BTreeMap::new(), unnarrowed());
         let result = run_script(
             &tool,
             "call-1",
@@ -826,7 +873,7 @@ mod tests {
     async fn details_shape_is_stable_and_serializable() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![echo], BTreeMap::new());
+        let tool = CodemodeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
 
         let result = tool
             .execute(
@@ -884,7 +931,7 @@ mod tests {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let seq_a = fake("SeqA", true, 60, Ok(serde_json::json!(1)), &trace);
         let seq_b = fake("SeqB", true, 60, Ok(serde_json::json!(2)), &trace);
-        let tool = CodemodeTool::new(vec![seq_a, seq_b], BTreeMap::new());
+        let tool = CodemodeTool::new(vec![seq_a, seq_b], BTreeMap::new(), unnarrowed());
         let result = run_script(
             &tool,
             "call-1",
@@ -953,6 +1000,7 @@ mod tests {
                 }),
             ],
             BTreeMap::new(),
+            unnarrowed(),
         );
         let result = run_script(
             &tool,
@@ -975,7 +1023,7 @@ mod tests {
     fn description_carries_prose_and_declarations_without_self() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![echo], BTreeMap::new());
+        let tool = CodemodeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
         let names = tool.script_tool_names();
         assert_eq!(names, vec!["Echo".to_string()]);
         assert!(!names.contains(&"Codemode".to_string()));
@@ -986,9 +1034,10 @@ mod tests {
     }
 
     /// The description's third part: a sibling whose sample blows the
-    /// declaration budget is dropped to a named hint (still callable,
-    /// discoverable via `ALL_TOOLS` / `describeTool`), and its declaration is
-    /// absent from the listing while the smaller sibling's stays.
+    /// declaration budget is dropped to a named hint (still callable when the
+    /// live selection admits it, discoverable via `ALL_TOOLS` /
+    /// `describeTool`), and its declaration is absent from the listing while
+    /// the smaller sibling's stays.
     #[test]
     fn an_oversized_sibling_drops_to_the_named_discovery_hint() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
@@ -1011,7 +1060,7 @@ mod tests {
                 }
             }),
         );
-        let tool = CodemodeTool::new(vec![echo, oversized], BTreeMap::new());
+        let tool = CodemodeTool::new(vec![echo, oversized], BTreeMap::new(), unnarrowed());
         // A dropped sibling stays script-callable — only its inline
         // declaration is gone.
         assert_eq!(
@@ -1038,8 +1087,7 @@ mod tests {
     /// matter how many sizable siblings mount: later tools drop whole to the
     /// name-only hint while earlier ones keep their declarations (first come,
     /// first served). Ten ~2k-char samples would stack past 20k chars without
-    /// the cap; the bound here is derived from the shared pool constant, so a
-    /// tuned budget does not silently invalidate the assertion.
+    /// the cap; the shared pool is 3000 est-tokens (12k chars).
     #[test]
     fn many_sizable_siblings_keep_the_description_bounded() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
@@ -1059,14 +1107,11 @@ mod tests {
                 )
             })
             .collect();
-        let tool = CodemodeTool::new(siblings, BTreeMap::new());
+        let tool = CodemodeTool::new(siblings, BTreeMap::new(), unnarrowed());
         let description = tool.description();
         let total = description.chars().count();
-        let shared_pool_chars =
-            manox_codemode::declarations::DEFAULT_TOTAL_DECLARATION_BUDGET_TOKENS
-                * manox_codemode::types::CHARS_PER_TOKEN;
         assert!(
-            total < PROMPT.chars().count() + shared_pool_chars + 2_000,
+            total < PROMPT.chars().count() + 12_000 + 2_000,
             "the description must stay near the shared budget, got {total}"
         );
         assert!(
@@ -1091,7 +1136,7 @@ mod tests {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let a = fake("Dup", false, 0, Ok(serde_json::json!(1)), &trace);
         let b = fake("Dup", false, 0, Ok(serde_json::json!(2)), &trace);
-        let tool = CodemodeTool::new(vec![a, b], BTreeMap::new());
+        let tool = CodemodeTool::new(vec![a, b], BTreeMap::new(), unnarrowed());
         assert!(tool.executor.is_err());
         assert!(tool.script_tool_names().is_empty());
         assert!(tool.description().contains("UNAVAILABLE"));
@@ -1116,7 +1161,7 @@ mod tests {
     async fn store_updates_follow_successful_executions() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![echo], BTreeMap::new());
+        let tool = CodemodeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
         async fn run(tool: &CodemodeTool, call_id: &str, code: &str) -> AgentToolResult {
             tool.execute(
                 call_id,
@@ -1162,6 +1207,7 @@ mod tests {
         let tool = CodemodeTool::new(
             vec![echo],
             BTreeMap::from([("seed".to_string(), "\"planted\"".to_string())]),
+            unnarrowed(),
         );
         let result = run_script(&tool, "c1", "text(String(load('seed')));").await;
         assert!(result.error.is_none(), "{:?}", result.error);
@@ -1179,7 +1225,7 @@ mod tests {
     async fn truncated_full_output_reaches_a_temp_file() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![echo], BTreeMap::new());
+        let tool = CodemodeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
         let result = tool
             .execute(
                 "call/big:1",
@@ -1232,7 +1278,7 @@ mod tests {
     async fn inline_content_is_rendered_text_plus_image_blocks() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![echo], BTreeMap::new());
+        let tool = CodemodeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
         let code = "text('a'); console.log('c1'); text('b'); \
                     image('data:image/png;base64,iVBORw0KGgo=');";
         let result = tool
@@ -1255,5 +1301,181 @@ mod tests {
             "console folds into the trailing block"
         );
         assert!(matches!(&result.content[2], ContentBlock::Image { .. }));
+    }
+
+    /// A shared selection cell the tests flip between executions of the SAME
+    /// tool instance — the dynamism half of the admission contract.
+    type SelectionCell = Arc<StdMutex<Option<Vec<String>>>>;
+
+    fn getter_from(cell: &SelectionCell) -> ActiveToolSelection {
+        let cell = Arc::clone(cell);
+        Arc::new(move || cell.lock().unwrap().clone())
+    }
+
+    /// A fresh session's authoritative selection is the mounted set minus the
+    /// browser suite (the composer `+` menu keeps it dormant), and a script
+    /// must not pull `WebExploreOpen` through the codemode surface the user
+    /// never enabled: the nested call is rejected with the composer-toggle
+    /// message while an in-selection sibling stays callable.
+    #[tokio::test]
+    async fn deselected_sibling_is_rejected_by_the_active_selection() {
+        let trace = Arc::new(StdMutex::new(Vec::new()));
+        let cell: SelectionCell = Arc::new(StdMutex::new(Some(vec![
+            "Read".to_string(),
+            "Bash".to_string(),
+            "Echo".to_string(),
+        ])));
+        let web = fake("WebExploreOpen", false, 0, Ok(serde_json::json!(1)), &trace);
+        let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
+        let tool = CodemodeTool::new(vec![web, echo], BTreeMap::new(), getter_from(&cell));
+        let result = run_script(
+            &tool,
+            "c1",
+            "const out = []; \
+             try { await tools.WebExploreOpen({}); } catch (e) { out.push(String(e.message ?? e)); } \
+             const ok = await tools.Echo({}); \
+             text(out.join('|'));",
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.calls.len(), 2);
+        assert_eq!(result.calls[0].name, "WebExploreOpen");
+        assert_eq!(result.calls[0].status, manox_codemode::CallStatus::Error);
+        assert_eq!(
+            result.calls[0].error.as_deref(),
+            Some(
+                "\"WebExploreOpen\" is not in the session's active tool selection; the user \
+                 can toggle tools from the composer"
+            ),
+        );
+        assert_eq!(result.calls[1].status, manox_codemode::CallStatus::Ok);
+        assert_eq!(
+            body_texts(&result),
+            vec![format!(
+                "\"WebExploreOpen\" is not in the session's active tool selection; the user \
+                 can toggle tools from the composer"
+            )]
+        );
+    }
+
+    /// Once the user enables the suite, the same mounted sibling's nested
+    /// call passes the admission untouched — the selection widens, the call
+    /// reaches the tool.
+    #[tokio::test]
+    async fn enabled_selection_admits_the_suite_sibling() {
+        let trace = Arc::new(StdMutex::new(Vec::new()));
+        let cell: SelectionCell = Arc::new(StdMutex::new(Some(vec![
+            "Read".to_string(),
+            "WebExploreOpen".to_string(),
+        ])));
+        let web = fake("WebExploreOpen", false, 0, Ok(serde_json::json!(1)), &trace);
+        let tool = CodemodeTool::new(vec![web], BTreeMap::new(), getter_from(&cell));
+        let result = run_script(&tool, "c1", "await tools.WebExploreOpen({});").await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.calls.len(), 1);
+        assert_eq!(result.calls[0].status, manox_codemode::CallStatus::Ok);
+        assert_eq!(result.calls[0].error, None);
+    }
+
+    /// `None` keeps the session's own never-narrowed semantics: the full
+    /// mounted set plays, so every sibling's nested call passes even a name
+    /// a narrowed selection would exclude.
+    #[tokio::test]
+    async fn unnarrowed_selection_admits_every_sibling() {
+        let trace = Arc::new(StdMutex::new(Vec::new()));
+        let web = fake("WebExploreOpen", false, 0, Ok(serde_json::json!(1)), &trace);
+        let tool = CodemodeTool::new(vec![web], BTreeMap::new(), unnarrowed());
+        let result = run_script(&tool, "c1", "await tools.WebExploreOpen({});").await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.calls.len(), 1);
+        assert_eq!(result.calls[0].status, manox_codemode::CallStatus::Ok);
+    }
+
+    /// The selection is read live per nested call: flipping the same tool
+    /// instance's getter output (suite off → on → off) changes the verdict of
+    /// the NEXT execution immediately, with no rebuild in between.
+    #[tokio::test]
+    async fn selection_flips_apply_to_the_next_nested_call_without_a_rebuild() {
+        let trace = Arc::new(StdMutex::new(Vec::new()));
+        let cell: SelectionCell = Arc::new(StdMutex::new(Some(vec!["Echo".to_string()])));
+        let web = fake("WebExploreOpen", false, 0, Ok(serde_json::json!(1)), &trace);
+        let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
+        let tool = CodemodeTool::new(vec![web, echo], BTreeMap::new(), getter_from(&cell));
+        let suite_status = |result: &manox_codemode::CodemodeResult| {
+            result
+                .calls
+                .iter()
+                .find(|call| call.name == "WebExploreOpen")
+                .map(|call| call.status)
+                .expect("the WebExploreOpen call record")
+        };
+
+        // Off: rejected.
+        let result = run_script(&tool, "c1", "await tools.WebExploreOpen({});").await;
+        assert_eq!(suite_status(&result), manox_codemode::CallStatus::Error);
+
+        // The composer toggle lands: the very next nested call admits.
+        cell.lock()
+            .unwrap()
+            .replace(vec!["Echo".to_string(), "WebExploreOpen".to_string()]);
+        let result = run_script(&tool, "c2", "await tools.WebExploreOpen({});").await;
+        assert_eq!(suite_status(&result), manox_codemode::CallStatus::Ok);
+
+        // Toggled back off: rejected again, same instance.
+        cell.lock().unwrap().replace(vec!["Echo".to_string()]);
+        let result = run_script(&tool, "c3", "await tools.WebExploreOpen({});").await;
+        assert_eq!(suite_status(&result), manox_codemode::CallStatus::Error);
+    }
+
+    /// The per-instance run lock makes the adapters' call-env invariant a
+    /// local guarantee: two executions driven concurrently on the same
+    /// instance (the top-level scheduler never does this, but the tool must
+    /// not depend on its caller's scheduling) serialize — every nested call
+    /// carries its own execution's parent id, and the executions' sibling
+    /// intervals never overlap.
+    #[tokio::test]
+    async fn concurrent_executions_serialize_per_instance() {
+        let trace = Arc::new(StdMutex::new(Vec::new()));
+        let slow = fake("Slow", false, 60, Ok(serde_json::json!(1)), &trace);
+        let tool = CodemodeTool::new(vec![slow], BTreeMap::new(), unnarrowed());
+        let code = serde_json::json!({"code": "await tools.Slow({});"});
+        let test_ctx = ctx();
+        let (a, b) = tokio::join!(
+            tool.execute("outer-a", code.clone(), CancellationToken::new(), &test_ctx),
+            tool.execute("outer-b", code, CancellationToken::new(), &test_ctx),
+        );
+        assert!(
+            !a.expect("the first execution completes").is_error,
+            "the first execution succeeds"
+        );
+        assert!(
+            !b.expect("the second execution completes").is_error,
+            "the second execution succeeds"
+        );
+        let t = trace.lock().unwrap();
+        // Each execution's nested call carries ITS OWN parent prefix: a
+        // racing second install would re-stamp the shared env mid-run and
+        // misattribute the other script's nested id.
+        assert!(
+            t.iter().any(|line| line == "id:outer-a:1"),
+            "the outer-a parent id survives: {t:?}"
+        );
+        assert!(
+            t.iter().any(|line| line == "id:outer-b:1"),
+            "the outer-b parent id survives: {t:?}"
+        );
+        // Strict start/end alternation proves the two executions never
+        // overlapped inside the sibling.
+        let events: Vec<&str> = t
+            .iter()
+            .filter_map(|e| {
+                (e.starts_with("start:") || e.starts_with("end:")).then_some(e.as_str())
+            })
+            .collect();
+        assert_eq!(
+            events,
+            vec!["start:Slow", "end:Slow", "start:Slow", "end:Slow"],
+            "executions must not overlap: {t:?}"
+        );
     }
 }

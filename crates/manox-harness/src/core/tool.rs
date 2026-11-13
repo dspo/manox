@@ -1794,6 +1794,7 @@ mod tests {
         let codemode = std::sync::Arc::new(crate::tools::codemode::CodemodeTool::new(
             Vec::new(),
             Default::default(),
+            std::sync::Arc::new(|| None::<Vec<String>>),
         ));
         let tools: Vec<std::sync::Arc<dyn AgentTool>> = vec![
             mk("ReadA", "ReadA", true),

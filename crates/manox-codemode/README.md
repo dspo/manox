@@ -145,47 +145,42 @@ instead.
 
 - [`CodemodeExecutor::new(Vec<Arc<dyn CodemodeTool>>)`] — rejects duplicate
   names and names that normalize to the same script identifier; renders the
-  tools' TypeScript declarations once. Two budgets bound the listing: 3000
-  est-tokens per tool (tag drop, then whole-tool drop) and a shared 4000
-  est-tokens across all samples (first come, first served; a tool that does
-  not fit the remaining pool drops whole to the name-only hint). On the main
-  assembly's core surface the shared pool admits Read/Write/Edit/Bash/
-  BashOutput/Grep/Glob/Ls (~18.4k characters, ~4.6k est-tokens including the
-  prompt), versus ~8.8k est-tokens with the per-tool budget alone.
+  tools' TypeScript declarations once (per-tool budget 3000 est-tokens,
+  `DEFAULT_DECLARATION_BUDGET_TOKENS`; first drops the constraint tags, then
+  the whole tool).
 - [`CodemodeExecutor::execute(source, store, cancel)`] — requires a tokio
   runtime context (nested calls are `tokio::spawn`ed). Never returns `Err`:
   failures are `CodemodeResult.error` (kinds `script` / `timeout` /
   `aborted` / `sandbox`), and every result carries the output produced before
   the failure. `store` in, `store_writes` out (empty unless the script
-  succeeded); the crate never touches the disk. `wall_time` covers the whole
-  call including any wait for a process-wide slot.
-- Process-wide admission: at most `MAX_CONCURRENT_EXECUTIONS` (2) executions
-  run at once across the process, queued in arrival order; a wait past
-  `EXECUTION_QUEUE_TIMEOUT` (60 s) fails as a `sandbox`-kind result (a host
-  resource, not a script fault), and a caller cancel during the wait ends as
-  `aborted`. The slot is held for the whole run.
+  succeeded); the crate never touches the disk.
+- Shared total declaration budget of 3000 est-tokens across the whole tool
+  set (`DEFAULT_TOTAL_DECLARATION_BUDGET_TOKENS`), first come, first served
+  over construction order: a tool that no longer fits drops whole to a
+  name-only hint — still callable when the session's live selection admits
+  it, discoverable via `ALL_TOOLS` / `describeTool`.
+- Process-wide execution cap of 2 concurrent runs
+  (`MAX_CONCURRENT_EXECUTIONS`) with a 60 s queue deadline
+  (`EXECUTION_QUEUE_TIMEOUT`); a wait past it fails as a sandbox-class
+  result. `CodemodeResult.wall_time` starts at the slot grant, so queueing
+  behind sibling executions never inflates the reported duration.
+- Call records cap at the first 100 (`MAX_RECORDED_CALLS`) in issue order
+  while `CodemodeResult.total_calls` carries the true issued count, so the
+  result surface stays bounded no matter how far a script fans out.
 - Global in-flight cap of 32 nested calls (`MAX_IN_FLIGHT_CALLS`); overflow
-  rejects immediately with an explanatory error. Call records cap at
-  `MAX_RECORDED_CALLS` (100) in the result, with `total_calls` carrying the
-  true count. Per-tool sequential-execution semantics are the MR2 adapter's
-  job, not the bridge's.
-
-The script surface itself is the caller's decision: the harness-side
-`CodemodeTool` is built over the session's assembly-time active set (the
-mounted tools minus opt-in suites such as the browser suite), so a dormant
-suite is neither callable nor advertised. Two fail-closed staleness classes
-follow: a suite enabled after assembly and an embedder tool registered later
-are not script-callable until the next assembly.
+  rejects immediately with an explanatory error. Per-tool sequential-execution
+  semantics are the MR2 adapter's job, not the bridge's.
 
 ## Testing
 
 `cargo test -p manox-codemode` — 25 unit tests (source parsing, store
-writes decoding, declaration rendering snapshots incl. both budgets, output
-rendering, error JSON shape) and 27 end-to-end tests against a live VM:
-isolation, true concurrency (`Promise.all` barrier), out-of-order result
-pairing, cancellation (loop, suspension, and during the slot queue), timeout,
-hang detection, memory and stack guards, soft/hard output limits, console
-block ordering, image validation, `@options` branches, store round-trip and
-limits, declaration discovery (`ALL_TOOLS`/`describeTool`), tool error text
-propagation, the in-flight and record caps, the process-wide slot cap,
-`return`/`exit` semantics, and syntax errors with aligned line numbers.
+writes decoding, declaration rendering snapshots, output rendering, error
+JSON shape) and 28 end-to-end tests against a live VM: isolation, true
+concurrency (`Promise.all` barrier), out-of-order result pairing,
+cancellation (loop and suspension), timeout, hang detection, memory and
+stack guards, soft/hard output limits, console block ordering, image
+validation, `@options` branches, store round-trip and limits, declaration
+discovery (`ALL_TOOLS`/`describeTool`), tool error text propagation, the
+in-flight cap, the process slot cap and its wall-time accounting,
+`return`/`exit` semantics, and syntax errors with aligned
+line numbers.
