@@ -12,9 +12,7 @@
 //! `Updated`), tombstones (`Cleared`), and `Round` token accounting — via
 //! `apply_goal_event`/`fold_goal_events`; the fold is fail-loud: a corrupt,
 //! malformed, or out-of-order event is an error, never a silent fallback.
-//! The db `thread_events` goal stream retired with the goal authority's
-//! stage ③ (a pre-release clean cut: the journal is the only durable
-//! plane).
+//! The journal is the only durable plane.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -112,9 +110,9 @@ pub enum GoalOperation {
     Block,
 }
 
-/// One durable goal event, serialized into the `data` column of a
-/// `thread_events` row. `kind` is internally tagged on `event` so the payload
-/// self-describes against the `event_type` column.
+/// One durable goal event, serialized into the journal's `goal` row payload
+/// (`GoalBridge::append_events` routes it through the session journal). `kind`
+/// is internally tagged on `event`, so a replayed row names its own kind.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalEvent {
     pub version: u32,
@@ -154,7 +152,7 @@ pub enum GoalEventKind {
 }
 
 impl GoalEvent {
-    /// The stable wire type stored in the `thread_events.event_type` column.
+    /// The stable wire type carried in the journal row's goal payload.
     pub fn event_type(&self) -> &'static str {
         match &self.kind {
             GoalEventKind::Created { .. } => "goal_created",

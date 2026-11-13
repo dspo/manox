@@ -87,13 +87,12 @@ pub struct ContinuableCreateRequest {
 pub struct ContinuableCreateSpec {
     /// Completed-turn prefix of the parent's history to seed the child with,
     /// or `None` for a fresh child.
-    pub seed: Option<Vec<crate::core::session::SessionTreeEntry>>,
+    pub seed: Option<Vec<crate::core::session::Event>>,
 }
 
-/// The host-side observer bridge. The ext run loop calls these at the same
-/// lifecycle points the retired host-side run task drove its `BackendNotice`
-/// sends from; a host implementation folds child events into its transcript
-/// surfaces, health watchdog, and background cards.
+/// The host-side observer bridge. The ext run loop calls these at each
+/// lifecycle point; a host implementation folds child events into its
+/// transcript surfaces, health watchdog, and background cards.
 pub trait RunObserver: Send + Sync {
     /// The run was published and its session built; surfaces may open a row.
     fn on_start(&self, info: &RunInfo) {

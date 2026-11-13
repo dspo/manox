@@ -51,7 +51,7 @@ pub fn rebuild_from_messages(messages: &[Message]) -> Vec<RestoredSubagent> {
                 continue;
             };
             // The delegation shape: `description` + `prompt`, and none of
-            // the retired Steer envelope keys.
+            // the Steer envelope keys.
             if tu.input.get("description").is_none()
                 || tu.input.get("prompt").is_none()
                 || tu.input.get("to").is_some()
@@ -334,8 +334,8 @@ mod tests {
                 background_result("t1", "sub-2"),
             ]),
             // The delivery as the host writes it: the verdict line first,
-            // the salvage after it. The wrapped model-facing prefix rides
-            // legacy transcripts only and is stripped either way.
+            // the salvage after it. The wrapped model-facing prefix is
+            // stripped either way.
             peer(
                 "sub-2",
                 "[from sub-2] `w` failed before it finished.\n\nPartial result:\nboom",
@@ -428,10 +428,10 @@ mod tests {
         assert!(rebuild_from_messages(&messages).is_empty());
     }
 
-    /// The retired Steer Dispatch shape is not a delegation call — old
-    /// transcripts simply yield no rows (no compatibility reads).
+    /// A Steer Dispatch is not a delegation call — such a transcript simply
+    /// yields no rows (no compatibility reads).
     #[test]
-    fn retired_steer_shape_is_ignored() {
+    fn steer_dispatch_shape_is_ignored() {
         let messages = vec![message(vec![
             tool_use(
                 "t1",

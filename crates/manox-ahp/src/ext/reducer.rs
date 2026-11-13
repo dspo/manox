@@ -16,8 +16,8 @@
 //! declaration in [`super`] promises a client.
 //!
 //! Unknown-tolerant by design: an action this build does not know (a newer
-//! client's extension, or a name we retired) leaves the state untouched and is
-//! reported as [`Outcome::Unrecognised`], never as an error.
+//! client's extension, or a name this build does not know) leaves the state
+//! untouched and is reported as [`Outcome::Unrecognised`], never as an error.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

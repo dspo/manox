@@ -1,4 +1,4 @@
-// Round-trip a v3 JSONL session: append messages, rebuild context, switch
+// Round-trip a v4 JSONL session: append messages, rebuild context, switch
 // the leaf to branch, and reopen from disk. Covers #372 (storage format) and
 // #373 (entry types / leaf-as-entry).
 //
@@ -7,7 +7,7 @@
 
 use manox_harness::AgentMessage;
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
-use manox_harness::session::{Session, SessionStorage, SessionTreeEntry};
+use manox_harness::session::{Event, Session, SessionStorage};
 
 #[tokio::main]
 async fn main() {
@@ -49,11 +49,7 @@ async fn main() {
     );
 
     // Switch the leaf back to the first answer and grow a branch from it.
-    session
-        .storage()
-        .set_leaf_id(Some(&m2))
-        .await
-        .expect("set leaf");
+    session.move_to(Some(&m2)).await.expect("set leaf");
     session
         .append_message(AgentMessage::user("branched follow-up"))
         .await
@@ -80,17 +76,17 @@ async fn main() {
     println!("ids: m1={m1} m2={m2} m4={m4}");
 }
 
-fn print_path(label: &str, path: &[SessionTreeEntry]) {
+fn print_path(label: &str, path: &[Event]) {
     let names: Vec<String> = path
         .iter()
         .map(|e| match e {
-            SessionTreeEntry::Message { message, .. } => match message {
+            Event::Message { message, .. } => match message {
                 AgentMessage::User { content, .. } => {
                     format!("user:{}", first_text(content))
                 }
                 _ => "assistant".into(),
             },
-            SessionTreeEntry::Compaction { .. } => "compaction".into(),
+            Event::Compaction { .. } => "compaction".into(),
             _ => "other".into(),
         })
         .collect();

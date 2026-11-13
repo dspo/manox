@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use manox_harness::session::SessionTreeEntry;
+use manox_harness::session::Event;
 use manox_harness::session::jsonl::JournalRecord;
 use manox_harness::types::AgentMessage;
 
@@ -28,7 +28,7 @@ use manox_harness::types::AgentMessage;
 pub fn codemode_store_from_history(records: &[JournalRecord]) -> BTreeMap<String, String> {
     let mut store = BTreeMap::new();
     for record in records {
-        let SessionTreeEntry::Message { message, .. } = &record.entry else {
+        let Event::Message { message, .. } = &record.entry else {
             continue;
         };
         let AgentMessage::ToolResult {
@@ -108,10 +108,10 @@ mod tests {
     use super::*;
     use crate::tools::CODEMODE;
     use chrono::Utc;
-    use manox_harness::session::SessionTreeEntry as E;
+    use manox_harness::session::Event as E;
     use manox_harness::session::jsonl::JournalRecord;
 
-    fn record(entry: SessionTreeEntry) -> JournalRecord {
+    fn record(entry: Event) -> JournalRecord {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         JournalRecord {
             seq: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -142,6 +142,7 @@ mod tests {
             timestamp: Utc::now(),
             message,
             origin: None,
+            ui: None,
         }
     }
 
@@ -162,6 +163,7 @@ mod tests {
             timestamp: Utc::now(),
             message,
             origin: None,
+            ui: None,
         }
     }
 

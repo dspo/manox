@@ -5,7 +5,7 @@
 //! incremental ledger: stats stay correct across restore, retries, and
 //! compaction by construction.
 
-use crate::session::SessionTreeEntry;
+use crate::session::Event;
 use crate::types::{AgentMessage, ContentBlock, Usage};
 use serde::{Deserialize, Serialize};
 
@@ -88,23 +88,23 @@ fn add_to_breakdown(
 /// entry and folds in the usage of assistant turns, tool results, and
 /// compaction/branch-summary calls alike — totals reflect what was
 /// actually billed across the session.
-pub fn session_stats_from_entries(entries: &[SessionTreeEntry]) -> SessionStats {
+pub fn session_stats_from_entries(entries: &[Event]) -> SessionStats {
     let mut stats = SessionStats::default();
     let mut per_model: std::collections::HashMap<String, UsageTotals> =
         std::collections::HashMap::new();
 
     for entry in entries {
         match entry {
-            SessionTreeEntry::Compaction {
+            Event::Compaction {
                 usage: Some(usage), ..
             }
-            | SessionTreeEntry::BranchSummary {
+            | Event::BranchSummary {
                 usage: Some(usage), ..
             } => {
                 add_usage_to_totals(&mut stats.tokens, usage);
                 add_to_breakdown(&mut per_model, TOOLS_SUMMARIES_KEY, usage);
             }
-            SessionTreeEntry::Message { message, .. } => {
+            Event::Message { message, .. } => {
                 stats.total_messages += 1;
                 match message {
                     AgentMessage::User { .. } => {
@@ -175,8 +175,8 @@ mod tests {
         }
     }
 
-    fn assistant(provider: &str, model: &str, usage: Usage) -> SessionTreeEntry {
-        SessionTreeEntry::Message {
+    fn assistant(provider: &str, model: &str, usage: Usage) -> Event {
+        Event::Message {
             id: "a".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -206,11 +206,12 @@ mod tests {
                 timestamp: chrono::Utc::now(),
             },
             origin: None,
+            ui: None,
         }
     }
 
-    fn user() -> SessionTreeEntry {
-        SessionTreeEntry::Message {
+    fn user() -> Event {
+        Event::Message {
             id: "u".into(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -220,6 +221,7 @@ mod tests {
                 id: None,
             },
             origin: None,
+            ui: None,
         }
     }
 
@@ -228,7 +230,7 @@ mod tests {
         let entries = vec![
             user(),
             assistant("p", "m-1", usage(100, 50, Some(0.5))),
-            SessionTreeEntry::Message {
+            Event::Message {
                 id: "tr".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -243,8 +245,9 @@ mod tests {
                     timestamp: chrono::Utc::now(),
                 },
                 origin: None,
+                ui: None,
             },
-            SessionTreeEntry::Compaction {
+            Event::Compaction {
                 id: "c".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -256,7 +259,7 @@ mod tests {
                 details: None,
                 from_hook: None,
             },
-            SessionTreeEntry::BranchSummary {
+            Event::BranchSummary {
                 id: "b".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -292,7 +295,7 @@ mod tests {
     #[test]
     fn response_model_wins_the_breakdown_key() {
         let mut entry = assistant("p", "requested", usage(1, 1, None));
-        let SessionTreeEntry::Message { message, .. } = &mut entry else {
+        let Event::Message { message, .. } = &mut entry else {
             panic!()
         };
         let AgentMessage::Assistant { response_model, .. } = message else {

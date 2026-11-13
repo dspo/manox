@@ -1,10 +1,9 @@
 //! Journal replay (L10, §C.3): the deterministic fold from one session's
 //! active entry chain to the thread's journal-backed observable state.
 //!
-//! This fold is the authority behind the engine's restore path (K2): every
-//! field a §C.2 state-change entry carries rebuilds from the chain, and the
-//! session sidecar is a derived cache that only fills fields the chain has
-//! never seen (legacy journals predate the decision-point entries). The
+//! This fold is the authority behind the engine's restore path: every field a
+//! §C.2 state-change entry carries rebuilds from the chain, and the chain is
+//! the only source — replay reads the journal and nothing else. The
 //! match below is exhaustive — a new kernel entry variant must classify
 //! here (state-bearing or ignored) before it compiles, mirroring the
 //! projection fold's coverage gate.
@@ -14,14 +13,14 @@
 //! IO inside the fold. That is the replay half of the L10 gate; the
 //! regression half (disk reload == live memory) lives in the engine tests.
 
-use manox_harness::session::SessionTreeEntry;
+use manox_harness::session::Event;
 use manox_harness::session::jsonl::JournalRecord;
+use manox_harness::types::AgentMessage;
 
 /// The journal-backed observable state of one thread, folded from its
-/// active chain. Every field is `None` while the chain carries no entry
-/// for it — the restore path falls back to the sidecar cache for exactly
-/// those fields (K2 migration window: old journals never saw the
-/// decision-point entries).
+/// active chain. Every field is `None` while the chain carries no entry for
+/// it — the journal is the only source of replay state, so a field with no
+/// entry has no journaled value.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReplayedThreadState {
     /// Display title from the last `title` entry.
@@ -51,6 +50,17 @@ pub struct ReplayedThreadState {
     /// Reasoning effort from the last `thinking_level_change` entry (the
     /// raw wire string, `"off"` included; the merge parses it).
     pub reasoning_effort: Option<String>,
+    /// The id of the turn this chain ends inside: a `turn_start` row (or a
+    /// `user` message row) with no later `turn_finish`. Legacy chains carry
+    /// no `turn_start` row at all, so the user row is the shape that catches
+    /// a host that died mid-turn there. `None` means the last turn closed and
+    /// the restore has nothing to reconcile.
+    pub open_turn: Option<String>,
+    /// The owner stamp of the open turn, when its `turn_start` carried one.
+    /// A restore consults it before closing the turn: an owner in another
+    /// live process keeps the turn (the lease normally blocks this case, but
+    /// the check is cheap and makes the reconcile safe on its own).
+    pub open_turn_owner: Option<manox_harness::session::TurnOwner>,
 }
 
 /// An approval or question request the chain never answered.
@@ -116,13 +126,13 @@ pub fn unsettled_interactions(
     let mut questions = Vec::new();
     for record in records {
         match &record.entry {
-            SessionTreeEntry::Approval {
+            Event::Approval {
                 kind,
                 auth_id,
                 payload,
                 ..
             } => track(&mut approvals, kind, auth_id, payload),
-            SessionTreeEntry::Question {
+            Event::Question {
                 kind,
                 auth_id,
                 payload,
@@ -141,11 +151,11 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
     let mut state = ReplayedThreadState::default();
     for record in records {
         match &record.entry {
-            // ── journal-backed state (K2 authority) ─────────────────────
-            SessionTreeEntry::Title { title, .. } => {
+            // ── journal-backed state ────────────────────────────────────
+            Event::Title { title, .. } => {
                 state.title = Some(title.clone());
             }
-            SessionTreeEntry::PinnedArchived {
+            Event::PinnedArchived {
                 pinned, archived, ..
             } => {
                 state.pinned = Some(*pinned);
@@ -153,45 +163,64 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             }
             // Durable user annotations: latest-wins per annotation id on the
             // replayed map — the same fold the notes cell renders from.
-            SessionTreeEntry::AnnotationSet { annotation, .. } => {
+            Event::AnnotationSet { annotation, .. } => {
                 if let Some(id) = annotation.get("id").and_then(serde_json::Value::as_str) {
                     state
                         .annotations
                         .insert(id.to_string(), Some(annotation.clone()));
                 }
             }
-            SessionTreeEntry::AnnotationRemoved { annotation_id, .. } => {
+            Event::AnnotationRemoved { annotation_id, .. } => {
                 state.annotations.insert(annotation_id.clone(), None);
             }
-            SessionTreeEntry::ProjectChange { path, .. } => {
+            Event::ProjectChange { path, .. } => {
                 state.project = Some(path.clone());
             }
-            SessionTreeEntry::PlanUpdate { snapshot, .. } => {
+            Event::PlanUpdate { snapshot, .. } => {
                 state.plan_snapshot = Some(snapshot.clone());
             }
-            SessionTreeEntry::Goal { goal, .. } => {
+            Event::Goal { goal, .. } => {
                 state.goal = Some(goal.clone().unwrap_or(serde_json::Value::Null));
             }
-            SessionTreeEntry::CwdChange { cwd, .. } => {
+            Event::CwdChange { cwd, .. } => {
                 state.cwd = Some(cwd.clone());
             }
             // ── session config (the journal rows are the durable authority):
             // last row wins, exactly the fold the AHP projection runs.
-            SessionTreeEntry::AccessModeChange { mode, .. } => {
+            Event::AccessModeChange { mode, .. } => {
                 state.access_mode = Some(mode.clone());
             }
-            SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => {
+            Event::ThinkingLevelChange { thinking_level, .. } => {
                 state.reasoning_effort = Some(thinking_level.clone());
+            }
+            // ── lifecycle: the chain's single open-turn fact ────────────
+            // A turn opens on its `turn_start` row and — on a chain with no
+            // `turn_start` — on the user row that begins it; a `turn_finish`
+            // closes whichever was open.
+            Event::TurnStart { id, owner, .. } => {
+                state.open_turn = Some(id.clone());
+                state.open_turn_owner = *owner;
+            }
+            Event::TurnFinish { .. } => {
+                state.open_turn = None;
+                state.open_turn_owner = None;
             }
             // ── transcript + display domain (rebuilt by the kernel's own
             //    transcript projection, not by this fold) ────────────────
-            SessionTreeEntry::Message { .. }
-            | SessionTreeEntry::UiNote { .. }
-            | SessionTreeEntry::Custom { .. }
-            | SessionTreeEntry::CustomMessage { .. }
-            | SessionTreeEntry::Compaction { .. }
-            | SessionTreeEntry::CompactionStarted { .. }
-            | SessionTreeEntry::BranchSummary { .. } => {}
+            Event::Message {
+                id,
+                message: AgentMessage::User { .. },
+                ..
+            } => {
+                state.open_turn = Some(id.clone());
+            }
+            Event::Message { .. }
+            | Event::UiNote { .. }
+            | Event::Custom { .. }
+            | Event::CustomMessage { .. }
+            | Event::Compaction { .. }
+            | Event::CompactionStarted { .. }
+            | Event::BranchSummary { .. } => {}
             // ── live-only or kernel-owned state: the active tool set rides
             //    `active_tools_change` through the kernel, and
             //    lifecycle/delta/metrics rows carry no persistable thread
@@ -200,33 +229,31 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             // The model row is here too, deliberately: the harness's own
             // restore projection reads it onto the agent, so this fold has
             // no second model answer to carry.
-            SessionTreeEntry::ModelChange { .. }
-            | SessionTreeEntry::ActiveToolsChange { .. }
-            | SessionTreeEntry::TurnStart { .. }
-            | SessionTreeEntry::TurnFinish { .. }
-            | SessionTreeEntry::Stop { .. }
-            | SessionTreeEntry::Retry { .. }
-            | SessionTreeEntry::ErrorEvent { .. }
-            | SessionTreeEntry::AgentTextDelta { .. }
-            | SessionTreeEntry::AgentThinkingDelta { .. }
-            | SessionTreeEntry::ToolCall { .. }
-            | SessionTreeEntry::ToolResult { .. }
-            | SessionTreeEntry::ToolOutputChunk { .. }
-            | SessionTreeEntry::SubagentChild { .. }
-            | SessionTreeEntry::SubagentProgress { .. }
-            | SessionTreeEntry::BrowserSuites { .. }
-            | SessionTreeEntry::BackgroundTask { .. }
-            | SessionTreeEntry::Approval { .. }
-            | SessionTreeEntry::Question { .. }
-            | SessionTreeEntry::Label { .. }
-            | SessionTreeEntry::SessionInfo { .. }
-            | SessionTreeEntry::Leaf { .. }
-            | SessionTreeEntry::RunStarted { .. }
-            | SessionTreeEntry::RunSettled { .. }
-            | SessionTreeEntry::RunEscalated { .. }
-            | SessionTreeEntry::RunContinued { .. }
-            | SessionTreeEntry::RunGuided { .. }
-            | SessionTreeEntry::Metrics { .. } => {}
+            Event::ModelChange { .. }
+            | Event::ActiveToolsChange { .. }
+            | Event::Stop { .. }
+            | Event::Retry { .. }
+            | Event::ErrorEvent { .. }
+            | Event::AgentTextDelta { .. }
+            | Event::AgentThinkingDelta { .. }
+            | Event::ToolCall { .. }
+            | Event::ToolResult { .. }
+            | Event::ToolOutputChunk { .. }
+            | Event::SubagentChild { .. }
+            | Event::SubagentProgress { .. }
+            | Event::BrowserSuites { .. }
+            | Event::BackgroundTask { .. }
+            | Event::Approval { .. }
+            | Event::Question { .. }
+            | Event::Label { .. }
+            | Event::SessionInfo { .. }
+            | Event::Leaf { .. }
+            | Event::RunStarted { .. }
+            | Event::RunSettled { .. }
+            | Event::RunEscalated { .. }
+            | Event::RunContinued { .. }
+            | Event::RunGuided { .. }
+            | Event::Metrics { .. } => {}
         }
     }
     state
@@ -236,9 +263,9 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use manox_harness::session::SessionTreeEntry as E;
+    use manox_harness::session::Event as E;
 
-    fn record(entry: SessionTreeEntry) -> JournalRecord {
+    fn record(entry: Event) -> JournalRecord {
         // The fold never reads seq; a dense counter keeps the fixtures
         // honest about chain order.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -252,7 +279,7 @@ mod tests {
         (uuid::Uuid::new_v4().to_string(), None, Utc::now())
     }
 
-    fn park_entry(kind: &str, is_approval: bool, auth: &str) -> SessionTreeEntry {
+    fn park_entry(kind: &str, is_approval: bool, auth: &str) -> Event {
         let id = uuid::Uuid::new_v4().to_string();
         let (_, parent, ts) = envelope();
         let payload = serde_json::json!({
@@ -349,15 +376,113 @@ mod tests {
         assert_eq!(state.archived, Some(true));
     }
 
+    /// The fold's open-turn fact, in both journal shapes: the chains with a
+    /// `turn_start` row (engine-owned turns) and those carrying only the user
+    /// row (a prompt turn whose writer did not stamp the open edge).
     #[test]
-    fn fields_without_entries_stay_none() {
-        // The K2 fallback contract: a legacy chain with no decision-point
-        // entries leaves every field `None` so the restore path reads the
-        // sidecar cache instead of overwriting it with defaults.
-        let state = replay_thread_state(&[]);
-        assert_eq!(state, ReplayedThreadState::default());
-        assert!(state.title.is_none() && state.pinned.is_none());
-        assert!(state.project.is_none());
+    fn an_unclosed_turn_stays_open_and_a_finish_closes_it() {
+        let ts = Utc::now();
+        let id = || uuid::Uuid::new_v4().to_string();
+        let user = |row_id: &str| E::Message {
+            id: row_id.to_string(),
+            parent_id: None,
+            timestamp: ts,
+            message: manox_harness::types::AgentMessage::user("hello"),
+            origin: None,
+            ui: None,
+        };
+        let finish = |row_id: &str| E::TurnFinish {
+            id: row_id.to_string(),
+            parent_id: None,
+            timestamp: ts,
+            cancelled: false,
+            failed: false,
+            stranded_steer_ids: Vec::new(),
+            reason: None,
+        };
+        let start = |row_id: &str| E::TurnStart {
+            id: row_id.to_string(),
+            parent_id: None,
+            timestamp: ts,
+            owner: None,
+        };
+
+        // Engine-owned shape: the turn_start row is the open fact.
+        let with_start = vec![
+            record(user("u-1")),
+            record(start("ts-1")),
+            record(E::AgentTextDelta {
+                id: id(),
+                parent_id: None,
+                timestamp: ts,
+                delta: "partial".into(),
+            }),
+        ];
+        assert_eq!(
+            replay_thread_state(&with_start).open_turn.as_deref(),
+            Some("ts-1")
+        );
+
+        // The user-row shape: no turn_start row at all — the user row is the
+        // open fact, so a host that died mid-turn is still detected.
+        let user_row_only = vec![record(user("u-unstamped"))];
+        assert_eq!(
+            replay_thread_state(&user_row_only).open_turn.as_deref(),
+            Some("u-unstamped")
+        );
+
+        // A later finish closes whatever was open, and a chain that ends
+        // closed reports none.
+        let closed = [
+            record(user("u-2")),
+            record(start("ts-2")),
+            record(finish("tf-2")),
+        ];
+        assert_eq!(replay_thread_state(&closed).open_turn, None);
+        // A user row after the close opens the next turn.
+        let reopened = [
+            record(user("u-3")),
+            record(finish("tf-3")),
+            record(user("u-4")),
+        ];
+        assert_eq!(
+            replay_thread_state(&reopened).open_turn.as_deref(),
+            Some("u-4")
+        );
+    }
+
+    /// The open turn's owner stamp rides the replay so a restore can leave a
+    /// turn another live process owns alone.
+    #[test]
+    fn the_open_turn_owner_reads_the_turn_start_stamp() {
+        let ts = Utc::now();
+        let owner = manox_harness::session::TurnOwner { pid: 4242 };
+        let open = vec![record(E::TurnStart {
+            id: "ts-1".into(),
+            parent_id: None,
+            timestamp: ts,
+            owner: Some(owner),
+        })];
+        assert_eq!(replay_thread_state(&open).open_turn_owner, Some(owner));
+
+        let closed = vec![
+            record(E::TurnStart {
+                id: "ts-2".into(),
+                parent_id: None,
+                timestamp: ts,
+                owner: Some(owner),
+            }),
+            record(E::TurnFinish {
+                id: "tf-2".into(),
+                parent_id: None,
+                timestamp: ts,
+                cancelled: false,
+                failed: false,
+                stranded_steer_ids: Vec::new(),
+                reason: None,
+            }),
+        ];
+        assert_eq!(replay_thread_state(&closed).open_turn_owner, None);
     }
 
     #[test]

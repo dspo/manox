@@ -31,14 +31,12 @@ pub(super) fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde
     };
     Some(match ev {
         // ── lifecycle ────────────────────────────────────────────────────
-        // The turn start stamps the owning process (§C.2 turnStart owner):
-        // the journal is shared across processes, and a reader of an open
-        // turn needs the owner's liveness to settle a dead turn on its
-        // behalf without ever killing one another process is running.
-        ThreadEvent::TurnStarted => (
-            "turn_start".into(),
-            json!({ "owner": manox_harness::session::TurnOwner::for_current_process() }),
-        ),
+        // The turn start is NOT journaled here: it is the turn's open edge,
+        // and it must be durable BEFORE the run it opens produces anything
+        // (the notice tap is an async hop, so its row could otherwise land
+        // after the turn's own close). The engine's `run_turn` appends it
+        // synchronously through the shared writer instead.
+        ThreadEvent::TurnStarted => return None,
         ThreadEvent::TurnFinished {
             cancelled,
             failed,
@@ -425,7 +423,7 @@ pub(super) async fn append_row_fail_loud(
 /// `session_path` is the store's cached journal-file path, needed for the
 /// cold path; `None` with no live route logs and drops the row (a thread
 /// that never materialized has no journal — its sidecar carries the flag
-/// until the journal exists, the K2 fallback).
+/// until the journal exists).
 /// Returns whether the row was handed to a path that can still land it: a live
 /// actor's queue, or a cold append against a file that exists. `false` means
 /// there is nowhere for the row to go — no actor and no file — which the caller
@@ -537,16 +535,15 @@ pub(super) async fn wait_then_cold_journal_append(
     cold_journal_append(session_path, kind, payload).await;
 }
 
-/// B3 (review round 3): the cold-append serialization locks, keyed by
-/// journal path. Each cold append opens a FRESH storage instance whose
-/// `append_lock`/leaf/seq views are instance-scoped — two spawned
-/// decisions on one engine-less thread (pin + archive is the canonical
-/// pair, and a retiring actor's `Fate::Wait` queue funnels several)
-/// raced: same parent, self-stamped seqs, a forked chain the load
-/// validator accepts (sibling rows are legal) while the cursor keeps
-/// only the file-last branch — the earlier decision silently left the
-/// chain. Entries are never evicted: one small map entry per distinct
-/// cold-appended session, process-lifetime.
+/// Cold appends serialize per journal path before a storage writer exists.
+///
+/// This is the append path's one sanctioned lock held across file I/O. It is
+/// not a correctness carrier: the storage's write fence plus stale-view reload
+/// already linearize two instances appending one file (a stale-parented `Tail`
+/// append is re-pointed under the fence). The lock only bounds the
+/// open+append window so two cold callers do not both stand up a view of the
+/// same file at once. Entries are never evicted: one small map entry per
+/// distinct cold-appended session, process-lifetime.
 pub(super) static COLD_APPEND_LOCKS: std::sync::OnceLock<
     std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 > = std::sync::OnceLock::new();
@@ -563,19 +560,18 @@ pub(super) fn cold_append_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
 
 /// Cold journal append for a decision whose thread has no live engine (K3):
 /// open the session file and land the typed row through the same storage
-/// face a live actor uses (`append_typed`: parent selection + append lock +
+/// face a live actor uses (`append_typed`: writer-ordered parent selection +
 /// seq stamp + journal broadcast). Safe because the registry protocol
 /// guarantees no live storage writes this file while the route is absent.
-/// A thread whose journal never materialized has no file: the row is
-/// skipped loudly at debug — the sidecar carries the flag until the journal
-/// exists (the K2 fallback).
+/// A thread whose journal never materialized has no file: the row is skipped
+/// loudly at debug — the sidecar carries the flag until the journal exists.
 ///
 /// Cross-process, the file may still have a live writer: another process's
 /// actor holding the write lease. The lease is taken here too (short-held:
 /// released with this function's return — the row-level serialization is
-/// the storage's own `WriteFence`), and contention degrades exactly like
-/// the K2 fallback: the row is skipped loudly and the sidecar keeps the
-/// flag until this process or the other re-lands it.
+/// the storage's own `WriteFence`), and contention degrades exactly like the
+/// no-file case: the row is skipped loudly and the sidecar keeps the flag
+/// until this process or the other re-lands it.
 pub(super) async fn cold_journal_append(
     session_path: Option<PathBuf>,
     kind: String,
@@ -603,10 +599,10 @@ pub(super) async fn cold_journal_append(
             return;
         }
     };
-    // B3: the file-level serialization the per-instance append_lock cannot
-    // give — held across the open (leaf/seq view) AND the append (stamp +
-    // write + the v3 lazy migration), so concurrent cold appends to one
-    // file run strictly one after another. The live-engine path needs no
+    // B3: the file-level serialization a fresh storage instance's own writer
+    // cannot give — held across the open (leaf/seq view) AND the append
+    // (stamp + write), so concurrent cold appends to one file run strictly
+    // one after another. The live-engine path needs no
     // such lock: its actor owns the file.
     let path_lock = cold_append_lock(&path);
     let _guard = path_lock.lock().await;

@@ -38,8 +38,8 @@ pub enum MessageAuthor {
 
 impl MessageAuthor {
     /// Routing identity: `"lead"` for the main agent, `"harness"` for the
-    /// host, the manifest / member name otherwise. The session sidecar
-    /// persists this string.
+    /// host, the manifest / member name otherwise. The user journal row
+    /// carries this string (`session::UserEntryUi`).
     pub fn routing(&self) -> &str {
         match self {
             MessageAuthor::Lead => crate::team::LEADER_NAME,
@@ -51,7 +51,7 @@ impl MessageAuthor {
     /// Inverse of [`MessageAuthor::routing`]. `"captain"` — the Steer bus's
     /// name for any thread's root agent — is a lead alias, so bus-authored
     /// deliveries and peer injections display identically whether the
-    /// attribution came from memory or from the sidecar round trip.
+    /// attribution came from memory or from the journal row's round trip.
     pub fn from_routing(name: &str) -> Self {
         if name == crate::team::LEADER_NAME || name == BUS_CAPTAIN_NAME {
             MessageAuthor::Lead

@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use manox_harness::compaction::SUMMARIZATION_SYSTEM_PROMPT;
 use manox_harness::session::Session;
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
-use manox_harness::session::{SessionStorage, SessionTreeEntry};
+use manox_harness::session::{Event, SessionStorage};
 use manox_harness::types::{AgentContext, AgentEvent, Model, StopReason, ThinkingKind, Usage};
 use manox_harness::{AgentHarness, AgentMessage, NavigateTreeOptions, StreamFn};
 
@@ -126,7 +126,7 @@ async fn main() {
     let first_reply = entries
         .iter()
         .find_map(|e| match e {
-            SessionTreeEntry::Message {
+            Event::Message {
                 id,
                 message: AgentMessage::Assistant { .. },
                 ..
@@ -159,12 +159,10 @@ async fn main() {
     let reopened = JsonlSessionStorage::open(&path).await.expect("reopen");
     let storage = reopened;
     let entries = storage.get_entries(Default::default()).await.unwrap();
-    let has_leaf = entries
-        .iter()
-        .any(|e| matches!(e, SessionTreeEntry::Leaf { .. }));
+    let has_leaf = entries.iter().any(|e| matches!(e, Event::Leaf { .. }));
     let has_summary = entries
         .iter()
-        .any(|e| matches!(e, SessionTreeEntry::BranchSummary { .. }));
+        .any(|e| matches!(e, Event::BranchSummary { .. }));
     println!(
         "reopened entries: {} (leaf: {has_leaf}, branch summary: {has_summary})",
         entries.len()

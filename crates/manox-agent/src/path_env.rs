@@ -6,7 +6,7 @@
 //! PATH is the system default (`/usr/bin:/bin:/usr/sbin:/sbin`) without
 //! Homebrew (`/opt/homebrew/bin`) or any user-added entries. Every
 //! subprocess inheriting that PATH loses `gh`, `rg`, `fd`, etc. — the
-//! failure that motivated the retired manox harness's `path_env` module.
+//! failure this module exists to prevent.
 //!
 //! The manox harness has a single injection point: the process environment itself.
 //! Every spawn site inherits it — the kernel's bash tool

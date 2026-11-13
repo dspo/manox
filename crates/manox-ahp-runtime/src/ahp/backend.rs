@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use crate::ahp::projection::Translator;
 use crate::ahp::projection::config_keys;
-use crate::error::RuntimeError;
+use crate::error::{RuntimeError, RuntimeErrorKind};
 use ahp_types::actions::{
     ActionOrigin, ChatChangesetsChangedAction, ChatInputCompletedAction,
     ChatPendingMessageRemovedAction, PartialChatSummary, SessionChatUpdatedAction, StateAction,
@@ -30,27 +30,20 @@ use ahp_types::state::{
     AgentInfo, BackgroundWork, ChatInputResponseKind, ChatState, RootState, SessionModelInfo,
     SessionState, SessionSummary, TerminalState, Turn,
 };
+use async_trait::async_trait;
 use manox_ahp::backend::{Backend, DispatchOutcome};
 #[cfg(feature = "terminal")]
 use manox_ahp::channels::terminal;
 use manox_ahp::channels::{chat, root, session};
 use manox_ahp::error::HostError;
 use manox_ahp::resource::ResourcePlane;
-use manox_harness::session::SessionTreeEntry;
+use manox_harness::session::Event;
 use manox_harness::types::AgentMessage;
 use parking_lot::Mutex;
 use serde_json::Value;
 
 use super::fold_journal;
 
-/// Run an async runtime seam from the host's synchronous `Backend` methods.
-///
-/// The host calls seeding from an async context but the trait is synchronous, so
-/// the block has to yield the worker rather than park it (`block_in_place`),
-/// which keeps the awaited runtime task able to make progress.
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::task::block_in_place(|| manox_agent::runtime::handle().block_on(future))
-}
 use crate::runtime_trait::SessionRuntime;
 
 /// Forward one gated MCP method to the upstream server over the registry's
@@ -66,10 +59,9 @@ async fn proxy_mcp_method(
     let invalid = |err: serde_json::Error| HostError::InvalidParams(err.to_string());
     let upstream = |err: rmcp::service::ServiceError| HostError::Backend(err.to_string());
     let encode = |err: serde_json::Error| HostError::Backend(err.to_string());
-    // The proxy runs on a synchronous seam (`block_in_place`); rmcp's
-    // convenience methods carry no default timeout, so a stuck upstream
-    // would park the worker and hang the client's request forever. Every
-    // forwarded call rides the same explicit deadline.
+    // rmcp's convenience methods carry no default timeout, so a stuck
+    // upstream would hang the client's request forever. Every forwarded call
+    // rides the same explicit deadline.
     let deadline = std::time::Duration::from_secs(30);
     tokio::time::timeout(deadline, async {
         match method {
@@ -149,14 +141,14 @@ impl Cursor {
 /// no other repair path), and both are lifecycle/state-transition rows, not
 /// per-chunk floods — dropping one leaves the task or agent frozen at its
 /// previous status for every live subscriber.
-fn is_state_bearing(event: &SessionTreeEntry) -> bool {
+fn is_state_bearing(event: &Event) -> bool {
     !matches!(
         event,
-        SessionTreeEntry::AgentTextDelta { .. }
-            | SessionTreeEntry::AgentThinkingDelta { .. }
-            | SessionTreeEntry::ToolOutputChunk { .. }
-            | SessionTreeEntry::Stop { .. }
-            | SessionTreeEntry::SubagentChild { .. }
+        Event::AgentTextDelta { .. }
+            | Event::AgentThinkingDelta { .. }
+            | Event::ToolOutputChunk { .. }
+            | Event::Stop { .. }
+            | Event::SubagentChild { .. }
     )
 }
 
@@ -269,6 +261,11 @@ impl RuntimeBackend {
 
     fn me(&self) -> Option<Arc<Self>> {
         self.me.get().and_then(Weak::upgrade)
+    }
+
+    /// The AHP-facing failure for a runtime refusal at this adapter seam.
+    fn host_error(error: RuntimeError) -> HostError {
+        crate::runtime_trait::to_host_error(error)
     }
 
     pub fn attach_host(&self, host: &Arc<manox_ahp::Host>) {
@@ -586,16 +583,16 @@ impl RuntimeBackend {
     ///
     /// A restored session serves folded state without an engine, so the
     /// command face would otherwise refuse work the dispatch actions accept.
-    /// The not-found code keeps its host-level shape rather than degrading to
-    /// `Backend`: a client that branches on the code cannot tell a cold miss
-    /// from an unknown id.
-    fn ensure_command_session(&self, session_id: &str) -> Result<(), HostError> {
-        match self.server.ensure_live("ahp", session_id) {
+    /// The not-found kind keeps its host-level shape rather than degrading to
+    /// `Backend`: a client that branches on the AHP code cannot tell a cold
+    /// miss from an unknown id.
+    async fn ensure_command_session(&self, session_id: &str) -> Result<(), HostError> {
+        match self.server.ensure_live("ahp", session_id).await {
             Ok(()) => Ok(()),
-            Err(error) if error.code.as_deref() == Some(crate::error::codes::SESSION_NOT_FOUND) => {
+            Err(error) if error.kind == RuntimeErrorKind::NotFound => {
                 Err(HostError::SessionNotFound(session_id.to_string()))
             }
-            Err(error) => Err(HostError::Backend(error.message)),
+            Err(error) => Err(Self::host_error(error)),
         }
     }
 
@@ -1041,13 +1038,13 @@ impl RuntimeBackend {
         session_id: &str,
         translator: &mut Translator,
         seq: u64,
-        entry: &SessionTreeEntry,
+        entry: &Event,
     ) {
         // A finished turn is when the agent's file changes settle: recompute
         // the changeset so subscribers watch one stream instead of polling.
         // Detached — the scan is synchronous and cheap, but it must not stall
         // the journal pump.
-        if matches!(entry, SessionTreeEntry::TurnFinish { .. })
+        if matches!(entry, Event::TurnFinish { .. })
             && let Some(backend) = self.me()
         {
             let session = session_id.to_string();
@@ -1103,11 +1100,11 @@ impl RuntimeBackend {
         // id.
         if matches!(
             entry,
-            SessionTreeEntry::Message {
+            Event::Message {
                 message: AgentMessage::User { .. },
                 ..
             }
-        ) || matches!(entry, SessionTreeEntry::TurnStart { .. })
+        ) || matches!(entry, Event::TurnStart { .. })
         {
             return;
         }
@@ -1137,15 +1134,14 @@ impl RuntimeBackend {
         }
         // A landed assistant row changes the Q face: republish the aggregate
         // so the metrics channel stays a read model of the journal, not a
-        // stream of per-call rows the client would have to re-aggregate (the
-        // v2 `GetConversationInfo` contract, now push).
+        // stream of per-call rows the client would have to re-aggregate.
         if matches!(
             entry,
-            SessionTreeEntry::Message {
+            Event::Message {
                 message: AgentMessage::Assistant { .. },
                 ..
             }
-        ) && let Some(metrics) = self.server.conversation_metrics(session_id)
+        ) && let Some(metrics) = self.server.conversation_metrics(session_id).await
         {
             let channel = format!("{}{session_id}", manox_ahp::ext::channels::METRICS);
             host.publish(
@@ -1168,8 +1164,7 @@ impl RuntimeBackend {
     /// the same numbered stream as every other channel state, and the browser of
     /// `serverSeq` stays intact.
     ///
-    /// The v2 follow-terminal stream relays the same tap per *stream*; an AHP
-    /// terminal is a channel, so one pump serves every subscriber.
+    /// An AHP terminal is a channel, so one pump serves every subscriber.
     #[cfg(feature = "terminal")]
     fn ensure_terminal_pump(&self, terminal_id: &str) {
         if self.terminal_pumps.lock().contains_key(terminal_id) {
@@ -1229,14 +1224,14 @@ impl RuntimeBackend {
 
     /// Register (or replace) one active client's contributed tools.
     ///
-    /// This is the AHP face of v2's `RegisterSessionTools`, and it fills the
+    /// This is the AHP face of session-tool registration, and it fills the
     /// same store: the engine's `embedder_tools` provider is what makes a
     /// registered tool callable by the model, so routing the protocol action
     /// here — rather than into a parallel table — is what keeps one source of
     /// truth for "the tools this session's clients contribute".
     ///
     /// Full replacement per client, matching `session/activeClientSet`'s
-    /// upsert-by-`clientId` semantics and the v2 call's own contract.
+    /// upsert-by-`clientId` semantics and the client-tool contract.
     ///
     /// Fail-closed on every input the runtime cannot honour: a session with no
     /// live engine would otherwise accept the registration, answer `Accepted`,
@@ -1246,8 +1241,8 @@ impl RuntimeBackend {
     /// its clients' claims an answer, so it is opened first — the same
     /// cold-open the submit/cancel/settle paths take — and only a genuinely
     /// unknown id (the open answers it not-found) or a failed open keeps the
-    /// refusal, in the `message [code]` shape the dispatch refusals use.
-    fn register_client_tools(
+    /// refusal, with the runtime's message as the rejection text.
+    async fn register_client_tools(
         &self,
         session_id: &str,
         client: &ahp_types::state::SessionActiveClient,
@@ -1255,18 +1250,16 @@ impl RuntimeBackend {
         if client.client_id.is_empty() {
             return Err("an active client needs a clientId".to_string());
         }
-        if let Err(error) = self.server.ensure_live("ahp", session_id) {
-            return Err(match &error.code {
-                Some(code) => format!("{} [{code}]", error.message),
-                None => error.message,
-            });
+        if let Err(error) = self.server.ensure_live("ahp", session_id).await {
+            return Err(error.message);
         }
         let mut specs = Vec::with_capacity(client.tools.len());
         for tool in &client.tools {
             specs.push(client_tool_spec(tool)?);
         }
         self.server
-            .set_embedder_tools(session_id, &client.client_id, specs);
+            .set_embedder_tools(session_id, &client.client_id, specs)
+            .await;
         Ok(())
     }
 
@@ -1416,7 +1409,7 @@ impl RuntimeBackend {
     /// without it (or for a call whose turn has already closed) settles
     /// nothing: a confirmation we cannot attribute must not guess an identity,
     /// because guessing would answer a *different* pending call.
-    fn confirm_tool_call(
+    async fn confirm_tool_call(
         &self,
         channel: &str,
         tool_call_id: &str,
@@ -1441,6 +1434,7 @@ impl RuntimeBackend {
         match self
             .server
             .confirm_tool_call(session_id, auth_id, approved, selected_option_id)
+            .await
         {
             Ok(()) => DispatchOutcome::Accepted,
             Err(error) => DispatchOutcome::Rejected(error.message),
@@ -1454,7 +1448,7 @@ impl RuntimeBackend {
     /// name one identity. The client's answers ride the completed card and are
     /// mapped here onto the kernel's `AskAnswer` list; the response kind
     /// carries the non-answer closes (an empty answer is not a cancel).
-    fn answer_question(
+    async fn answer_question(
         &self,
         channel: &str,
         request_id: &str,
@@ -1467,6 +1461,7 @@ impl RuntimeBackend {
         match self
             .server
             .answer_question(session_id, request_id, response, answers)
+            .await
         {
             Ok(()) => DispatchOutcome::Accepted,
             Err(error) => DispatchOutcome::Rejected(error.message),
@@ -1496,7 +1491,7 @@ impl RuntimeBackend {
     /// first key applied — the client rolls back the whole action, and a
     /// half-landed write would strand the session on state its own chip
     /// no longer shows.
-    fn apply_session_config(
+    async fn apply_session_config(
         &self,
         channel: &str,
         config: &ahp_types::common::JsonObject,
@@ -1531,26 +1526,27 @@ impl RuntimeBackend {
                 ));
             }
         }
-        // Validate everything, land nothing — then apply everything. The
-        // refusal text carries the runtime error's code so clients can
-        // branch on it without string-matching the message.
-        let refusal = |error: RuntimeError| match &error.code {
-            Some(code) => format!("{} [{code}]", error.message),
-            None => error.message,
-        };
-        if let Err(error) = self.server.preflight_config(
-            session_id,
-            config.get(config_keys::MODEL).and_then(Value::as_str),
-            config
-                .get(config_keys::REASONING_EFFORT)
-                .and_then(Value::as_str),
-            config.get(config_keys::ACCESS_MODE).and_then(Value::as_str),
-            config
-                .get(config_keys::NETWORK_ACCESS)
-                .and_then(Value::as_str),
-        ) {
-            return DispatchOutcome::Rejected(refusal(error));
+        // Validate everything, land nothing — then apply everything. A
+        // refusal is the runtime's message; the kind is not a wire code.
+        if let Err(error) = self
+            .server
+            .preflight_config(
+                session_id,
+                config.get(config_keys::MODEL).and_then(Value::as_str),
+                config
+                    .get(config_keys::REASONING_EFFORT)
+                    .and_then(Value::as_str),
+                config.get(config_keys::ACCESS_MODE).and_then(Value::as_str),
+                config
+                    .get(config_keys::NETWORK_ACCESS)
+                    .and_then(Value::as_str),
+            )
+            .await
+        {
+            return DispatchOutcome::Rejected(error.message);
         }
+        // The picks are awaited one at a time, in declaration order, and the
+        // first refusal answers — the same sequence the sync seam ran.
         let applied = [
             config
                 .get(config_keys::MODEL)
@@ -1570,8 +1566,8 @@ impl RuntimeBackend {
                 .map(|access| self.server.set_network_access(session_id, access)),
         ];
         for outcome in applied.into_iter().flatten() {
-            if let Err(error) = outcome {
-                return DispatchOutcome::Rejected(refusal(error));
+            if let Err(error) = outcome.await {
+                return DispatchOutcome::Rejected(error.message);
             }
         }
         DispatchOutcome::Accepted
@@ -1624,8 +1620,8 @@ struct SeededFacts {
 /// The command/skill catalogue served on `x-manox-commands://`.
 ///
 /// AHP has no notion of a slash command, so this channel is where a client
-/// reads the palette it can offer. The three sources are the same ones the v2
-/// `ListCommands` call read, in the same precedence: built-ins first, then
+/// reads the palette it can offer. The three sources, in precedence order:
+/// built-ins first, then
 /// user commands, then skills, with a name claimed by an earlier source
 /// winning — a user command that shadows a built-in must not appear twice.
 fn command_catalogue() -> Value {
@@ -1869,6 +1865,7 @@ fn summary_from_row(
     }
 }
 
+#[async_trait]
 impl Backend for RuntimeBackend {
     fn root_state(&self) -> RootState {
         root::with_agents(self.agents(), Some(self.server.terminal_infos()))
@@ -1880,8 +1877,7 @@ impl Backend for RuntimeBackend {
         // hundreds of sessions totalling gigabytes, so folding each one to
         // produce a one-line summary made `listSessions` time out — and it is
         // both the first call a client makes and the source of every later
-        // page. The v2 list path (`threads_snapshot`) reads the same rows for
-        // the same reason.
+        // page.
         //
         // The child partition rides the same walk: delegated subagent
         // sessions come back as ordinary rows (annotated with parent/kind in
@@ -1911,17 +1907,17 @@ impl Backend for RuntimeBackend {
         })
     }
 
-    fn session_state(&self, session_id: &str) -> Option<SessionState> {
-        let seeded = block_on(self.seeded(session_id))?;
+    async fn session_state(&self, session_id: &str) -> Option<SessionState> {
+        let seeded = self.seeded(session_id).await?;
         Some(seeded.session.clone())
     }
 
-    fn chat_state(&self, chat_id: &str) -> Option<ChatState> {
-        let seeded = block_on(self.seeded(chat_id))?;
+    async fn chat_state(&self, chat_id: &str) -> Option<ChatState> {
+        let seeded = self.seeded(chat_id).await?;
         Some(seeded.chat.clone())
     }
 
-    fn session_state_for_chat(&self, chat_id: &str) -> Option<String> {
+    async fn session_state_for_chat(&self, chat_id: &str) -> Option<String> {
         // A live session owns its chat from the moment `createSession`
         // answered: the blank claim is lazily materialized (nothing durable
         // exists until the first journal append), so the durable legs below
@@ -1931,7 +1927,7 @@ impl Backend for RuntimeBackend {
         if self.server.has_session(chat_id) {
             return Some(chat_id.to_string());
         }
-        block_on(super::thread_of_session(chat_id))
+        super::thread_of_session(chat_id).await
     }
 
     #[cfg(feature = "terminal")]
@@ -1976,7 +1972,7 @@ impl Backend for RuntimeBackend {
     }
 
     #[cfg(feature = "terminal")]
-    fn create_terminal(
+    async fn create_terminal(
         &self,
         session_id: &str,
         terminal_id: &str,
@@ -1985,6 +1981,7 @@ impl Backend for RuntimeBackend {
     ) -> Result<(), HostError> {
         self.server
             .create_terminal(session_id, terminal_id, cols, rows)
+            .await
             .map_err(|error| HostError::Backend(error.message))?;
         self.ensure_terminal_pump(terminal_id);
         self.publish_terminals_changed();
@@ -1992,9 +1989,10 @@ impl Backend for RuntimeBackend {
     }
 
     #[cfg(feature = "terminal")]
-    fn dispose_terminal(&self, terminal_id: &str) -> Result<(), HostError> {
+    async fn dispose_terminal(&self, terminal_id: &str) -> Result<(), HostError> {
         self.server
             .dispose_terminal(terminal_id)
+            .await
             .map_err(|_| HostError::NotFound(manox_ahp::channels::terminal::uri(terminal_id)))?;
         self.publish_terminals_changed();
         Ok(())
@@ -2007,7 +2005,7 @@ impl Backend for RuntimeBackend {
         None
     }
 
-    fn create_session(
+    async fn create_session(
         &self,
         session_id: &str,
         params: &CreateSessionParams,
@@ -2047,23 +2045,19 @@ impl Backend for RuntimeBackend {
         };
         self.server
             .create_session(&owner, intent)
-            // The refusal carries its stable code in the message when one
-            // applies (`[model-unresolvable]`, …), the same vocabulary
-            // `apply_session_config` puts on the wire — a create refused on
-            // its config must be as branchable as a mid-session switch.
-            .map_err(|error| match &error.code {
-                Some(code) => HostError::Backend(format!("{} [{code}]", error.message)),
-                None => HostError::Backend(error.message),
-            })?;
+            .await
+            // A create refused on its config is as branchable as a mid-session
+            // switch: the runtime's kind becomes the AHP error variant.
+            .map_err(Self::host_error)?;
         super::create_intent::note(session_id, recorded);
         // Seed and bridge the new session now, so a client that subscribes after
         // creating it gets a snapshot and then live actions.
-        let _ = block_on(self.seeded(session_id));
+        let _ = self.seeded(session_id).await;
         Ok(())
     }
 
-    fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
-        let _ = self.server.dispose_session("ahp", session_id);
+    async fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
+        let _ = self.server.dispose_session("ahp", session_id).await;
         // The intent only exists to answer a seed of a session this process
         // drives; a disposed session will not be subscribed again, and the
         // object row (when the desktop wrote one) stays the durable intent.
@@ -2074,7 +2068,7 @@ impl Backend for RuntimeBackend {
         Ok(())
     }
 
-    fn move_chat(
+    async fn move_chat(
         &self,
         params: &ahp_types::commands::MoveChatParams,
     ) -> Result<ahp_types::commands::MoveChatResult, HostError> {
@@ -2116,7 +2110,7 @@ impl Backend for RuntimeBackend {
                 }
                 // The whole chain moves: the through anchor is the source's
                 // last durable row.
-                let snapshot = block_on(crate::journal_query::cold_read(&source_id));
+                let snapshot = crate::journal_query::cold_read(&source_id).await;
                 let last_entry = match snapshot {
                     crate::journal_query::ColdRead::Data(snapshot) => snapshot
                         .records
@@ -2143,13 +2137,14 @@ impl Backend for RuntimeBackend {
                 };
                 self.server
                     .fork_session(&owner, intent)
+                    .await
                     .map_err(|error| HostError::Backend(error.message))?;
                 // The source session retires as moved: archived, so the list
                 // face stops offering it while the journal stays forensically
                 // present (a move is atomic at the copy boundary; the source
                 // is never deleted out from under a reader).
                 self.server.archive_session(&owner, &source_id, true);
-                let _ = block_on(self.seeded(&fresh));
+                let _ = self.seeded(&fresh).await;
                 Ok(ahp_types::commands::MoveChatResult {
                     session: session::uri(&fresh),
                 })
@@ -2157,7 +2152,7 @@ impl Backend for RuntimeBackend {
         }
     }
 
-    fn create_chat(
+    async fn create_chat(
         &self,
         session_id: &str,
         chat_id: &str,
@@ -2217,23 +2212,24 @@ impl Backend for RuntimeBackend {
         };
         self.server
             .fork_session(&owner, intent)
+            .await
             .map_err(|error| HostError::Backend(error.message))?;
         let _ = session_id;
         // The forked journal is new to the host: seed and bridge it so a client
         // that subscribes right after creating it gets a snapshot and then live
         // actions.
-        let _ = block_on(self.seeded(chat_id));
+        let _ = self.seeded(chat_id).await;
         Ok(())
     }
 
-    fn dispose_chat(&self, chat_id: &str) -> Result<(), HostError> {
+    async fn dispose_chat(&self, chat_id: &str) -> Result<(), HostError> {
         // Disposing a chat retires its journal's live resources. The session
         // itself survives, so this disposes the engine rather than the row.
-        let _ = self.server.dispose_session("ahp", chat_id);
+        let _ = self.server.dispose_session("ahp", chat_id).await;
         Ok(())
     }
 
-    fn fetch_turns(
+    async fn fetch_turns(
         &self,
         chat_id: &str,
         cursor: Option<&str>,
@@ -2242,7 +2238,7 @@ impl Backend for RuntimeBackend {
         Ok(self.fetch_turns_window(chat_id, cursor, limit)?.0)
     }
 
-    fn fetch_turns_page(
+    async fn fetch_turns_page(
         &self,
         chat_id: &str,
         cursor: Option<&str>,
@@ -2251,7 +2247,7 @@ impl Backend for RuntimeBackend {
         self.fetch_turns_window(chat_id, cursor, limit)
     }
 
-    fn dispatch(
+    async fn dispatch(
         &self,
         channel: &str,
         action: &StateAction,
@@ -2267,7 +2263,7 @@ impl Backend for RuntimeBackend {
                 let owner = origin.client_id.clone();
                 let target = session_id.to_string();
                 let session_id = target.clone();
-                match self.server.submit(&owner, &target, text) {
+                match self.server.submit(&owner, &target, text).await {
                     Ok(_) => {
                         // The router folds and broadcasts this very action when
                         // the dispatch returns Accepted (host.rs: "the dispatch
@@ -2305,7 +2301,7 @@ impl Backend for RuntimeBackend {
                 // the echo retirement share.
                 let text = set.message.text.clone();
                 let target = session_id.to_string();
-                let receipt = match self.server.steer(&target, &set.id, text) {
+                let receipt = match self.server.steer(&target, &set.id, text).await {
                     Ok(receipt) => receipt,
                     Err(error) => return DispatchOutcome::Rejected(error.message),
                 };
@@ -2345,7 +2341,7 @@ impl Backend for RuntimeBackend {
                 let Some(session_id) = chat::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
-                match self.server.cancel_turn(session_id) {
+                match self.server.cancel_turn(session_id).await {
                     Ok(()) => {
                         // The router publishes this very turn-cancel action on
                         // Accepted, and the fold archives the active turn with
@@ -2378,18 +2374,20 @@ impl Backend for RuntimeBackend {
                 }
             }
             StateAction::ChatToolCallConfirmed(confirmed) => {
-                let outcome = self.confirm_tool_call(
-                    channel,
-                    &confirmed.tool_call_id,
-                    confirmed.meta.as_ref(),
-                    confirmed.approved,
-                    confirmed.selected_option_id.clone(),
-                );
+                let outcome = self
+                    .confirm_tool_call(
+                        channel,
+                        &confirmed.tool_call_id,
+                        confirmed.meta.as_ref(),
+                        confirmed.approved,
+                        confirmed.selected_option_id.clone(),
+                    )
+                    .await;
                 // A settle may have cold-opened the session (a verdict for a
                 // subscribed-but-never-submitted thread): the bridge the seed
                 // skipped now has an engine to bridge, and the verdict's
                 // journal row above the seed's watermark is how every client
-                // fold learns the card retired.
+                // fold learns the card cleared.
                 if matches!(
                     outcome,
                     DispatchOutcome::Accepted | DispatchOutcome::AcceptedThen(_)
@@ -2406,12 +2404,14 @@ impl Backend for RuntimeBackend {
                     ahp_types::state::ChatInputResponseKind::Decline => QuestionResponse::Dismiss,
                     ahp_types::state::ChatInputResponseKind::Cancel => QuestionResponse::Cancel,
                 };
-                let outcome = self.answer_question(
-                    channel,
-                    &completed.request_id,
-                    response,
-                    map_answers(&completed.answers),
-                );
+                let outcome = self
+                    .answer_question(
+                        channel,
+                        &completed.request_id,
+                        response,
+                        map_answers(&completed.answers),
+                    )
+                    .await;
                 if matches!(
                     outcome,
                     DispatchOutcome::Accepted | DispatchOutcome::AcceptedThen(_)
@@ -2424,6 +2424,7 @@ impl Backend for RuntimeBackend {
             // ── session actions ────────────────────────────────────────────
             StateAction::SessionConfigChanged(changed) => {
                 self.apply_session_config(channel, &changed.config, changed.replace)
+                    .await
             }
             StateAction::SessionWorkingDirectorySet(set) => {
                 let Some(session_id) = session::id(channel) else {
@@ -2434,7 +2435,7 @@ impl Backend for RuntimeBackend {
                         "working directories must be file:// URIs".to_string(),
                     );
                 };
-                match self.server.set_cwd(session_id, &path) {
+                match self.server.set_cwd(session_id, &path).await {
                     Ok(()) => DispatchOutcome::Accepted,
                     Err(error) => DispatchOutcome::Rejected(error.message),
                 }
@@ -2445,14 +2446,17 @@ impl Backend for RuntimeBackend {
             // registration needs no `x-manox` channel: the action *is* the
             // registration, and the host's reducer folds it into the very state
             // a subscriber reads. The runtime half is the same registration
-            // store the v2 `RegisterSessionTools` call fills, so a tool a
-            // client contributes here becomes callable by the model through the
-            // one existing path (`embedder_tools`), not a second one.
+            // store client-tool registration fills, so a tool a client
+            // contributes here becomes callable by the model through the one
+            // existing path (`embedder_tools`), not a second one.
             StateAction::SessionActiveClientSet(set) => {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
-                match self.register_client_tools(session_id, &set.active_client) {
+                match self
+                    .register_client_tools(session_id, &set.active_client)
+                    .await
+                {
                     Ok(()) => DispatchOutcome::Accepted,
                     Err(reason) => DispatchOutcome::Rejected(reason),
                 }
@@ -2514,7 +2518,7 @@ impl Backend for RuntimeBackend {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
-                match self.server.mcp_start(session_id, &requested.id) {
+                match self.server.mcp_start(session_id, &requested.id).await {
                     Ok(()) => DispatchOutcome::Accepted,
                     Err(error) => DispatchOutcome::Rejected(error.message),
                 }
@@ -2523,7 +2527,7 @@ impl Backend for RuntimeBackend {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
-                match self.server.mcp_stop(session_id, &requested.id) {
+                match self.server.mcp_stop(session_id, &requested.id).await {
                     Ok(()) => DispatchOutcome::Accepted,
                     Err(error) => DispatchOutcome::Rejected(error.message),
                 }
@@ -2555,6 +2559,7 @@ impl Backend for RuntimeBackend {
                 match self
                     .server
                     .mcp_set_enabled(session_id, &toggled.id, enabled)
+                    .await
                 {
                     Ok(()) => DispatchOutcome::Accepted,
                     Err(error) => DispatchOutcome::Rejected(error.message),
@@ -2576,7 +2581,7 @@ impl Backend for RuntimeBackend {
                 let Some(terminal_id) = terminal::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
-                match self.server.terminal_input(terminal_id, &input.data) {
+                match self.server.terminal_input(terminal_id, &input.data).await {
                     Ok(()) => DispatchOutcome::Accepted,
                     Err(error) => DispatchOutcome::Rejected(error.message),
                 }
@@ -2597,7 +2602,7 @@ impl Backend for RuntimeBackend {
                         resized.cols, resized.rows
                     ));
                 };
-                match self.server.terminal_resize(terminal_id, cols, rows) {
+                match self.server.terminal_resize(terminal_id, cols, rows).await {
                     Ok(()) => DispatchOutcome::Accepted,
                     Err(error) => DispatchOutcome::Rejected(error.message),
                 }
@@ -2617,8 +2622,7 @@ impl Backend for RuntimeBackend {
             // AHP has no pin bit and no ordering field (verified against
             // `SessionStatus`, `SessionMetadata` and `SessionSummary`), so both
             // ride the declared extension surface. Their durable authority is
-            // the store row plus `sidebar_order`, the same layers v2's
-            // `PinThread` / `InsertThreadBefore` use.
+            // the store row plus `sidebar_order`.
             StateAction::Unknown(tag)
                 if tag.get("type").and_then(Value::as_str)
                     == Some(manox_ahp::ext::actions::PINNED_CHANGED) =>
@@ -2853,11 +2857,14 @@ impl Backend for RuntimeBackend {
     /// runs — the fold and the live stream are one code path, so they
     /// cannot drift (the wire face of #884: without this, subscribe and
     /// dispatch both die at `ensure_annotations` with NotFound).
-    fn annotations_state(&self, session_id: &str) -> Option<ahp_types::state::AnnotationsState> {
+    async fn annotations_state(
+        &self,
+        session_id: &str,
+    ) -> Option<ahp_types::state::AnnotationsState> {
         let mut state = manox_ahp::channels::annotations::initial();
         let mut translator = crate::ahp::projection::Translator::new();
         let channel = manox_ahp::channels::annotations::uri(session_id);
-        let snapshot = block_on(crate::journal_query::cold_read(session_id));
+        let snapshot = crate::journal_query::cold_read(session_id).await;
         match snapshot {
             crate::journal_query::ColdRead::Data(snapshot) => {
                 for record in &snapshot.records {
@@ -2882,18 +2889,18 @@ impl Backend for RuntimeBackend {
         }
     }
 
-    fn changeset_state(&self, channel: &str) -> Option<ahp_types::state::ChangesetState> {
+    async fn changeset_state(&self, channel: &str) -> Option<ahp_types::state::ChangesetState> {
         let (session_id, key) = super::changeset::parse(channel)?;
         // First sight: run the scan (the catalogue call ensures the engine
         // entry), then answer from it.
-        let dirs = block_on(async { seed_directories(&session_id).await });
+        let dirs = seed_directories(&session_id).await;
         if let Some(dirs) = dirs {
             super::changeset::Engine::global().catalogue(&session_id, dirs);
         }
         super::changeset::Engine::global().state(&session_id, key)
     }
 
-    fn invoke_changeset_operation(
+    async fn invoke_changeset_operation(
         &self,
         channel: &str,
         operation_id: &str,
@@ -2970,7 +2977,7 @@ impl Backend for RuntimeBackend {
         }
     }
 
-    fn mcp_channel_request(
+    async fn mcp_channel_request(
         &self,
         channel: &str,
         method: &str,
@@ -2993,7 +3000,7 @@ impl Backend for RuntimeBackend {
                 // customization's cleared `channel` is the honest signal.
                 return Err(HostError::NotFound(channel.to_string()));
             };
-            block_on(async { proxy_mcp_method(connected.client.peer(), method, params).await })
+            proxy_mcp_method(connected.client.peer(), method, params).await
         }
         #[cfg(not(feature = "mcp"))]
         {
@@ -3021,7 +3028,7 @@ impl Backend for RuntimeBackend {
     /// A channel with no folded state still answers: an empty object is "this
     /// channel is served and currently has nothing", which is a different and
     /// actionable statement from silence.
-    fn extension_baseline(&self, channel: &str) -> Option<Value> {
+    async fn extension_baseline(&self, channel: &str) -> Option<Value> {
         if !manox_ahp::ext::is_extension_channel(channel) {
             return None;
         }
@@ -3037,6 +3044,7 @@ impl Backend for RuntimeBackend {
                 // the channel is served, the first bridge frame fills it.
                 self.server
                     .conversation_metrics(session_id)
+                    .await
                     .unwrap_or_else(|| serde_json::json!({}))
             } else if manox_ahp::ext::is_session_scoped_channel(channel) {
                 let session_id = channel
@@ -3055,14 +3063,14 @@ impl Backend for RuntimeBackend {
                 // no rows yet answers its (empty) state, not `null`: the
                 // client replaces what it holds, and `null` would claim the
                 // channel says nothing.
-                block_on(super::extension_channel_baseline(channel, session_id))
+                super::extension_channel_baseline(channel, session_id).await
             } else {
                 self.catalogue_baseline(channel)
             };
         Some(state)
     }
 
-    fn extension(&self, method: &str, params: &Value) -> Result<Value, HostError> {
+    async fn extension(&self, method: &str, params: &Value) -> Result<Value, HostError> {
         // The extension surface is declared once in `ext::commands`; this maps
         // the subset the runtime actually performs onto its existing intents.
         // Everything else answers `Unimplemented`, which is the honest reply
@@ -3074,9 +3082,10 @@ impl Backend for RuntimeBackend {
                     .get("instructions")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                self.ensure_command_session(&session_id)?;
+                self.ensure_command_session(&session_id).await?;
                 self.server
                     .compact(&session_id, instructions)
+                    .await
                     .map_err(|error| HostError::Backend(error.message))?;
                 // The cold-open gave the command an engine the seed never
                 // bridged: the summary row it writes must still reach the
@@ -3090,7 +3099,7 @@ impl Backend for RuntimeBackend {
                 // answer is available for any journaled session — including
                 // one another process (the cx CLI) owns and is running.
                 let session_id = extension_session(params)?;
-                let owner = block_on(super::open_turn_owner(&session_id));
+                let owner = super::open_turn_owner(&session_id).await;
                 Ok(serde_json::json!({ "owner": owner }))
             }
             manox_ahp::ext::commands::GOAL => {
@@ -3103,7 +3112,7 @@ impl Backend for RuntimeBackend {
                         "x-manox/goal needs action".to_string(),
                     ));
                 };
-                self.ensure_command_session(&session_id)?;
+                self.ensure_command_session(&session_id).await?;
                 let objective = params
                     .get("objective")
                     .and_then(Value::as_str)
@@ -3112,6 +3121,7 @@ impl Backend for RuntimeBackend {
                 let max_rounds = params.get("maxRounds").and_then(Value::as_u64);
                 self.server
                     .goal(&session_id, action, objective, budget, max_rounds)
+                    .await
                     .map_err(|error| HostError::Backend(error.message))?;
                 // Goal state is journal-derived: the `x-manox-work` action
                 // that announces it rides the bridge, which the cold seed
@@ -3159,18 +3169,17 @@ impl Backend for RuntimeBackend {
                 }
                 let mut receipts = Vec::with_capacity(ids.len());
                 for id in &ids {
-                    let receipt =
-                        self.server
-                            .teardown_container("ahp", id, mode)
-                            .map_err(|error| {
-                                if error.code.as_deref()
-                                    == Some(crate::error::codes::SESSION_NOT_FOUND)
-                                {
-                                    HostError::SessionNotFound(id.clone())
-                                } else {
-                                    HostError::Backend(error.message)
-                                }
-                            })?;
+                    let receipt = self
+                        .server
+                        .teardown_container("ahp", id, mode)
+                        .await
+                        .map_err(|error| {
+                            if error.kind == RuntimeErrorKind::NotFound {
+                                HostError::SessionNotFound(id.clone())
+                            } else {
+                                Self::host_error(error)
+                            }
+                        })?;
                     let mut entry = serde_json::Map::new();
                     entry.insert("session".to_string(), serde_json::json!(id));
                     if let Value::Object(rest) = receipt {
@@ -3496,6 +3505,10 @@ mod answer_mapping_tests {
 /// accepted and forwarded verbatim.
 #[cfg(test)]
 mod mcp_dispatch_tests {
+    // The suite holds the process-global state locks (store override, HOME,
+    // runtime) for the whole test body, so its guards span the awaits by
+    // design; dropping them at an await would unsynchronize the suite.
+    #![allow(clippy::await_holding_lock)]
     use super::*;
     use crate::error::RuntimeError;
     use crate::runtime_trait::{
@@ -3547,12 +3560,13 @@ mod mcp_dispatch_tests {
         }
     }
 
+    #[async_trait]
     impl SessionRuntime for McpOnlyRuntime {
         fn set_project_alias(&self, _: &str, _: Option<&str>) -> bool {
             false
         }
 
-        fn preflight_config(
+        async fn preflight_config(
             &self,
             _session_id: &str,
             _model: Option<&str>,
@@ -3562,7 +3576,7 @@ mod mcp_dispatch_tests {
         ) -> Result<(), RuntimeError> {
             Ok(())
         }
-        fn set_network_access(&self, _: &str, _: &str) -> Result<(), RuntimeError> {
+        async fn set_network_access(&self, _: &str, _: &str) -> Result<(), RuntimeError> {
             Ok(())
         }
         fn terminal_state(&self, _terminal_id: &str) -> Option<TerminalSnapshot> {
@@ -3574,7 +3588,7 @@ mod mcp_dispatch_tests {
         ) -> Option<tokio::sync::broadcast::Receiver<std::sync::Arc<Vec<u8>>>> {
             None
         }
-        fn create_terminal(
+        async fn create_terminal(
             &self,
             _session_id: &str,
             _terminal_id: &str,
@@ -3583,13 +3597,17 @@ mod mcp_dispatch_tests {
         ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn dispose_terminal(&self, _terminal_id: &str) -> Result<(), RuntimeError> {
+        async fn dispose_terminal(&self, _terminal_id: &str) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn terminal_input(&self, _terminal_id: &str, _data: &str) -> Result<(), RuntimeError> {
+        async fn terminal_input(
+            &self,
+            _terminal_id: &str,
+            _data: &str,
+        ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn terminal_resize(
+        async fn terminal_resize(
             &self,
             _terminal_id: &str,
             _cols: u16,
@@ -3597,22 +3615,34 @@ mod mcp_dispatch_tests {
         ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn create_session(&self, _owner: &str, _intent: SessionIntent) -> Result<(), RuntimeError> {
+        async fn create_session(
+            &self,
+            _owner: &str,
+            _intent: SessionIntent,
+        ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn fork_session(&self, _owner: &str, _intent: ForkIntent) -> Result<(), RuntimeError> {
+        async fn fork_session(
+            &self,
+            _owner: &str,
+            _intent: ForkIntent,
+        ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn dispose_session(&self, _owner: &str, _session_id: &str) -> Result<(), RuntimeError> {
+        async fn dispose_session(
+            &self,
+            _owner: &str,
+            _session_id: &str,
+        ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
         fn has_session(&self, _session_id: &str) -> bool {
             false
         }
-        fn open_session(&self, _owner: &str, _session_id: &str) -> Result<(), RuntimeError> {
+        async fn open_session(&self, _owner: &str, _session_id: &str) -> Result<(), RuntimeError> {
             unreachable!("unused")
         }
-        fn submit(
+        async fn submit(
             &self,
             _owner: &str,
             _session_id: &str,
@@ -3620,7 +3650,7 @@ mod mcp_dispatch_tests {
         ) -> Result<Value, RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn steer(
+        async fn steer(
             &self,
             _session_id: &str,
             _message_id: &str,
@@ -3629,27 +3659,31 @@ mod mcp_dispatch_tests {
             Err(RuntimeError::new("unused"))
         }
         fn drop_queued(&self, _session_id: &str, _message_id: &str) {}
-        fn cancel_turn(&self, _session_id: &str) -> Result<(), RuntimeError> {
+        async fn cancel_turn(&self, _session_id: &str) -> Result<(), RuntimeError> {
             if self.cancel_ok {
                 Ok(())
             } else {
                 Err(RuntimeError::new("unused"))
             }
         }
-        fn set_model(&self, _session_id: &str, _model: &str) -> Result<(), RuntimeError> {
+        async fn set_model(&self, _session_id: &str, _model: &str) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn set_reasoning_effort(
+        async fn set_reasoning_effort(
             &self,
             _session_id: &str,
             _effort: &str,
         ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn set_access_mode(&self, _session_id: &str, _mode: &str) -> Result<(), RuntimeError> {
+        async fn set_access_mode(
+            &self,
+            _session_id: &str,
+            _mode: &str,
+        ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn set_cwd(&self, _session_id: &str, _cwd: &str) -> Result<(), RuntimeError> {
+        async fn set_cwd(&self, _session_id: &str, _cwd: &str) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
         fn archive_session(&self, _owner: &str, _session_id: &str, _archived: bool) {}
@@ -3668,14 +3702,14 @@ mod mcp_dispatch_tests {
         fn order_session(&self, _session_id: &str, _before: Option<&str>) -> bool {
             false
         }
-        fn compact(
+        async fn compact(
             &self,
             _session_id: &str,
             _instructions: Option<String>,
         ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn goal(
+        async fn goal(
             &self,
             _session_id: &str,
             _action: &str,
@@ -3685,7 +3719,7 @@ mod mcp_dispatch_tests {
         ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn confirm_tool_call(
+        async fn confirm_tool_call(
             &self,
             _session_id: &str,
             _auth_id: &str,
@@ -3694,7 +3728,7 @@ mod mcp_dispatch_tests {
         ) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
         }
-        fn answer_question(
+        async fn answer_question(
             &self,
             _session_id: &str,
             _request_id: &str,
@@ -3706,7 +3740,7 @@ mod mcp_dispatch_tests {
         fn journal_feed(&self, _session_id: &str) -> Option<manox_agent::thread::ThreadHandle> {
             None
         }
-        fn set_embedder_tools(
+        async fn set_embedder_tools(
             &self,
             _session_id: &str,
             _client_id: &str,
@@ -3714,7 +3748,7 @@ mod mcp_dispatch_tests {
         ) {
         }
 
-        fn mcp_start(&self, _session_id: &str, id: &str) -> Result<(), RuntimeError> {
+        async fn mcp_start(&self, _session_id: &str, id: &str) -> Result<(), RuntimeError> {
             if !self.served {
                 return Err(RuntimeError::new(
                     "MCP start is not supported by this runtime",
@@ -3724,7 +3758,7 @@ mod mcp_dispatch_tests {
             Ok(())
         }
 
-        fn mcp_stop(&self, _session_id: &str, id: &str) -> Result<(), RuntimeError> {
+        async fn mcp_stop(&self, _session_id: &str, id: &str) -> Result<(), RuntimeError> {
             if !self.served {
                 return Err(RuntimeError::new(
                     "MCP stop is not supported by this runtime",
@@ -3734,7 +3768,7 @@ mod mcp_dispatch_tests {
             Ok(())
         }
 
-        fn mcp_set_enabled(
+        async fn mcp_set_enabled(
             &self,
             _session_id: &str,
             id: &str,
@@ -3750,172 +3784,182 @@ mod mcp_dispatch_tests {
         }
     }
 
-    fn dispatch_start(backend: &RuntimeBackend, channel: &str, id: &str) -> DispatchOutcome {
-        backend.dispatch(
-            channel,
-            &StateAction::SessionMcpServerStartRequested(
-                ahp_types::actions::SessionMcpServerStartRequestedAction { id: id.to_string() },
-            ),
-            &ActionOrigin {
-                client_id: "client-1".to_string(),
-                client_seq: 1,
-            },
-        )
+    async fn dispatch_start(backend: &RuntimeBackend, channel: &str, id: &str) -> DispatchOutcome {
+        backend
+            .dispatch(
+                channel,
+                &StateAction::SessionMcpServerStartRequested(
+                    ahp_types::actions::SessionMcpServerStartRequestedAction { id: id.to_string() },
+                ),
+                &ActionOrigin {
+                    client_id: "client-1".to_string(),
+                    client_seq: 1,
+                },
+            )
+            .await
     }
 
-    fn dispatch_stop(backend: &RuntimeBackend, channel: &str, id: &str) -> DispatchOutcome {
-        backend.dispatch(
-            channel,
-            &StateAction::SessionMcpServerStopRequested(
-                ahp_types::actions::SessionMcpServerStopRequestedAction { id: id.to_string() },
-            ),
-            &ActionOrigin {
-                client_id: "client-1".to_string(),
-                client_seq: 2,
-            },
-        )
+    async fn dispatch_stop(backend: &RuntimeBackend, channel: &str, id: &str) -> DispatchOutcome {
+        backend
+            .dispatch(
+                channel,
+                &StateAction::SessionMcpServerStopRequested(
+                    ahp_types::actions::SessionMcpServerStopRequestedAction { id: id.to_string() },
+                ),
+                &ActionOrigin {
+                    client_id: "client-1".to_string(),
+                    client_seq: 2,
+                },
+            )
+            .await
     }
 
     fn backend(runtime: Arc<McpOnlyRuntime>) -> Arc<RuntimeBackend> {
         RuntimeBackend::new(runtime as Arc<dyn SessionRuntime>, std::env::temp_dir())
     }
 
-    #[test]
-    fn a_start_on_a_runtime_without_the_mcp_plane_is_a_refusal() {
+    #[tokio::test]
+    async fn a_start_on_a_runtime_without_the_mcp_plane_is_a_refusal() {
         let backend = backend(McpOnlyRuntime::refusing());
-        let outcome = dispatch_start(&backend, "ahp-session:/s-1", "github");
+        let outcome = dispatch_start(&backend, "ahp-session:/s-1", "github").await;
         assert!(
             matches!(&outcome, DispatchOutcome::Rejected(reason) if reason.contains("not supported")),
             "the refusal must reach the client: {outcome:?}"
         );
     }
 
-    #[test]
-    fn a_stop_on_a_runtime_without_the_mcp_plane_is_a_refusal() {
+    #[tokio::test]
+    async fn a_stop_on_a_runtime_without_the_mcp_plane_is_a_refusal() {
         let backend = backend(McpOnlyRuntime::refusing());
-        let outcome = dispatch_stop(&backend, "ahp-session:/s-1", "github");
+        let outcome = dispatch_stop(&backend, "ahp-session:/s-1", "github").await;
         assert!(matches!(outcome, DispatchOutcome::Rejected(_)));
     }
 
-    #[test]
-    fn a_start_intent_is_accepted_and_forwarded_with_its_id() {
+    #[tokio::test]
+    async fn a_start_intent_is_accepted_and_forwarded_with_its_id() {
         let runtime = McpOnlyRuntime::serving();
         let backend = backend(Arc::clone(&runtime));
         assert_eq!(
-            dispatch_start(&backend, "ahp-session:/s-1", "github"),
+            dispatch_start(&backend, "ahp-session:/s-1", "github").await,
             DispatchOutcome::Accepted
         );
         assert_eq!(*runtime.started.lock(), vec!["github".to_string()]);
     }
 
-    #[test]
-    fn a_stop_intent_is_accepted_and_forwarded_with_its_id() {
+    #[tokio::test]
+    async fn a_stop_intent_is_accepted_and_forwarded_with_its_id() {
         let runtime = McpOnlyRuntime::serving();
         let backend = backend(Arc::clone(&runtime));
         assert_eq!(
-            dispatch_stop(&backend, "ahp-session:/s-1", "github"),
+            dispatch_stop(&backend, "ahp-session:/s-1", "github").await,
             DispatchOutcome::Accepted
         );
         assert_eq!(*runtime.stopped.lock(), vec!["github".to_string()]);
     }
 
-    #[test]
-    fn an_mcp_intent_off_the_session_channel_is_rejected() {
+    #[tokio::test]
+    async fn an_mcp_intent_off_the_session_channel_is_rejected() {
         let backend = backend(McpOnlyRuntime::serving());
         assert!(matches!(
-            dispatch_start(&backend, "ahp-root://", "github"),
+            dispatch_start(&backend, "ahp-root://", "github").await,
             DispatchOutcome::Rejected(_)
         ));
     }
 
-    fn dispatch_toggle(backend: &RuntimeBackend, id: &str, enabled: bool) -> DispatchOutcome {
+    async fn dispatch_toggle(backend: &RuntimeBackend, id: &str, enabled: bool) -> DispatchOutcome {
         use ahp_types::state::CustomizationEnablement;
-        backend.dispatch(
-            "ahp-session:/s-1",
-            &StateAction::SessionCustomizationToggled(
-                ahp_types::actions::SessionCustomizationToggledAction {
-                    id: id.to_string(),
-                    enablement: vec![CustomizationEnablement::Global { enabled }],
+        backend
+            .dispatch(
+                "ahp-session:/s-1",
+                &StateAction::SessionCustomizationToggled(
+                    ahp_types::actions::SessionCustomizationToggledAction {
+                        id: id.to_string(),
+                        enablement: vec![CustomizationEnablement::Global { enabled }],
+                    },
+                ),
+                &ActionOrigin {
+                    client_id: "client-1".to_string(),
+                    client_seq: 3,
                 },
-            ),
-            &ActionOrigin {
-                client_id: "client-1".to_string(),
-                client_seq: 3,
-            },
-        )
+            )
+            .await
     }
 
-    #[test]
-    fn a_toggle_reaches_the_runtime_with_its_decisive_value() {
+    #[tokio::test]
+    async fn a_toggle_reaches_the_runtime_with_its_decisive_value() {
         let runtime = McpOnlyRuntime::serving();
         let backend = backend(Arc::clone(&runtime));
         assert_eq!(
-            dispatch_toggle(&backend, "github", false),
+            dispatch_toggle(&backend, "github", false).await,
             DispatchOutcome::Accepted
         );
         assert_eq!(*runtime.enabled.lock(), vec![("github".to_string(), false)]);
     }
 
-    #[test]
-    fn a_toggle_on_a_runtime_without_the_mcp_plane_is_a_refusal() {
+    #[tokio::test]
+    async fn a_toggle_on_a_runtime_without_the_mcp_plane_is_a_refusal() {
         let backend = backend(McpOnlyRuntime::refusing());
         assert!(matches!(
-            dispatch_toggle(&backend, "github", true),
+            dispatch_toggle(&backend, "github", true).await,
             DispatchOutcome::Rejected(_)
         ));
     }
 
-    #[test]
-    fn a_session_scoped_decision_still_carries_its_enabled_value() {
+    #[tokio::test]
+    async fn a_session_scoped_decision_still_carries_its_enabled_value() {
         use ahp_types::state::CustomizationEnablement;
         let runtime = McpOnlyRuntime::serving();
         let backend = backend(Arc::clone(&runtime));
-        backend.dispatch(
-            "ahp-session:/s-1",
-            &StateAction::SessionCustomizationToggled(
-                ahp_types::actions::SessionCustomizationToggledAction {
-                    id: "fs".to_string(),
-                    enablement: vec![
-                        CustomizationEnablement::Session { enabled: false },
-                        CustomizationEnablement::Global { enabled: true },
-                    ],
+        backend
+            .dispatch(
+                "ahp-session:/s-1",
+                &StateAction::SessionCustomizationToggled(
+                    ahp_types::actions::SessionCustomizationToggledAction {
+                        id: "fs".to_string(),
+                        enablement: vec![
+                            CustomizationEnablement::Session { enabled: false },
+                            CustomizationEnablement::Global { enabled: true },
+                        ],
+                    },
+                ),
+                &ActionOrigin {
+                    client_id: "client-1".to_string(),
+                    client_seq: 4,
                 },
-            ),
-            &ActionOrigin {
-                client_id: "client-1".to_string(),
-                client_seq: 4,
-            },
-        );
+            )
+            .await;
         // The first entry is decisive per the wire contract (descending
         // specificity); manox degrades the scope to global but honors the
         // value.
         assert_eq!(*runtime.enabled.lock(), vec![("fs".to_string(), false)]);
     }
 
-    #[test]
-    fn a_toggle_without_a_recognisable_decision_is_refused_not_defaulted() {
+    #[tokio::test]
+    async fn a_toggle_without_a_recognisable_decision_is_refused_not_defaulted() {
         let backend = backend(McpOnlyRuntime::serving());
-        let outcome = backend.dispatch(
-            "ahp-session:/s-1",
-            &StateAction::SessionCustomizationToggled(
-                ahp_types::actions::SessionCustomizationToggledAction {
-                    id: "github".to_string(),
-                    enablement: Vec::new(),
+        let outcome = backend
+            .dispatch(
+                "ahp-session:/s-1",
+                &StateAction::SessionCustomizationToggled(
+                    ahp_types::actions::SessionCustomizationToggledAction {
+                        id: "github".to_string(),
+                        enablement: Vec::new(),
+                    },
+                ),
+                &ActionOrigin {
+                    client_id: "client-1".to_string(),
+                    client_seq: 6,
                 },
-            ),
-            &ActionOrigin {
-                client_id: "client-1".to_string(),
-                client_seq: 6,
-            },
-        );
+            )
+            .await;
         assert!(
             matches!(&outcome, DispatchOutcome::Rejected(reason) if reason.contains("no recognisable")),
             "an empty decision is a refusal, never a defaulted enable: {outcome:?}"
         );
     }
 
-    #[test]
-    fn customization_mutations_beyond_enablement_are_refused() {
+    #[tokio::test]
+    async fn customization_mutations_beyond_enablement_are_refused() {
         use ahp_types::state::{
             Customization, McpServerCustomization, McpServerReadyState, McpServerState,
         };
@@ -3932,16 +3976,18 @@ mod mcp_dispatch_tests {
             channel: None,
             mcp_app: None,
         }));
-        let outcome = backend.dispatch(
-            "ahp-session:/s-1",
-            &StateAction::SessionCustomizationUpdated(Box::new(
-                ahp_types::actions::SessionCustomizationUpdatedAction { customization },
-            )),
-            &ActionOrigin {
-                client_id: "client-1".to_string(),
-                client_seq: 5,
-            },
-        );
+        let outcome = backend
+            .dispatch(
+                "ahp-session:/s-1",
+                &StateAction::SessionCustomizationUpdated(Box::new(
+                    ahp_types::actions::SessionCustomizationUpdatedAction { customization },
+                )),
+                &ActionOrigin {
+                    client_id: "client-1".to_string(),
+                    client_seq: 5,
+                },
+            )
+            .await;
         assert!(
             matches!(&outcome, DispatchOutcome::Rejected(reason) if reason.contains("file-owned")),
             "the refusal must name the ownership rule: {outcome:?}"
@@ -4029,9 +4075,9 @@ mod mcp_dispatch_tests {
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&dir).unwrap();
         let store = manox_agent::thread_store::standalone_for_test_at(&dir);
-        write_journal_fixture(&dir, "s-stamped", Some("hello"));
+        let stamped_journal = write_journal_fixture(&dir, "s-stamped", Some("hello"));
         write_journal_fixture(&dir, "s-silent", None);
-        manox_harness::session_meta::update(&dir, &dir.join("s-stamped.jsonl"), |meta| {
+        manox_harness::session_meta::update(&dir, &stamped_journal, |meta| {
             meta.interacted_at = Some(100);
             meta.last_settled_at = Some(150);
         })
@@ -4101,8 +4147,13 @@ mod mcp_dispatch_tests {
     /// A flat journal fixture: the header plus, when `first_user` is set,
     /// one user message (the shape the store suite's fixtures use). The
     /// header-only variant is the never-spoke session.
-    fn write_journal_fixture(dir: &std::path::Path, id: &str, first_user: Option<&str>) {
-        std::fs::create_dir_all(dir).unwrap();
+    /// A canonical journal fixture (`<dir>/<bucket>/<id>/session.jsonl`) —
+    /// the only shape the store's scan admits.
+    fn write_journal_fixture(
+        dir: &std::path::Path,
+        id: &str,
+        first_user: Option<&str>,
+    ) -> std::path::PathBuf {
         let mut content = format!(
             "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{id}\"}}}}\n"
         );
@@ -4111,7 +4162,13 @@ mod mcp_dispatch_tests {
                 "{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-09-13T00:00:01Z\",\"seq\":0,\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"timestamp\":1770000000000}}}}\n"
             ));
         }
-        std::fs::write(dir.join(format!("{id}.jsonl")), content).unwrap();
+        let path = dir
+            .join("--fixture--")
+            .join(id)
+            .join(manox_harness::session::identity::JOURNAL_FILE);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        path
     }
 
     /// The catalogue aggregation: ranked rows first — their interaction-rank
@@ -4185,8 +4242,8 @@ mod mcp_dispatch_tests {
     /// folded the action for every subscriber, and a fold the disk will
     /// not confirm is the never-happened state the fail-closed rule
     /// forbids.
-    #[test]
-    fn a_viewed_declaration_stamps_the_derived_read() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_viewed_declaration_stamps_the_derived_read() {
         // The store override is process-global and the suite runs in
         // parallel: hold the same serialization the cold-seed tests do, or
         // a swap mid-test answers another test's lookup with nothing.
@@ -4207,19 +4264,21 @@ mod mcp_dispatch_tests {
         assert!(unread(&store), "the settle lights the bit (no view yet)");
 
         let backend = backend(McpOnlyRuntime::serving());
-        let declare = |backend: &RuntimeBackend, is_read: bool| {
-            backend.dispatch(
-                "ahp-session:/s-derived",
-                &StateAction::SessionIsReadChanged(
-                    ahp_types::actions::SessionIsReadChangedAction { is_read },
-                ),
-                &ActionOrigin {
-                    client_id: "client-1".to_string(),
-                    client_seq: 1,
-                },
-            )
+        let declare = async |backend: &RuntimeBackend, is_read: bool| {
+            backend
+                .dispatch(
+                    "ahp-session:/s-derived",
+                    &StateAction::SessionIsReadChanged(
+                        ahp_types::actions::SessionIsReadChangedAction { is_read },
+                    ),
+                    &ActionOrigin {
+                        client_id: "client-1".to_string(),
+                        client_seq: 1,
+                    },
+                )
+                .await
         };
-        assert_eq!(declare(&backend, true), DispatchOutcome::Accepted);
+        assert_eq!(declare(&backend, true).await, DispatchOutcome::Accepted);
         assert!(!unread(&store), "the focus declaration clears the bit");
 
         let now = chrono::Utc::now().timestamp();
@@ -4228,7 +4287,7 @@ mod mcp_dispatch_tests {
         });
         assert!(unread(&store), "a settle after the view re-lights it");
 
-        assert_eq!(declare(&backend, false), DispatchOutcome::Accepted);
+        assert_eq!(declare(&backend, false).await, DispatchOutcome::Accepted);
         assert!(
             unread(&store),
             "the mark-unread sentinel keeps the recorded settle un-viewed"
@@ -4323,11 +4382,15 @@ mod mcp_dispatch_tests {
 /// composer in ask mode until restart).
 #[cfg(test)]
 mod turn_cancel_ask_settlement_tests {
+    // The suite holds the process-global state locks (store override, HOME,
+    // runtime) for the whole test body, so its guards span the awaits by
+    // design; dropping them at an await would unsynchronize the suite.
+    #![allow(clippy::await_holding_lock)]
     use super::mcp_dispatch_tests::McpOnlyRuntime;
     use super::*;
     use ahp_types::state::ResponsePart;
 
-    fn kernel_entry(mut fields: serde_json::Value) -> SessionTreeEntry {
+    fn kernel_entry(mut fields: serde_json::Value) -> Event {
         let mut base = serde_json::json!({
             "id": "e-1",
             "parentId": serde_json::Value::Null,
@@ -4358,159 +4421,160 @@ mod turn_cancel_ask_settlement_tests {
     /// archive the turn with the ask SETTLED — the settlement rides ahead of
     /// the cancellation echo, because a completion after the archive reduces
     /// to NoOp and strands every client's card.
-    #[test]
-    fn a_turn_cancel_settles_the_open_ask_ahead_of_the_archive() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_cancel_settles_the_open_ask_ahead_of_the_archive() {
         let _g = crate::test_support::lock_globals();
         crate::test_support::hermetic_home();
         crate::test_support::init_globals();
-        manox_agent::runtime::handle().block_on(async {
-            // The sessions dir the cold seed resolves through (the core
-            // layout: bucket over per-session directories).
-            let sessions = manox_agent::paths::core_root().unwrap().join("t");
-            std::fs::create_dir_all(&sessions).unwrap();
-            let journal = |root: &std::path::Path, id: &str| {
-                root.join(id)
-                    .join(manox_harness::session::identity::JOURNAL_FILE)
-            };
+        // The sessions dir the cold seed resolves through (the core
+        // layout: bucket over per-session directories).
+        let sessions = manox_agent::paths::core_root().unwrap().join("t");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let journal = |root: &std::path::Path, id: &str| {
+            root.join(id)
+                .join(manox_harness::session::identity::JOURNAL_FILE)
+        };
 
-            // A journal whose turn sits parked on an unanswered question — no
-            // decision row, the shape the live cancel leaves mid-flight.
-            let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
-                &journal(&sessions, "s-1"),
-                manox_harness::session::jsonl::JsonlSessionMetadata {
-                    id: "s-1".to_string(),
-                    cwd: "/".to_string(),
-                    created_at: chrono::Utc::now(),
-                    parent_session_path: None,
-                    // The header's thread stamp is how the cold seed resolves
-                    // the chat's owning thread (`header_thread_id`).
-                    metadata: Some(serde_json::json!({ "thread": "s-1" })),
-                },
+        // A journal whose turn sits parked on an unanswered question — no
+        // decision row, the shape the live cancel leaves mid-flight.
+        let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
+            &journal(&sessions, "s-1"),
+            manox_harness::session::jsonl::JsonlSessionMetadata {
+                id: "s-1".to_string(),
+                cwd: "/".to_string(),
+                created_at: chrono::Utc::now(),
+                parent_session_path: None,
+                // The header's thread stamp is how the cold seed resolves
+                // the chat's owning thread (`header_thread_id`).
+                metadata: Some(serde_json::json!({ "thread": "s-1" })),
+            },
+        )
+        .await
+        .expect("create the journal");
+        let storage = manox_harness::session::Session::new(storage);
+        storage
+            .append_entries(vec![
+                kernel_entry(serde_json::json!({
+                    "type": "message",
+                    "id": "sentry-0",
+                    "message": {"role": "user",
+                                "content": [{"type": "text", "text": "plan the release"}]},
+                })),
+                kernel_entry(serde_json::json!({"type": "turn_start", "id": "sentry-1"})),
+                kernel_entry(serde_json::json!({
+                    "type": "question",
+                    "id": "sentry-2",
+                    "kind": "request",
+                    "authId": "call_ask",
+                    "payload": {
+                        "toolName": "AskUserQuestion",
+                        "input": {"questions": [{
+                            "question": "q", "header": "h", "multiSelect": false,
+                        }]},
+                    },
+                })),
+            ])
+            .await
+            .expect("append the ask rows");
+        drop(storage);
+
+        let (_backend, host) = wired_host();
+        let (host_side, client_side) = manox_ahp::transport::inproc::pair();
+        host.accept(host_side);
+        let client = ahp::Client::connect(client_side, ahp::ClientConfig::default())
+            .await
+            .expect("connect");
+        client
+            .initialize(
+                "desktop".to_string(),
+                vec![ahp_types::version::PROTOCOL_VERSION.to_string()],
+                vec!["ahp-chat:/s-1".to_string()],
             )
             .await
-            .expect("create the journal");
-            storage
-                .append_entries(&[
-                    kernel_entry(serde_json::json!({
-                        "type": "message",
-                        "id": "sentry-0",
-                        "message": {"role": "user",
-                                    "content": [{"type": "text", "text": "plan the release"}]},
-                    })),
-                    kernel_entry(serde_json::json!({"type": "turn_start", "id": "sentry-1"})),
-                    kernel_entry(serde_json::json!({
-                        "type": "question",
-                        "id": "sentry-2",
-                        "kind": "request",
-                        "authId": "call_ask",
-                        "payload": {
-                            "toolName": "AskUserQuestion",
-                            "input": {"questions": [{
-                                "question": "q", "header": "h", "multiSelect": false,
-                            }]},
-                        },
-                    })),
-                ])
-                .await
-                .expect("append the ask rows");
-            drop(storage);
+            .expect("initialize subscribes and cold-seeds the chat");
 
-            let (_backend, host) = wired_host();
-            let (host_side, client_side) = manox_ahp::transport::inproc::pair();
-            host.accept(host_side);
-            let client = ahp::Client::connect(client_side, ahp::ClientConfig::default())
-                .await
-                .expect("connect");
-            client
-                .initialize(
-                    "desktop".to_string(),
-                    vec![ahp_types::version::PROTOCOL_VERSION.to_string()],
-                    vec!["ahp-chat:/s-1".to_string()],
-                )
-                .await
-                .expect("initialize subscribes and cold-seeds the chat");
-
-            let active_turn_id = {
-                let before = host.chat_state("s-1").expect("the cold seed ran");
-                let active = before.active_turn.as_ref().expect("the turn is open");
-                let parked = active
-                    .response_parts
-                    .iter()
-                    .find_map(|p| match p {
-                        ResponsePart::InputRequest(input) if input.response.is_none() => Some(()),
-                        _ => None,
-                    })
-                    .is_some();
-                assert!(
-                    parked,
-                    "the fixture parks an unanswered ask on the active turn"
-                );
-                // The cancel's own inventory reads the same park — the read
-                // the settlement loop is driven by.
-                assert_eq!(host.open_ask_ids("s-1"), vec!["call_ask".to_string()]);
-                active.id.clone()
-            };
-
-            client
-                .dispatch(
-                    "ahp-chat:/s-1".to_string(),
-                    StateAction::ChatTurnCancelled(ahp_types::actions::ChatTurnCancelledAction {
-                        turn_id: active_turn_id,
-                        duration: 0,
-                        meta: None,
-                    }),
-                )
-                .await
-                .expect("dispatch is fire-and-forget");
-
-            // The dispatch rides a notification; poll until the host folded it.
-            let mut state = None;
-            for _ in 0..60 {
-                if let Some(current) = host.chat_state("s-1")
-                    && current.active_turn.is_none()
-                {
-                    state = Some(current);
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            let state = state.expect("the cancellation archived the turn");
-            let turn = state.turns.last().expect("the turn is archived");
-            let ask = turn
+        let active_turn_id = {
+            let before = host.chat_state("s-1").expect("the cold seed ran");
+            let active = before.active_turn.as_ref().expect("the turn is open");
+            let parked = active
                 .response_parts
                 .iter()
                 .find_map(|p| match p {
-                    ResponsePart::InputRequest(input) => Some(input),
+                    ResponsePart::InputRequest(input) if input.response.is_none() => Some(()),
                     _ => None,
                 })
-                .expect("the ask part survives the archive");
+                .is_some();
             assert!(
-                ask.response.is_some(),
-                "the open ask settled before the turn archived — a completion after \
-                 it would reduce to NoOp and strand the card"
+                parked,
+                "the fixture parks an unanswered ask on the active turn"
             );
-            // The archived park is none of a later cancel's business: the
-            // inventory answers asks on the ACTIVE turn only.
-            assert!(host.open_ask_ids("s-1").is_empty());
-        });
+            // The cancel's own inventory reads the same park — the read
+            // the settlement loop is driven by.
+            assert_eq!(host.open_ask_ids("s-1"), vec!["call_ask".to_string()]);
+            active.id.clone()
+        };
+
+        client
+            .dispatch(
+                "ahp-chat:/s-1".to_string(),
+                StateAction::ChatTurnCancelled(ahp_types::actions::ChatTurnCancelledAction {
+                    turn_id: active_turn_id,
+                    duration: 0,
+                    meta: None,
+                }),
+            )
+            .await
+            .expect("dispatch is fire-and-forget");
+
+        // The dispatch rides a notification; poll until the host folded it.
+        let mut state = None;
+        for _ in 0..60 {
+            if let Some(current) = host.chat_state("s-1")
+                && current.active_turn.is_none()
+            {
+                state = Some(current);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let state = state.expect("the cancellation archived the turn");
+        let turn = state.turns.last().expect("the turn is archived");
+        let ask = turn
+            .response_parts
+            .iter()
+            .find_map(|p| match p {
+                ResponsePart::InputRequest(input) => Some(input),
+                _ => None,
+            })
+            .expect("the ask part survives the archive");
+        assert!(
+            ask.response.is_some(),
+            "the open ask settled before the turn archived — a completion after \
+             it would reduce to NoOp and strand the card"
+        );
+        // The archived park is none of a later cancel's business: the
+        // inventory answers asks on the ACTIVE turn only.
+        assert!(host.open_ask_ids("s-1").is_empty());
     }
 
-    #[test]
-    fn a_cancel_without_an_open_ask_stays_a_plain_accept() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_without_an_open_ask_stays_a_plain_accept() {
         crate::test_support::init_globals();
         let (backend, host) = wired_host();
-        let outcome = backend.dispatch(
-            "ahp-chat:/s-1",
-            &StateAction::ChatTurnCancelled(ahp_types::actions::ChatTurnCancelledAction {
-                turn_id: "t-none".to_string(),
-                duration: 0,
-                meta: None,
-            }),
-            &ActionOrigin {
-                client_id: "client-1".to_string(),
-                client_seq: 1,
-            },
-        );
+        let outcome = backend
+            .dispatch(
+                "ahp-chat:/s-1",
+                &StateAction::ChatTurnCancelled(ahp_types::actions::ChatTurnCancelledAction {
+                    turn_id: "t-none".to_string(),
+                    duration: 0,
+                    meta: None,
+                }),
+                &ActionOrigin {
+                    client_id: "client-1".to_string(),
+                    client_seq: 1,
+                },
+            )
+            .await;
         assert_eq!(outcome, DispatchOutcome::Accepted);
         assert!(
             host.chat_state("s-1")
@@ -4662,5 +4726,58 @@ mod summary_live_bits_tests {
             status & SessionStatus::IsArchived.bits() != 0,
             "a journalled archive survives the overlay"
         );
+    }
+}
+
+/// The runtime's refusal kind is what the adapter maps onto AHP. Pinning each
+/// branch keeps a new kind from silently degrading to `Backend`.
+#[cfg(test)]
+mod refusal_kind_tests {
+    use super::mcp_dispatch_tests::McpOnlyRuntime;
+    use crate::error::{RuntimeError, RuntimeErrorKind};
+    use crate::runtime_trait::SessionRuntime;
+    use manox_ahp::error::HostError;
+
+    #[test]
+    fn every_refusal_kind_maps_to_its_host_error_variant() {
+        let mapped = |kind| McpOnlyRuntime::host_error(RuntimeError::new("boom").with_kind(kind));
+        assert_eq!(
+            mapped(RuntimeErrorKind::Backend),
+            HostError::Backend("boom".into())
+        );
+        assert_eq!(
+            mapped(RuntimeErrorKind::NotFound),
+            HostError::NotFound("boom".into())
+        );
+        assert_eq!(
+            mapped(RuntimeErrorKind::AlreadyOwned),
+            HostError::Conflict("boom".into())
+        );
+        assert_eq!(
+            mapped(RuntimeErrorKind::BadRequest),
+            HostError::InvalidParams("boom".into())
+        );
+    }
+
+    #[test]
+    fn constructors_set_the_kind_and_display_is_the_message() {
+        assert_eq!(RuntimeError::new("x").kind, RuntimeErrorKind::Backend);
+        assert_eq!(
+            RuntimeError::not_found("x").kind,
+            RuntimeErrorKind::NotFound
+        );
+        assert_eq!(
+            RuntimeError::already_owned("x").kind,
+            RuntimeErrorKind::AlreadyOwned
+        );
+        assert_eq!(
+            RuntimeError::bad_request("x").kind,
+            RuntimeErrorKind::BadRequest
+        );
+        assert_eq!(
+            RuntimeError::bad_request("only the message").to_string(),
+            "only the message"
+        );
+        assert_eq!(RuntimeErrorKind::default(), RuntimeErrorKind::Backend);
     }
 }

@@ -83,6 +83,10 @@ pub(crate) enum WebFetchError {
     InvalidUrl(String),
     #[error("WEB_BLOCKED_URL: {0}")]
     BlockedUrl(String),
+    #[error(
+        "WEB_FAKE_IP: every DNS answer for {host} sits in 198.18.0.0/15, the placeholder range a local transparent proxy/TUN in fake-IP mode hands out; with no proxy route covering this destination the guard refuses it. Configure an environment or system proxy, or use the browser tools."
+    )]
+    FakeIpDns { host: String },
     #[error("WEB_FETCH_TOO_LARGE: received {received} bytes, cap is {cap}")]
     TooLarge { received: u64, cap: usize },
     #[error("WEB_FETCH_TIMEOUT: request timed out after {after:?}")]
@@ -163,7 +167,7 @@ pub(crate) async fn fetch(
     cancel: &CancellationToken,
 ) -> Result<WebFetchResult, WebFetchError> {
     let parsed = validate_url(url)?;
-    let (transport, proxy) = match proxy::route_for(&parsed) {
+    let (transport, proxy) = match proxy::route_for(&parsed).await {
         Route::Direct => (Transport::guarded(Arc::new(SystemResolver)), None),
         Route::Proxied(proxy) => (Transport::unguarded(Arc::new(SystemResolver)), Some(proxy)),
     };
@@ -575,6 +579,29 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, WebFetchError::BlockedUrl(_)), "{err}");
         assert!(err.to_string().contains("non-public"), "{err}");
+    }
+
+    /// A pure fake-IP answer set reaches the tool as its own diagnosis, not
+    /// as a generic non-public refusal.
+    #[tokio::test]
+    async fn fake_ip_answers_surface_the_tun_diagnosis() {
+        let mut map = HashMap::new();
+        map.insert(
+            "fake.test".to_string(),
+            vec!["198.18.0.5:80".parse().unwrap()],
+        );
+        let transport = Transport::guarded(Arc::new(StaticResolver { map }));
+        let err = fetch_with_transport(
+            "http://fake.test/",
+            &limits(),
+            &CancellationToken::new(),
+            &transport,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, WebFetchError::FakeIpDns { .. }), "{err}");
+        assert!(err.to_string().starts_with("WEB_FAKE_IP"), "{err}");
     }
 
     #[tokio::test]

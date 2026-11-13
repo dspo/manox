@@ -181,7 +181,7 @@ impl PlanSnapshot {
 /// Pure over `messages`: reload, thread switch, and post-compaction rebuild all
 /// route through here, so the rail's plan state is always a function of the
 /// canonical history and never drifts from it.
-/// The `UpdatePlan` tool (`AgentTool` port of the retired manox tool):
+/// The `UpdatePlan` tool (`AgentTool` surface):
 /// the model publishes a structured task list that the context rail renders
 /// as an execution overview. Stateless: validation lives in
 /// [`PlanSnapshot::from_input`]; the validated snapshot rides

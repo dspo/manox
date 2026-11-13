@@ -1,4 +1,4 @@
-// The event vocabulary of the session log (Session Core, format v1).
+// The event vocabulary of the session log (Session Core, format v4).
 //
 // One serde vocabulary is the whole durable schema: the log line IS the
 // wire form of an `Event` wrapped in an `Envelope`. The AHP projection
@@ -8,11 +8,9 @@
 // identity field never appears in an event payload — events carry id
 // references only, identity lives in the immutable header.
 //
-// The conversation domain (deltas, tool calls, turns) joins this enum when
-// the engine's writers are re-homed onto it; its row names are unchanged
-// from the previous journal, so the move is mechanical. This file starts
-// with the domains that have no legacy shape to inherit: session facts,
-// swarm lifecycle, and system notes.
+// The conversation domain (deltas, tool calls, turns) shares this enum with
+// session facts, swarm lifecycle, and system notes: one vocabulary, one
+// schema, no alternate row shapes.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -47,11 +45,26 @@ pub enum SettlementKind {
     MaxTokens,
 }
 
+/// Authorship of a user row the human did not type.
+///
+/// It rides the entry (`Event::Message::ui`), not a sidecar: the fold reads
+/// the journal, so a row's attribution must be a journal fact. Live and
+/// replayed views then agree by construction. Absent means human input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserEntryUi {
+    /// Routing name: "lead" | "harness" | an agent's name.
+    pub author: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub peer: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_text: Option<String>,
+}
+
 /// The whole durable vocabulary of a session log: one serde enum is the
-/// single schema (absorbed from the former `SessionTreeEntry`; that name
-/// lives on as a type alias while call sites migrate). Wire names are the
-/// row names — the conversation domain keeps its historical names, and the
-/// swarm/disposal rows join them under the same tag.
+/// single schema. Wire names are the row names — the conversation domain
+/// keeps its historical names, and the swarm/disposal rows join them under
+/// the same tag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Event {
@@ -68,6 +81,11 @@ pub enum Event {
         /// every other entry and on older session files.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
+        /// Send-time authorship of this user row (`None` = the human typed
+        /// it). Entry-level so the AHP fold attributes the row without any
+        /// sidecar read; every other variant stays attribution-free.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui: Option<UserEntryUi>,
     },
     #[serde(rename = "compaction", rename_all = "camelCase")]
     Compaction {
@@ -172,8 +190,8 @@ pub enum Event {
         data: Option<JsonValue>,
     },
     /// An extension message whose payload the harness does not interpret.
-    /// `content` is a plain string or an array of text/image blocks, matching
-    /// the v3 schema.
+    /// `content` is a plain string or an array of text/image blocks, the
+    /// flat wire shape.
     #[serde(rename = "custom_message", rename_all = "camelCase")]
     CustomMessage {
         id: String,
@@ -224,7 +242,7 @@ pub enum Event {
     // keys (`seq`/`id`/`parentId`/`timestamp`/`type`) are exclusive: payload
     // fields never reuse them, so tool handles are `callId` and subagent
     // handles `agentId` (§C.1 exclusivity rule).
-    /// A persisted UI note card (was the fire-and-forget AppendUiNote).
+    /// A persisted UI note card.
     #[serde(rename = "ui_note", rename_all = "camelCase")]
     UiNote {
         id: String,
@@ -254,6 +272,12 @@ pub enum Event {
         cancelled: bool,
         failed: bool,
         stranded_steer_ids: Vec<String>,
+        /// Why the turn closed, when the closer knows something the flags do
+        /// not say (the restore reconciliation writes `"host exited"` for a
+        /// turn its previous process never closed). Absent on every live
+        /// settle, so the row shape is unchanged there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// The loop stopped advancing.
     #[serde(rename = "stop", rename_all = "camelCase")]
@@ -684,6 +708,7 @@ mod tests {
                 id: None,
             },
             origin: None,
+            ui: None,
         };
         assert!(user.marks_interaction());
         let other = Event::Title {
@@ -706,6 +731,60 @@ mod tests {
             gated_denials: None,
         };
         assert!(!run.marks_interaction());
+    }
+
+    /// Authorship rides the user row as an optional entry fact: absent means
+    /// human input, and only the set fields reach the wire.
+    #[test]
+    fn a_user_rows_authorship_is_an_optional_entry_fact() {
+        let row = |ui: Option<UserEntryUi>| Event::Message {
+            id: "e-1".into(),
+            parent_id: None,
+            timestamp: DateTime::<Utc>::UNIX_EPOCH,
+            message: crate::types::AgentMessage::user("hi"),
+            origin: None,
+            ui,
+        };
+
+        let human = serde_json::to_string(&row(None)).unwrap();
+        assert!(
+            !human.contains("\"ui\""),
+            "a human row must not leak an attribution key: {human}"
+        );
+
+        let harness = serde_json::to_string(&row(Some(UserEntryUi {
+            author: "harness".into(),
+            peer: false,
+            display_text: None,
+        })))
+        .unwrap();
+        assert!(
+            harness.contains(r#""ui":{"author":"harness"}"#),
+            "only the set fields serialize (peer=false and no display text stay off the wire): {harness}"
+        );
+
+        let peer = serde_json::to_string(&row(Some(UserEntryUi {
+            author: "Sailor".into(),
+            peer: true,
+            display_text: Some("unwrapped body".into()),
+        })))
+        .unwrap();
+        assert!(
+            peer.contains(r#""ui":{"author":"Sailor","peer":true,"displayText":"unwrapped body"}"#),
+            "the camelCase entry shape round-trips: {peer}"
+        );
+        let back: Event = serde_json::from_str(&peer).unwrap();
+        match back {
+            Event::Message { ui, .. } => assert_eq!(
+                ui,
+                Some(UserEntryUi {
+                    author: "Sailor".into(),
+                    peer: true,
+                    display_text: Some("unwrapped body".into()),
+                })
+            ),
+            other => panic!("expected Message, got {other:?}"),
+        }
     }
 
     #[test]
@@ -732,11 +811,11 @@ mod tests {
         assert!(serde_json::from_str::<Envelope>(bad).is_err());
     }
 
-    /// A retired row name is refused like any other unknown one. The
-    /// vocabulary has no compatibility reads: a journal naming a row this
-    /// build does not write fails loudly instead of folding to a guess.
+    /// A row name this build does not write is refused like any other
+    /// unknown one. The vocabulary has no compatibility reads: such a
+    /// journal fails loudly instead of folding to a guess.
     #[test]
-    fn a_retired_row_name_is_refused_like_an_unknown_one() {
+    fn an_unwritten_row_name_is_refused_like_an_unknown_one() {
         let bad = r#"{"seq":1,"ts":"1970-01-01T00:00:00Z","type":"session/disposed","id":"e-1","parentId":null,"timestamp":"1970-01-01T00:00:00Z"}"#;
         assert!(serde_json::from_str::<Envelope>(bad).is_err());
     }

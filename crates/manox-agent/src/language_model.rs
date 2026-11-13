@@ -153,6 +153,7 @@ pub enum LanguageModelToolChoice {
 
 /// User-facing reasoning effort knob for providers that expose an effort
 /// parameter (Anthropic `output_config.effort`, OpenAI `reasoning.effort`).
+/// The `snake_case` name is the only encoding: no integer form exists.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
@@ -200,24 +201,6 @@ impl ReasoningEffort {
             "high"
         } else {
             self.wire_value()
-        }
-    }
-
-    /// Integer encoding for SQLite persistence. Keeps the original code points
-    /// (`High` = 2, `Max` = 4) for backward compatibility with existing DB
-    /// records; unknown values fall back to `High`.
-    pub fn from_i64(v: i64) -> Self {
-        match v {
-            2 => Self::High,
-            4 => Self::Max,
-            _ => Self::High,
-        }
-    }
-
-    pub fn as_i64(self) -> i64 {
-        match self {
-            Self::High => 2,
-            Self::Max => 4,
         }
     }
 }
@@ -402,23 +385,6 @@ mod tests {
         assert_eq!(ReasoningEffort::Max.openai_wire_value(true), "high");
         // Compatible endpoints pass max through.
         assert_eq!(ReasoningEffort::Max.openai_wire_value(false), "max");
-    }
-
-    #[test]
-    fn from_i64_is_backward_compatible_and_falls_back_to_high() {
-        // Known code points.
-        assert_eq!(ReasoningEffort::from_i64(2), ReasoningEffort::High);
-        assert_eq!(ReasoningEffort::from_i64(4), ReasoningEffort::Max);
-        // Unknown values fall back to High.
-        assert_eq!(ReasoningEffort::from_i64(0), ReasoningEffort::High);
-        assert_eq!(ReasoningEffort::from_i64(99), ReasoningEffort::High);
-    }
-
-    #[test]
-    fn as_i64_round_trips() {
-        for effort in ReasoningEffort::ALL {
-            assert_eq!(ReasoningEffort::from_i64(effort.as_i64()), effort);
-        }
     }
 
     #[test]

@@ -15,8 +15,9 @@ use manox_harness::types::StopReason;
 pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
     match event {
         AgentEvent::AgentStart | AgentEvent::AgentEnd { .. } => Vec::new(),
-        // `TurnStarted` is emitted once by the facade (matching `Thread`
-        // semantics); the kernel's per-round `TurnStart` must not duplicate it.
+        // The turn's open edge is journaled once by `run_turn` (the engine's
+        // `TurnStarted`); the kernel's per-round `TurnStart` must not
+        // duplicate it or land it after the close.
         AgentEvent::TurnStart => Vec::new(),
         AgentEvent::MessageStart { .. } => Vec::new(),
         AgentEvent::MessageUpdate {
@@ -206,7 +207,7 @@ pub fn harness_messages_to_messages(input: &[AgentMessage]) -> Vec<Message> {
 /// away notes inside the kept segment (the tail payload holds only
 /// messages) — the same loss as the summarized history itself.
 pub fn entries_to_display(
-    entries: &[manox_harness::session::SessionTreeEntry],
+    entries: &[manox_harness::session::Event],
 ) -> (Vec<HistoryEntry>, Vec<PositionedNote>) {
     let mut display: Vec<HistoryEntry> = Vec::new();
     let mut notes: Vec<PositionedNote> = Vec::new();
@@ -217,7 +218,7 @@ pub fn entries_to_display(
     let mut folded: Vec<(String, usize, usize)> = Vec::new();
     for entry in entries {
         match entry {
-            manox_harness::session::SessionTreeEntry::Custom {
+            manox_harness::session::Event::Custom {
                 custom_type, data, ..
             } => {
                 if custom_type == UI_NOTE_CUSTOM_TYPE {
@@ -240,7 +241,7 @@ pub fn entries_to_display(
                 }
                 continue;
             }
-            manox_harness::session::SessionTreeEntry::AnnotationSet { annotation, .. } => {
+            manox_harness::session::Event::AnnotationSet { annotation, .. } => {
                 if let Some((id, note)) = annotation_ui_note(annotation) {
                     retract_note(&mut folded, &id, &mut display, &mut notes);
                     notes.push(PositionedNote {
@@ -251,14 +252,27 @@ pub fn entries_to_display(
                     folded.push((id, display.len() - 1, notes.len() - 1));
                 }
             }
-            manox_harness::session::SessionTreeEntry::AnnotationRemoved {
-                annotation_id, ..
-            } => {
+            manox_harness::session::Event::AnnotationRemoved { annotation_id, .. } => {
                 retract_note(&mut folded, annotation_id, &mut display, &mut notes);
             }
             _ => {
+                // A user row's authorship is an entry fact (`Event::Message::ui`),
+                // so the rebuilt bubble carries the same send-time header live
+                // and after a restart — no sidecar read.
+                let attribution = match entry {
+                    manox_harness::session::Event::Message { ui: Some(ui), .. } => {
+                        Some(user_entry_ui_to_message_ui(ui))
+                    }
+                    _ => None,
+                };
                 for message in manox_harness::session::session_entry_to_context_messages(entry) {
-                    let mapped = harness_messages_to_messages(std::slice::from_ref(&message));
+                    let mut mapped = harness_messages_to_messages(std::slice::from_ref(&message));
+                    if let (Some(ui), Some(first)) = (attribution.as_ref(), mapped.first_mut())
+                        && first.role == crate::language_model::Role::User
+                        && first.provenance == crate::message::MessageProvenance::User
+                    {
+                        first.ui = Some(ui.clone());
+                    }
                     message_count += mapped.len();
                     display.extend(mapped.into_iter().map(HistoryEntry::Message));
                 }
@@ -266,6 +280,18 @@ pub fn entries_to_display(
         }
     }
     (display, notes)
+}
+
+/// Translate the entry-level authorship fact into the host's UI metadata.
+fn user_entry_ui_to_message_ui(
+    ui: &manox_harness::session::UserEntryUi,
+) -> crate::message::MessageUiMetadata {
+    crate::message::MessageUiMetadata {
+        author: Some(crate::message::MessageAuthor::from_routing(&ui.author)),
+        peer: ui.peer,
+        display_text: ui.display_text.clone(),
+        ..Default::default()
+    }
 }
 
 /// Drop a folded annotation card from both output lists, closing the gap so
@@ -501,8 +527,6 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             Some(steps) => format!("UpdatePlan ({} steps)", steps.len()),
             None => "UpdatePlan".to_string(),
         },
-        // Task tools were removed in the tools-optimization cycle — they
-        // were retired with the Steer-based team architecture.
         "CreateGoal" => match arg("objective") {
             Some(objective) => format!("CreateGoal {}", short_value(&objective, 40)),
             None => "CreateGoal".to_string(),
@@ -588,7 +612,7 @@ fn first_string_arg(args: &serde_json::Value) -> Option<String> {
 }
 
 /// First object entry of a tool-call's arguments as a `(key, short value)`
-/// hint, mirroring the retired bridge's `summary_key`/`summary`.
+/// hint.
 pub(crate) fn arg_hint(arguments: &serde_json::Value) -> Option<(String, String)> {
     arguments.as_object()?.iter().next().map(|(key, value)| {
         let value = match value {
@@ -604,20 +628,21 @@ pub(crate) fn arg_hint(arguments: &serde_json::Value) -> Option<(String, String)
 mod tests {
     use super::*;
     use crate::db::UiNoteKind;
-    use manox_harness::session::SessionTreeEntry;
+    use manox_harness::session::Event;
 
-    fn message_entry(id: &str, text: &str) -> SessionTreeEntry {
-        SessionTreeEntry::Message {
+    fn message_entry(id: &str, text: &str) -> Event {
+        Event::Message {
             id: id.to_string(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user(text),
             origin: None,
+            ui: None,
         }
     }
 
-    fn note_entry(text: &str) -> SessionTreeEntry {
-        SessionTreeEntry::Custom {
+    fn note_entry(text: &str) -> Event {
+        Event::Custom {
             id: format!("note-{text}"),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -634,7 +659,7 @@ mod tests {
         let entries = vec![
             message_entry("m1", "one"),
             note_entry("boom"),
-            SessionTreeEntry::Custom {
+            Event::Custom {
                 id: "other".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -664,7 +689,7 @@ mod tests {
         // projection of `m1 [dropped] m2 [kept] c1(keeps m2) m3` is
         // [c1, m2, note-kept, m3]; positions count the summary + m2.
         let entries = vec![
-            SessionTreeEntry::Compaction {
+            Event::Compaction {
                 id: "c1".into(),
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
@@ -695,8 +720,8 @@ mod tests {
         assert_eq!(kinds, vec!["m", "m", "n", "m"]);
     }
 
-    fn annotation_set_entry(id: &str, annotation: serde_json::Value) -> SessionTreeEntry {
-        SessionTreeEntry::AnnotationSet {
+    fn annotation_set_entry(id: &str, annotation: serde_json::Value) -> Event {
+        Event::AnnotationSet {
             id: id.to_string(),
             parent_id: None,
             timestamp: chrono::Utc::now(),
@@ -704,8 +729,8 @@ mod tests {
         }
     }
 
-    fn annotation_removed_entry(id: &str, annotation_id: &str) -> SessionTreeEntry {
-        SessionTreeEntry::AnnotationRemoved {
+    fn annotation_removed_entry(id: &str, annotation_id: &str) -> Event {
+        Event::AnnotationRemoved {
             id: id.to_string(),
             parent_id: None,
             timestamp: chrono::Utc::now(),

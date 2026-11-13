@@ -5,7 +5,7 @@ use ahp_types::state::{ResponsePart, ToolCallState, ToolResultContent, TurnState
 use ahp_types::state::{SessionLifecycle, SessionStatus};
 use chrono::{DateTime, Utc};
 use manox_ahp_runtime::ahp::{chat_state, session_state};
-use manox_harness::session::SessionTreeEntry as E;
+use manox_harness::session::Event as E;
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 use manox_harness::types::{AgentMessage, ContentBlock, Usage};
 use serde_json::json;
@@ -175,7 +175,7 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
 }
 
 /// A session journal's path in the core layout (bucket over per-session
-/// directories, `log.v1.jsonl` inside) under the store's root.
+/// directories, `session.jsonl` inside) under the store's root.
 fn core_journal(id: &str) -> std::path::PathBuf {
     manox_agent::thread_store::global_sessions_dir()
         .join("t")
@@ -205,7 +205,10 @@ async fn seed_session(id: &str, thread: &str, cwd: &str, events: Vec<(&str, E)>)
     )
     .await
     .unwrap();
-    storage.append_entries(&entries).await.unwrap();
+    manox_harness::session::Session::new(storage)
+        .append_entries(entries)
+        .await
+        .unwrap();
 }
 
 /// Write one delegated child session journal (header-only): the
@@ -246,6 +249,7 @@ fn user(text: &str) -> E {
             id: None,
         },
         origin: Some("rpc-1".into()),
+        ui: None,
     }
 }
 
@@ -276,6 +280,7 @@ fn assistant(text: &str, input: u64, output: u64) -> E {
             timestamp: stamp(),
         },
         origin: None,
+        ui: None,
     }
 }
 
@@ -296,6 +301,7 @@ fn turn_finish() -> E {
         cancelled: false,
         failed: false,
         stranded_steer_ids: Vec::new(),
+        reason: None,
     }
 }
 
@@ -364,63 +370,61 @@ fn kinds(parts: &[ResponsePart]) -> Vec<&'static str> {
         .collect()
 }
 
-#[test]
-fn chat_fold_replays_the_journal_transcript() {
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_fold_replays_the_journal_transcript() {
     let _guards = install();
-    manox_agent::runtime::handle().block_on(async {
-        seed_session("chatfold-1", "thread-A", "/", transcript()).await;
-        let state = chat_state("chatfold-1").await.expect("chat state");
+    seed_session("chatfold-1", "thread-A", "/", transcript()).await;
+    let state = chat_state("chatfold-1").await.expect("chat state");
 
-        assert_eq!(state.resource, manox_ahp::channels::chat::uri("chatfold-1"));
-        assert!(state.active_turn.is_none(), "the journal closed both turns");
-        assert!(state.queued_messages.as_ref().is_none_or(|q| q.is_empty()));
-        // Determinism: the stamp is the journal's last entry, not "now".
-        assert_eq!(state.modified_at, wire_stamp());
+    assert_eq!(state.resource, manox_ahp::channels::chat::uri("chatfold-1"));
+    assert!(state.active_turn.is_none(), "the journal closed both turns");
+    assert!(state.queued_messages.as_ref().is_none_or(|q| q.is_empty()));
+    // Determinism: the stamp is the journal's last entry, not "now".
+    assert_eq!(state.modified_at, wire_stamp());
 
-        assert_eq!(state.turns.len(), 2);
-        let first = &state.turns[0];
-        assert_eq!(first.message.text, "hello");
-        assert_eq!(first.state, TurnState::Complete);
-        // Deltas opened one markdown run; the tool call closed it; the
-        // settled assistant row is silent (first-writer-wins on streamed
-        // text), so the turn carries exactly [markdown, toolCall].
-        assert_eq!(kinds(&first.response_parts), vec!["markdown", "toolCall"]);
-        let ResponsePart::Markdown(md) = &first.response_parts[0] else {
-            panic!("markdown first");
-        };
-        assert_eq!(md.content, "Hi there");
-        let ResponsePart::ToolCall(call) = &first.response_parts[1] else {
-            panic!("tool call second");
-        };
-        match &call.tool_call {
-            ToolCallState::Completed(done) => {
-                assert_eq!(done.tool_call_id, "c1");
-                assert!(done.success, "the tool result reported success");
-                let content = done.content.as_ref().expect("result content");
-                assert!(
-                    content.iter().any(|c| matches!(
-                        c,
-                        ToolResultContent::Text(t) if t.text == "ok"
-                    )),
-                    "the tool result text reaches the completed call: {content:?}"
-                );
-            }
-            other => panic!("expected a completed tool call, got {other:?}"),
+    assert_eq!(state.turns.len(), 2);
+    let first = &state.turns[0];
+    assert_eq!(first.message.text, "hello");
+    assert_eq!(first.state, TurnState::Complete);
+    // Deltas opened one markdown run; the tool call closed it; the
+    // settled assistant row is silent (first-writer-wins on streamed
+    // text), so the turn carries exactly [markdown, toolCall].
+    assert_eq!(kinds(&first.response_parts), vec!["markdown", "toolCall"]);
+    let ResponsePart::Markdown(md) = &first.response_parts[0] else {
+        panic!("markdown first");
+    };
+    assert_eq!(md.content, "Hi there");
+    let ResponsePart::ToolCall(call) = &first.response_parts[1] else {
+        panic!("tool call second");
+    };
+    match &call.tool_call {
+        ToolCallState::Completed(done) => {
+            assert_eq!(done.tool_call_id, "c1");
+            assert!(done.success, "the tool result reported success");
+            let content = done.content.as_ref().expect("result content");
+            assert!(
+                content.iter().any(|c| matches!(
+                    c,
+                    ToolResultContent::Text(t) if t.text == "ok"
+                )),
+                "the tool result text reaches the completed call: {content:?}"
+            );
         }
-        // Usage rides the turn the assistant row settled.
-        let usage = first.usage.as_ref().expect("turn usage");
-        assert_eq!(usage.input_tokens, Some(10));
-        assert_eq!(usage.output_tokens, Some(5));
+        other => panic!("expected a completed tool call, got {other:?}"),
+    }
+    // Usage rides the turn the assistant row settled.
+    let usage = first.usage.as_ref().expect("turn usage");
+    assert_eq!(usage.input_tokens, Some(10));
+    assert_eq!(usage.output_tokens, Some(5));
 
-        let second = &state.turns[1];
-        // A turn with no user row carries the empty `noUserRow` message.
-        assert_eq!(second.message.text, "");
-        assert_eq!(kinds(&second.response_parts), vec!["markdown"]);
-        let ResponsePart::Markdown(md) = &second.response_parts[0] else {
-            panic!("markdown");
-        };
-        assert_eq!(md.content, "bye");
-    });
+    let second = &state.turns[1];
+    // A turn with no user row carries the empty `noUserRow` message.
+    assert_eq!(second.message.text, "");
+    assert_eq!(kinds(&second.response_parts), vec!["markdown"]);
+    let ResponsePart::Markdown(md) = &second.response_parts[0] else {
+        panic!("markdown");
+    };
+    assert_eq!(md.content, "bye");
     uninstall();
 }
 
@@ -429,277 +433,265 @@ fn chat_fold_replays_the_journal_transcript() {
 /// every fresh subscriber's snapshot depend on this fold carrying the active
 /// turn with ALL its parts (the desktop attached to exactly this shape and
 /// rendered only the user bubble when the fold lost them).
-#[test]
-fn a_running_manox_turn_folds_all_its_parts() {
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_manox_turn_folds_all_its_parts() {
     let _guards = install();
-    manox_agent::runtime::handle().block_on(async {
-        let events = vec![
-            ("e1", user("review dspo/manox pr #824")),
-            (
-                "e2",
-                E::AgentThinkingDelta {
-                    id: String::new(),
-                    parent_id: None,
-                    timestamp: stamp(),
-                    delta: "thinking".into(),
-                },
-            ),
-            ("e3", delta("partial answer")),
-            ("e4", assistant("settled", 10, 5)),
-            (
-                "e5",
-                E::Stop {
-                    id: String::new(),
-                    parent_id: None,
-                    timestamp: stamp(),
-                    reason: Some("tool_use".into()),
-                },
-            ),
-            ("e6", tool_call()),
-            ("e7", tool_result()),
-            (
-                "e8",
-                E::AgentThinkingDelta {
-                    id: String::new(),
-                    parent_id: None,
-                    timestamp: stamp(),
-                    delta: "more".into(),
-                },
-            ),
-        ];
-        seed_session("probe-1", "thread-P", "/", events).await;
-        let state = chat_state("probe-1").await.expect("chat state");
-        let active = state.active_turn.as_ref().expect("the turn is open");
-        assert_eq!(active.message.text, "review dspo/manox pr #824");
-        assert_eq!(
-            kinds(&active.response_parts),
-            vec!["reasoning", "markdown", "toolCall", "reasoning"],
-            "every streamed part survives the fold"
-        );
-    });
+    let events = vec![
+        ("e1", user("review dspo/manox pr #824")),
+        (
+            "e2",
+            E::AgentThinkingDelta {
+                id: String::new(),
+                parent_id: None,
+                timestamp: stamp(),
+                delta: "thinking".into(),
+            },
+        ),
+        ("e3", delta("partial answer")),
+        ("e4", assistant("settled", 10, 5)),
+        (
+            "e5",
+            E::Stop {
+                id: String::new(),
+                parent_id: None,
+                timestamp: stamp(),
+                reason: Some("tool_use".into()),
+            },
+        ),
+        ("e6", tool_call()),
+        ("e7", tool_result()),
+        (
+            "e8",
+            E::AgentThinkingDelta {
+                id: String::new(),
+                parent_id: None,
+                timestamp: stamp(),
+                delta: "more".into(),
+            },
+        ),
+    ];
+    seed_session("probe-1", "thread-P", "/", events).await;
+    let state = chat_state("probe-1").await.expect("chat state");
+    let active = state.active_turn.as_ref().expect("the turn is open");
+    assert_eq!(active.message.text, "review dspo/manox pr #824");
+    assert_eq!(
+        kinds(&active.response_parts),
+        vec!["reasoning", "markdown", "toolCall", "reasoning"],
+        "every streamed part survives the fold"
+    );
     uninstall();
 }
 
 /// TEMP device probe: fold a real journal (PROBE_JOURNAL=path) and print the
 /// active turn's inventory. `#[ignore]`d — run explicitly with
 /// `cargo test -p manox-session-core probe_real_journal -- --ignored --nocapture`.
-#[test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-fn probe_real_journal_fold() {
+async fn probe_real_journal_fold() {
     let src = std::path::PathBuf::from(std::env::var("PROBE_JOURNAL").expect("PROBE_JOURNAL"));
     let _guards = install();
     let dst = manox_agent::thread_store::global_sessions_dir().join(src.file_name().unwrap());
     std::fs::copy(&src, &dst).unwrap();
-    manox_agent::runtime::handle().block_on(async {
-        // The core layout: `log.v1.jsonl` inside a directory named by the
-        // session's id.
-        let session_id = src.parent().unwrap().file_name().unwrap().to_str().unwrap();
-        match chat_state(session_id).await {
-            Some(state) => {
-                assert!(
-                    state.active_turn.is_some() || !state.turns.is_empty(),
-                    "a journal with content must fold to a non-empty chat"
-                );
+    // The core layout: `session.jsonl` inside a directory named by the
+    // session's id.
+    let session_id = src.parent().unwrap().file_name().unwrap().to_str().unwrap();
+    match chat_state(session_id).await {
+        Some(state) => {
+            assert!(
+                state.active_turn.is_some() || !state.turns.is_empty(),
+                "a journal with content must fold to a non-empty chat"
+            );
+            println!(
+                "PROBE turns={} active={} title={:?}",
+                state.turns.len(),
+                state.active_turn.is_some(),
+                state.title
+            );
+            if let Some(active) = &state.active_turn {
                 println!(
-                    "PROBE turns={} active={} title={:?}",
-                    state.turns.len(),
-                    state.active_turn.is_some(),
-                    state.title
+                    "PROBE active id={} parts={}",
+                    active.id,
+                    active.response_parts.len()
                 );
-                if let Some(active) = &state.active_turn {
+                for p in active.response_parts.iter().take(8) {
                     println!(
-                        "PROBE active id={} parts={}",
-                        active.id,
-                        active.response_parts.len()
-                    );
-                    for p in active.response_parts.iter().take(8) {
-                        println!(
-                            "PROBE part {}",
-                            match p {
-                                ResponsePart::Markdown(m) =>
-                                    format!("markdown len={}", m.content.len()),
-                                ResponsePart::Reasoning(r) =>
-                                    format!("reasoning len={}", r.content.len()),
-                                ResponsePart::ToolCall(t) => format!(
-                                    "toolCall {:?}",
-                                    match &t.tool_call {
-                                        ToolCallState::Streaming(_) => "streaming",
-                                        ToolCallState::PendingConfirmation(_) => "pending",
-                                        ToolCallState::Running(_) => "running",
-                                        ToolCallState::AuthRequired(_) => "auth-required",
-                                        ToolCallState::PendingResultConfirmation(_) =>
-                                            "pending-result",
-                                        ToolCallState::Completed(_) => "completed",
-                                        ToolCallState::Cancelled(_) => "cancelled",
-                                        ToolCallState::Unknown(_) => "unknown",
-                                    }
-                                ),
-                                ResponsePart::InputRequest(i) => format!(
-                                    "ask id={} answered={}",
-                                    i.request.id,
-                                    i.response.is_some()
-                                ),
-                                _ => "other".into(),
-                            }
-                        );
-                    }
-                }
-                for turn in state.turns.iter().rev().take(2) {
-                    println!(
-                        "PROBE settled turn id={} parts={} text={:?}",
-                        turn.id,
-                        turn.response_parts.len(),
-                        turn.message.text.chars().take(40).collect::<String>()
+                        "PROBE part {}",
+                        match p {
+                            ResponsePart::Markdown(m) =>
+                                format!("markdown len={}", m.content.len()),
+                            ResponsePart::Reasoning(r) =>
+                                format!("reasoning len={}", r.content.len()),
+                            ResponsePart::ToolCall(t) => format!(
+                                "toolCall {:?}",
+                                match &t.tool_call {
+                                    ToolCallState::Streaming(_) => "streaming",
+                                    ToolCallState::PendingConfirmation(_) => "pending",
+                                    ToolCallState::Running(_) => "running",
+                                    ToolCallState::AuthRequired(_) => "auth-required",
+                                    ToolCallState::PendingResultConfirmation(_) => "pending-result",
+                                    ToolCallState::Completed(_) => "completed",
+                                    ToolCallState::Cancelled(_) => "cancelled",
+                                    ToolCallState::Unknown(_) => "unknown",
+                                }
+                            ),
+                            ResponsePart::InputRequest(i) =>
+                                format!("ask id={} answered={}", i.request.id, i.response.is_some()),
+                            _ => "other".into(),
+                        }
                     );
                 }
             }
-            None => println!("PROBE no chat state"),
+            for turn in state.turns.iter().rev().take(2) {
+                println!(
+                    "PROBE settled turn id={} parts={} text={:?}",
+                    turn.id,
+                    turn.response_parts.len(),
+                    turn.message.text.chars().take(40).collect::<String>()
+                );
+            }
         }
-    });
+        None => println!("PROBE no chat state"),
+    }
     uninstall();
 }
 
-#[test]
-fn session_fold_merges_thread_metadata_and_journal_facts() {
+#[tokio::test(flavor = "multi_thread")]
+async fn session_fold_merges_thread_metadata_and_journal_facts() {
     let _guards = install();
-    manox_agent::runtime::handle().block_on(async {
-        let store = manox_agent::thread_store::global();
-        store.with_mut(|s| {
-            s.insert_summary_for_test("thread-A", None);
-            s.mark_running("thread-A");
-        });
-        manox_agent::thread_registry::set_active("thread-A", "chatfold-1").await;
-        seed_session("chatfold-1", "thread-A", "/tmp/seed", transcript()).await;
-        // Session-channel facts arrive on a sibling journal of the thread…
-        seed_session(
-            "chatfold-2",
-            "thread-A",
-            "/",
-            vec![
-                (
-                    "f1",
-                    E::Title {
-                        id: String::new(),
-                        parent_id: None,
-                        timestamp: stamp(),
-                        title: "Renamed thread".into(),
-                    },
-                ),
-                (
-                    "f2",
-                    E::ModelChange {
-                        id: String::new(),
-                        parent_id: None,
-                        timestamp: stamp(),
-                        provider: "newprov".into(),
-                        model_id: "x-model".into(),
-                    },
-                ),
-                (
-                    "f3",
-                    E::CwdChange {
-                        id: String::new(),
-                        parent_id: None,
-                        timestamp: stamp(),
-                        cwd: "/work/x".into(),
-                    },
-                ),
-                (
-                    "f4",
-                    E::PinnedArchived {
-                        id: String::new(),
-                        parent_id: None,
-                        timestamp: stamp(),
-                        pinned: false,
-                        archived: true,
-                    },
-                ),
-            ],
-        )
-        .await;
-        // …and a foreign thread's journal must stay out of the catalogue.
-        seed_session("other-sess", "thread-B", "/", transcript()).await;
-
-        let state = session_state("thread-A").await.expect("session state");
-        assert_eq!(
-            state.title, "Renamed thread",
-            "the journalled title beats the store mirror"
-        );
-        assert_eq!(state.provider, "newprov", "derived from the model ref");
-        assert_eq!(state.lifecycle, SessionLifecycle::Ready);
-        let active_chat = manox_ahp::channels::chat::uri("chatfold-1");
-        assert_eq!(
-            state.default_chat.as_deref(),
-            Some(active_chat.as_str()),
-            "the registry's active-session pointer is defaultChat"
-        );
-        let mut resources: Vec<&str> = state.chats.iter().map(|c| c.resource.as_str()).collect();
-        resources.sort();
-        assert_eq!(
-            resources,
-            vec![
-                manox_ahp::channels::chat::uri("chatfold-1").as_str(),
-                manox_ahp::channels::chat::uri("chatfold-2").as_str(),
-            ],
-            "the catalogue lists exactly this thread's journals"
-        );
-        let dirs = state.working_directories.as_ref().expect("granted dirs");
-        assert!(
-            dirs.contains(&"file:///tmp/seed".to_string()),
-            "the active session's creation cwd is seeded: {dirs:?}"
-        );
-        assert!(
-            dirs.contains(&"file:///work/x".to_string()),
-            "a journalled cwdChange grants membership: {dirs:?}"
-        );
-        let config = state.config.expect("config container");
-        assert_eq!(
-            config.values.get("model").and_then(|v| v.as_str()),
-            Some("newprov/x-model"),
-            "model / effort / approval values fold from their rows"
-        );
-        assert_eq!(
-            config
-                .values
-                .get("workingDirectory")
-                .and_then(|v| v.as_str()),
-            Some("/work/x")
-        );
-        let want = SessionStatus::Idle.bits()
-            | SessionStatus::IsRead.bits()
-            | SessionStatus::InProgress.bits()
-            | SessionStatus::IsArchived.bits();
-        assert_eq!(
-            state.status & want,
-            want,
-            "live flags + the journalled archive bit are set"
-        );
-        assert_eq!(
-            state.status & SessionStatus::Error.bits(),
-            0,
-            "no error flag on a clean thread"
-        );
+    let store = manox_agent::thread_store::global();
+    store.with_mut(|s| {
+        s.insert_summary_for_test("thread-A", None);
+        s.mark_running("thread-A");
     });
+    manox_agent::thread_registry::set_active("thread-A", "chatfold-1").await;
+    seed_session("chatfold-1", "thread-A", "/tmp/seed", transcript()).await;
+    // Session-channel facts arrive on a sibling journal of the thread…
+    seed_session(
+        "chatfold-2",
+        "thread-A",
+        "/",
+        vec![
+            (
+                "f1",
+                E::Title {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    title: "Renamed thread".into(),
+                },
+            ),
+            (
+                "f2",
+                E::ModelChange {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    provider: "newprov".into(),
+                    model_id: "x-model".into(),
+                },
+            ),
+            (
+                "f3",
+                E::CwdChange {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    cwd: "/work/x".into(),
+                },
+            ),
+            (
+                "f4",
+                E::PinnedArchived {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    pinned: false,
+                    archived: true,
+                },
+            ),
+        ],
+    )
+    .await;
+    // …and a foreign thread's journal must stay out of the catalogue.
+    seed_session("other-sess", "thread-B", "/", transcript()).await;
+
+    let state = session_state("thread-A").await.expect("session state");
+    assert_eq!(
+        state.title, "Renamed thread",
+        "the journalled title beats the store mirror"
+    );
+    assert_eq!(state.provider, "newprov", "derived from the model ref");
+    assert_eq!(state.lifecycle, SessionLifecycle::Ready);
+    let active_chat = manox_ahp::channels::chat::uri("chatfold-1");
+    assert_eq!(
+        state.default_chat.as_deref(),
+        Some(active_chat.as_str()),
+        "the registry's active-session pointer is defaultChat"
+    );
+    let mut resources: Vec<&str> = state.chats.iter().map(|c| c.resource.as_str()).collect();
+    resources.sort();
+    assert_eq!(
+        resources,
+        vec![
+            manox_ahp::channels::chat::uri("chatfold-1").as_str(),
+            manox_ahp::channels::chat::uri("chatfold-2").as_str(),
+        ],
+        "the catalogue lists exactly this thread's journals"
+    );
+    let dirs = state.working_directories.as_ref().expect("granted dirs");
+    assert!(
+        dirs.contains(&"file:///tmp/seed".to_string()),
+        "the active session's creation cwd is seeded: {dirs:?}"
+    );
+    assert!(
+        dirs.contains(&"file:///work/x".to_string()),
+        "a journalled cwdChange grants membership: {dirs:?}"
+    );
+    let config = state.config.expect("config container");
+    assert_eq!(
+        config.values.get("model").and_then(|v| v.as_str()),
+        Some("newprov/x-model"),
+        "model / effort / approval values fold from their rows"
+    );
+    assert_eq!(
+        config
+            .values
+            .get("workingDirectory")
+            .and_then(|v| v.as_str()),
+        Some("/work/x")
+    );
+    let want = SessionStatus::Idle.bits()
+        | SessionStatus::IsRead.bits()
+        | SessionStatus::InProgress.bits()
+        | SessionStatus::IsArchived.bits();
+    assert_eq!(
+        state.status & want,
+        want,
+        "live flags + the journalled archive bit are set"
+    );
+    assert_eq!(
+        state.status & SessionStatus::Error.bits(),
+        0,
+        "no error flag on a clean thread"
+    );
     uninstall();
 }
 
-#[test]
-fn folds_answer_none_for_absent_inputs() {
+#[tokio::test(flavor = "multi_thread")]
+async fn folds_answer_none_for_absent_inputs() {
     let _guards = install();
-    manox_agent::runtime::handle().block_on(async {
-        let store = manox_agent::thread_store::global();
-        store.with_mut(|s| s.insert_summary_for_test("thread-A", None));
-        assert!(chat_state("ghost-session").await.is_none());
-        assert!(session_state("ghost-thread").await.is_none());
-        // A known thread whose journals are all absent still answers:
-        // empty catalogue, defaultChat pinned to the registry's pointer.
-        let state = session_state("thread-A").await.expect("empty fold");
-        assert!(state.chats.is_empty());
-        assert_eq!(
-            state.default_chat.as_deref(),
-            Some(manox_ahp::channels::chat::uri("thread-A").as_str())
-        );
-    });
+    let store = manox_agent::thread_store::global();
+    store.with_mut(|s| s.insert_summary_for_test("thread-A", None));
+    assert!(chat_state("ghost-session").await.is_none());
+    assert!(session_state("ghost-thread").await.is_none());
+    // A known thread whose journals are all absent still answers:
+    // empty catalogue, defaultChat pinned to the registry's pointer.
+    let state = session_state("thread-A").await.expect("empty fold");
+    assert!(state.chats.is_empty());
+    assert_eq!(
+        state.default_chat.as_deref(),
+        Some(manox_ahp::channels::chat::uri("thread-A").as_str())
+    );
     uninstall();
 }
 
@@ -735,7 +727,7 @@ mod dispatch {
     use ahp_types::version::PROTOCOL_VERSION;
     use manox_ahp::backend::{Backend, DispatchOutcome};
     use manox_ahp::channels::{chat, session};
-    use manox_harness::session::SessionTreeEntry as E;
+    use manox_harness::session::Event as E;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -777,7 +769,10 @@ mod dispatch {
             .into_iter()
             .map(|(eid, parent, event)| with_chain(eid, parent.map(str::to_string), event))
             .collect();
-        storage.append_entries(&entries).await.expect("appends");
+        manox_harness::session::Session::new(storage)
+            .append_entries(entries)
+            .await
+            .expect("appends");
     }
 
     /// The full host assembly (AhpRuntime over a gateway) seeded with one
@@ -1152,7 +1147,9 @@ mod dispatch {
             meta: None,
         });
         assert_eq!(
-            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&chat::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         uninstall();
@@ -1182,7 +1179,9 @@ mod dispatch {
             selected_option_id: None,
         });
         assert_eq!(
-            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&chat::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
 
@@ -1193,7 +1192,9 @@ mod dispatch {
             confirmed.meta = None;
         }
         assert_eq!(
-            backend.dispatch(&chat::uri("s-dispatch"), &unattributed, &origin()),
+            backend
+                .dispatch(&chat::uri("s-dispatch"), &unattributed, &origin())
+                .await,
             DispatchOutcome::Ignored
         );
         uninstall();
@@ -1212,7 +1213,9 @@ mod dispatch {
             replace: None,
         });
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         uninstall();
@@ -1283,7 +1286,10 @@ mod dispatch {
             config,
             replace: None,
         });
-        match backend.dispatch(&session::uri("s-dispatch"), &action, &origin()) {
+        match backend
+            .dispatch(&session::uri("s-dispatch"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Rejected(reason) => {
                 assert!(
                     reason.contains("cannot be served"),
@@ -1315,7 +1321,9 @@ mod dispatch {
             replace: None,
         });
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         let thread = server
@@ -1358,7 +1366,10 @@ mod dispatch {
             config,
             replace: None,
         });
-        match backend.dispatch(&session::uri("s-dispatch"), &action, &origin()) {
+        match backend
+            .dispatch(&session::uri("s-dispatch"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Rejected(reason) => {
                 assert!(
                     reason.contains("cannot be served"),
@@ -1391,7 +1402,10 @@ mod dispatch {
             config,
             replace: Some(true),
         });
-        match backend.dispatch(&session::uri("s-dispatch"), &action, &origin()) {
+        match backend
+            .dispatch(&session::uri("s-dispatch"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Rejected(reason) => {
                 assert!(
                     reason.contains("replacement is not supported"),
@@ -1416,7 +1430,10 @@ mod dispatch {
             config,
             replace: None,
         });
-        match backend.dispatch(&session::uri("s-dispatch"), &action, &origin()) {
+        match backend
+            .dispatch(&session::uri("s-dispatch"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Rejected(reason) => {
                 assert!(
                     reason.contains("must be a string"),
@@ -1443,7 +1460,10 @@ mod dispatch {
             config,
             replace: None,
         });
-        match backend.dispatch(&session::uri("s-dispatch"), &action, &origin()) {
+        match backend
+            .dispatch(&session::uri("s-dispatch"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Rejected(reason) => {
                 assert!(
                     reason.contains("not session-mutable"),
@@ -1455,14 +1475,14 @@ mod dispatch {
         uninstall();
     }
 
-    /// A submit that lands mid-turn is parked and then drained into a
-    /// follow-up turn when the turn settles.
-    ///
-    /// The drain is the one piece of turn bookkeeping the gateway cannot
-    /// delegate: parking without draining strands the user's text forever,
-    /// and the receipt it already returned said the submission was accepted.
+    /// A submit that lands mid-turn is handed to the engine, never parked in
+    /// the gateway: the actor owns the ordering (a held turn is committed
+    /// before the new one starts, a running one queues the submit as its
+    /// follow-up). Parking it here is `dspo/manox#899` — a held turn cleared
+    /// the gateway's running flag never, so every later submit stranded in a
+    /// queue nothing drained.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_mid_turn_submit_is_drained_into_a_follow_up_turn() {
+    async fn a_mid_turn_submit_reaches_the_engine_without_parking() {
         let _guards = install();
         let (server, _backend) = fixture().await;
         let engine = attach_engine(&server);
@@ -1476,9 +1496,7 @@ mod dispatch {
         )));
         await_until(|| server.turn_active_for_test("s-dispatch")).await;
 
-        // The submit intent is what parks: with the turn active the text
-        // cannot run now, so it must wait for the settle edge.
-        let parked = inner
+        let receipt = inner
             .submit(
                 "owner",
                 "s-dispatch",
@@ -1488,25 +1506,27 @@ mod dispatch {
                 None,
             )
             .await
-            .expect("a parked submit still answers a receipt");
-        assert_eq!(parked["accepted"], serde_json::json!(true));
-        assert!(
-            engine.prompts.lock().is_empty(),
-            "a mid-turn submit must not start a run of its own"
+            .expect("a mid-turn submit still answers a receipt");
+        assert_eq!(receipt["accepted"], serde_json::json!(true));
+        await_until(|| !engine.prompts.lock().is_empty()).await;
+        assert_eq!(
+            engine.prompts.lock().as_slice(),
+            ["queued text"],
+            "the submit reaches the engine at once; the actor orders it"
         );
 
-        // Settle: the parked text must become the follow-up run.
+        // The settle edge re-sends nothing: the text is not parked anywhere.
         thread.handle_notice(manox_agent::thread_engine::BackendNotice::Settled {
             cancelled: false,
             failed: false,
             steered: Vec::new(),
             stranded: Vec::new(),
         });
-        await_until(|| !engine.prompts.lock().is_empty()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
-            engine.prompts.lock().as_slice(),
-            ["queued text"],
-            "the drained batch runs as one follow-up turn, with its own text"
+            engine.prompts.lock().len(),
+            1,
+            "no second run of the same text at settle"
         );
         uninstall();
     }
@@ -1522,7 +1542,9 @@ mod dispatch {
             id: "p-1".to_string(),
         });
         assert_eq!(
-            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&chat::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         uninstall();
@@ -1539,7 +1561,9 @@ mod dispatch {
             draft: None,
         });
         assert_eq!(
-            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&chat::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Ignored
         );
         uninstall();
@@ -1572,11 +1596,14 @@ mod dispatch {
         };
         backend
             .create_chat("s-dispatch", "client-chosen", &params)
+            .await
             .expect("the fork lands on the requested id");
 
         // The same id used twice must be refused, not silently truncated over
         // the journal that already lives there.
-        let again = backend.create_chat("s-dispatch", "client-chosen", &params);
+        let again = backend
+            .create_chat("s-dispatch", "client-chosen", &params)
+            .await;
         assert!(
             again.is_err(),
             "a colliding chat id must not overwrite the existing journal"
@@ -1616,11 +1643,13 @@ mod dispatch {
                     ahp_types::commands::ChatMoveToNewSessionDestination {},
                 ),
             })
+            .await
             .expect("the re-home lands");
         let new_session = session::id(&result.session).expect("the result names a session");
         assert_ne!(new_session, source, "the move mints a fresh session id");
         let new_state = backend
             .chat_state(new_session)
+            .await
             .expect("the re-homed chat is foldable on its new id");
         assert!(
             !new_state.turns.is_empty(),
@@ -1636,16 +1665,18 @@ mod dispatch {
         // A `session` destination is the merge manox cannot do: one journal
         // is one session, and merging two journals is not a row-level
         // operation. The refusal names the alternative.
-        let refused = backend.move_chat(&ahp_types::commands::MoveChatParams {
-            channel: chat::uri(new_session),
-            meta: None,
-            destination: ahp_types::commands::ChatMoveDestination::Session(
-                ahp_types::commands::ChatMoveToSessionDestination {
-                    session: session::uri("elsewhere"),
-                    after: None,
-                },
-            ),
-        });
+        let refused = backend
+            .move_chat(&ahp_types::commands::MoveChatParams {
+                channel: chat::uri(new_session),
+                meta: None,
+                destination: ahp_types::commands::ChatMoveDestination::Session(
+                    ahp_types::commands::ChatMoveToSessionDestination {
+                        session: session::uri("elsewhere"),
+                        after: None,
+                    },
+                ),
+            })
+            .await;
         assert!(
             matches!(&refused, Err(e) if matches!(e, manox_ahp::error::HostError::Unimplemented(reason)
                 if reason.contains("one journal is one session"))),
@@ -1667,13 +1698,15 @@ mod dispatch {
         // dispatch path consults.
         manox_agent::thread_store::global().with_mut(|s| s.mark_running(&source));
 
-        let refused = backend.move_chat(&ahp_types::commands::MoveChatParams {
-            channel: chat::uri(&source),
-            meta: None,
-            destination: ahp_types::commands::ChatMoveDestination::NewSession(
-                ahp_types::commands::ChatMoveToNewSessionDestination {},
-            ),
-        });
+        let refused = backend
+            .move_chat(&ahp_types::commands::MoveChatParams {
+                channel: chat::uri(&source),
+                meta: None,
+                destination: ahp_types::commands::ChatMoveDestination::NewSession(
+                    ahp_types::commands::ChatMoveToNewSessionDestination {},
+                ),
+            })
+            .await;
         assert!(
             matches!(&refused, Err(manox_ahp::error::HostError::Conflict(reason))
                 if reason.contains("live turn")),
@@ -1705,6 +1738,7 @@ mod dispatch {
         assert!(
             backend
                 .create_chat("s-dispatch", "side-1", &params)
+                .await
                 .is_err()
         );
         uninstall();
@@ -1740,6 +1774,7 @@ mod dispatch {
         assert_eq!(
             backend
                 .extension(manox_ahp::ext::commands::COMPACT, &params)
+                .await
                 .expect("compact is performed"),
             serde_json::Value::Null
         );
@@ -1748,6 +1783,7 @@ mod dispatch {
         // client that guessed a method this build does not serve learns so.
         let err = backend
             .extension("x-manox/notAServedCommand", &params)
+            .await
             .expect_err("an unserved name is refused");
         assert_eq!(err.code(), manox_ahp::codes::X_MANOX_UNSUPPORTED);
 
@@ -1762,7 +1798,7 @@ mod dispatch {
         // is it working. `Unimplemented` is the tell for a name with nothing
         // behind it.
         for command in manox_ahp::ext::commands::ALL {
-            if let Err(error) = backend.extension(command, &params) {
+            if let Err(error) = backend.extension(command, &params).await {
                 assert_ne!(
                     error.code(),
                     manox_ahp::codes::X_MANOX_UNSUPPORTED,
@@ -1776,6 +1812,7 @@ mod dispatch {
         assert!(
             backend
                 .extension(manox_ahp::ext::commands::COMPACT, &wrong)
+                .await
                 .is_err()
         );
         uninstall();
@@ -1794,7 +1831,7 @@ mod dispatch {
         std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
         std::fs::write(
             &session_file,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"s-dispatch\",\
+            "{\"type\":\"session\",\"version\":4,\"id\":\"s-dispatch\",\
          \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
          \"metadata\":{\"host\":\"manox\"}}\n",
         )
@@ -1809,7 +1846,9 @@ mod dispatch {
                 title: "  a better name  ".to_string(),
             });
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         let stored = manox_agent::thread_store::global().read(|s| {
@@ -1828,7 +1867,9 @@ mod dispatch {
             });
         assert!(
             matches!(
-                backend.dispatch(&session::uri("s-dispatch"), &blank, &origin()),
+                backend
+                    .dispatch(&session::uri("s-dispatch"), &blank, &origin())
+                    .await,
                 DispatchOutcome::Rejected(_)
             ),
             "a blank title must not be echoed as accepted"
@@ -1928,6 +1969,7 @@ mod dispatch {
             content: Vec<manox_harness::types::ContentBlock>,
             origin: Option<String>,
             _accepted_entry: Option<String>,
+            _ui: Option<manox_harness::session::UserEntryUi>,
         ) {
             self.run_origins.lock().push(origin);
             self.run(prompt, content);
@@ -2011,11 +2053,10 @@ mod dispatch {
         )
         .await
         .unwrap();
-        storage
-            .append_entries(&[with_chain("e-1", None, user("child prompt"))])
+        manox_harness::session::Session::new(storage)
+            .append_entries(vec![with_chain("e-1", None, user("child prompt"))])
             .await
             .unwrap();
-        drop(storage);
 
         let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
         let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
@@ -2071,7 +2112,9 @@ mod dispatch {
                 answers: None,
             });
         assert_eq!(
-            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&chat::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         assert_eq!(
@@ -2096,7 +2139,9 @@ mod dispatch {
             meta: None,
         });
         assert_eq!(
-            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&chat::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         assert_eq!(
@@ -2128,7 +2173,9 @@ mod dispatch {
             },
         );
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         assert_eq!(
@@ -2150,7 +2197,9 @@ mod dispatch {
             },
         );
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &again, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &again, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         assert_eq!(
@@ -2169,7 +2218,9 @@ mod dispatch {
             },
         );
         assert!(matches!(
-            backend.dispatch(&session::uri("s-dispatch"), &bogus, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &bogus, &origin())
+                .await,
             DispatchOutcome::Rejected(_)
         ));
         assert_eq!(engine.cwds.lock().len(), 2, "the bogus grant never landed");
@@ -2201,7 +2252,9 @@ mod dispatch {
                 selected_option_id: None,
             });
             assert_eq!(
-                backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+                backend
+                    .dispatch(&chat::uri("s-dispatch"), &action, &origin())
+                    .await,
                 DispatchOutcome::Accepted
             );
         }
@@ -2242,7 +2295,9 @@ mod dispatch {
                 message: user_message("change course"),
             });
         assert_eq!(
-            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&chat::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::AcceptedThen(vec![StateAction::ChatPendingMessageRemoved(
                 ChatPendingMessageRemovedAction {
                     kind: PendingMessageKind::Steering,
@@ -2283,7 +2338,7 @@ mod dispatch {
 
         // And a steer with no turn running reports the opposite: it opens a
         // turn of its own, so its pending entry is carried by that turn rather
-        // than retired.
+        // than cleared.
         server
             .ahp_inner()
             .session_thread("s-dispatch")
@@ -2379,7 +2434,9 @@ mod dispatch {
             ahp_types::actions::SessionIsArchivedChangedAction { is_archived: false },
         );
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         let archived = manox_agent::thread_store::global()
@@ -2393,14 +2450,13 @@ mod dispatch {
     }
 
     /// The rename's **durable** half: the journal row, which is the only route
-    /// either protocol face takes.
+    /// the AHP face takes.
     ///
-    /// The in-memory summary is not the contract. The v2 projection folds
-    /// `SessionTreeEntry::Title` and the AHP translator reads the journal,
-    /// while the live `TitleChanged` event sits on `translate.rs`'s `Skip`
-    /// list — so a rename that only flipped the summary would pass a
+    /// The in-memory summary is not the contract. The AHP translator reads the
+    /// journal, while the live `TitleChanged` event sits on `translate.rs`'s
+    /// `Skip` list — so a rename that only flipped the summary would pass a
     /// summary-only assertion and still be invisible to every client following
-    /// the session. This is the cross-protocol hole, pinned.
+    /// the session. This is the client-visibility hole, pinned.
     ///
     /// A **unique session id** is load-bearing: engine routes are a
     /// process-global map keyed by thread id (`engine::engine_routes`), so
@@ -2418,7 +2474,7 @@ mod dispatch {
         std::fs::write(
             &session_file,
             format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"{session_id}\",\
+                "{{\"type\":\"session\",\"version\":4,\"id\":\"{session_id}\",\
              \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
              \"metadata\":{{\"host\":\"manox\"}}}}\n"
             ),
@@ -2453,7 +2509,9 @@ mod dispatch {
                 title: "durable name".to_string(),
             });
         assert_eq!(
-            backend.dispatch(&session::uri(&session_id), &action, &origin()),
+            backend
+                .dispatch(&session::uri(&session_id), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
 
@@ -2468,7 +2526,7 @@ mod dispatch {
                 .expect("journal reads")
                 .into_iter()
                 .filter_map(|record| match record.entry {
-                    manox_harness::session::SessionTreeEntry::Title { title, .. } => Some(title),
+                    manox_harness::session::Event::Title { title, .. } => Some(title),
                     _ => None,
                 })
                 .collect();
@@ -2507,7 +2565,10 @@ mod dispatch {
             StateAction::SessionTitleChanged(ahp_types::actions::SessionTitleChangedAction {
                 title: "   ".to_string(),
             });
-        match backend.dispatch(&session::uri("s-dispatch"), &action, &origin()) {
+        match backend
+            .dispatch(&session::uri("s-dispatch"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Rejected(reason) => assert!(
                 reason.contains("blank"),
                 "a blank title names itself as the cause: {reason}"
@@ -2520,7 +2581,10 @@ mod dispatch {
             StateAction::SessionTitleChanged(ahp_types::actions::SessionTitleChangedAction {
                 title: "fine".to_string(),
             });
-        match backend.dispatch(&session::uri("s-absent-entirely"), &unknown, &origin()) {
+        match backend
+            .dispatch(&session::uri("s-absent-entirely"), &unknown, &origin())
+            .await
+        {
             DispatchOutcome::Rejected(reason) => assert!(
                 reason.contains("unknown session"),
                 "an unknown session names itself: {reason}"
@@ -2562,7 +2626,7 @@ mod dispatch {
             .expect("session opens");
 
         // No store row was inserted: this is the state `createSession` seeds in.
-        let seeded = backend.session_state(&session_id);
+        let seeded = backend.session_state(&session_id).await;
         assert!(
             seeded.is_some(),
             "a fresh session seeds from an empty state, not `None`"
@@ -2606,13 +2670,13 @@ mod dispatch {
             active_client: None,
             progress_token: None,
         };
-        backend.create_session(&id, &params).expect("creates");
+        backend.create_session(&id, &params).await.expect("creates");
         assert!(
             server.ahp_inner().session_thread(&id).is_some(),
             "the runtime addresses the session by the client's chosen id"
         );
         assert!(
-            backend.chat_state(&id).is_some(),
+            backend.chat_state(&id).await.is_some(),
             "the AHP chat channel resolves for the created session"
         );
 
@@ -2620,7 +2684,10 @@ mod dispatch {
             StateAction::SessionTitleChanged(ahp_types::actions::SessionTitleChangedAction {
                 title: "created rename".to_string(),
             });
-        match backend.dispatch(&session::uri(&id), &action, &origin()) {
+        match backend
+            .dispatch(&session::uri(&id), &action, &origin())
+            .await
+        {
             DispatchOutcome::Rejected(reason) => assert!(
                 reason.contains("not writable"),
                 "the reason is durability, not identity: {reason}"
@@ -2673,6 +2740,7 @@ mod dispatch {
         let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         backend
             .create_session(&id, &create_params(&id, Some(&cwd_string)))
+            .await
             .expect("the retry drives the id it already owns");
         assert!(
             server.ahp_inner().session_thread(&id).is_some(),
@@ -2701,6 +2769,7 @@ mod dispatch {
         let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         let err = backend
             .create_session(&id, &create_params(&id, Some("/definitely/elsewhere")))
+            .await
             .expect_err("a create naming another directory is refused");
         assert!(
             format!("{err:?}").contains("lives in"),
@@ -2746,6 +2815,7 @@ mod dispatch {
         let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         let err = backend
             .create_session(&id, &create_params(&id, Some(&cwd_string)))
+            .await
             .expect_err("a subagent session is never claimed");
         assert!(
             format!("{err:?}").contains("cannot be claimed"),
@@ -2867,6 +2937,7 @@ mod dispatch {
         let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         let state = backend
             .chat_state("s-orphanrun")
+            .await
             .expect("the cold seed answers");
         assert!(
             state
@@ -2922,6 +2993,7 @@ mod dispatch {
         let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         let state = backend
             .chat_state("s-liverun")
+            .await
             .expect("the cold seed answers");
         let listed = state.background_work.as_deref().unwrap_or_default().len();
         manox_harness::subagent::feeds::remove_child_feed("sub-live", activation);
@@ -2957,6 +3029,7 @@ mod dispatch {
         let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         let state = backend
             .chat_state("s-deadturn")
+            .await
             .expect("the cold seed answers");
         assert!(
             state.active_turn.is_none(),
@@ -2971,7 +3044,7 @@ mod dispatch {
         assert_eq!(
             state.status & SessionStatus::InProgress.bits(),
             0,
-            "the chat status no longer claims InProgress"
+            "the chat status does not claim InProgress"
         );
         uninstall();
     }
@@ -3009,6 +3082,7 @@ mod dispatch {
         let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         let state = backend
             .chat_state("s-liveowner")
+            .await
             .expect("the cold seed answers");
         assert!(
             state.active_turn.is_some(),
@@ -3055,7 +3129,10 @@ mod dispatch {
             duration: 0,
             meta: None,
         });
-        match backend.dispatch(&chat::uri("s-coldcancel"), &action, &origin()) {
+        match backend
+            .dispatch(&chat::uri("s-coldcancel"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Accepted => {}
             other => panic!("a cold session's cancel must open and settle, got {other:?}"),
         }
@@ -3068,7 +3145,7 @@ mod dispatch {
 
     /// A cold session's `session/configChanged` must open it instead of
     /// refusing: the desktop's first model/approval change on a restored
-    /// session died as `unknown session [session/not-found]` while the client
+    /// session died as `unknown session` while the client
     /// had already folded the change into its chips (real-device round).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cold_restored_sessions_config_write_opens_it_instead_of_refusing() {
@@ -3105,7 +3182,10 @@ mod dispatch {
             config,
             replace: None,
         });
-        match backend.dispatch(&session::uri("s-coldconfig"), &action, &origin()) {
+        match backend
+            .dispatch(&session::uri("s-coldconfig"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Accepted => {}
             other => panic!("a cold session's config write must open and land, got {other:?}"),
         }
@@ -3158,7 +3238,10 @@ mod dispatch {
             StateAction::SessionActiveClientSet(ahp_types::actions::SessionActiveClientSetAction {
                 active_client: active_client("client-a", vec![tool_definition("cold_claim_tool")]),
             });
-        match backend.dispatch(&session::uri("s-coldclaim"), &action, &origin()) {
+        match backend
+            .dispatch(&session::uri("s-coldclaim"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Accepted => {}
             other => panic!("a cold session's claim must open and register, got {other:?}"),
         }
@@ -3228,7 +3311,10 @@ mod dispatch {
                 directory: format!("file://{target}"),
             },
         );
-        match backend.dispatch(&session::uri("s-coldcwd"), &action, &origin()) {
+        match backend
+            .dispatch(&session::uri("s-coldcwd"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Accepted => {}
             other => panic!("a cold session's cwd write must open and land, got {other:?}"),
         }
@@ -3273,11 +3359,14 @@ mod dispatch {
             config,
             replace: None,
         });
-        match backend.dispatch(&session::uri("s-nothing"), &action, &origin()) {
+        match backend
+            .dispatch(&session::uri("s-nothing"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Rejected(reason) => {
                 assert!(
-                    reason.contains("session/not-found"),
-                    "the refusal carries the stable code: {reason}"
+                    reason.contains("unknown session"),
+                    "the refusal names the missing session: {reason}"
                 );
             }
             other => panic!("an id unknown on disk must stay not-found, got {other:?}"),
@@ -3286,10 +3375,9 @@ mod dispatch {
     }
 
     /// The `x-manox` command face must accept a cold session too: `compact`
-    /// and `goal` are the v2 height of `Compact` and `Goal`, and a restored
-    /// session is exactly where a user reaches for them. Each arm used to
-    /// bare-look the sessions table and refuse before the runtime's own
-    /// cold-open could run.
+    /// and `goal` are the command face of the compaction and goal actions, and
+    /// a restored session is exactly where a user reaches for them. Each arm
+    /// cold-opens through the runtime instead of refusing first.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cold_restored_sessions_commands_open_it_instead_of_refusing() {
         let _guards = install();
@@ -3314,10 +3402,12 @@ mod dispatch {
         let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
         let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
 
-        let compact = backend.extension(
-            manox_ahp::ext::commands::COMPACT,
-            &json!({"channel": session::uri("s-coldcompact"), "instructions": "tighten"}),
-        );
+        let compact = backend
+            .extension(
+                manox_ahp::ext::commands::COMPACT,
+                &json!({"channel": session::uri("s-coldcompact"), "instructions": "tighten"}),
+            )
+            .await;
         assert_eq!(
             compact.expect("a cold session compacts"),
             serde_json::Value::Null
@@ -3327,10 +3417,12 @@ mod dispatch {
             "the compact command's cold open loaded the session"
         );
 
-        let goal = backend.extension(
-            manox_ahp::ext::commands::GOAL,
-            &json!({"channel": session::uri("s-coldgoal"), "action": "clear"}),
-        );
+        let goal = backend
+            .extension(
+                manox_ahp::ext::commands::GOAL,
+                &json!({"channel": session::uri("s-coldgoal"), "action": "clear"}),
+            )
+            .await;
         assert_eq!(
             goal.expect("a cold session clears its goal"),
             serde_json::Value::Null
@@ -3347,6 +3439,7 @@ mod dispatch {
                 manox_ahp::ext::commands::COMPACT,
                 &json!({"channel": session::uri("s-nothing-cold")}),
             )
+            .await
             .expect_err("an unknown id stays not-found");
         assert_eq!(err.code(), manox_ahp::codes::ahp::SESSION_NOT_FOUND);
         assert!(
@@ -3384,6 +3477,7 @@ mod dispatch {
             };
             let baseline = backend
                 .extension_baseline(&channel)
+                .await
                 .unwrap_or_else(|| panic!("{channel} is declared and must answer"));
             assert!(
                 baseline.is_object(),
@@ -3401,9 +3495,15 @@ mod dispatch {
         assert!(
             backend
                 .extension_baseline("ahp-session:/s-dispatch")
+                .await
                 .is_none()
         );
-        assert!(backend.extension_baseline("ahp-chat:/s-dispatch").is_none());
+        assert!(
+            backend
+                .extension_baseline("ahp-chat:/s-dispatch")
+                .await
+                .is_none()
+        );
         uninstall();
     }
 
@@ -3421,14 +3521,14 @@ mod dispatch {
 
         let baseline = backend
             .extension_baseline(manox_ahp::ext::channels::COMMANDS)
+            .await
             .expect("the command catalogue is declared and must answer");
         let commands = baseline["commands"]
             .as_array()
             .expect("the catalogue carries a commands array");
         assert!(
             !commands.is_empty(),
-            "the built-in slash commands must appear; an empty palette is what \
-         the v2 ListCommands call never returned"
+            "the built-in slash commands must appear; an empty palette would be a bug"
         );
         let names: Vec<&str> = commands.iter().filter_map(|c| c["name"].as_str()).collect();
         assert!(
@@ -3452,7 +3552,7 @@ mod dispatch {
     /// subscriber would have reached — not an empty placeholder.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_extension_baseline_carries_the_folded_state() {
-        use manox_harness::session::SessionTreeEntry as E;
+        use manox_harness::session::Event as E;
         let _guards = install();
         let session_id = "s-ext-baseline";
         super::seed_session(
@@ -3492,6 +3592,7 @@ mod dispatch {
         let channel = format!("{}{session_id}", manox_ahp::ext::channels::PLAN);
         let payload = backend
             .extension_baseline(&channel)
+            .await
             .expect("the plan channel answers");
         assert_eq!(
             payload["plan"],
@@ -3510,20 +3611,22 @@ mod dispatch {
         let (_, backend) = fixture().await;
 
         assert!(matches!(
-            backend.dispatch(
-                &manox_ahp::channels::terminal::uri("no-such-terminal"),
-                &StateAction::TerminalInput(ahp_types::actions::TerminalInputAction {
-                    data: "x".to_string(),
-                }),
-                &origin(),
-            ),
+            backend
+                .dispatch(
+                    &manox_ahp::channels::terminal::uri("no-such-terminal"),
+                    &StateAction::TerminalInput(ahp_types::actions::TerminalInputAction {
+                        data: "x".to_string(),
+                    }),
+                    &origin(),
+                )
+                .await,
             DispatchOutcome::Rejected(_)
         ));
         assert!(backend.terminal_state("no-such-terminal").is_none());
     }
 
     /// The capability router's AHP leg declines cleanly when the transport has
-    /// no capable client, so the v2 path still runs.
+    /// no capable client, so the router falls through to the next leg.
     ///
     /// The positive half — an AHP client that declared a capability is the one
     /// asked — is pinned in `manox-ahp`'s `only_declared_client_requests_select_a_connection`,
@@ -3569,7 +3672,7 @@ mod dispatch {
         uninstall();
     }
 
-    /// Pin and manual ordering are user-visible v2 features with no AHP slot, so
+    /// Pin and manual ordering are user-visible features with no AHP slot, so
     /// they ride the declared extension surface. Both must reach their durable
     /// layer — a pin the sidebar shows and a cold restore forgets would be the
     /// worst of both.
@@ -3589,7 +3692,9 @@ mod dispatch {
             "pinned": true,
         }));
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &pin, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &pin, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         let pinned =
@@ -3602,42 +3707,52 @@ mod dispatch {
             "before": "s-other",
         }));
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &order, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &order, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
 
         // Both refuse an unknown session rather than reporting a success the
         // sidebar would not show.
         assert!(matches!(
-            backend.dispatch(&session::uri("s-absent"), &pin, &origin()),
+            backend
+                .dispatch(&session::uri("s-absent"), &pin, &origin())
+                .await,
             DispatchOutcome::Rejected(_)
         ));
         assert!(matches!(
-            backend.dispatch(&session::uri("s-absent"), &order, &origin()),
+            backend
+                .dispatch(&session::uri("s-absent"), &order, &origin())
+                .await,
             DispatchOutcome::Rejected(_)
         ));
 
         // A malformed payload is refused by name, not folded.
         assert!(matches!(
-            backend.dispatch(
-                &session::uri("s-dispatch"),
-                &StateAction::Unknown(json!({
-                    "type": manox_ahp::ext::actions::PINNED_CHANGED,
-                    "pinned": "yes",
-                })),
-                &origin(),
-            ),
+            backend
+                .dispatch(
+                    &session::uri("s-dispatch"),
+                    &StateAction::Unknown(json!({
+                        "type": manox_ahp::ext::actions::PINNED_CHANGED,
+                        "pinned": "yes",
+                    })),
+                    &origin(),
+                )
+                .await,
             DispatchOutcome::Rejected(_)
         ));
         assert!(matches!(
-            backend.dispatch(
-                &session::uri("s-dispatch"),
-                &StateAction::Unknown(json!({
-                    "type": manox_ahp::ext::actions::ORDER_CHANGED,
-                    "before": 42,
-                })),
-                &origin(),
-            ),
+            backend
+                .dispatch(
+                    &session::uri("s-dispatch"),
+                    &StateAction::Unknown(json!({
+                        "type": manox_ahp::ext::actions::ORDER_CHANGED,
+                        "before": 42,
+                    })),
+                    &origin(),
+                )
+                .await,
             DispatchOutcome::Rejected(_)
         ));
         uninstall();
@@ -3894,7 +4009,7 @@ mod dispatch {
             "archived": true,
         }));
         assert_eq!(
-            backend.dispatch(root::URI, &archive, &origin()),
+            backend.dispatch(root::URI, &archive, &origin()).await,
             DispatchOutcome::Accepted,
             "the batch rides the root channel"
         );
@@ -3916,7 +4031,7 @@ mod dispatch {
             "archived": false,
         }));
         assert_eq!(
-            backend.dispatch(root::URI, &unarchive, &origin()),
+            backend.dispatch(root::URI, &unarchive, &origin()).await,
             DispatchOutcome::Accepted
         );
         let gone_is_back =
@@ -3931,15 +4046,17 @@ mod dispatch {
             s.insert_summary_for_test("s-guarded", None);
         });
         assert!(matches!(
-            backend.dispatch(
-                root::URI,
-                &StateAction::Unknown(json!({
-                    "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
-                    "sessions": ["s-guarded", "s-absent"],
-                    "archived": true,
-                })),
-                &origin(),
-            ),
+            backend
+                .dispatch(
+                    root::URI,
+                    &StateAction::Unknown(json!({
+                        "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
+                        "sessions": ["s-guarded", "s-absent"],
+                        "archived": true,
+                    })),
+                    &origin(),
+                )
+                .await,
             DispatchOutcome::Rejected(_)
         ));
         let guarded_archived =
@@ -3974,7 +4091,9 @@ mod dispatch {
         ] {
             assert!(
                 matches!(
-                    backend.dispatch(root::URI, &StateAction::Unknown(payload.clone()), &origin()),
+                    backend
+                        .dispatch(root::URI, &StateAction::Unknown(payload.clone()), &origin())
+                        .await,
                     DispatchOutcome::Rejected(_)
                 ),
                 "malformed payload refused: {payload}"
@@ -3983,15 +4102,18 @@ mod dispatch {
         // One frame cannot ask the host for unbounded journal + dispose work:
         // the batch has a ceiling and it is refused by name, never truncated.
         let oversized: Vec<String> = (0..1025).map(|i| format!("s-bulk-{i}")).collect();
-        match backend.dispatch(
-            root::URI,
-            &StateAction::Unknown(json!({
-                "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
-                "sessions": oversized,
-                "archived": true,
-            })),
-            &origin(),
-        ) {
+        match backend
+            .dispatch(
+                root::URI,
+                &StateAction::Unknown(json!({
+                    "type": manox_ahp::ext::actions::ARCHIVED_CHANGED,
+                    "sessions": oversized,
+                    "archived": true,
+                })),
+                &origin(),
+            )
+            .await
+        {
             // The refusal must name the ceiling: every id here is also
             // unknown, so a reason about sessions would let a missing cap
             // pass this assertion.
@@ -4098,7 +4220,10 @@ mod dispatch {
         let action = StateAction::ChatTruncated(ahp_types::actions::ChatTruncatedAction {
             turn_id: Some("t-1".to_string()),
         });
-        match backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()) {
+        match backend
+            .dispatch(&chat::uri("s-dispatch"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Rejected(reason) => {
                 assert!(
                     reason.contains("chat/truncated"),
@@ -4112,7 +4237,7 @@ mod dispatch {
 
     // ── client-contributed tools (`session/activeClientSet`) ───────────────
     //
-    // The AHP face of v2's `RegisterSessionTools`. The registration lands in
+    // The AHP face of client-tool registration. The registration lands in
     // the runtime's embedder-tool store (so the model can call the tool) while
     // `activeClients` carries it on the protocol surface (so every subscriber
     // reads it). Both halves are asserted here, because either alone is a
@@ -4154,8 +4279,8 @@ mod dispatch {
     }
 
     /// A registration reaches the runtime's tool store, so the model can call
-    /// the tool: the AHP action and the v2 `RegisterSessionTools` call fill the
-    /// same registration the engine consults at assembly.
+    /// the tool: the AHP action and client-tool registration fill the same
+    /// registration the engine consults at assembly.
     #[tokio::test(flavor = "multi_thread")]
     async fn active_client_set_registers_tools_the_runtime_will_mount() {
         let _guards = install();
@@ -4167,7 +4292,9 @@ mod dispatch {
             vec![tool_definition("get_selection")],
         ));
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
 
@@ -4188,7 +4315,7 @@ mod dispatch {
     }
 
     /// Re-registering replaces the set (full replacement per client), which is
-    /// both the AHP upsert contract and the v2 call's own semantics.
+    /// both the AHP upsert contract and the client-tool contract.
     #[tokio::test(flavor = "multi_thread")]
     async fn active_client_set_replaces_a_previous_registration() {
         let _guards = install();
@@ -4197,12 +4324,16 @@ mod dispatch {
 
         let first = active_client_set(active_client("client-a", vec![tool_definition("old")]));
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &first, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &first, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         let second = active_client_set(active_client("client-a", vec![tool_definition("new")]));
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &second, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &second, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
 
@@ -4228,7 +4359,9 @@ mod dispatch {
         for (client, tool) in [("client-a", "alpha"), ("client-b", "beta")] {
             let action = active_client_set(active_client(client, vec![tool_definition(tool)]));
             assert_eq!(
-                backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+                backend
+                    .dispatch(&session::uri("s-dispatch"), &action, &origin())
+                    .await,
                 DispatchOutcome::Accepted
             );
         }
@@ -4254,7 +4387,10 @@ mod dispatch {
         let _guards = install();
         let (_server, backend) = fixture().await;
         let action = active_client_set(active_client("client-a", vec![tool_definition("t")]));
-        match backend.dispatch(&session::uri("no-such-session"), &action, &origin()) {
+        match backend
+            .dispatch(&session::uri("no-such-session"), &action, &origin())
+            .await
+        {
             DispatchOutcome::Rejected(reason) => {
                 assert!(
                     reason.contains("no-such-session"),
@@ -4276,7 +4412,9 @@ mod dispatch {
         let action = active_client_set(active_client("client-a", vec![tool_definition("  ")]));
         assert!(
             matches!(
-                backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+                backend
+                    .dispatch(&session::uri("s-dispatch"), &action, &origin())
+                    .await,
                 DispatchOutcome::Rejected(_)
             ),
             "a tool definition without a name is not registrable"
@@ -4293,7 +4431,9 @@ mod dispatch {
         let (_server, backend) = fixture().await;
         let action = active_client_set(active_client("", vec![tool_definition("t")]));
         assert!(matches!(
-            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Rejected(_)
         ));
         uninstall();
@@ -4312,7 +4452,9 @@ mod dispatch {
         let action = active_client_set(active_client("client-a", vec![tool]));
 
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
         let provider = crate::agent_server::AgentServerEmbedderTools::new(&server);
@@ -4341,7 +4483,9 @@ mod dispatch {
         });
         let action = active_client_set(active_client("client-a", vec![tool]));
         assert_eq!(
-            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            backend
+                .dispatch(&session::uri("s-dispatch"), &action, &origin())
+                .await,
             DispatchOutcome::Accepted
         );
 
@@ -4495,7 +4639,7 @@ mod create_intent {
     use manox_ahp::channels::session;
     use manox_harness::provider_registry::ProviderRegistry;
     use manox_harness::provider_registry::{Api, Cost, ProviderConfig, ProviderModelConfig};
-    use manox_harness::session::SessionTreeEntry;
+    use manox_harness::session::Event;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
@@ -4592,7 +4736,7 @@ mod create_intent {
         panic!("the engine never assembled its appender");
     }
 
-    async fn rows(path: &Path) -> Vec<SessionTreeEntry> {
+    async fn rows(path: &Path) -> Vec<Event> {
         manox_harness::session::jsonl::JsonlSessionStorage::open(path)
             .await
             .expect("the journal opens")
@@ -4610,10 +4754,10 @@ mod create_intent {
         for _ in 0..500 {
             if path.exists() {
                 let entries = rows(path).await;
-                let has = |want: fn(&SessionTreeEntry) -> bool| entries.iter().any(want);
-                if has(|e| matches!(e, SessionTreeEntry::ModelChange { .. }))
-                    && has(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. }))
-                    && has(|e| matches!(e, SessionTreeEntry::AccessModeChange { .. }))
+                let has = |want: fn(&Event) -> bool| entries.iter().any(want);
+                if has(|e| matches!(e, Event::ModelChange { .. }))
+                    && has(|e| matches!(e, Event::ThinkingLevelChange { .. }))
+                    && has(|e| matches!(e, Event::AccessModeChange { .. }))
                 {
                     return;
                 }
@@ -4655,6 +4799,7 @@ mod create_intent {
 
         backend
             .create_session(&id, &create_params(&id, None, None))
+            .await
             .expect("the create resolves its project");
 
         let thread = server
@@ -4693,7 +4838,7 @@ mod create_intent {
         assert!(
             entries.iter().any(|e| matches!(
                 e,
-                SessionTreeEntry::ProjectChange { path, .. }
+                Event::ProjectChange { path, .. }
                     if path.as_deref() == Some(project_string.as_str())
             )),
             "the thread row's project binding is journaled: {entries:?}"
@@ -4799,6 +4944,7 @@ mod create_intent {
 
         backend
             .create_session(&id, &create_params(&id, Some("/tmp"), None))
+            .await
             .expect("the create lands");
 
         let thread = server
@@ -4870,6 +5016,7 @@ mod create_intent {
         let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         backend
             .create_session(&id, &create_params(&id, Some(&cwd_string), None))
+            .await
             .expect("the retry restores the id it already owns");
         assert_eq!(
             std::fs::read(&seeded_path).expect("the journal reads"),
@@ -4912,6 +5059,7 @@ mod create_intent {
         );
         backend
             .create_session(&id, &params)
+            .await
             .expect("the create lands");
 
         materialize(&server, &id).await;
@@ -4921,7 +5069,7 @@ mod create_intent {
         assert!(
             entries.iter().any(|e| matches!(
                 e,
-                SessionTreeEntry::ModelChange { provider, model_id, .. }
+                Event::ModelChange { provider, model_id, .. }
                     if provider == "p-beta" && model_id == "beta"
             )),
             "the model pick journals its row: {entries:?}"
@@ -4936,7 +5084,10 @@ mod create_intent {
         });
         let cold_gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
         let cold = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(cold_gateway, cwd);
-        let state = cold.session_state(&id).expect("the cold fold answers");
+        let state = cold
+            .session_state(&id)
+            .await
+            .expect("the cold fold answers");
         let values = state
             .config
             .expect("the fold carries the config seat")
@@ -4976,6 +5127,7 @@ mod create_intent {
 
         backend
             .create_session(&id, &create_params(&id, None, None))
+            .await
             .expect("the create lands");
         // Let the actor drain any queued command before asserting silence.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -5010,11 +5162,15 @@ mod create_intent {
                     Some(serde_json::json!({ "model": "p-nope/nope" })),
                 ),
             )
+            .await
             .expect_err("an unresolvable model refuses the create");
-        let message = format!("{err:?}");
         assert!(
-            message.contains("unknown model") && message.contains("model/unresolvable"),
-            "the refusal uses the model-unresolvable vocabulary: {err:?}"
+            matches!(
+                &err,
+                manox_ahp::error::HostError::InvalidParams(message)
+                    if message.contains("unknown model")
+            ),
+            "an unresolvable model is a bad request: {err:?}"
         );
         assert!(
             !journal_of(&unresolvable, None).exists(),
@@ -5031,6 +5187,7 @@ mod create_intent {
                     Some(serde_json::json!({ "networkAccess": "on" })),
                 ),
             )
+            .await
             .expect_err("a non-create key refuses the create");
         assert!(!journal_of(&unknown, None).exists());
 
@@ -5040,6 +5197,7 @@ mod create_intent {
                 &nonstring,
                 &create_params(&nonstring, None, Some(serde_json::json!({ "model": 42 }))),
             )
+            .await
             .expect_err("a non-string value refuses the create");
         assert!(!journal_of(&nonstring, None).exists());
         assert!(
@@ -5100,12 +5258,14 @@ mod create_intent {
                     })),
                 ),
             )
+            .await
             .expect("the create lands");
 
         // No Submit, no materialization wait: this is exactly the state the
         // desktop's first subscribe sees.
         let state = backend
             .session_state(&id)
+            .await
             .expect("the deferred seed answers");
         let values = state
             .config
@@ -5295,15 +5455,20 @@ mod create_intent {
                     })),
                 ),
             )
+            .await
             .expect("the create lands");
         // Drop every process-scoped trace of the deferred session.
-        backend.dispose_session(&id).expect("the session disposes");
+        backend
+            .dispose_session(&id)
+            .await
+            .expect("the session disposes");
 
         let reseeded_gateway =
             Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
         let reseeded = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(reseeded_gateway, cwd);
         let state = reseeded
             .session_state(&id)
+            .await
             .expect("the durable intent still answers");
         let values = state.config.expect("config seat").values;
         assert_eq!(
@@ -5365,10 +5530,12 @@ mod create_intent {
                     })),
                 ),
             )
+            .await
             .expect("the create lands");
 
         let state = backend
             .session_state(&id)
+            .await
             .expect("the create intent seeds the session");
         let values = state.config.expect("config seat").values;
         assert_eq!(
@@ -5453,12 +5620,14 @@ mod create_intent {
         };
         backend
             .create_session(&id, &params)
+            .await
             .expect("the create lands");
 
         // The channel state carries the full grant group, insertion order
         // preserved (the declared primary seats first, as the effective cwd).
         let state = backend
             .session_state(&id)
+            .await
             .expect("the create seeds the session");
         let dirs = state.working_directories.expect("granted dirs");
         let primary_uri = format!("file://{primary_string}");
@@ -5589,6 +5758,7 @@ mod create_intent {
             manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway.clone(), cwd.clone());
         first
             .create_session(&id, &create_params(&id, Some("/tmp"), None))
+            .await
             .expect("the create lands");
 
         // Append a chat row that lands in the deferred storage only.
@@ -5608,7 +5778,7 @@ mod create_intent {
                 && snapshot.records.iter().any(|record| {
                     matches!(
                         &record.entry,
-                        SessionTreeEntry::Custom { custom_type, .. }
+                        Event::Custom { custom_type, .. }
                             if custom_type == manox_agent::db::UI_NOTE_CUSTOM_TYPE
                     )
                 })
@@ -5627,7 +5797,7 @@ mod create_intent {
         // A fresh backend = a subscriber arriving after those rows landed.
         let late_gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
         let late = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(late_gateway, cwd);
-        let chat = late.chat_state(&id).expect("the late seed answers");
+        let chat = late.chat_state(&id).await.expect("the late seed answers");
         assert!(
             serde_json::to_string(&chat)
                 .expect("the chat serializes")
@@ -6077,10 +6247,7 @@ mod teardown {
         // resolves through (the scanned rows always have one).
         manox_agent::thread_store::global().with_mut(|s| {
             s.insert_summary_for_test("s-teardown", None);
-            s.note_session_path(
-                "s-teardown",
-                &manox_agent::thread_store::global_sessions_dir().join("s-teardown.jsonl"),
-            );
+            s.note_session_path("s-teardown", &super::core_journal("s-teardown"));
         });
         let engine = StopAllEngine::new(&["sub-1", "sub-2"]);
         let (_notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6103,6 +6270,7 @@ mod teardown {
         });
         let receipt = backend
             .extension(ext::commands::TEARDOWN, &params)
+            .await
             .expect("stop-all is performed");
         assert_eq!(
             receipt,
@@ -6382,6 +6550,7 @@ mod teardown {
         });
         let receipt = backend
             .extension(ext::commands::TEARDOWN, &params)
+            .await
             .expect("stop-all is performed");
         assert_eq!(
             receipt["containers"][0]["interruptedRuns"],
@@ -6446,6 +6615,7 @@ mod teardown {
         });
         let receipt = backend
             .extension(ext::commands::TEARDOWN, &params)
+            .await
             .expect("archive is performed");
         assert_eq!(
             receipt,
@@ -6523,6 +6693,7 @@ mod teardown {
         });
         let error = backend
             .extension(ext::commands::TEARDOWN, &params)
+            .await
             .expect_err("an unknown id refuses the batch");
         assert_eq!(error.code(), manox_ahp::codes::ahp::SESSION_NOT_FOUND);
         // Nothing landed: the known row is still unarchived and listed.
@@ -6551,6 +6722,7 @@ mod teardown {
             });
             let error = backend
                 .extension(ext::commands::TEARDOWN, &params)
+                .await
                 .expect_err("an unknown mode refuses");
             assert_eq!(error.code(), manox_ahp::codes::rpc::INVALID_PARAMS);
         }
@@ -6561,6 +6733,7 @@ mod teardown {
         });
         let error = backend
             .extension(ext::commands::TEARDOWN, &empty)
+            .await
             .expect_err("an empty batch refuses");
         assert_eq!(error.code(), manox_ahp::codes::rpc::INVALID_PARAMS);
         uninstall();

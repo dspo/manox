@@ -3,16 +3,14 @@
 //! The sidebar's session list comes from the session repository (jsonl)
 //! plus a per-session UI-metadata sidecar (`manox_harness::session_meta`).
 //! The transcript persists itself, so `refresh_thread_list` only refreshes
-//! the sidebar list; manox SQLite timeline/note records are not produced.
+//! the sidebar list; no SQLite timeline/note records exist.
 //! Archived sessions are excluded from the sidebar list but stay in
-//! `session_paths` so their sidecar remains addressable. The retired manox
-//! SQLite-backed implementation was removed; see git history (or the
-//! `origin/Manox` backup branch) for it.
+//! `session_paths` so their sidecar remains addressable.
 //!
 //! A refresh is a RECONCILE, not a scan: a `read_dir` + `stat` sweep
 //! fingerprints every session file (and its sidecar); files whose append-only
 //! coverage still holds reuse the cached bounded facts (`session_index` hot
-//! map + db table), and only the new or shrunk ones take a bounded read
+//! map), and only the new or shrunk ones take a bounded read
 //! (header + first user message — never the transcript). Latency grows with
 //! CHANGES, not with history: a 40 MiB session being actively appended is
 //! never re-read.
@@ -95,7 +93,7 @@ pub struct ThreadStore {
     pending_meta_writes: Vec<MetaWrite>,
     /// Working-directory grants held in memory until the session's journal
     /// materializes: writing a sidecar for a session with no journal orphans
-    /// a meta with no log (the v1 black-hole class). Flushed the moment the
+    /// a meta with no log. Flushed the moment the
     /// journal file appears.
     pending_working_dirs: HashMap<String, Vec<String>>,
     /// View stamps observed before the session's sidecar path materialized
@@ -528,7 +526,7 @@ fn write_projects_file(path: &std::path::Path, projects: &[ProjectEntry]) -> std
 }
 
 pub(crate) fn sessions_dir() -> PathBuf {
-    // The v1.0.0 core root: per-session directories under project buckets.
+    // The core root: per-session directories under project buckets.
     // Computed DIRECTLY (never through `paths::core_root`, which resolves
     // through this store — re-entering the global during store construction
     // deadlocks).
@@ -1050,10 +1048,9 @@ impl ThreadStore {
     ///
     /// Three legs, and a rename needs all three:
     ///
-    /// - **the journal** ([`Self::journal_title`]) carries `SessionTreeEntry::Title`,
-    ///   which the v2 title projection folds (`projections.rs`) and the AHP
-    ///   translator reads (`translate/actions.rs`). It is the only route
-    ///   either takes: the live `ThreadEvent::TitleChanged` is on
+    /// - **the journal** ([`Self::journal_title`]) carries `Event::Title`,
+    ///   which the AHP translator reads (`translate/actions.rs`). It is the
+    ///   only route: the live `ThreadEvent::TitleChanged` is on
     ///   `translate.rs`'s `Skip` list precisely because the journal row is its
     ///   durable form.
     /// - **the in-memory summary** updates the `title_override` slot that
@@ -1209,28 +1206,18 @@ impl ThreadStore {
 
     /// The ACTIVE session id a surfaced row id resolves to. The scan maps
     /// every row id — thread key or singleton session id — to its active
-    /// session's journal path; the id the engine assembles lives in that
-    /// path: the per-session DIRECTORY name in the core layout (the file is
-    /// the fixed `session.jsonl`), the file stem in the flat legacy layout
-    /// (`<id>.jsonl` beside the buckets). This is the row-id → session-id
-    /// seam for host gestures that must reach the live engine (container
-    /// teardown): a legacy journal's row id (the thread key) is not the
-    /// session id, and a caller that consults the engine with the raw row
-    /// id finds nothing live. An id the store never scanned answers `None`.
+    /// session's journal path; the id the engine assembles is the journal's
+    /// per-session DIRECTORY name (the file is the fixed `session.jsonl`).
+    /// This is the row-id → session-id seam for host gestures that must reach
+    /// the live engine (container teardown), where a row id that is a thread
+    /// key would otherwise find nothing live. An id the store never scanned
+    /// answers `None`.
     pub fn active_session_id(&self, row_id: &str) -> Option<String> {
         let path = self.session_paths.get(row_id)?;
-        if path.file_name().and_then(|n| n.to_str())
-            == Some(manox_harness::session::identity::JOURNAL_FILE)
-        {
-            path.parent()
-                .and_then(|dir| dir.file_name())
-                .and_then(|n| n.to_str())
-                .map(str::to_string)
-        } else {
-            path.file_stem()
-                .and_then(|n| n.to_str())
-                .map(str::to_string)
-        }
+        path.parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
     }
 
     /// The journal file for one session id as it exists ON DISK: the
@@ -1629,8 +1616,7 @@ impl ThreadStore {
             self.write_meta(&tid, move |meta| meta.archived = archived);
             if archived {
                 // Plugin lifecycle: archiving ends the session's working life
-                // (the retired harness fired on thread deletion; the manox harness
-                // keeps sessions and archives instead). Fail-open, detached.
+                // (sessions are archived, never deleted). Fail-open, detached.
                 crate::plugin_hooks::fire(
                     crate::plugin_hooks::HookEvent::SessionEnd,
                     None,
@@ -1853,10 +1839,9 @@ async fn reconcile_summaries(
     dir: &std::path::Path,
     index: &mut SessionIndex,
 ) -> (Vec<SessionRow>, Vec<SessionRow>) {
-    // The cold-cache layer retired with the db: the in-memory index still
-    // accelerates a live process's repeat scans, but every restart starts
-    // from a bounded header scan — the list's content never depended on the
-    // cache anyway.
+    // The in-memory index accelerates a live process's repeat scans, but
+    // every restart starts from a bounded header scan — the list's content
+    // never depends on the cache anyway.
     index.seeded = true;
     let stats = stat_session_files(dir).await;
     let live: std::collections::HashSet<PathBuf> = stats.iter().map(|s| s.path.clone()).collect();
@@ -1933,7 +1918,7 @@ async fn reconcile_summaries(
                     );
                     // Negative cache: the failure is fingerprinted, so an
                     // unchanged file never re-reads (or re-warns) — a store
-                    // carrying legacy headerless zombies pays for them once.
+                    // carrying headerless files pays for them once.
                     index.dirty = true;
                     index.rows.insert(
                         stat.path.clone(),
@@ -2151,9 +2136,10 @@ async fn stat_session_files(dir: &std::path::Path) -> Vec<Stat> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
         // The core root is two-deep: project buckets over per-session
-        // directories, the journal (`log.v1.jsonl`) inside each. A flat
-        // `*.jsonl` beside the buckets (the pre-core layout a test store
-        // still uses) stays visible — both shapes scan.
+        // directories, the journal (`session.jsonl`) inside each. That shape
+        // is the ONLY one the sidebar sees — a flat `*.jsonl` beside the
+        // buckets is not a layout this store writes, so a stray one never
+        // lists or opens here.
         fn walk(dir: &std::path::Path, depth: u8, out: &mut Vec<Stat>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
@@ -2169,7 +2155,12 @@ async fn stat_session_files(dir: &std::path::Path) -> Vec<Stat> {
                     }
                     continue;
                 }
-                if path.extension().is_none_or(|e| e != "jsonl") {
+                // Only the canonical journal at its own level: a bucket's
+                // `cache/` sidecars and any stray `.jsonl` are not sessions.
+                if depth != 0
+                    || path.file_name().and_then(|name| name.to_str())
+                        != Some(manox_harness::session::identity::JOURNAL_FILE)
+                {
                     continue;
                 }
                 let sidecar =
@@ -2281,7 +2272,7 @@ fn resolve_depths(list: &mut [ThreadSummary]) {
 /// storage. The surfaced session is the registry's active pointer when it
 /// hits, else the newest; the row carries the THREAD's id (stable across
 /// swaps and restarts) and the active session's fields. Sessions without a
-/// thread stamp (legacy files) pass through as singleton rows keyed by
+/// thread stamp (a journal with no stamp) pass through as singleton rows keyed by
 /// their own id. Child rows (delegated subagent sessions) never group —
 /// their parent edge resolves against the same session→thread map so the
 /// catalogue annotation names the row the client actually sees. Returns
@@ -2298,19 +2289,14 @@ fn group_by_thread(
     Vec<ThreadSummary>,
     Vec<ThreadSummary>,
 ) {
-    // Session id (the `<id>.jsonl` stem) → row index, and the session→thread
-    // map used to remap team edges from session ids to thread keys.
+    // Session id (the scanned header's own id — the path carries no id in
+    // the canonical layout) → row index, and the session→thread map used to
+    // remap team edges from session ids to thread keys.
     let mut by_session: HashMap<String, usize> = HashMap::new();
     let mut session_to_thread: HashMap<String, String> = HashMap::new();
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
-        let session_id = row
-            .path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default()
-            .to_string();
-        by_session.insert(session_id, i);
+        by_session.insert(row.summary.id.clone(), i);
         if let Some(key) = &row.thread_key {
             session_to_thread.insert(row.summary.id.clone(), key.clone());
             groups.entry(key.clone()).or_default().push(i);
@@ -2339,7 +2325,7 @@ fn group_by_thread(
         consumed.extend(members.iter().copied());
         // The row IS the thread: stable id across session swaps, team edge
         // remapped from the leader's SESSION id to the leader's THREAD key
-        // (unresolvable legacy edges keep their raw value).
+        // (an edge that resolves to no row keeps its raw value).
         sum.id = thread_key.clone();
         if let Some(parent_session) = sum.parent_id.clone()
             && let Some(leader_thread) = session_to_thread.get(&parent_session)
@@ -2545,8 +2531,7 @@ mod tests {
     /// A rename must land a durable `title` **journal** row, not only the
     /// sidecar.
     ///
-    /// The row is the only route the two protocol faces take — the v2
-    /// projection folds `SessionTreeEntry::Title` and the AHP translator reads
+    /// The row is the only route the AHP face takes — the translator reads
     /// the journal, while the live `TitleChanged` event is on `translate.rs`'s
     /// `Skip` list. A store-side rename that skipped this would be invisible to
     /// every client following the session, which is exactly the cross-protocol
@@ -2562,7 +2547,7 @@ mod tests {
         // nowhere to put the row, and the sidecar carries the flag instead.
         std::fs::write(
             &session,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"t-title\",\
+            "{\"type\":\"session\",\"version\":4,\"id\":\"t-title\",\
              \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
              \"metadata\":{\"host\":\"manox\"}}\n",
         )
@@ -2594,7 +2579,7 @@ mod tests {
                 })
                 .into_iter()
                 .filter_map(|record| match record.entry {
-                    manox_harness::session::SessionTreeEntry::Title { title, .. } => Some(title),
+                    manox_harness::session::Event::Title { title, .. } => Some(title),
                     _ => None,
                 })
                 .collect()
@@ -2714,18 +2699,19 @@ mod tests {
 
         // A create on a not-yet-materialized session leaves no sidecar: a
         // session that never materializes leaves no disk trace at all.
+        let blank = session_path(&dir, "s-blank");
+        let meta_path = manox_harness::session_meta::meta_path(&dir, &blank);
         handle.with_mut(|s| {
-            s.note_session_path("s-blank", &dir.join("s-blank.jsonl"));
+            s.note_session_path("s-blank", &blank);
             s.set_working_directories("s-blank", vec!["/w/extra".into()]);
         });
-        assert!(!dir.join("s-blank.meta.json").exists());
+        assert!(!meta_path.exists());
 
         // The journal materializes; the next store pass flushes the grants.
         // The sidecar write lands on the store's async refresh pump, so the
         // test waits for it rather than racing the spawn.
         write_session_fixture(&dir, "s-blank", "first");
         handle.with_mut(|s| s.flush_materialized_working_dirs());
-        let meta_path = dir.join("s-blank.meta.json");
         let mut landed = false;
         for _ in 0..500 {
             if meta_path.exists() {
@@ -2747,26 +2733,38 @@ mod tests {
         id: &str,
         first_user: &str,
     ) -> std::path::PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
-        let path = dir.join(format!("{id}.jsonl"));
         let content = format!(
             "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{id}\"}}}}\n{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-09-13T00:00:01Z\",\"seq\":0,\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{first_user}\"}}],\"timestamp\":1770000000000}}}}\n",
         );
+        write_journal(dir, id, &content)
+    }
+
+    /// The canonical journal path for a test session: one directory per
+    /// session under a test bucket, `session.jsonl` inside — the only shape
+    /// the sidebar scan admits.
+    fn session_path(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+        dir.join("--store-test--")
+            .join(id)
+            .join(manox_harness::session::identity::JOURNAL_FILE)
+    }
+
+    /// Write a canonical journal at `session_path(dir, id)`, creating its
+    /// directories.
+    fn write_journal(dir: &std::path::Path, id: &str, content: &str) -> std::path::PathBuf {
+        let path = session_path(dir, id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, content).unwrap();
         path
     }
 
     /// A header-only v4 fixture: the journal a session leaves before its
-    /// first message (a subagent's dispatch declaration, a legacy
+    /// first message (a subagent's dispatch declaration, a
     /// never-materialized row).
     fn write_header_only_fixture(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
-        let path = dir.join(format!("{id}.jsonl"));
         let content = format!(
             "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{id}\"}}}}\n"
         );
-        std::fs::write(&path, content).unwrap();
-        path
+        write_journal(dir, id, &content)
     }
 
     fn first_summary_of(store: &StoreHandle, id: &str) -> String {
@@ -2790,13 +2788,10 @@ mod tests {
         parent: &str,
         label: &str,
     ) -> std::path::PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
-        let path = dir.join(format!("{id}.jsonl"));
         let content = format!(
             "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{{\"host\":\"manox\",\"subagent\":{{\"type\":\"Explore\",\"label\":\"{label}\",\"parent\":\"{parent}\",\"depth\":1}}}}}}\n{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-09-13T00:00:01Z\",\"seq\":0,\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"survey the auth module\"}}],\"timestamp\":1770000000000}}}}\n",
         );
-        std::fs::write(&path, content).unwrap();
-        path
+        write_journal(dir, id, &content)
     }
 
     /// The fact-layer rule: append-only GROWTH never rescans a session's
@@ -2830,7 +2825,7 @@ mod tests {
     }
 
     /// The one append that DOES touch a cached fact: a journal first scanned
-    /// before any message landed (a subagent's dispatch declaration, a legacy
+    /// before any message landed (a subagent's dispatch declaration, a
     /// header-only file) must re-read once a message arrives. The message-less
     /// row's `has_messages` gates the catalogue's recency key, so pinning it
     /// false until a shrink that an append-only writer never produces would
@@ -2899,7 +2894,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let header = r#"{"type":"session","version":4,"id":"torn","timestamp":"2026-09-13T00:00:00Z","cwd":"/proj","metadata":{"host":"manox","thread":"torn"}}"#;
         let torn_line = r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-09-13T00:00:01Z","seq":0,"message":{"role":"user","content":[{"type":"text","text":"mid-write"}],"timestamp":1770000000000}}"#;
-        std::fs::write(dir.join("torn.jsonl"), format!("{header}\n{torn_line}")).unwrap();
+        write_journal(&dir, "torn", &format!("{header}\n{torn_line}"));
 
         store.refresh_now().await;
         assert_eq!(first_summary_of(&store, "torn"), "mid-write");
@@ -2907,7 +2902,7 @@ mod tests {
         // The line completes with DIFFERENT text and padding (the file only
         // grew — the case the fact layer would treat as append-only).
         let completed = r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-09-13T00:00:01Z","seq":0,"message":{"role":"user","content":[{"type":"text","text":"completed wording, settled"}],"timestamp":1770000000000}}"#;
-        std::fs::write(dir.join("torn.jsonl"), format!("{header}\n{completed}  \n")).unwrap();
+        write_journal(&dir, "torn", &format!("{header}\n{completed}  \n"));
         store.refresh_now().await;
         assert_eq!(
             first_summary_of(&store, "torn"),
@@ -2926,8 +2921,9 @@ mod tests {
         let store = standalone_for_test();
         let dir = store.read(|s| s.sessions_dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
-        // A headerless zombie (the shape a pre-fix bug left on real stores).
-        std::fs::write(dir.join("zombie.jsonl"), "not a session header\n").unwrap();
+        // A headerless zombie (the shape a pre-fix bug left on real stores),
+        // in the canonical file position so the scan actually reads it.
+        write_journal(&dir, "zombie", "not a session header\n");
         write_session_fixture(&dir, "alive", "hello");
 
         store.refresh_now().await;
@@ -2948,9 +2944,51 @@ mod tests {
         );
     }
 
-    /// A restart rebuilds identical rows from the bounded scan alone — the
-    /// cold-cache layer retired with the db, and the list's content never
-    /// depended on it.
+    /// The canonical layout is the ONLY shape the scan admits: a journal left
+    /// beside the buckets never lists, never resolves as an open target, and
+    /// never shadows a canonical sibling.
+    #[tokio::test]
+    async fn a_flat_journal_is_invisible_to_the_scan() {
+        let _db_path = temp_db();
+        let store = standalone_for_test();
+        let dir = store.read(|s| s.sessions_dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let header = |id: &str| {
+            format!(
+                "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{id}\"}}}}\n"
+            )
+        };
+        // The shapes the scan refuses: a valid session file directly in the
+        // core root, and a journal-shaped file one level short (inside a
+        // bucket, not a per-session directory).
+        std::fs::write(dir.join("flat-old.jsonl"), header("flat-old")).unwrap();
+        let bucket = dir.join("--bucket--");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(
+            bucket.join(manox_harness::session::identity::JOURNAL_FILE),
+            header("bucket-file"),
+        )
+        .unwrap();
+
+        store.refresh_now().await;
+        assert!(
+            store.read(|s| s.summaries().is_empty() && s.archived_summaries().is_empty()),
+            "a flat or shallow journal never becomes a sidebar row"
+        );
+        assert!(
+            store.read(|s| s.journal_path_on_disk("flat-old").is_none()),
+            "a flat journal is not an open target either"
+        );
+
+        // The canonical sibling is the one the scan serves.
+        write_session_fixture(&dir, "canonical", "hello");
+        store.refresh_now().await;
+        assert_eq!(first_summary_of(&store, "canonical"), "hello");
+        assert_eq!(store.read(|s| s.summaries().len()), 1);
+    }
+
+    /// A restart rebuilds identical rows from the bounded scan alone — no
+    /// cache layer exists, so the list's content never depends on one.
     #[tokio::test]
     async fn reconcile_rebuilds_identical_rows_after_a_restart() {
         let store = standalone_for_test();
@@ -3264,9 +3302,9 @@ mod tests {
     }
 
     /// A thread's real session files (base + worktree fork, both stamped
-    /// with the same header `thread` key as the retired worktree fork left them)
-    /// collapse to ONE sidebar row keyed by the thread id, following the
-    /// registry's active pointer in both directions.
+    /// with the same header `thread` key) collapse to ONE sidebar row keyed by
+    /// the thread id, following the registry's active pointer in both
+    /// directions.
     #[tokio::test]
     async fn grouping_end_to_end_over_real_session_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -3274,24 +3312,12 @@ mod tests {
         let (base_id, fork_id, thread_key) = ("base-session", "fork-session", "thread-1");
         let header = |id: &str, cwd: &str| {
             format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"{cwd}\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{thread_key}\"}}}}\n"
+                "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"{cwd}\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{thread_key}\"}}}}\n"
             )
         };
-        tokio::fs::write(
-            sessions.join(format!("{base_id}.jsonl")),
-            header(base_id, "/proj/a"),
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(
-            sessions.join(format!("{fork_id}.jsonl")),
-            header(fork_id, "/tmp/wt"),
-        )
-        .await
-        .unwrap();
+        let base_path = write_journal(sessions, base_id, &header(base_id, "/proj/a"));
+        let fork_path = write_journal(sessions, fork_id, &header(fork_id, "/tmp/wt"));
         // Sidecars: the fork wears the source's title/project.
-        let base_path = sessions.join(format!("{base_id}.jsonl"));
-        let fork_path = sessions.join(format!("{fork_id}.jsonl"));
         manox_harness::session_meta::update(sessions, &base_path, |m| {
             m.title = Some("the title".into());
             m.project = Some("/proj/a".into());
@@ -3364,7 +3390,7 @@ mod tests {
         assert_eq!(
             child.parent_id.as_deref(),
             Some("captain-1"),
-            "the parent resolves to the thread row the catalogue serves (v1.0.0: thread id == session id)"
+            "the parent resolves to the thread row the catalogue serves (thread id == session id)"
         );
         assert_eq!(child.display_title(), "survey auth");
         // Addressable for reopen and flag writes; lookup reaches the
@@ -3377,7 +3403,7 @@ mod tests {
     }
 
     /// The parent edge names the catalogue's join key: a spawning session
-    /// grouped under a legacy thread key remaps the child's parent to that
+    /// grouped under a thread key remaps the child's parent to that
     /// row id (the team-edge remap's rule), so the client's fold finds the
     /// parent row the list actually carries.
     #[tokio::test]
@@ -3387,7 +3413,7 @@ mod tests {
         // The captain's session id differs from its thread key (a
         // worktree-era multi-session thread).
         let header = r#"{"type":"session","version":4,"id":"captain-old","timestamp":"2026-09-13T00:00:00Z","cwd":"/proj","metadata":{"host":"manox","thread":"thread-old"}}"#;
-        std::fs::write(sessions.join("captain-old.jsonl"), header).unwrap();
+        write_journal(sessions, "captain-old", header);
         write_child_session_fixture(sessions, "run-1", "captain-old", "survey auth");
 
         let store = standalone_for_test();
@@ -3740,14 +3766,14 @@ mod tests {
         let db_path = temp_db();
         crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("t1.jsonl");
-        // A real session file so the post-write rescan keeps the row (and
-        // its `session_paths` entry) addressable for follow-up writes.
-        std::fs::write(
-            &session,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"t1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{\"host\":\"manox\"}}\n",
-        )
-        .unwrap();
+        // A real (canonical) session file so the post-write rescan keeps the
+        // row (and its `session_paths` entry) addressable for follow-up
+        // writes.
+        let session = write_journal(
+            dir.path(),
+            "t1",
+            "{\"type\":\"session\",\"version\":4,\"id\":\"t1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{\"host\":\"manox\"}}\n",
+        );
         let store = store_handle();
         store.with_mut(|s| {
             s.session_paths.insert("t1".to_string(), session.clone());
@@ -3903,28 +3929,22 @@ mod tests {
             assert!(s.child_summaries.iter().all(|row| row.id != "sub-a"));
         });
 
-        // The row-id → active-session-id seam over both journal layouts.
+        // The row-id → active-session-id seam: the journal's per-session
+        // directory names the live session.
         let dir = store.read(|s| s.sessions_dir.clone());
-        std::fs::create_dir_all(&dir).unwrap();
-        let flat = dir.join("lead.jsonl");
-        std::fs::write(&flat, b"").unwrap();
-        store.with_mut(|s| s.note_session_path("lead", &flat));
-        let core = dir
-            .join("t")
-            .join("sub-b")
-            .join(manox_harness::session::identity::JOURNAL_FILE);
-        std::fs::create_dir_all(core.parent().unwrap()).unwrap();
-        std::fs::write(&core, b"").unwrap();
+        let core = write_journal(&dir, "sub-b", "");
         store.with_mut(|s| s.note_session_path("sub-b", &core));
+        let lead = write_journal(&dir, "lead", "");
+        store.with_mut(|s| s.note_session_path("lead", &lead));
         assert_eq!(
             store.read(|s| s.active_session_id("lead")).as_deref(),
             Some("lead"),
-            "flat layout: the stem is the session id"
+            "the per-session directory names the session id"
         );
         assert_eq!(
             store.read(|s| s.active_session_id("sub-b")).as_deref(),
             Some("sub-b"),
-            "core layout: the per-session directory names the id"
+            "the same shape for a child run"
         );
         assert_eq!(store.read(|s| s.active_session_id("ghost")), None);
         std::fs::remove_file(db_path).ok();
@@ -3941,18 +3961,18 @@ mod tests {
         let db_path = temp_db();
         crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
-        // Real session files (v3 headers: the cold append rides the lazy
-        // v3→v4 migration like any other writer). The child carries its
+        // Real session files: the cold append opens them through their
+        // header row like any other writer. The child carries its
         // team edge in the header so the post-write rescans (which rebuild
         // the summaries from disk) keep the cascade link.
         let write_session = |id: &str, metadata: &str| {
-            let path = dir.path().join(format!("{id}.jsonl"));
-            std::fs::write(
-                &path,
-                format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{metadata}}}\n"),
+            write_journal(
+                dir.path(),
+                id,
+                &format!(
+                    "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{metadata}}}\n"
+                ),
             )
-            .unwrap();
-            path
         };
         let lead = write_session("k3-lead", "{\"host\":\"manox\"}");
         let child = write_session(
@@ -3980,10 +4000,8 @@ mod tests {
                 })
                 .into_iter()
                 .filter_map(|record| match record.entry {
-                    manox_harness::session::SessionTreeEntry::PinnedArchived {
-                        pinned,
-                        archived,
-                        ..
+                    manox_harness::session::Event::PinnedArchived {
+                        pinned, archived, ..
                     } => Some((pinned, archived)),
                     _ => None,
                 })
@@ -4043,10 +4061,9 @@ mod tests {
 
     /// B3/P0-4 (review round 3): two store decisions on one engine-less
     /// thread each spawn their own cold append — fresh storage instances
-    /// whose instance-scoped append locks never see each other. Raced on a
-    /// v3 file (where both appends also race the lazy v3→v4 migration,
-    /// which used to share one temp name), they must still land a LINEAR
-    /// chain: the chain-walking journal_range reads BOTH `pinned_archived`
+    /// whose writers never see each other. Raced on one file (where both
+    /// appends also race each other through the write fence), they must
+    /// still land a LINEAR chain: the chain-walking journal_range reads BOTH `pinned_archived`
     /// rows. Pre-fix the pair forked — both rows parented to the same
     /// leaf, each seq self-stamped, the load validator accepts siblings,
     /// and the cursor kept only the file-last branch, so the range never
@@ -4069,10 +4086,8 @@ mod tests {
                 })
                 .into_iter()
                 .filter_map(|record| match record.entry {
-                    manox_harness::session::SessionTreeEntry::PinnedArchived {
-                        pinned,
-                        archived,
-                        ..
+                    manox_harness::session::Event::PinnedArchived {
+                        pinned, archived, ..
                     } => Some((pinned, archived)),
                     _ => None,
                 })
@@ -4098,7 +4113,7 @@ mod tests {
             let path = dir.path().join(format!("{id}.jsonl"));
             std::fs::write(
                 &path,
-                format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{{\"host\":\"manox\"}}}}\n"),
+                format!("{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{{\"host\":\"manox\"}}}}\n"),
             )
             .unwrap();
             store.with_mut(|s| {
@@ -4496,7 +4511,9 @@ mod tests {
         // Pin one row: the rerank then orders it ahead of the scan's
         // recency walk, so held order and fresh walk order structurally
         // disagree — exactly the false-change the gate must not fire on.
-        let pin = manox_harness::session_meta::meta_path(&dir, &dir.join("t-quiet-b.jsonl"));
+        let pinned_journal = session_path(&dir, "t-quiet-b");
+        let pin = manox_harness::session_meta::meta_path(&dir, &pinned_journal);
+        std::fs::create_dir_all(pin.parent().unwrap()).unwrap();
         std::fs::write(&pin, "{\"pinned\": true}").unwrap();
         let rx = store.subscribe();
 
@@ -4552,8 +4569,8 @@ mod tests {
 
         // B's viewer declares the view. The write is QUEUED for the store's
         // pass runner (a direct `refresh_now` does not drain the queue), so
-        // wait for it to land on the shared disk before A re-scans — racing
-        // the spawned runner is the flake this test used to carry.
+        // wait for it to land on the shared disk before A re-scans — the
+        // race against the spawned runner is what the wait guards against.
         b.with_mut(|s| assert!(s.mark_viewed("s-cross", 100)));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -4601,8 +4618,7 @@ mod tests {
 
         // The disk still says "viewed" — what a scan that started before the
         // lowering's queued write would read.
-        write_session_fixture(&dir, "s-unread", "hello");
-        let path = dir.join("s-unread.jsonl");
+        let path = write_session_fixture(&dir, "s-unread", "hello");
         manox_harness::session_meta::update(&dir, &path, |meta| {
             meta.last_settled_at = Some(42);
             meta.last_viewed_at = Some(1_000);

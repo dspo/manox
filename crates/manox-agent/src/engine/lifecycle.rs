@@ -54,8 +54,10 @@ pub(super) fn mirror_ui_note(state: &Arc<EngineState>, record: UiNoteRecord) {
 }
 
 /// Serialize and append one UI note as a `custom` entry at the session leaf.
+/// Takes the journal handle, not the session: the projection persists parked
+/// notes detached from the run that produced them.
 pub(super) async fn persist_ui_note(
-    session: &AgentSession,
+    appender: &Arc<JournalAppender>,
     state: &EngineState,
     notice_tx: &tokio::sync::mpsc::UnboundedSender<BackendNotice>,
     record: &UiNoteRecord,
@@ -78,7 +80,7 @@ pub(super) async fn persist_ui_note(
     // so its loss never voids the turn.
     let mut last_err = None;
     for attempt in 1..=TYPED_APPEND_ATTEMPTS {
-        match session
+        match appender
             .append_custom(UI_NOTE_CUSTOM_TYPE, data.clone())
             .await
         {
@@ -93,8 +95,7 @@ pub(super) async fn persist_ui_note(
         }
     }
     let err = last_err.expect("the attempt loop ran at least once");
-    let appender = session.journal_appender();
-    if let Some(row) = record_journal_loss(&appender, "ui_note", &err).await {
+    if let Some(row) = record_journal_loss(appender, "ui_note", &err).await {
         state.pending_journal.lock().unwrap().push(row);
     }
     send_notice(
@@ -161,7 +162,7 @@ pub(super) fn project_browser_suites(active: &[String]) -> Vec<BrowserSuite> {
 
 /// The shared mid-run journal writer (`AgentSession::journal_appender`): the
 /// same session `Arc` the persistence middleware holds, so a mid-run append
-/// is linearized by the session's append lock and broadcasts to followers
+/// is serialized by the session's journal writer and broadcasts to followers
 /// like any other append.
 pub(super) type JournalAppender =
     manox_harness::session::Session<manox_harness::session::jsonl::JsonlSessionStorage>;
@@ -198,7 +199,7 @@ pub(super) fn prompt_user_message(text: &str, images: &[ContentBlock]) -> AgentM
 /// the normal path. The pin and any drain-time append carry the
 /// POST-expansion text (the K5 edge: the run announces the expanded
 /// shape); the acceptance-side persistence expands identically. An origin-less prompt (an internally-driven `run()`
-/// turn, a goal seed) keeps the legacy flow: the middleware
+/// turn, a goal seed) keeps the middleware flow: the middleware
 /// persists its user message at announce time.
 pub(super) async fn persist_prompt_user_entry(
     session: &AgentSession,
@@ -231,10 +232,16 @@ pub(super) async fn persist_prompt_user_entry(
     let entry_id = match accepted_entry {
         Some(id) => id,
         None => {
+            // The drain-time append is the row's one append, so it consumes
+            // the authorship pin exactly like the persistence middleware
+            // would on the run's announcement.
+            let ui = appender.take_pending_user_ui();
             // Durable: a still-deferred session (no file yet) puts the
             // accepted text on disk here, not at the first assistant
             // message.
-            appender.append_message_durable(message, origin_rpc).await?
+            appender
+                .append_message_durable_with_ui(message, origin_rpc, ui)
+                .await?
         }
     };
     appender.pin_accepted_user_entry(entry_id.clone(), content);

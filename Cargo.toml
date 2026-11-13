@@ -36,7 +36,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.1"
+version = "0.9.1"
 edition = "2024"
 publish = false
 
@@ -80,6 +80,9 @@ rquickjs = { version = "=0.14.0", default-features = false, features = ["std"] }
 
 anyhow = "1"
 async-channel = "2"
+# async-trait — the AHP seams (`Backend`, `SessionRuntime`) are async; both are
+# held as `dyn` trait objects, which is what the macro adds over native AFIT.
+async-trait = "0.1"
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 # ahp / ahp-types —— Agent Host Protocol 官方 Rust crate（wire 类型 + 客户端
@@ -106,7 +109,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 schemars = { version = "0.8", features = ["derive"] }
 jsonschema = "0.18"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 zstd = "0.13"
 uuid = { version = "1", features = ["v4"] }

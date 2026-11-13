@@ -41,7 +41,7 @@ pub struct ToSpec {
     pub spawn: Option<String>,
 }
 
-/// The message payload. v1 carries text only (no images).
+/// The message payload. Text only (no images).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerPayload {
     pub text: String,

@@ -47,11 +47,13 @@ mod subagent_authority;
 #[cfg(test)]
 mod tests;
 mod tools_assembly;
+mod turn;
 use journal::*;
 use lifecycle::*;
 use run::*;
 use subagent_authority::*;
 use tools_assembly::*;
+use turn::*;
 // Public aliases: `BrowserSuite` and the two journal entry points are
 // addressed as `crate::engine::…` from other modules.
 pub(crate) use journal::{dispatch_store_journal_row, register_engine_route};
@@ -78,7 +80,8 @@ async fn close_held_turn(
     let Some(held) = state.held_settle.lock().unwrap().take() else {
         return;
     };
-    run::finish_held_settle(held, cancelled, session, state, cwd, notice_tx).await;
+    let appender = session.journal_appender();
+    run::finish_held_settle(held, cancelled, &appender, state, cwd, notice_tx).await;
     if !cancelled && !seeds.is_empty() {
         send_notice(
             notice_tx,
@@ -106,6 +109,10 @@ pub(crate) enum SessionCmd {
         /// actor pins the middleware skip from it instead of appending its
         /// own entry; `None` persists the entry at drain, before the run.
         accepted_entry: Option<String>,
+        /// The entry-level authorship of this prompt's user row
+        /// (`None` = the human typed it). The actor pins it on the session
+        /// so whichever append lands the row carries it.
+        ui: Option<manox_harness::session::UserEntryUi>,
     },
     /// Inject a steer into the running turn.
     Steer {
@@ -244,8 +251,8 @@ fn spawn_journal_relay_rx(
 ///
 /// Reads the storage directly through the shared appender (the same `Arc`
 /// the persistence middleware holds), so the answer is current at any await
-/// point — including mid-run, where live appends already land on the storage
-/// under the append lock (L5 read face: reads never park behind the run).
+/// point — including mid-run, where live appends already land through the
+/// journal writer (L5 read face: reads never park behind the run).
 async fn reply_journal_snapshot(
     appender: &JournalAppender,
     reply: tokio::sync::oneshot::Sender<JournalSnapshotData>,
@@ -260,6 +267,18 @@ async fn reply_journal_snapshot(
     let records = storage.journal_range(0, u64::MAX).await.unwrap_or_default();
     let cursor = records.last().map(|r| r.seq).unwrap_or(0);
     let _ = reply.send(JournalSnapshotData { cursor, records });
+}
+
+/// Lock a derived-state mutex even if a panic poisoned it.
+///
+/// A projected mirror is discardable and rebuilt by the next pass; a poisoned
+/// lock must therefore degrade to "the next writer recovers", never to a
+/// permanent panic loop (or a panic on the run path, which pushes parked rows
+/// while the projection is broken).
+fn lock_mirror<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Authoritative state the actor writes and the facade mirrors.
@@ -289,6 +308,9 @@ struct EngineState {
     /// Usage of each model's most recent request; the context-budget
     /// numerator behind the env card's `used / window` rows.
     per_model_last_usage: Mutex<HashMap<String, TokenUsage>>,
+    /// The accumulated usage of the transcript's last user turn: what the
+    /// conversation footer stamps onto the reply that just settled.
+    last_turn_usage: Mutex<Option<TokenUsage>>,
     cumulative: Mutex<TokenUsage>,
     per_model: Mutex<HashMap<String, TokenUsage>>,
     /// USD cost aggregated from the kernel's rate-card pricing (#418 wire
@@ -341,9 +363,10 @@ struct EngineState {
     question_gate: Arc<crate::questions::UserQuestionGate>,
     /// A run that ended on a delivered ask holds its turn open until the
     /// answer settles (the ahp reducer only settles input parts on the
-    /// ACTIVE turn): the settle path parks its turn-finish here, and the
-    /// settling cmd closes it. `None` whenever no run is held.
-    held_settle: Mutex<Option<run::HeldSettle>>,
+    /// ACTIVE turn): the commit parks its close here, and the settling cmd
+    /// (answer, dismiss, abort or a new submit) closes it. `None` whenever no
+    /// turn is held.
+    held_settle: Mutex<Option<HeldTurn>>,
     /// Ask cards re-parked at restore: their turn predates this process, so
     /// they never hold a turn or seed a run — a settle of theirs is a
     /// journal-only decision row.
@@ -399,6 +422,70 @@ struct EngineState {
     /// for the `SetThinkingLevel` arms, independent of the session's
     /// clamp-adjusted in-force level.
     journaled_thinking_level: Mutex<Option<String>>,
+    /// Detached-projection bookkeeping: at most one projection runs at a
+    /// time, and a request that lands while one runs only raises `dirty`
+    /// (the running pass reruns once).
+    projection: Mutex<ProjectionFlight>,
+    /// Test seam: the abort grace this state's drive loop enforces (`0` = the
+    /// production constant). The beyond-grace test cannot wait ten seconds.
+    #[cfg(test)]
+    abort_grace_ms: AtomicU64,
+    /// The run supervisor could not guarantee the harness's state: a run
+    /// future panicked, outlived its abort grace, or a turn was dropped
+    /// between open and commit. Only a process restart clears it; every
+    /// Prompt/Steer submit is refused with a readable error meanwhile.
+    degraded: AtomicBool,
+    degraded_reason: Mutex<Option<String>>,
+}
+
+impl EngineState {
+    /// Record that this session's harness state can no longer be trusted.
+    /// Idempotent: the first reason wins, so the original failure is the one
+    /// the refusal reports.
+    fn mark_degraded(&self, reason: &str) {
+        tracing::error!(
+            reason,
+            "session degraded: the turn supervisor lost control of its turn"
+        );
+        let mut slot = self.degraded_reason.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(reason.to_string());
+        }
+        self.degraded.store(true, Ordering::Release);
+    }
+
+    fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Acquire)
+    }
+
+    /// The abort grace in force for this state's turns.
+    fn abort_grace(&self) -> std::time::Duration {
+        #[cfg(test)]
+        {
+            let millis = self.abort_grace_ms.load(Ordering::Relaxed);
+            if millis > 0 {
+                return std::time::Duration::from_millis(millis);
+            }
+        }
+        ABORT_GRACE
+    }
+
+    /// The readable refusal a submit gets while degraded (`None` when the
+    /// session is healthy).
+    fn degraded_refusal(&self) -> Option<String> {
+        if !self.is_degraded() {
+            return None;
+        }
+        let reason = self
+            .degraded_reason
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "an unknown supervisor failure".to_string());
+        Some(format!(
+            "this session is degraded after a supervisor failure ({reason}); restart the process to continue"
+        ))
+    }
 }
 
 /// Live transcript snapshot maintained by the session listener so the engine
@@ -541,6 +628,7 @@ pub fn spawn_engine(
         journal_tx: journal_feed_handle.clone(),
         request_usage: Mutex::new(HashMap::new()),
         per_model_last_usage: Mutex::new(HashMap::new()),
+        last_turn_usage: Mutex::new(None),
         cumulative: Mutex::new(TokenUsage::default()),
         per_model: Mutex::new(HashMap::new()),
         cumulative_cost: Mutex::new(0.0),
@@ -574,6 +662,11 @@ pub fn spawn_engine(
             granted
         },
         last_cwd_note: Mutex::new(None),
+        projection: Mutex::new(ProjectionFlight::default()),
+        #[cfg(test)]
+        abort_grace_ms: AtomicU64::new(0),
+        degraded: AtomicBool::new(false),
+        degraded_reason: Mutex::new(None),
     });
     // The actor's own copy of the declared roots: the prompt's project-root
     // section is seeded from this construction-time snapshot, never from a
@@ -704,12 +797,14 @@ impl ThreadEngine for Engine {
         images: Vec<manox_harness::types::ContentBlock>,
         origin: Option<String>,
         accepted_entry: Option<String>,
+        ui: Option<manox_harness::session::UserEntryUi>,
     ) {
         let _ = self.cmd_tx.send(SessionCmd::Prompt {
             text: prompt,
             images,
             origin_rpc: origin,
             accepted_entry,
+            ui,
         });
     }
     fn persist_user_submission(
@@ -744,6 +839,8 @@ impl ThreadEngine for Engine {
             // Durable: a still-deferred session (no file yet) materializes
             // here — the accepted text is on disk before the caller's
             // receipt returns.
+            // Accept-time persistence precedes the host insert that knows
+            // the authorship, so this row is always human input.
             let id = appender.append_message_durable(message, origin).await?;
             Ok(Some(id))
         })
@@ -766,6 +863,10 @@ impl ThreadEngine for Engine {
 
     fn per_model_last_request_usage(&self) -> HashMap<String, TokenUsage> {
         self.state.per_model_last_usage.lock().unwrap().clone()
+    }
+
+    fn last_turn_token_usage(&self) -> Option<TokenUsage> {
+        *self.state.last_turn_usage.lock().unwrap()
     }
 
     fn cumulative_token_usage(&self) -> TokenUsage {
@@ -807,6 +908,7 @@ impl ThreadEngine for Engine {
             images,
             origin_rpc: None,
             accepted_entry: None,
+            ui: None,
         });
     }
 
@@ -1256,10 +1358,10 @@ async fn run_actor(
     // reads; shared so mid-run history refreshes never borrow the session.
     let live_mirror: Arc<Mutex<LiveTranscript>> = Arc::new(Mutex::new(LiveTranscript::default()));
     let restored_provider_responses = successful_provider_responses(session.harness_messages());
-    // K2: the journal-first restore rebuild — the active chain is the
-    // authority for every field §C.2 entries carry, the sidecar fills the
-    // fields the chain has never seen, and a diverging cache is repaired
-    // toward the journal.
+    // The journal-first restore rebuild: the active chain is the authority
+    // for every field §C.2 entries carry, the sidecar fills the fields the
+    // chain has never seen, and a diverging cache is repaired toward the
+    // journal.
     let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
     let title_scheduler = TitleScheduler::new(
         runtime.clone(),
@@ -1323,9 +1425,15 @@ async fn run_actor(
     // mirror and strand the thread on the loading screen. Unconditional so a
     // failed restore (fresh fallback session) also clears any preview the
     // display stream had written.
-    sync_history(&session, &sessions_dir, &state).await;
+    sync_history(
+        &session.journal_appender(),
+        &sessions_dir,
+        session.path(),
+        &state,
+    )
+    .await;
     if restored {
-        sync_usage(&session, &state).await;
+        sync_usage(&session.journal_appender(), &state, None).await;
     }
     // The active-tool set is authoritative for the composer chips; `None`
     // (never narrowed) reads as the full mounted set.
@@ -1384,7 +1492,7 @@ async fn run_actor(
         // session); drain before blocking on the next command.
         let parked = std::mem::take(&mut *state.pending_ui_notes.lock().unwrap());
         for record in parked {
-            let _ = persist_ui_note(&session, &state, &notice_tx, &record).await;
+            let _ = persist_ui_note(&session.journal_appender(), &state, &notice_tx, &record).await;
         }
         let parked_journal = std::mem::take(&mut *state.pending_journal.lock().unwrap());
         if !parked_journal.is_empty() {
@@ -1465,7 +1573,32 @@ async fn run_actor(
                 images,
                 origin_rpc,
                 accepted_entry,
+                ui,
             } => {
+                // Ownership honesty, not a retry: after a supervisor failure
+                // the harness may be mid-state, so a submit is refused with a
+                // readable error until the process restarts. The `Settled`
+                // makes the facade converge the turn it optimistically opened.
+                if let Some(refusal) = state.degraded_refusal() {
+                    send_notice(
+                        &notice_tx,
+                        BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
+                            "{refusal}"
+                        )))),
+                        "degraded submit refusal",
+                    );
+                    send_notice(
+                        &notice_tx,
+                        BackendNotice::Settled {
+                            cancelled: false,
+                            failed: true,
+                            steered: Vec::new(),
+                            stranded: Vec::new(),
+                        },
+                        "degraded submit refusal",
+                    );
+                    continue;
+                }
                 // The user speaks while answers are pending: the open cards
                 // dismiss (their seeds drop — the message supersedes; the
                 // answered decisions stay journaled), the held turn closes,
@@ -1473,18 +1606,13 @@ async fn run_actor(
                 // turn_start follows the held turn's turn_finish.
                 if state.awaiting_answers.load(Ordering::Relaxed) {
                     held_seeds.clear();
-                    let appender = session.journal_appender();
-                    for (id, meta) in state.question_gate.withdraw_all() {
-                        run::journal_ask_decision(
-                            &appender,
-                            &id,
-                            &meta,
-                            "dismissed",
-                            &state,
-                            &notice_tx,
-                        )
-                        .await;
-                    }
+                    withdraw_open_asks(
+                        &session.journal_appender(),
+                        &state,
+                        &notice_tx,
+                        "dismissed",
+                    )
+                    .await;
                     close_held_turn(&session, &state, &cwd, &notice_tx, Vec::new(), false).await;
                 }
                 // #805 companion: the host registers its client tools only
@@ -1501,6 +1629,10 @@ async fn run_actor(
                 // awaited the append before its receipt and passes the
                 // entry id) or here, at drain, for a queued Submit. The
                 // middleware skips its own append through the pinned id.
+                // The row's author rides the session pin so the append that
+                // lands the row (drain-time here, or the persistence
+                // middleware on the run's MessageEnd) attaches it.
+                session.set_pending_user_ui(ui);
                 if let Err(err) =
                     persist_prompt_user_entry(&session, &text, &images, origin_rpc, accepted_entry)
                         .await
@@ -1537,16 +1669,12 @@ async fn run_actor(
                         serde_json::json!({ "cwd": cwd.display().to_string() }),
                     );
                 }
-                state.running.store(true, Ordering::Relaxed);
                 let handle = session.handle();
-                let active_session_path = session.path().clone();
-                let journal_appender = session.journal_appender();
-                // Drive the run while still servicing mid-run commands
-                // (abort/steer) through the session handle, then chain
-                // automatic goal rounds until the goal stops or the user
-                // interrupts.
-                let (result, abort_requested) = drive_run(
-                    session.prompt_with_images(&text, images),
+                // Open -> drive -> commit -> project. The turn's close is
+                // durable before any derived work runs.
+                let settlement = run_turn(
+                    &mut session,
+                    TurnInput::Prompt { text, images },
                     &handle,
                     &mut cmd_rx,
                     &mut run_steers,
@@ -1556,25 +1684,19 @@ async fn run_actor(
                     &notice_tx,
                     &mut harness_model,
                     &sessions_dir,
-                    &active_session_path,
-                    &journal_appender,
-                )
-                .await;
-                settle_run(
-                    &result,
-                    abort_requested,
-                    &session,
-                    &state,
-                    &sessions_dir,
                     &cwd,
-                    &notice_tx,
-                    &mut run_steers,
                 )
                 .await;
                 if shutdown_after_run {
                     break;
                 }
-                goal_housekeeping(&result, abort_requested, &session, &state).await;
+                goal_housekeeping(
+                    &settlement.result,
+                    settlement.abort_requested,
+                    &session,
+                    &state,
+                )
+                .await;
                 if shutdown_after_run {
                     break;
                 }
@@ -1590,7 +1712,6 @@ async fn run_actor(
                     &mut harness_model,
                     &sessions_dir,
                     &cwd,
-                    &active_session_path,
                 )
                 .await;
                 if shutdown_after_run {
@@ -1668,6 +1789,20 @@ async fn run_actor(
                 }
             }
             SessionCmd::Steer { id, text, images } => {
+                if let Some(refusal) = state.degraded_refusal() {
+                    // A steer has no run to join and no turn to open; refuse
+                    // it loudly rather than letting it sit in a queue nothing
+                    // will ever drain.
+                    send_notice(
+                        &notice_tx,
+                        BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
+                            "{refusal}"
+                        )))),
+                        "degraded steer refusal",
+                    );
+                    let _ = id;
+                    continue;
+                }
                 // S1 (idle-steer): a steer that arrives while
                 // the actor is idle no longer waits for an unrelated next turn.
                 // Enqueue it under its command id (S4 retractable; S3 the same
@@ -1796,11 +1931,7 @@ async fn run_actor(
                 // Chain continuation rounds only when the gate actually owes
                 // one — no round, no run (continue_ with empty queues errors).
                 if !state.running.load(Ordering::Relaxed) {
-                    state.running.store(true, Ordering::Relaxed);
-                    let _ =
-                        notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
                     let handle = session.handle();
-                    let active_session_path = session.path().clone();
                     chain_goal_rounds(
                         &mut session,
                         &handle,
@@ -1813,7 +1944,6 @@ async fn run_actor(
                         &mut harness_model,
                         &sessions_dir,
                         &cwd,
-                        &active_session_path,
                     )
                     .await;
                     if shutdown_after_run {
@@ -1838,8 +1968,14 @@ async fn run_actor(
                         // otherwise attach the pre-compaction ordinals to the
                         // wrong prompts.
                         clear_user_chrome(&sessions_dir, session.path()).await;
-                        sync_history(&session, &sessions_dir, &state).await;
-                        sync_usage(&session, &state).await;
+                        sync_history(
+                            &session.journal_appender(),
+                            &sessions_dir,
+                            session.path(),
+                            &state,
+                        )
+                        .await;
+                        sync_usage(&session.journal_appender(), &state, None).await;
                         spawn_session_list_refresh(&sessions_dir, &state);
                     }
                     Err(err)
@@ -1880,7 +2016,7 @@ async fn run_actor(
                     &bus,
                 )
                 .await;
-                // K2: the journal-first rebuild resolves the swapped-in
+                // The journal-first rebuild resolves the swapped-in
                 // session's observable state (authority: its active chain;
                 // gap-fill: its sidecar).
                 let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
@@ -1927,8 +2063,14 @@ async fn run_actor(
                 // Opened sessions are resumed conversations: SessionStart
                 // already happened in a prior lifetime.
                 state.session_start_fired.store(true, Ordering::SeqCst);
-                sync_history(&session, &sessions_dir, &state).await;
-                sync_usage(&session, &state).await;
+                sync_history(
+                    &session.journal_appender(),
+                    &sessions_dir,
+                    session.path(),
+                    &state,
+                )
+                .await;
+                sync_usage(&session.journal_appender(), &state, None).await;
                 spawn_session_list_refresh(&sessions_dir, &state);
             }
             SessionCmd::SetCwd { path } => {
@@ -1938,7 +2080,7 @@ async fn run_actor(
                 // Persist at the leaf through the append queue and refresh
                 // the mirror so an idle switch-away sees the note before the
                 // next authoritative sync.
-                if persist_ui_note(&session, &state, &notice_tx, &record).await {
+                if persist_ui_note(&session.journal_appender(), &state, &notice_tx, &record).await {
                     mirror_ui_note(&state, record);
                 }
             }
@@ -2298,7 +2440,7 @@ async fn load_title_scheduler(
     provider_responses: usize,
     journal_title: Option<String>,
 ) -> PersistedTitleScheduler {
-    // K2: the journal chain's title is the authority; the sidecar fills a
+    // The journal chain's title is the authority; the sidecar fills a
     // chain that never saw a `title` entry.
     let sidecar = manox_harness::session_meta::load(sessions_dir, session_path)
         .await
@@ -2363,7 +2505,7 @@ async fn write_plan_snapshot_sidecar(
 
 /// Parse the facade's effort knob wire value; other levels (e.g. "off")
 /// are not user-facing and yield `None`. Shared with the journal replay
-/// fold (K2), which reads the same vocabulary off `thinking_level_change`
+/// fold, which reads the same vocabulary off `thinking_level_change`
 /// entries.
 pub(crate) fn parse_reasoning_effort(raw: &str) -> Option<ReasoningEffort> {
     match raw {
@@ -2419,7 +2561,7 @@ fn repark_unsettled(state: &Arc<EngineState>, restored: &RestoredThreadState) {
     }
 }
 
-/// Re-apply the persisted access mode after a session switch (K2): the
+/// Re-apply the persisted access mode after a session switch: the
 /// mode comes from the journal-first restore rebuild; align the gate, the
 /// facade's chip, and the durable diff baseline with it.
 fn resync_access_mode(
@@ -2438,7 +2580,7 @@ fn resync_access_mode(
     );
 }
 
-/// The observable state of a restored thread (K2), resolved journal-first:
+/// The observable state of a restored thread, resolved journal-first:
 /// every field a §C.2 state-change entry carries rebuilds from the active
 /// chain ([`crate::replay::replay_thread_state`]) — the session-mutable
 /// config keys (`access_mode_change` / `thinking_level_change`) included —
@@ -2462,9 +2604,8 @@ struct RestoredThreadState {
     unsettled_questions: Vec<crate::replay::UnsettledInteraction>,
     plan_snapshot: Option<serde_json::Value>,
     title: Option<String>,
-    /// Journal authority (goal stage ②): the replayed last `goal` snapshot
-    /// (`Some(Null)` = the explicit clear; `None` = the chain never saw one
-    /// — the bridge keeps its db fold).
+    /// Journal authority: the replayed last `goal` snapshot (`Some(Null)` =
+    /// the explicit clear; `None` = the chain never saw one).
     goal: Option<serde_json::Value>,
     pinned: bool,
     archived: bool,
@@ -2482,7 +2623,7 @@ fn journal_plan_snapshot(
         .filter(|value| !value.as_array().is_some_and(|plan| plan.is_empty()))
 }
 
-/// Resolve the journal replay against the sidecar cache (the K2 merge):
+/// Resolve the journal replay against the sidecar cache:
 /// journal-backed fields win wherever the chain carries them; the sidecar
 /// fills exactly the fields the chain has never seen (title / plan /
 /// project). Pure and total — every restore face applies this resolution
@@ -2534,15 +2675,77 @@ fn merge_restored_state(
     }
 }
 
+/// Close a turn the previous process never closed (restore reconciliation).
+///
+/// A journal whose tail is an open turn — a `turn_start` row, or the `user`
+/// row that opened a turn on a chain with no `turn_start`, with no later
+/// `turn_finish` —
+/// belongs to a host that died mid-turn: nothing will ever settle it. The
+/// restore appends the close the AHP cold seed synthesizes for the same chain
+/// (`cancelled: true`, failed: false, reason `"host exited"`) and replays the
+/// closed chain, so the durable row and the synthetic served state agree and
+/// `snapshot == fold(replay)` holds. The write goes through the session's own
+/// journal writer, the same face every live close uses.
+///
+/// A failed append leaves the chain open for the next restore to retry: the
+/// cold seed still serves the turn settled, which is what a dead host's
+/// reader expects.
+async fn reconcile_open_turn(
+    session: &AgentSession,
+    records: Vec<manox_harness::session::jsonl::JournalRecord>,
+) -> (
+    Vec<manox_harness::session::jsonl::JournalRecord>,
+    crate::replay::ReplayedThreadState,
+) {
+    let replayed = crate::replay::replay_thread_state(&records);
+    if replayed.open_turn.is_none() {
+        return (records, replayed);
+    }
+    // Another live process may own the turn (the per-session lease normally
+    // prevents this, but the check is cheap). Our own pid is never a reason to
+    // skip: this process just started, so its previous run is gone.
+    if let Some(owner) = replayed.open_turn_owner
+        && owner.pid != std::process::id()
+        && owner.is_alive()
+    {
+        tracing::debug!(
+            owner_pid = owner.pid,
+            "restore leaves the open turn to its live owner"
+        );
+        return (records, replayed);
+    }
+    let appender = session.journal_appender();
+    let payload = serde_json::json!({
+        "cancelled": true,
+        "failed": false,
+        "strandedSteerIds": Vec::<String>::new(),
+        "reason": "host exited",
+    });
+    if let Err(err) = append_typed_resilient(&appender, "turn_finish", payload).await {
+        tracing::error!(
+            %err,
+            "restore could not close the interrupted turn; the chain keeps it open for the next restore"
+        );
+        return (records, replayed);
+    }
+    let closed = appender
+        .storage()
+        .journal_range(0, u64::MAX)
+        .await
+        .unwrap_or_default();
+    let replayed = crate::replay::replay_thread_state(&closed);
+    (closed, replayed)
+}
+
 /// Fold one session's active chain and resolve it against the sidecar
-/// cache (K2). Runs on every restore face: startup, `Open`, and
+/// cache. Runs on every restore face: startup, `Open`, and
 /// `NewSession` (a fresh chain resolves entirely to sidecar defaults).
 async fn rebuild_restored_state(
     session: &AgentSession,
     sessions_dir: &Path,
 ) -> RestoredThreadState {
     let records = session.journal_range(0, u64::MAX).await.unwrap_or_default();
-    let replayed = crate::replay::replay_thread_state(&records);
+    let (records, replayed) = reconcile_open_turn(session, records).await;
     let (unsettled_approvals, unsettled_questions) =
         crate::replay::unsettled_interactions(&records);
     let meta = manox_harness::session_meta::load(sessions_dir, session.path())
@@ -2562,7 +2765,7 @@ async fn rebuild_restored_state(
     let repair_title = replayed
         .title
         .filter(|title| meta.title.as_deref() != Some(title.as_str()));
-    // K2 title repair, ENABLED (the rename-route decision): the only
+    // Title repair, ENABLED (the rename-route decision): the only
     // direct-sidecar title writer is `set_external_title`, which serves
     // EXTERNAL TUI sessions — they carry no journal chain, never reach
     // this rebuild, and their sidecar is desktop-authoritative by design
@@ -2616,29 +2819,44 @@ async fn rebuild_restored_state(
     merged
 }
 
-/// Mirror the session's authoritative entry list (compaction-aware, every
-/// entry type) into engine state: the display sequence interleaves UI note
-/// entries at their persisted position, then re-attaches the sidecar's
-/// per-ordinal user-turn chrome (registry slash display forms + agent
-/// attributions) — the transcript stores only wire content, so the attach
-/// is what keeps a reloaded thread's bubbles send-time accurate.
-async fn sync_history(session: &AgentSession, sessions_dir: &Path, state: &Arc<EngineState>) {
-    let entries = match session.context_entries().await {
+/// Map the journal's active chain into the display sequence plus the
+/// positioned UI notes: the display interleaves the note entries at their
+/// persisted position, then re-attaches the sidecar's per-ordinal registry
+/// slash display forms — the transcript stores only wire content, so the
+/// attach is what keeps a reloaded thread's bubbles send-time accurate.
+/// Authorship needs no attach: it rides the user row (`Event::Message::ui`).
+///
+/// Reads go through the journal handle, never a session borrow: the turn's
+/// projection runs detached from the run that produced the chain.
+async fn display_from_entries(
+    entries: &[manox_harness::session::Event],
+    sessions_dir: &Path,
+    session_path: &Path,
+) -> (Vec<HistoryEntry>, Vec<PositionedNote>) {
+    let (mut display, notes) = adapt::entries_to_display(entries);
+    attach_registry_displays(
+        &mut display,
+        &load_registry_displays(sessions_dir, session_path).await,
+    );
+    (display, notes)
+}
+
+/// Mirror the session's authoritative entry list into engine state (the idle
+/// faces: `Ready`, `Open`, compaction).
+async fn sync_history(
+    appender: &Arc<JournalAppender>,
+    sessions_dir: &Path,
+    session_path: &Path,
+    state: &Arc<EngineState>,
+) {
+    let entries = match appender.build_context_entries().await {
         Ok(entries) => entries,
         Err(err) => {
             tracing::warn!(error = %err, "context entries unavailable; mirror left as-is");
             return;
         }
     };
-    let (mut display, notes) = adapt::entries_to_display(&entries);
-    attach_registry_displays(
-        &mut display,
-        &load_registry_displays(sessions_dir, session.path()).await,
-    );
-    attach_user_attributions(
-        &mut display,
-        &load_user_attributions(sessions_dir, session.path()).await,
-    );
+    let (display, notes) = display_from_entries(&entries, sessions_dir, session_path).await;
     *state.history.lock().unwrap() = display;
     *state.notes.lock().unwrap() = notes;
     state.notes_gen.fetch_add(1, Ordering::SeqCst);
@@ -2657,36 +2875,25 @@ async fn load_registry_displays(
         .unwrap_or_default()
 }
 
-/// The agent attributions persisted per user-message ordinal by
-/// `Thread::persist_user_attribution`. Missing sidecar or field reads as
-/// empty (human-only transcript).
-async fn load_user_attributions(
-    sessions_dir: &Path,
-    session_path: &Path,
-) -> std::collections::HashMap<usize, manox_harness::session_meta::UserAttributionMeta> {
-    manox_harness::session_meta::load(sessions_dir, session_path)
-        .await
-        .map(|meta| meta.user_attributions)
-        .unwrap_or_default()
-}
-
-/// Drop the per-ordinal user-turn chrome (registry display forms + agent
-/// attributions). A compaction rebuilds the transcript as a summary user
-/// message plus the retained tail, which shifts every persisted ordinal;
-/// the stale records would otherwise attach to the wrong user prompt on
-/// the next `sync_history`. New turns after the compaction persist fresh
-/// ordinals over the rebuilt sequence.
+/// Drop the per-ordinal registry display forms. A compaction rebuilds the
+/// transcript as a summary user message plus the retained tail, which shifts
+/// every persisted ordinal; the stale records would otherwise attach to the
+/// wrong user prompt on the next `sync_history`. New turns after the
+/// compaction persist fresh ordinals over the rebuilt sequence. Attribution
+/// needs no sidecar clearing — it rides the original row. The engine mirror's
+/// retained-tail rebuild (`Vec<AgentMessage>`) cannot carry it, so a compacted
+/// thread's mirrored prompts lose their author; the AHP fold, which folds the
+/// pre-boundary rows, keeps it.
 async fn clear_user_chrome(sessions_dir: &Path, session_path: &Path) {
-    // Probe first: clearing empty maps would only churn the sidecar.
+    // Probe first: clearing an empty map would only churn the sidecar.
     let meta = manox_harness::session_meta::load(sessions_dir, session_path)
         .await
         .unwrap_or_default();
-    if meta.registry_displays.is_empty() && meta.user_attributions.is_empty() {
+    if meta.registry_displays.is_empty() {
         return;
     }
     if let Err(err) = manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
         meta.registry_displays.clear();
-        meta.user_attributions.clear();
     })
     .await
     {
@@ -2730,39 +2937,6 @@ fn attach_registry_displays(
     }
 }
 
-/// Re-attach `author`/`peer` to the user prompt message at each persisted
-/// ordinal. The ordinal counts `Role::User` messages with a `User`
-/// provenance — the same set `Thread` counts when persisting — so steers
-/// (user prompts too) and tool results (excluded) align between the two.
-fn attach_user_attributions(
-    history: &mut [HistoryEntry],
-    attributions: &std::collections::HashMap<
-        usize,
-        manox_harness::session_meta::UserAttributionMeta,
-    >,
-) {
-    if attributions.is_empty() {
-        return;
-    }
-    let mut ordinal = 0usize;
-    for entry in history {
-        let HistoryEntry::Message(message) = entry else {
-            continue;
-        };
-        if message.role == crate::language_model::Role::User
-            && message.provenance == crate::message::MessageProvenance::User
-        {
-            if let Some(record) = attributions.get(&ordinal) {
-                let ui = message.ui.get_or_insert_with(Default::default);
-                ui.author = Some(crate::message::MessageAuthor::from_routing(&record.author));
-                ui.peer = record.peer;
-                ui.display_text = record.display_text.clone();
-            }
-            ordinal += 1;
-        }
-    }
-}
-
 /// Persist the bound project in the session sidecar so the sidebar groups
 /// the session under its project folder across restarts.
 async fn write_project_sidecar(sessions_dir: &Path, session_path: &Path, project: &Path) {
@@ -2776,7 +2950,7 @@ async fn write_project_sidecar(sessions_dir: &Path, session_path: &Path, project
 }
 
 /// Bind a session to its project (K3): the sidecar cache write plus the
-/// `project_change` journal entry — the entry is the authority (K2), the
+/// `project_change` journal entry — the entry is the authority, the
 /// sidecar stays the derived fast-list cache. The append runs the shared
 /// fail-loud discipline; a still-down storage parks the loss record for
 /// the next drain and the facade hears one `Error` notice.
@@ -3047,24 +3221,46 @@ async fn persist_initial_title(
     }
 }
 
-/// Mirror session usage into the engine state. Cumulative and per-model
-/// totals come from the kernel's stats over the full active branch —
-/// compacted history, tool results, and summarization usage included
-/// (totals reflect what was actually billed).
-/// Only the per-request attribution for the env card stays a thin
-/// presentation walk here.
-async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
-    let stats = match session.session_stats().await {
-        Ok(stats) => stats,
+/// Mirror session usage into the engine state, reading the journal handle
+/// only. Cumulative and per-model totals come from the kernel's stats over the
+/// full active branch — compacted history, tool results, and summarization
+/// usage included (totals reflect what was actually billed); the per-request
+/// attribution is a presentation walk over the kernel transcript alone (#920).
+///
+/// `since`, when given, is the journal seq the caller started from: a chain
+/// that moved on meanwhile supersedes this pass, so nothing is written.
+/// Returns whether the mirror was written.
+async fn sync_usage(
+    appender: &Arc<JournalAppender>,
+    state: &Arc<EngineState>,
+    since: Option<u64>,
+) -> bool {
+    let branch = match appender.get_branch().await {
+        Ok(branch) => branch,
         Err(err) => {
-            // Degrade to the assistant-only walk (the pre-stats mechanism)
-            // so a failing stats read never freezes UI usage at stale
-            // values. Loses tool-result/summary usage for this sync only.
-            tracing::warn!("session stats failed; falling back to message walk: {err:#}");
-            sync_usage_from_messages(session, state);
-            return;
+            tracing::warn!(error = %err, "session stats unavailable; usage mirror left as-is");
+            return false;
         }
     };
+    let entries = match appender.build_context_entries().await {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(error = %err, "context entries unavailable; usage mirror left as-is");
+            return false;
+        }
+    };
+    let stats = manox_harness::coding_agent::usage::session_stats_from_entries(&branch);
+    let messages: Vec<AgentMessage> = entries
+        .iter()
+        .flat_map(manox_harness::session::session_entry_to_context_messages)
+        .collect();
+    let (per_turn, per_model_last, last_turn) = request_attribution(&messages);
+    if let Some(seq) = since
+        && journal_advanced(appender, seq).await
+    {
+        tracing::debug!("usage mirror discarded: the journal moved past the projection's cursor");
+        return false;
+    }
     let cumulative = token_usage_from_totals(&stats.tokens);
     let mut per_model = HashMap::new();
     let mut per_model_cost = HashMap::new();
@@ -3078,55 +3274,43 @@ async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
     *state.per_model.lock().unwrap() = per_model;
     *state.cumulative_cost.lock().unwrap() = stats.tokens.cost;
     *state.per_model_cost.lock().unwrap() = per_model_cost;
-    store_attribution(state, session);
-}
-
-/// Rebuild both attribution maps from the authoritative mapped history and
-/// the kernel transcript, then mirror them into engine state.
-fn store_attribution(state: &Arc<EngineState>, session: &AgentSession) {
-    let (per_turn, per_model_last) =
-        request_attribution(&state.history.lock().unwrap(), session.harness_messages());
     *state.request_usage.lock().unwrap() = per_turn;
     *state.per_model_last_usage.lock().unwrap() = per_model_last;
+    *state.last_turn_usage.lock().unwrap() = last_turn;
+    true
 }
 
-/// Presentation-layer attribution for the env card, walked in lockstep over
-/// the kernel transcript and the authoritative mapped history so per-turn
-/// keys are the facade's own message ids. Returns the per-turn totals (each
-/// assistant request accumulates under the user message that triggered its
-/// turn) and each model's latest single request (the context-budget
-/// numerator; summing requests would count the repeated prompt prefix once
-/// per tool-loop iteration).
+/// Presentation-layer attribution for the env card, walking the kernel
+/// transcript alone (#920) — no mirrored-history stream, no parity assert.
+/// The per-turn key is the user message's own stable id (S3: a client
+/// submit/steer id); a message built without one (an internally-driven prompt)
+/// keys its turn by its ordinal among the transcript's user messages, which is
+/// stable for a given chain.
+///
+/// Returns the per-turn totals (each assistant request accumulates under the
+/// user message that triggered its turn), each model's latest single request
+/// (the context-budget numerator; summing requests would count the repeated
+/// prompt prefix once per tool-loop iteration), and the last turn's own total
+/// (the footer's stamp, key-free).
 fn request_attribution(
-    history: &[HistoryEntry],
     messages: &[AgentMessage],
-) -> (HashMap<String, TokenUsage>, HashMap<String, TokenUsage>) {
+) -> (
+    HashMap<String, TokenUsage>,
+    HashMap<String, TokenUsage>,
+    Option<TokenUsage>,
+) {
     let mut per_turn: HashMap<String, TokenUsage> = HashMap::new();
     let mut per_model_last: HashMap<String, TokenUsage> = HashMap::new();
-    let mut ids = history.iter().filter_map(|entry| match entry {
-        HistoryEntry::Message(message) => Some(message),
-        HistoryEntry::Note(_) => None,
-    });
     let mut turn_key: Option<String> = None;
-    let mut over_consumed = false;
-    for m in messages {
-        // Id-stream cardinality must mirror
-        // `adapt::harness_messages_to_messages`: hidden Custom messages
-        // produce no mapped row.
-        let id = match m {
-            AgentMessage::Custom {
-                display, content, ..
-            } if !*display || content.is_empty() => None,
-            _ => match ids.next() {
-                Some(id) => Some(id),
-                None => {
-                    over_consumed = true;
-                    None
-                }
-            },
-        };
-        match m {
-            AgentMessage::User { .. } => turn_key = id.map(|m| m.id.clone()),
+    let mut last_turn_key: Option<String> = None;
+    let mut user_ordinal = 0usize;
+    for message in messages {
+        match message {
+            AgentMessage::User { id, .. } => {
+                turn_key = Some(id.clone().unwrap_or_else(|| format!("user-{user_ordinal}")));
+                last_turn_key = turn_key.clone();
+                user_ordinal += 1;
+            }
             AgentMessage::Assistant {
                 usage,
                 model,
@@ -3153,52 +3337,11 @@ fn request_attribution(
             _ => {}
         }
     }
-    // Cardinality backstop: the skip rules above manually mirror
-    // `adapt::harness_messages_to_messages`; a divergence shifts every later
-    // attribution, so trip loudly in debug builds.
-    debug_assert!(
-        !over_consumed && ids.next().is_none(),
-        "request_attribution id stream out of lockstep with the mapped history"
-    );
-    (per_turn, per_model_last)
-}
-
-/// Fallback aggregation when `session_stats()` is unavailable: assistant
-/// usage only. Keys keep the stats path's "{provider}/{model}" shape so
-/// consumers can resolve the model regardless of which path produced them.
-fn sync_usage_from_messages(session: &AgentSession, state: &Arc<EngineState>) {
-    let mut cumulative = TokenUsage::default();
-    let mut per_model: HashMap<String, TokenUsage> = HashMap::new();
-    for m in session.harness_messages() {
-        let AgentMessage::Assistant {
-            usage,
-            model,
-            provider,
-            response_model,
-            ..
-        } = m
-        else {
-            continue;
-        };
-        let u = to_token_usage(usage);
-        if u.total_tokens() == 0 {
-            continue;
-        }
-        cumulative = cumulative + u;
-        let key = format!(
-            "{provider}/{}",
-            response_model.as_deref().unwrap_or(model.as_str())
-        );
-        per_model
-            .entry(key)
-            .and_modify(|acc| *acc = *acc + u)
-            .or_insert(u);
-    }
-    *state.cumulative.lock().unwrap() = cumulative;
-    *state.per_model.lock().unwrap() = per_model;
-    *state.cumulative_cost.lock().unwrap() = 0.0;
-    *state.per_model_cost.lock().unwrap() = HashMap::new();
-    store_attribution(state, session);
+    let last_turn = last_turn_key
+        .as_ref()
+        .and_then(|key| per_turn.get(key))
+        .copied();
+    (per_turn, per_model_last, last_turn)
 }
 
 /// Kernel usage totals → the facade's token usage shape.
