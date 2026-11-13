@@ -1217,7 +1217,10 @@ async fn run_actor(
         // The restore path passes no model override: `builder.open()`
         // projects the session's own model only when the builder carries
         // none, and the actor adopts
-        // it right after the open below.
+        // it right after the open below. The codemode store replays the
+        // restored journal before the assembly (D8).
+        let codemode_store =
+            crate::codemode::codemode_store_from_journal(Some(&session_path)).await;
         let (builder, background, subagent_observer) = session_builder(
             &tool_cwd,
             &sessions_dir,
@@ -1233,6 +1236,7 @@ async fn run_actor(
             &thread_id,
             None,
             &bus,
+            codemode_store,
         );
         // Published per assembly like the acceptance-time writer (the actor
         // propagates a mid-turn mode flip through it).
@@ -1256,6 +1260,10 @@ async fn run_actor(
     let mut session = match session {
         Some(s) => s,
         None => {
+            // A fresh spawn replays whatever journal the deferred session
+            // already materialized (usually none — an empty store).
+            let codemode_store =
+                crate::codemode::codemode_store_from_journal(session_file.as_deref()).await;
             let (builder, background, subagent_observer) = session_builder(
                 &cwd,
                 &sessions_dir,
@@ -1271,6 +1279,7 @@ async fn run_actor(
                 &thread_id,
                 parent_session.as_deref(),
                 &bus,
+                codemode_store,
             );
             // Published per assembly like the acceptance-time writer (the actor
             // propagates a mid-turn mode flip through it).

@@ -679,7 +679,7 @@ pub(super) fn fence_roots(
 }
 
 /// The one fs containment verdict every enforcing surface shares: the host
-/// gate's `Write`/`Edit`/`Py` check and the subagent snapshot's fence. `deny`
+/// gate's `Write`/`Edit` check and the subagent snapshot's fence. `deny`
 /// is the caller's refusal text — the host gate teaches the escalation retry,
 /// the subagent fence reports a blocker instead (it has no channel). Either
 /// way the refusal carries the authorized root set the verdict judged
@@ -751,15 +751,6 @@ pub(super) fn fs_write_verdict(
             }
             Ok(())
         }
-        // Py: a script's write targets are decided at runtime, so containment
-        // cannot be proven the way Write/Edit prove a path — and unlike
-        // sandbox-confined Bash there is no OS fence to stand in (the
-        // interpreter runs in-process, with the app's full user privileges).
-        // The call fails closed; under the host gate the assembly line arms
-        // the wrapper with the escalation config, so an approved
-        // `require_escalated`+`justification` grant widens the mode for
-        // exactly that call.
-        crate::tools::PY => refuse(),
         // Every other gated call (escalated bash, unknown mutating tools) has
         // no in-workspace proof. A tool that does not mutate through fs paths
         // never reaches this ruling — `sandbox_verdict` admits it first.
@@ -1103,41 +1094,6 @@ mod tests {
                 CancellationToken::new(),
                 &ctx,
             )
-            .await
-            .unwrap();
-        assert!(!result.is_error);
-        assert_eq!(ran.load(Ordering::SeqCst), 1);
-    }
-
-    /// Py has no statically knowable target set — a script decides at
-    /// runtime what it touches — and no OS sandbox stands in (the
-    /// interpreter runs in-process), so the sandbox mode fails it closed:
-    /// it denies with the escalation hint (the assembly line arms the
-    /// wrapper with the escalation config, so an approved
-    /// `require_escalated` grant is the one wider road), and only full
-    /// access runs the script.
-    #[tokio::test]
-    async fn py_fails_closed_in_sandbox_runs_in_full_access() {
-        let (gate, _rx) = gate_with_events();
-        gate.set_mode(AccessMode::Sandbox);
-        let (tool, ran) = gated_named("Py", true, false, Arc::clone(&gate));
-        let ctx = tool_ctx();
-        let params = serde_json::json!({"script": "print(1)", "cwd": [""]});
-        let err = tool
-            .execute("c1", params.clone(), CancellationToken::new(), &ctx)
-            .await
-            .unwrap_err();
-        match err {
-            ToolError::Other(message) => {
-                assert!(message.contains("sandbox mode"), "{message}");
-            }
-            other => panic!("expected the sandbox refusal, got {other:?}"),
-        }
-        assert_eq!(ran.load(Ordering::SeqCst), 0, "the script never ran");
-
-        gate.set_mode(AccessMode::FullAccess);
-        let result = tool
-            .execute("c3", params, CancellationToken::new(), &ctx)
             .await
             .unwrap();
         assert!(!result.is_error);

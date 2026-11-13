@@ -516,9 +516,6 @@ pub(super) fn subagent_bash_tool(
 /// - Write/Edit carry the process write lock (`fence(FileLocked(tool))`, so
 ///   the fence judges before the lock is taken) and the same fs containment
 ///   verdict.
-/// - Py is deliberately absent: the interpreter runs in-process with no OS
-///   sandbox, so its only fence would be the host-side escalation round
-///   trip, which the child snapshot does not carry.
 ///
 /// This is the shared fallback shape (no escalation channel); the child
 /// authority arms each run at spawn with per-run replacements carrying the
@@ -782,6 +779,7 @@ pub(super) fn build_tools(
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     granted_roots: &crate::granted_roots::GrantedRoots,
     bus: &Arc<crate::steer_bus::AgentBus>,
+    codemode_store: std::collections::BTreeMap<String, String>,
 ) -> (
     Vec<Arc<dyn HarnessAgentTool>>,
     Arc<BackgroundManager>,
@@ -909,13 +907,6 @@ pub(super) fn build_tools(
         Arc::new(manox_harness::tools::grep::GrepTool),
         Arc::new(manox_harness::tools::glob::GlobTool),
         Arc::new(manox_harness::tools::ls::LsTool),
-        // Py: a short Python script on the embedded interpreter. It is not a
-        // file tool — the prompt sends ordinary reads/writes/searches to
-        // Read/Write/Edit/Grep/Glob/Ls — and it owns no sandbox: unlike
-        // sandbox-confined Bash it has no OS fence to ride, so the gate
-        // fails it closed under sandbox and an approved escalation is
-        // its only wider road.
-        Arc::new(manox_harness::tools::py::PyTool),
         Arc::new(bash),
         Arc::new(BashOutputTool::new(background.clone())),
         Arc::new(HostTaskList {
@@ -953,10 +944,7 @@ pub(super) fn build_tools(
             }
             if matches!(
                 name.as_str(),
-                crate::tools::WRITE
-                    | crate::tools::EDIT
-                    | crate::tools::TASK_STOP
-                    | crate::tools::PY
+                crate::tools::WRITE | crate::tools::EDIT | crate::tools::TASK_STOP
             ) {
                 wrapper = wrapper.with_escalation(
                     Arc::clone(&escalation_approver),
@@ -1301,6 +1289,33 @@ pub(super) fn build_tools(
         Arc::clone(&subagent_runtime),
         Arc::clone(&subagent_observer),
         Arc::clone(&catalog),
+    )));
+    // Codemode: a JS script (QuickJS sandbox) orchestrating the mounted
+    // tools. Joins ungated like AskUserQuestion — it writes nothing itself
+    // (the script's own store map is session runtime state), and every
+    // nested call carries its own gate/lock/fence on the wrapped sibling
+    // instances, so no approval surface is bypassed.
+    //
+    // The sibling list is the session's DEFAULT ACTIVE SET — the mounted
+    // table minus the opt-in suites — not the full table: a dormant suite is
+    // a consent control, and a script must not reach what the user has not
+    // enabled. The clone precedes the push, so Codemode itself is excluded
+    // by construction (no self-recursion). Two staleness classes follow, both
+    // fail-closed: a suite enabled after assembly is not script-callable
+    // until the next assembly, and an embedder registration
+    // (refresh_embedder_tools) reaches the top level but not the script's
+    // list until then either. Mounted only in this main-session assembly: the
+    // child snapshot (D11) strips the codemode surface.
+    let default_active: std::collections::HashSet<String> =
+        default_active_tool_names(&tools).into_iter().collect();
+    let codemode_siblings: Vec<Arc<dyn HarnessAgentTool>> = tools
+        .iter()
+        .filter(|tool| default_active.contains(tool.name()))
+        .cloned()
+        .collect();
+    tools.push(Arc::new(manox_harness::tools::codemode::CodemodeTool::new(
+        codemode_siblings,
+        codemode_store,
     )));
     (tools, manager, subagent_observer)
 }

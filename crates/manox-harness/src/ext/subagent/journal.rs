@@ -161,11 +161,6 @@ fn tool_title(name: &str, args: &Value) -> String {
         "Bash" => arg("command").map(|command| format!("$ {command}")),
         // The body is the argument; the header names only the intent.
         "Code" => Some("Code".to_string()),
-        "Py" => arg("script")
-            .and_then(|script| script.lines().next())
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(|line| format!("Py {}", short_value(line, 40))),
         other => first_string_arg(args).map(|value| format!("{other} {}", short_value(&value, 40))),
     };
     title.unwrap_or_else(|| name.to_string())

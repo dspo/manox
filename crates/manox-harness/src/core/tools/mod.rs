@@ -4,6 +4,7 @@
 // ExecutionEnv abstraction, making them runtime-agnostic.
 
 pub mod bash;
+pub mod codemode;
 pub mod edit;
 pub mod edit_diff;
 pub mod file_mutation_queue;
@@ -11,7 +12,6 @@ pub mod glob;
 pub mod grep;
 pub mod ls;
 pub mod path_utils;
-pub mod py;
 pub mod read;
 pub mod truncate;
 pub mod write;
@@ -62,7 +62,6 @@ impl ToolRegistry {
         self.register(Arc::new(write::WriteTool));
         self.register(Arc::new(edit::EditTool::default()));
         self.register(Arc::new(bash::BashTool::new(None)));
-        self.register(Arc::new(py::PyTool));
         self.register(Arc::new(grep::GrepTool));
         self.register(Arc::new(glob::GlobTool));
         self.register(Arc::new(ls::LsTool));
@@ -91,11 +90,10 @@ mod tests {
         assert!(names.contains(&"Write"));
         assert!(names.contains(&"Edit"));
         assert!(names.contains(&"Bash"));
-        assert!(names.contains(&"Py"));
         assert!(names.contains(&"Grep"));
         assert!(names.contains(&"Glob"));
         assert!(!names.contains(&"Find"));
         assert!(names.contains(&"Ls"));
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 7);
     }
 }

@@ -11,6 +11,8 @@ manox 是**自研 agent runtime 库仓**（gpui-free、headless）：内核（ha
 ```
 crates/                    # Rust workspace 成员（全部 gpui-free）
   manox-agent/             # 核心 agent 逻辑（宿主层）
+  manox-codemode/          # QuickJS 脚本沙箱 + 工具桥（零 manox-harness 依赖；
+                           #   唯一消费者是 harness 的 CodemodeTool 薄壳，见 core/tools/codemode.rs）
   manox-providers/         # LLM provider 配置与路由
   manox-harness/           # Trait agent 内核（core/ + ext/ 两子模块）
     src/core/              # 通用 agent 内核（纯内核，无业务逻辑）
@@ -118,7 +120,9 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`）�
 - **crates/manox-harness/src/ext 扩展**：只经内核拓展点扩展业务能力（provider 自治注册、bash 编排、子代理、session sidecar、model_ref 等），不反向依赖宿主。
 - **manox-agent 宿主**：装配 + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、内建 skills 等）。manox-harness 是唯一 harness 后端。
 
-`Py`（内建工具，`core/tools/py.rs`）用 RustPython 在进程内跑短脚本（frozen stdlib、无第三方包、无 TLS、≤120 行）。它**不是文件工具**——常规读写搜归 Read/Write/Edit/Grep/Glob/Ls，提示词与 `description()` 都这么写；它**不自带沙箱**：权限门控在宿主（read-only 整调用拒绝、workspace-write 放行），超时不可抢占（脚本线程被放弃后可能仍在跑），cwd 经进程级 `chdir` 串行设置并在 drop 时恢复。`sqlite` feature 开启（多一份 bundled `libsqlite3-sys`，`rusqlite` 已因此对齐到 0.40）。
+**内建脚本工具的权威模型**（Py + RustPython 已随 D16/D17 下线，此段是唯一权威表述）：内建脚本工具只有 **`Codemode`**（`manox-codemode` + `core/tools/codemode.rs`）——**零权威沙箱**：本体 ungated 装配（与 AskUserQuestion/UpdatePlan 同类），脚本唯一的出界能力是嵌套调用本会话已装配的工具实例，每个嵌套调用继承各自的审批门 / FileLock / 围栏，沙箱不加旁路；仓内**不存在**任何带进程内权威（进程内任意代码 + 自带 IO）的脚本工具，也不要再造一个（D16 结论）。需要真实 python3 的场景走 **Bash + 系统 python3**。
+
+脚本可调面 = **装配时的默认 active 集合**（挂载表减去 opt-in 套件），不是完整挂载表：休眠中的套件（WebExplore）既不可调也不出现在声明里——它是用户 consent 控制，脚本不得越过。两条 fail-closed 滞后：装配之后才开启的套件、之后才注册的 embedder 工具，都要等到下一次装配才对脚本可见。嵌套调用不走 `execute_tool_calls`（D6），因此**不触发**插件 `PreToolUse`/`PostToolUse` hook——插件若需要审计脚本内的调用，得另找缝。
 
 ### 能力定层判定（每条新能力开工前必做）
 

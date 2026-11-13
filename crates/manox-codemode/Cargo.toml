@@ -1,0 +1,19 @@
+[package]
+name = "manox-codemode"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rquickjs.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+
+[lints]
+workspace = true
