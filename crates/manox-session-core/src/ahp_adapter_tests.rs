@@ -6219,18 +6219,37 @@ mod teardown {
         fn set_cwd(&self, _path: std::path::PathBuf) {}
     }
 
-    /// Poll `condition` to a deadline, yielding to the runtime between checks
-    /// (the task stop is spawned onto the agent runtime, a task the test does
-    /// not own).
-    async fn await_until(condition: impl Fn() -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    /// Poll `condition` until it holds or `budget` passes, yielding to the
+    /// runtime between checks (the work these waits observe is spawned onto a
+    /// runtime the test does not own).
+    ///
+    /// The budget is the caller's choice on purpose: the durability waits
+    /// below observe rows landed by fire-and-forget cold appends, and one
+    /// append may spend up to 5 s on the journal's shared read fence plus 2 s
+    /// on its exclusive write fence. A fixed 10 s wall clock therefore left
+    /// almost no headroom on a loaded CI runner and flaked once as
+    /// "condition never became true"; in-memory conditions keep a short
+    /// budget.
+    async fn wait_until(condition: impl Fn() -> bool, budget: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
         while !condition() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "condition never became true"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        true
+    }
+
+    /// The last journal lines, for a failed durability wait's diagnostics:
+    /// enough to tell a missing row from a different vocabulary.
+    fn journal_tail(path: &std::path::Path) -> String {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return format!("<unreadable: {}>", path.display());
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let tail = lines[lines.len().saturating_sub(4)..].join("\n");
+        format!("{tail}\n({} bytes total)", content.len())
     }
 
     /// Stop-all on a live container: the turn abort lands, every canned
@@ -6292,7 +6311,15 @@ mod teardown {
         // (spawned onto the runtime inside `cancel`) drains on its own. The
         // settlement still lands, with TaskStop semantics — Stopped, the
         // user-cancel verdict, not the thread-teardown SessionEnded.
-        await_until(|| task.status().is_terminal()).await;
+        assert!(
+            wait_until(
+                || task.status().is_terminal(),
+                std::time::Duration::from_secs(10)
+            )
+            .await,
+            "the background task never settled: {:?}",
+            task.status()
+        );
         assert_eq!(
             task.status(),
             manox_agent::background_task::TaskStatus::Stopped,
@@ -6536,12 +6563,19 @@ mod teardown {
         let run_id = ack_json["run_id"].as_str().unwrap().to_string();
 
         // The durable start row is the readiness signal.
-        await_until(|| {
-            std::fs::read_to_string(&journal)
-                .map(|content| content.contains("run/started") && content.contains(&run_id))
-                .unwrap_or(false)
-        })
-        .await;
+        assert!(
+            wait_until(
+                || {
+                    std::fs::read_to_string(&journal)
+                        .map(|content| content.contains("run/started") && content.contains(&run_id))
+                        .unwrap_or(false)
+                },
+                std::time::Duration::from_secs(30)
+            )
+            .await,
+            "the run/started row never landed for {run_id}; journal tail:\n{}",
+            journal_tail(&journal)
+        );
 
         let params = serde_json::json!({
             "channel": manox_ahp::channels::session::uri("s-teardown"),
@@ -6560,14 +6594,21 @@ mod teardown {
 
         // The settlement lands through the real chain: run/settled with the
         // aborted vocabulary, in the parent journal.
-        await_until(|| {
-            std::fs::read_to_string(&journal).is_ok_and(|content| {
-                content.contains("run/settled")
-                    && content.contains(&run_id)
-                    && content.contains("\"settlement\":\"aborted\"")
-            })
-        })
-        .await;
+        assert!(
+            wait_until(
+                || {
+                    std::fs::read_to_string(&journal).is_ok_and(|content| {
+                        content.contains("run/settled")
+                            && content.contains(&run_id)
+                            && content.contains("\"settlement\":\"aborted\"")
+                    })
+                },
+                std::time::Duration::from_secs(30)
+            )
+            .await,
+            "the run/settled (aborted) row never landed for {run_id}; journal tail:\n{}",
+            journal_tail(&journal)
+        );
         uninstall();
     }
 
