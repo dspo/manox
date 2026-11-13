@@ -353,11 +353,20 @@ async fn cancellation_aborts_a_pure_js_loop() {
 #[tokio::test]
 async fn cancellation_aborts_a_script_awaiting_a_tool_result() {
     // The tool parks until its signal fires, so the only way out is the
-    // cancellation path through the recv loop.
+    // cancellation path through the recv loop. The canceller fires only once
+    // the call has actually entered the tool: under the process-wide slot cap
+    // the execution may queue for a while first, and an abort during the
+    // queue wait is a different outcome (no calls recorded at all).
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_for_tool = Arc::clone(&entered);
     let parking = Arc::new(FnTool {
         name: "park".to_owned(),
         f: move |_call_id: String, _args: Value, signal: CancellationToken| {
+            let entered = Arc::clone(&entered_for_tool);
             Box::pin(async move {
+                // notify_one parks a permit when nobody waits yet, so the
+                // canceller never misses the signal.
+                entered.notify_one();
                 signal.cancelled().await;
                 Err("cancelled".to_owned()) as Result<Value, String>
             }) as ToolFuture
@@ -367,7 +376,7 @@ async fn cancellation_aborts_a_script_awaiting_a_tool_result() {
     let cancel = CancellationToken::new();
     let canceller = cancel.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        entered.notified().await;
         canceller.cancel();
     });
     let result = executor
