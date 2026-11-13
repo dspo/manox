@@ -372,25 +372,25 @@ impl AgentTool for CodemodeTool {
             text: header,
             signature: None,
         });
+        // The inline text is the crate's rendered output — body text items in
+        // order plus the trailing `<console_output>` block, soft-truncated to
+        // the script's budget. This block (not the raw `output` items) is what
+        // bounds what the model sees; the untruncated text travels via
+        // `full_output` when the budget fired.
+        if !result.text.is_empty() {
+            content.push(ContentBlock::Text {
+                text: result.text.clone(),
+                signature: None,
+            });
+        }
+        // Images cannot join the text block: they stay independent blocks,
+        // preserving their relative output order, after the text.
         for item in &result.output {
-            match item {
-                manox_codemode::OutputItem::Text { text, console } => {
-                    let text = if *console {
-                        format!("<console_output>\n{text}\n</console_output>")
-                    } else {
-                        text.clone()
-                    };
-                    content.push(ContentBlock::Text {
-                        text,
-                        signature: None,
-                    });
-                }
-                manox_codemode::OutputItem::Image { data, mime_type } => {
-                    content.push(ContentBlock::Image {
-                        data: data.clone(),
-                        mime_type: mime_type.clone(),
-                    });
-                }
+            if let manox_codemode::OutputItem::Image { data, mime_type } = item {
+                content.push(ContentBlock::Image {
+                    data: data.clone(),
+                    mime_type: mime_type.clone(),
+                });
             }
         }
         if let Some(value) = &result.value {
@@ -1026,7 +1026,10 @@ mod tests {
     }
 
     /// Soft-truncated output lands in a temp file named after the call and
-    /// the path is reported both in the details and in the result text.
+    /// the path is reported both in the details and in the result text. The
+    /// inline text block is the crate's truncated rendering (omission marker
+    /// present, near the budget), not the raw 80k-char output — the default
+    /// budget actually bounds what reaches the model.
     #[tokio::test]
     async fn truncated_full_output_reaches_a_temp_file() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
@@ -1051,10 +1054,53 @@ mod tests {
         );
         let persisted = std::fs::read_to_string(&path).expect("full output persisted");
         assert_eq!(persisted.chars().count(), 80_000);
+        // The inline body is truncated in place: marker inside, size near the
+        // 10k-token (40k chars) budget — never the full 80k chars.
+        let ContentBlock::Text { text, .. } = &result.content[1] else {
+            panic!("the body text block follows the header");
+        };
+        assert!(text.contains("characters omitted"), "{text}");
+        assert!(
+            text.chars().count() < 50_000,
+            "inline text must be truncated, got {}",
+            text.chars().count()
+        );
         let ContentBlock::Text { text, .. } = &result.content[result.content.len() - 1] else {
             panic!("the truncation note is the last text block");
         };
         assert!(text.contains(&path.display().to_string()), "{text}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The session-facing content folds the crate's rendered text: body items
+    /// in order, one trailing `<console_output>` block, images as independent
+    /// blocks after the text — never per-item console blocks inline.
+    #[tokio::test]
+    async fn inline_content_is_rendered_text_plus_image_blocks() {
+        let trace = Arc::new(StdMutex::new(Vec::new()));
+        let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
+        let tool = CodemodeTool::new(vec![echo], BTreeMap::new());
+        let code = "text('a'); console.log('c1'); text('b'); \
+                    image('data:image/png;base64,iVBORw0KGgo=');";
+        let result = tool
+            .execute(
+                "call-1",
+                serde_json::json!({"code": code}),
+                CancellationToken::new(),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        // header, single rendered text block, one image block.
+        assert_eq!(result.content.len(), 3, "{:?}", result.content);
+        let ContentBlock::Text { text, .. } = &result.content[1] else {
+            panic!("second block is the rendered text");
+        };
+        assert_eq!(
+            text, "a\nb\n<console_output>\nc1\n</console_output>",
+            "console folds into the trailing block"
+        );
+        assert!(matches!(&result.content[2], ContentBlock::Image { .. }));
     }
 }
