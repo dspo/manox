@@ -139,8 +139,8 @@ pub struct CodemodeResult {
     /// Records of the first [`MAX_RECORDED_CALLS`] nested tool calls, in
     /// issue order; `total_calls` counts every call the script issued.
     pub calls: Vec<CallRecord>,
-    /// The true number of nested tool calls the script issued, when the
-    /// record list was truncated to [`MAX_RECORDED_CALLS`].
+    /// The true number of nested tool calls the script issued; equal to
+    /// `calls.len()` unless the list was truncated to [`MAX_RECORDED_CALLS`].
     pub total_calls: usize,
     /// Store mutations; empty unless the execution succeeded.
     pub store_writes: StoreWrites,

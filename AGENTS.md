@@ -122,6 +122,8 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`）�
 
 **内建脚本工具的权威模型**（Py + RustPython 已随 D16/D17 下线，此段是唯一权威表述）：内建脚本工具只有 **`Codemode`**（`manox-codemode` + `core/tools/codemode.rs`）——**零权威沙箱**：本体 ungated 装配（与 AskUserQuestion/UpdatePlan 同类），脚本唯一的出界能力是嵌套调用本会话已装配的工具实例，每个嵌套调用继承各自的审批门 / FileLock / 围栏，沙箱不加旁路；仓内**不存在**任何带进程内权威（进程内任意代码 + 自带 IO）的脚本工具，也不要再造一个（D16 结论）。需要真实 python3 的场景走 **Bash + 系统 python3**。
 
+脚本可调面 = **装配时的默认 active 集合**（挂载表减去 opt-in 套件），不是完整挂载表：休眠中的套件（WebExplore）既不可调也不出现在声明里——它是用户 consent 控制，脚本不得越过。两条 fail-closed 滞后：装配之后才开启的套件、之后才注册的 embedder 工具，都要等到下一次装配才对脚本可见。嵌套调用不走 `execute_tool_calls`（D6），因此**不触发**插件 `PreToolUse`/`PostToolUse` hook——插件若需要审计脚本内的调用，得另找缝。
+
 ### 能力定层判定（每条新能力开工前必做）
 
 按三分法定层：

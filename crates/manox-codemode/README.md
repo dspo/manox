@@ -145,27 +145,47 @@ instead.
 
 - [`CodemodeExecutor::new(Vec<Arc<dyn CodemodeTool>>)`] — rejects duplicate
   names and names that normalize to the same script identifier; renders the
-  tools' TypeScript declarations once (budget 3000 est-tokens; first drops
-  the constraint tags, then the whole tool).
+  tools' TypeScript declarations once. Two budgets bound the listing: 3000
+  est-tokens per tool (tag drop, then whole-tool drop) and a shared 4000
+  est-tokens across all samples (first come, first served; a tool that does
+  not fit the remaining pool drops whole to the name-only hint). On the main
+  assembly's core surface the shared pool admits Read/Write/Edit/Bash/
+  BashOutput/Grep/Glob/Ls (~18.4k characters, ~4.6k est-tokens including the
+  prompt), versus ~8.8k est-tokens with the per-tool budget alone.
 - [`CodemodeExecutor::execute(source, store, cancel)`] — requires a tokio
   runtime context (nested calls are `tokio::spawn`ed). Never returns `Err`:
   failures are `CodemodeResult.error` (kinds `script` / `timeout` /
   `aborted` / `sandbox`), and every result carries the output produced before
   the failure. `store` in, `store_writes` out (empty unless the script
-  succeeded); the crate never touches the disk.
+  succeeded); the crate never touches the disk. `wall_time` covers the whole
+  call including any wait for a process-wide slot.
+- Process-wide admission: at most `MAX_CONCURRENT_EXECUTIONS` (2) executions
+  run at once across the process, queued in arrival order; a wait past
+  `EXECUTION_QUEUE_TIMEOUT` (60 s) fails as a `sandbox`-kind result (a host
+  resource, not a script fault), and a caller cancel during the wait ends as
+  `aborted`. The slot is held for the whole run.
 - Global in-flight cap of 32 nested calls (`MAX_IN_FLIGHT_CALLS`); overflow
-  rejects immediately with an explanatory error. Per-tool sequential-execution
-  semantics are the MR2 adapter's job, not the bridge's.
+  rejects immediately with an explanatory error. Call records cap at
+  `MAX_RECORDED_CALLS` (100) in the result, with `total_calls` carrying the
+  true count. Per-tool sequential-execution semantics are the MR2 adapter's
+  job, not the bridge's.
+
+The script surface itself is the caller's decision: the harness-side
+`CodemodeTool` is built over the session's assembly-time active set (the
+mounted tools minus opt-in suites such as the browser suite), so a dormant
+suite is neither callable nor advertised. Two fail-closed staleness classes
+follow: a suite enabled after assembly and an embedder tool registered later
+are not script-callable until the next assembly.
 
 ## Testing
 
-`cargo test -p manox-codemode` — 23 unit tests (source parsing, store
-writes decoding, declaration rendering snapshots, output rendering, error
-JSON shape) and 25 end-to-end tests against a live VM: isolation, true
-concurrency (`Promise.all` barrier), out-of-order result pairing,
-cancellation (loop and suspension), timeout, hang detection, memory and
-stack guards, soft/hard output limits, console block ordering, image
-validation, `@options` branches, store round-trip and limits, declaration
-discovery (`ALL_TOOLS`/`describeTool`), tool error text propagation, the
-in-flight cap, `return`/`exit` semantics, and syntax errors with aligned
-line numbers.
+`cargo test -p manox-codemode` — 25 unit tests (source parsing, store
+writes decoding, declaration rendering snapshots incl. both budgets, output
+rendering, error JSON shape) and 27 end-to-end tests against a live VM:
+isolation, true concurrency (`Promise.all` barrier), out-of-order result
+pairing, cancellation (loop, suspension, and during the slot queue), timeout,
+hang detection, memory and stack guards, soft/hard output limits, console
+block ordering, image validation, `@options` branches, store round-trip and
+limits, declaration discovery (`ALL_TOOLS`/`describeTool`), tool error text
+propagation, the in-flight and record caps, the process-wide slot cap,
+`return`/`exit` semantics, and syntax errors with aligned line numbers.

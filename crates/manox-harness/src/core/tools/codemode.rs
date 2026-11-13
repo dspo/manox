@@ -30,9 +30,10 @@ const PROMPT: &str = include_str!("codemode_prompt.md");
 
 /// One sibling adapted to the bridge's tool trait. The adapter holds the
 /// per-execution call environment (parent call id + owned context) in a
-/// mutex cell: a `CodemodeTool` never runs two executions concurrently (it
-/// declares `Sequential`), so the cell has a single writer per execution and
-/// every nested call of that execution reads the same environment.
+/// mutex cell. Two guarantees keep that cell single-writer: the tool declares
+/// `Sequential` (so the batch scheduler never overlaps it with another call)
+/// and `CodemodeTool::execute` holds a per-instance execution mutex, so even
+/// a caller that bypasses the scheduler cannot cross-wire two runs.
 struct SiblingAdapter {
     tool: Arc<dyn AgentTool>,
     /// Present exactly when the sibling declares `ExecutionMode::Sequential`:
@@ -192,6 +193,11 @@ pub struct CodemodeTool {
     /// continuity is separate — the journal replay folds the same writes out
     /// of the transcript at assembly (manox-agent `codemode` module).
     store: std::sync::Mutex<BTreeMap<String, String>>,
+    /// One execution at a time per instance. The sibling adapters carry the
+    /// running execution's context in a shared cell, so overlapping runs
+    /// would cross-wire their nested calls; `Sequential` keeps the batch
+    /// scheduler from doing that, and this mutex keeps the invariant local.
+    executions: tokio::sync::Mutex<()>,
     description: String,
 }
 
@@ -260,6 +266,7 @@ impl CodemodeTool {
             executor,
             adapters,
             store: std::sync::Mutex::new(initial_store),
+            executions: tokio::sync::Mutex::new(()),
             description,
         }
     }
@@ -347,6 +354,9 @@ impl AgentTool for CodemodeTool {
                     .into(),
             ));
         };
+        // The adapter cell carries one execution's environment: serialize here
+        // so a caller outside the batch scheduler cannot cross-wire two runs.
+        let _execution = self.executions.lock().await;
         let owned_ctx = owned_context(ctx)?;
         for adapter in &self.adapters {
             adapter.install(tool_call_id, Arc::clone(&owned_ctx));
@@ -1028,7 +1038,8 @@ mod tests {
     /// matter how many sizable siblings mount: later tools drop whole to the
     /// name-only hint while earlier ones keep their declarations (first come,
     /// first served). Ten ~2k-char samples would stack past 20k chars without
-    /// the cap; the shared pool is 3000 est-tokens (12k chars).
+    /// the cap; the bound here is derived from the shared pool constant, so a
+    /// tuned budget does not silently invalidate the assertion.
     #[test]
     fn many_sizable_siblings_keep_the_description_bounded() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
@@ -1051,8 +1062,11 @@ mod tests {
         let tool = CodemodeTool::new(siblings, BTreeMap::new());
         let description = tool.description();
         let total = description.chars().count();
+        let shared_pool_chars =
+            manox_codemode::declarations::DEFAULT_TOTAL_DECLARATION_BUDGET_TOKENS
+                * manox_codemode::types::CHARS_PER_TOKEN;
         assert!(
-            total < PROMPT.chars().count() + 12_000 + 2_000,
+            total < PROMPT.chars().count() + shared_pool_chars + 2_000,
             "the description must stay near the shared budget, got {total}"
         );
         assert!(

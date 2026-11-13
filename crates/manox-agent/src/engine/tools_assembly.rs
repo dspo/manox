@@ -1294,14 +1294,25 @@ pub(super) fn build_tools(
     // tools. Joins ungated like AskUserQuestion — it writes nothing itself
     // (the script's own store map is session runtime state), and every
     // nested call carries its own gate/lock/fence on the wrapped sibling
-    // instances, so no approval surface is bypassed. The sibling list is the
-    // FULL mounted table cloned here at the tail — Codemode excluded by
-    // construction (the clone precedes the push), which also keeps a script
-    // from invoking itself recursively. Mounted only in this main-session
-    // assembly: the child snapshot (D11) strips the codemode surface, and a
-    // later embedder registration (refresh_embedder_tools) reaches the top
-    // level but not the script's list until the next assembly.
-    let codemode_siblings = tools.clone();
+    // instances, so no approval surface is bypassed.
+    //
+    // The sibling list is the session's DEFAULT ACTIVE SET — the mounted
+    // table minus the opt-in suites — not the full table: a dormant suite is
+    // a consent control, and a script must not reach what the user has not
+    // enabled. The clone precedes the push, so Codemode itself is excluded
+    // by construction (no self-recursion). Two staleness classes follow, both
+    // fail-closed: a suite enabled after assembly is not script-callable
+    // until the next assembly, and an embedder registration
+    // (refresh_embedder_tools) reaches the top level but not the script's
+    // list until then either. Mounted only in this main-session assembly: the
+    // child snapshot (D11) strips the codemode surface.
+    let default_active: std::collections::HashSet<String> =
+        default_active_tool_names(&tools).into_iter().collect();
+    let codemode_siblings: Vec<Arc<dyn HarnessAgentTool>> = tools
+        .iter()
+        .filter(|tool| default_active.contains(tool.name()))
+        .cloned()
+        .collect();
     tools.push(Arc::new(manox_harness::tools::codemode::CodemodeTool::new(
         codemode_siblings,
         codemode_store,

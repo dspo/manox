@@ -7809,4 +7809,11 @@ async fn codemode_mounts_ungated_exactly_once_and_excludes_itself() {
         codemode.description().contains("Write("),
         "the gated Write sibling must be script-callable"
     );
+    // The dormant browser suite is a consent control, so it is not part of
+    // the script surface at all: the description neither declares its tools
+    // nor names them in the dropped-tools hint.
+    assert!(
+        !codemode.description().contains("WebExplore"),
+        "the opt-in browser suite must not be advertised to scripts"
+    );
 }
