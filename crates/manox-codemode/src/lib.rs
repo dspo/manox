@@ -190,7 +190,8 @@ impl CodemodeExecutor {
     /// Executions are admitted through the process-wide slot cap
     /// ([`MAX_CONCURRENT_EXECUTIONS`]): arrivals queue in order and a wait
     /// past [`EXECUTION_QUEUE_TIMEOUT`] fails as a sandbox-class result. The
-    /// slot is held for the whole run and released on completion.
+    /// slot is held for the whole run and released on completion. The
+    /// result's `wall_time` covers the run itself, not the queue wait.
     ///
     /// Requires a tokio runtime context. Never returns `Err`: script failures
     /// are results, and every result carries the output produced before the
@@ -201,22 +202,27 @@ impl CodemodeExecutor {
         store: &StoreSnapshot,
         cancel: CancellationToken,
     ) -> CodemodeResult {
-        let started = Instant::now();
+        let queued_since = Instant::now();
         let ParsedSource { code, options } = match source::parse_source(source) {
             Ok(parsed) => parsed,
-            Err(error) => return self.empty_result(started, CodemodeError::script(error.message)),
+            Err(error) => {
+                return self.empty_result(queued_since, CodemodeError::script(error.message));
+            }
         };
         // The slot acquire is async and must stay on the tokio side, before
         // the VM thread starts (the bridge runs that thread blocking). A
-        // caller cancel during the queue wait aborts without running.
+        // caller cancel during the queue wait aborts without running. The
+        // pre-slot failures keep the arrival stamp, so their `wall_time`
+        // reports how long the caller waited to learn the outcome; a run's
+        // `wall_time` starts at the slot (below) and excludes the wait.
         let _slot = tokio::select! {
             slot = acquire_execution_slot(EXECUTION_QUEUE_TIMEOUT) => match slot {
                 Ok(permit) => permit,
-                Err(error) => return self.empty_result(started, error),
+                Err(error) => return self.empty_result(queued_since, error),
             },
             _ = cancel.cancelled() => {
                 return self.empty_result(
-                    started,
+                    queued_since,
                     CodemodeError {
                         kind: CodemodeErrorKind::Aborted,
                         message: "Execution aborted".into(),
@@ -225,6 +231,10 @@ impl CodemodeExecutor {
                 );
             }
         };
+        // The run's clock starts when the slot is granted: queueing behind
+        // sibling executions is not work this script did, so it must not
+        // inflate the reported wall time.
+        let started = Instant::now();
         let tools_json = self.tools_json();
         let store_json = serde_json::to_string(store).expect("a map of strings always serializes");
         let deadline = options.timeout_ms.map(Duration::from_millis);

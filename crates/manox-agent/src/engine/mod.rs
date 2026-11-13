@@ -336,6 +336,11 @@ struct EngineState {
     /// A browser-suite toggle that arrived mid-run; the running turn owns the
     /// session, so the toggle parks here and lands right after settle.
     pending_browser_suite: Mutex<Option<(BrowserSuite, bool)>>,
+    /// The CodemodeTool's nested-call admission source: the session's
+    /// authoritative active-tool selection, mirrored by the engine at every
+    /// change (post-open, suite toggles, tool-refresh re-mounts). See
+    /// [`tools_assembly::ActiveToolMirror`].
+    active_tool_mirror: ActiveToolMirror,
     /// Session cmds that arrived mid-run but are not serviceable until the
     /// turn settles (e.g. `NewSession`/`Open`/`SetCwd` — the first two
     /// rebuild the session, the third moves the sticky cwd a running turn's
@@ -638,6 +643,7 @@ pub fn spawn_engine(
         sessions: Mutex::new(Vec::new()),
         active_path: Mutex::new(initial_path.clone()),
         pending_browser_suite: Mutex::new(None),
+        active_tool_mirror: ActiveToolMirror::default(),
         pending_session_cmds: Mutex::new(Vec::new()),
         current_appender: Mutex::new(None),
         current_resources: Mutex::new(None),
@@ -1237,6 +1243,7 @@ async fn run_actor(
             None,
             &bus,
             codemode_store,
+            &state.active_tool_mirror,
         );
         // Published per assembly like the acceptance-time writer (the actor
         // propagates a mid-turn mode flip through it).
@@ -1247,6 +1254,10 @@ async fn run_actor(
                 attach_plugin_hooks(&mut s, &tool_cwd);
                 attach_prefix_gate(&mut s, &notice_tx, &thread_id);
                 adopt_session_model(&mut s, &mut harness_model, &state).await;
+                // The mirror follows the restored session before any command
+                // is served: Codemode's nested-call admission reads it, and
+                // the restored selection may differ from the assembly default.
+                state.active_tool_mirror.sync_from(&s);
                 restored = true;
                 // The restored file is the thread's active session.
                 crate::thread_registry::set_active(&thread_id, &header.id).await;
@@ -1280,6 +1291,7 @@ async fn run_actor(
                 parent_session.as_deref(),
                 &bus,
                 codemode_store,
+                &state.active_tool_mirror,
             );
             // Published per assembly like the acceptance-time writer (the actor
             // propagates a mid-turn mode flip through it).
@@ -1294,6 +1306,9 @@ async fn run_actor(
                     attach_prefix_gate(&mut s, &notice_tx, &thread_id);
                     // A fresh session is pinned to the facade thread's id.
                     crate::thread_registry::set_active(&thread_id, &thread_id).await;
+                    // The mirror seeds from the fresh session's default
+                    // selection (full set minus the dormant browser suite).
+                    state.active_tool_mirror.sync_from(&s);
                     s
                 }
                 Err(err) => {
@@ -1525,7 +1540,7 @@ async fn run_actor(
         // before the await so the future stays `Send`.
         let parked_suite = state.pending_browser_suite.lock().unwrap().take();
         if let Some((suite, enable)) = parked_suite {
-            apply_browser_suite(&mut session, suite, enable).await;
+            apply_browser_suite(&mut session, suite, enable, &state.active_tool_mirror).await;
         }
         // Mid-run non-serviceable cmds (NewSession/Open/...) parked
         // themselves for the same reason; re-queue so the post-settle dispatch
@@ -1620,10 +1635,23 @@ async fn run_actor(
                 // spawned this engine — so re-consult the embedder provider
                 // before every prompt (no-op while the registration set is
                 // unchanged) instead of trusting the one-time assembly
-                // snapshot.
-                refresh_embedder_tools(&mut session, &thread_id, &state.gate).await;
+                // snapshot. Both refreshes sync the active-tool mirror
+                // themselves when they rewrite the selection.
+                refresh_embedder_tools(
+                    &mut session,
+                    &thread_id,
+                    &state.gate,
+                    &state.active_tool_mirror,
+                )
+                .await;
                 #[cfg(feature = "mcp")]
-                refresh_mcp_tools(&mut session, &thread_id, &state.gate).await;
+                refresh_mcp_tools(
+                    &mut session,
+                    &thread_id,
+                    &state.gate,
+                    &state.active_tool_mirror,
+                )
+                .await;
                 // K5: the prompt's user entry is on disk before the run
                 // starts — persisted at Submit acceptance (the gateway
                 // awaited the append before its receipt and passes the
@@ -1877,7 +1905,7 @@ async fn run_actor(
                 apply_network_access(&state, access, &notice_tx).await;
             }
             SessionCmd::SetBrowserSuite { suite, enable } => {
-                apply_browser_suite(&mut session, suite, enable).await;
+                apply_browser_suite(&mut session, suite, enable, &state.active_tool_mirror).await;
             }
             SessionCmd::PersistPlanSnapshot(snapshot) => {
                 if let Err(err) =

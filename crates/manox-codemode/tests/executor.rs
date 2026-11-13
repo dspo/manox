@@ -22,6 +22,15 @@ use manox_codemode::{
 
 type ToolFuture = Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;
 
+/// Serializes the two quota tests ([`process_slot_cap_admits_two_and_fails_a_queued_third`]
+/// and [`wall_time_excludes_the_queueing_wait`]): both need the whole
+/// 2-permit pool to themselves, and an interleaving with each other wedged
+/// the suite once — a barrier partner starved past its queue deadline while
+/// the other test held its slot, stranding the half that waits on the
+/// unbounded barrier. Every other test only borrows slots transiently,
+/// which the holders' retry loops tolerate.
+static QUOTA_EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A tool with a canned response and an optional pre-response delay.
 struct TestTool {
     name: String,
@@ -930,7 +939,11 @@ async fn declarations_render_into_describe_tool() {
 /// (shortened) queue deadline as a sandbox-class error — a host resource, not
 /// a script fault.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+// The guard must span the whole body: the test holds the full slot quota
+// across its awaits, and the per-test runtime has no re-entrant taker.
 async fn process_slot_cap_admits_two_and_fails_a_queued_third() {
+    let _quota = QUOTA_EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let meet = |name: &str, barrier: Arc<tokio::sync::Barrier>| {
         Arc::new(FnTool {
@@ -986,6 +999,49 @@ async fn process_slot_cap_admits_two_and_fails_a_queued_third() {
         error.message
     );
     drop(held);
+}
+
+/// `wall_time` measures the run, not the wait: an execution that queues
+/// behind a held quota reports the time from its slot grant onward, so the
+/// queued dwell time never inflates the reported duration.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+// Same as the slot-cap test: the quota must stay held across the awaits,
+// and the per-test runtime has no re-entrant taker.
+async fn wall_time_excludes_the_queueing_wait() {
+    let _quota = QUOTA_EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner());
+    // Hold the whole quota (waiting out any parallel test's in-flight
+    // execution), start the run while it is parked, and release after a
+    // dwell the run itself could not have taken.
+    let mut held = Vec::new();
+    for _ in 0..manox_codemode::MAX_CONCURRENT_EXECUTIONS {
+        loop {
+            match manox_codemode::execution_slots().try_acquire() {
+                Ok(permit) => {
+                    held.push(permit);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    }
+    let executor = echo_executor();
+    let at_start = std::time::Instant::now();
+    let execution = tokio::spawn(async move { run(&executor, "await tools.echo({});").await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(held);
+    let result = execution.await.expect("the run task joins");
+    assert!(result.error.is_none(), "{:?}", result.error);
+    let total_waited = at_start.elapsed();
+    assert!(
+        total_waited >= Duration::from_millis(500),
+        "the execution must have queued through the dwell: {total_waited:?}"
+    );
+    assert!(
+        result.wall_time < Duration::from_millis(400),
+        "wall_time starts at the slot grant, not the queue entry: {:?}",
+        result.wall_time
+    );
 }
 
 /// The record list caps at the crate exit: details travel into the journal, so

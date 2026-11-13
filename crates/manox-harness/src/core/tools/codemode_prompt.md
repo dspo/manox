@@ -21,9 +21,12 @@ Environment contract:
   text; a failure rejects the promise with the tool's error text —
   `Promise.allSettled` keeps partial success usable). Names normalize for
   property access (`mcp__a-b` → `tools.mcp__a_b`); `tools["<original>"]`
-  always works. `ALL_TOOLS` lists every callable name and `describeTool(name)`
+  always works. `ALL_TOOLS` lists every mounted tool name and `describeTool(name)`
   prints one tool's schema — including tools whose declaration did not fit
-  this description.
+  this description. A tool outside the session's current active-tool
+  selection rejects its nested call; the selection is read live at each
+  call, and the user enables or disables tool suites (such as the browser
+  tools) from the composer.
 - `text(v)` / `console.log|info|warn|error|debug(...)` — add output items;
   non-strings are JSON-encoded. Console lines render after the body in a
   `<console_output>` block.

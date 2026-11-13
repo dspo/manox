@@ -139,14 +139,18 @@ pub struct CodemodeResult {
     /// Records of the first [`MAX_RECORDED_CALLS`] nested tool calls, in
     /// issue order; `total_calls` counts every call the script issued.
     pub calls: Vec<CallRecord>,
-    /// The true number of nested tool calls the script issued; equal to
-    /// `calls.len()` unless the list was truncated to [`MAX_RECORDED_CALLS`].
+    /// The number of nested tool calls the script issued — always the true
+    /// count, even when the `calls` list was truncated to
+    /// [`MAX_RECORDED_CALLS`].
     pub total_calls: usize,
     /// Store mutations; empty unless the execution succeeded.
     pub store_writes: StoreWrites,
     /// Why the execution failed, `None` on success.
     pub error: Option<CodemodeError>,
-    /// Wall-clock time of the whole execution.
+    /// Wall-clock time of the run, from the moment an execution slot was
+    /// granted (a process-wide queueing wait before that is excluded).
+    /// Pre-slot failures — a source error, a queue timeout, or an abort while
+    /// queued — report the wait instead, since no run happened.
     pub wall_time: Duration,
 }
 
