@@ -62,7 +62,7 @@ const SCHEMA_MAX_CHARS: usize = 16_000;
 /// blow up the output.
 const MAX_REF_EXPANSIONS: usize = 32;
 /// JSON Schema keywords rendered as `@keyword value` tags.
-const TAG_KEYWORDS: [&str; 10] = [
+const TAG_KEYWORDS: [&str; 11] = [
     "minimum",
     "exclusiveMinimum",
     "maximum",
@@ -73,6 +73,7 @@ const TAG_KEYWORDS: [&str; 10] = [
     "pattern",
     "format",
     "minItems",
+    "maxItems",
 ];
 /// Tag keywords whose values all hold at once, so only the binding one matters.
 const LOWER_BOUNDS: [&str; 4] = ["minimum", "exclusiveMinimum", "minLength", "minItems"];
@@ -737,6 +738,20 @@ mod tests {
         assert_eq!(
             schema_type(schema),
             "{\n  // @exclusiveMinimum 0 @exclusiveMaximum 10\n  n?: number;\n}"
+        );
+    }
+
+    #[test]
+    fn array_item_bounds_render_as_tags() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 10}
+            }
+        });
+        assert_eq!(
+            schema_type(schema),
+            "{\n  // @minItems 1 @maxItems 10\n  tags?: Array<string>;\n}"
         );
     }
 

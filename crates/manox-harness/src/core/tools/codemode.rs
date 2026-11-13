@@ -510,9 +510,11 @@ fn owned_context(ctx: &dyn ToolContext) -> Result<Arc<dyn ToolContext>, ToolErro
     }
 }
 
-/// Persist the untruncated output next to the session's other scratch: a
-/// temp file named for the call, so a script's too-large answer stays
-/// recoverable through the file tools.
+/// Persist the untruncated output to a file under `std::env::temp_dir()`,
+/// named for the call plus a nanosecond suffix (a same-call re-entry writes a
+/// fresh file instead of clobbering the first). Nothing ever deletes these
+/// files — their lifecycle is the system's temp-dir reclamation; the reported
+/// path is what keeps the content recoverable through the file tools.
 fn write_full_output(tool_call_id: &str, full_output: &str) -> std::io::Result<std::path::PathBuf> {
     let safe: String = tool_call_id
         .chars()
@@ -524,7 +526,11 @@ fn write_full_output(tool_call_id: &str, full_output: &str) -> std::io::Result<s
             }
         })
         .collect();
-    let path = std::env::temp_dir().join(format!("manox-codemode-{safe}.txt"));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!("manox-codemode-{safe}-{nanos}.txt"));
     std::fs::write(&path, full_output)?;
     Ok(path)
 }
@@ -1173,9 +1179,17 @@ mod tests {
         let details = result.details.expect("details row");
         let path =
             std::path::PathBuf::from(details["fullOutputPath"].as_str().expect("path reported"));
-        assert_eq!(
-            path,
-            std::env::temp_dir().join("manox-codemode-call_big_1.txt")
+        // The sanitized call id names the file; the nanosecond suffix keeps a
+        // same-call re-entry from clobbering it.
+        assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf8 file name")
+            .to_owned();
+        assert!(
+            name.starts_with("manox-codemode-call_big_1-") && name.ends_with(".txt"),
+            "unique per-write name: {name}"
         );
         let persisted = std::fs::read_to_string(&path).expect("full output persisted");
         assert_eq!(persisted.chars().count(), 80_000);
