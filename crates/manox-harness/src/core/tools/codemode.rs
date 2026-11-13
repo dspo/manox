@@ -467,6 +467,8 @@ impl AgentTool for CodemodeTool {
         };
         let details = serde_json::json!({
             "calls": result.calls,
+            "totalCalls": result.total_calls,
+            "callsTruncated": result.calls.len() < result.total_calls,
             "storeWrites": store_writes,
             "options": options,
             "wallTimeMs": u64::try_from(result.wall_time.as_millis()).unwrap_or(u64::MAX),
@@ -834,6 +836,8 @@ mod tests {
         );
         assert_eq!(details["options"]["timeoutMs"], JsonValue::Null);
         assert_eq!(details["calls"].as_array().map(Vec::len), Some(1));
+        assert_eq!(details["totalCalls"], serde_json::json!(1));
+        assert_eq!(details["callsTruncated"], serde_json::json!(false));
         assert!(details["wallTimeMs"].is_u64());
 
         // A failed script omits the writes entirely.

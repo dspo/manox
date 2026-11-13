@@ -20,6 +20,10 @@ pub const MAX_OUTPUT_ITEMS: usize = 100_000;
 /// Global cap on in-flight nested tool calls. Calls issued beyond the cap are
 /// rejected immediately with an explanatory error.
 pub const MAX_IN_FLIGHT_CALLS: usize = 32;
+/// Cap on the call records one result carries (`details.calls`): a script
+/// issuing more keeps only the first [`MAX_RECORDED_CALLS`] records in issue
+/// order, and `CodemodeResult::total_calls` counts every call it issued.
+pub const MAX_RECORDED_CALLS: usize = 100;
 /// Estimated tokens of a string: one token per four characters.
 pub const CHARS_PER_TOKEN: usize = 4;
 
@@ -132,8 +136,12 @@ pub struct CodemodeResult {
     /// The script's `return` value as JSON text, `None` when it returned
     /// nothing or the execution failed.
     pub value: Option<String>,
-    /// Records of every nested tool call, in issue order.
+    /// Records of the first [`MAX_RECORDED_CALLS`] nested tool calls, in
+    /// issue order; `total_calls` counts every call the script issued.
     pub calls: Vec<CallRecord>,
+    /// The true number of nested tool calls the script issued, when the
+    /// record list was truncated to [`MAX_RECORDED_CALLS`].
+    pub total_calls: usize,
     /// Store mutations; empty unless the execution succeeded.
     pub store_writes: StoreWrites,
     /// Why the execution failed, `None` on success.

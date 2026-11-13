@@ -261,6 +261,7 @@ impl CodemodeExecutor {
             full_output: None,
             value: None,
             calls: Vec::new(),
+            total_calls: 0,
             store_writes: StoreWrites::default(),
             error: Some(error),
             wall_time: started.elapsed(),
@@ -268,7 +269,7 @@ impl CodemodeExecutor {
     }
 
     /// Fold the bridge outcome into the result: decode the terminal, render
-    /// the output text under the soft limit.
+    /// the output text under the soft limit, cap the call records.
     fn assemble(
         &self,
         started: Instant,
@@ -314,12 +315,20 @@ impl CodemodeExecutor {
             }
         }
         let (text, full_output) = types::render_output(&outcome.output, options.max_output_tokens);
+        // The record list is capped at the crate exit: details.travel into the
+        // journal, so a fan-out script must not append unbounded rows. The
+        // first records in issue order are kept; the true count travels
+        // alongside.
+        let total_calls = outcome.calls.len();
+        let mut calls = outcome.calls;
+        calls.truncate(types::MAX_RECORDED_CALLS);
         CodemodeResult {
             output: outcome.output,
             text,
             full_output,
             value,
-            calls: outcome.calls,
+            calls,
+            total_calls,
             store_writes: writes,
             error,
             wall_time: started.elapsed(),

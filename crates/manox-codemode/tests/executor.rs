@@ -978,3 +978,32 @@ async fn process_slot_cap_admits_two_and_fails_a_queued_third() {
     );
     drop(held);
 }
+
+/// The record list caps at the crate exit: details travel into the journal, so
+/// a fan-out script must not append unbounded rows. An over-cap script keeps
+/// the first records in issue order while the true count travels alongside;
+/// under the cap the count matches the list.
+#[tokio::test]
+async fn call_records_cap_with_total_count_at_the_crate_exit() {
+    let executor = echo_executor();
+    let source = "for (let i = 0; i < 120; i++) await tools.echo({ index: i });";
+    let result = run(&executor, source).await;
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(
+        result.calls.len(),
+        manox_codemode::types::MAX_RECORDED_CALLS,
+        "the list keeps only the first records"
+    );
+    assert_eq!(result.total_calls, 120, "the true count survives the cap");
+    assert!(
+        result
+            .calls
+            .iter()
+            .all(|call| call.name == "echo" && call.status == CallStatus::Ok),
+        "kept records stay in issue order with their status"
+    );
+
+    let small = run(&executor, "await tools.echo({}); await tools.echo({});").await;
+    assert_eq!(small.calls.len(), 2);
+    assert_eq!(small.total_calls, 2, "no phantom truncation under the cap");
+}
