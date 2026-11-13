@@ -914,3 +914,67 @@ async fn declarations_render_into_describe_tool() {
     let _ = DEFAULT_DECLARATION_BUDGET_TOKENS;
     let _ = to_js_identifier;
 }
+
+/// D9: the process-wide slot cap. Two real executions overlap (their tools
+/// meet at a two-party barrier, passable only while both hold a slot at
+/// once), and a third acquire queued behind a full quota fails at the
+/// (shortened) queue deadline as a sandbox-class error — a host resource, not
+/// a script fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn process_slot_cap_admits_two_and_fails_a_queued_third() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let meet = |name: &str, barrier: Arc<tokio::sync::Barrier>| {
+        Arc::new(FnTool {
+            name: name.to_owned(),
+            f: move |_call_id: String, _args: Value, _signal: CancellationToken| {
+                let barrier = Arc::clone(&barrier);
+                Box::pin(async move {
+                    // Only passable when both executions run concurrently.
+                    barrier.wait().await;
+                    Ok(json!({"met": true})) as Result<Value, String>
+                }) as ToolFuture
+            },
+        }) as Arc<dyn CodemodeTool>
+    };
+    let executor_a = executor_with(vec![meet("meet_a", Arc::clone(&barrier))]);
+    let executor_b = executor_with(vec![meet("meet_b", barrier)]);
+    let (result_a, result_b) = tokio::join!(
+        run(&executor_a, "await tools.meet_a({});"),
+        run(&executor_b, "await tools.meet_b({});")
+    );
+    assert!(
+        result_a.error.is_none(),
+        "the first execution must hold a slot: {:?}",
+        result_a.error
+    );
+    assert!(
+        result_b.error.is_none(),
+        "the second execution must hold a slot concurrently: {:?}",
+        result_b.error
+    );
+
+    // The queue deadline: hold the full quota directly (waiting out any
+    // parallel test's in-flight execution), then a queued acquire must time
+    // out without running.
+    let mut held = Vec::new();
+    for _ in 0..manox_codemode::MAX_CONCURRENT_EXECUTIONS {
+        loop {
+            match manox_codemode::execution_slots().try_acquire() {
+                Ok(permit) => {
+                    held.push(permit);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    }
+    let queued = manox_codemode::acquire_execution_slot(Duration::from_millis(250)).await;
+    let error = queued.expect_err("a full quota must time out the queued acquire");
+    assert_eq!(error.kind, CodemodeErrorKind::Sandbox);
+    assert!(
+        error.message.contains("process-wide slot") && error.message.contains("waited"),
+        "the queue timeout explains itself: {}",
+        error.message
+    );
+    drop(held);
+}
