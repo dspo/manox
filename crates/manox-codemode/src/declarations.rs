@@ -11,8 +11,10 @@
 //! Each tool's sample (description + declaration) has a token budget
 //! (estimated chars/4). When a sample exceeds the budget it is first re-rendered
 //! without the constraint tags, and if it is still too large the whole tool is
-//! dropped: the caller learns which tools were dropped from the result and can
-//! point the script at `ALL_TOOLS` instead.
+//! dropped. Across tools the samples share a total budget: samples are admitted
+//! in input order (first come, first served) until the pool is spent, and later
+//! tools drop whole. The caller learns which tools were dropped from the result
+//! and can point the script at `ALL_TOOLS` instead.
 
 use std::collections::HashSet;
 
@@ -49,6 +51,10 @@ pub struct RenderedDeclarations {
 
 /// Per-tool sample budget, in estimated tokens.
 pub const DEFAULT_DECLARATION_BUDGET_TOKENS: usize = 3000;
+/// Shared budget across every tool's sample combined, in estimated tokens:
+/// the declaration listing must stay bounded no matter how wide the tool
+/// surface grows (MCP servers add tools and schema bulk linearly).
+pub const DEFAULT_TOTAL_DECLARATION_BUDGET_TOKENS: usize = 3000;
 /// Largest rendered input type, in characters, before it degrades (`unknown`
 /// at the schema level, tag-drop and tool-drop at the budget level).
 const SCHEMA_MAX_CHARS: usize = 16_000;
@@ -74,21 +80,41 @@ const UPPER_BOUNDS: [&str; 4] = ["maximum", "exclusiveMaximum", "maxLength", "ma
 /// Longest single tag; longer ones (large defaults, long patterns) are left out.
 const MAX_TAG_CHARS: usize = 80;
 
-/// Render declarations for a tool list with the default budget.
+/// Render declarations for a tool list with the default budgets.
 pub fn render_declarations(tools: &[DeclaredTool]) -> RenderedDeclarations {
     render_declarations_with_budget(tools, DEFAULT_DECLARATION_BUDGET_TOKENS)
 }
 
-/// Render declarations for a tool list. Per tool: render with tags, re-render
-/// without tags when the sample exceeds the budget, drop the tool when it
-/// still does not fit.
+/// Render declarations for a tool list with the default total budget. Per
+/// tool: render with tags, re-render without tags when the sample exceeds the
+/// budget, drop the tool when it still does not fit.
 pub fn render_declarations_with_budget(
     tools: &[DeclaredTool],
     budget_tokens: usize,
 ) -> RenderedDeclarations {
-    let budget_chars = budget_tokens.saturating_mul(crate::types::CHARS_PER_TOKEN);
+    render_declarations_with_total_budget(
+        tools,
+        budget_tokens,
+        DEFAULT_TOTAL_DECLARATION_BUDGET_TOKENS,
+    )
+}
+
+/// Render declarations for a tool list with explicit per-tool and total
+/// budgets. The per-tool budget is the second-level trim (tag drop, then tool
+/// drop) for one oversized sample; the total budget is the shared pool across
+/// all samples — admitted in input order, first come first served, and a tool
+/// whose sample does not fit the remaining pool drops whole (name-only) while
+/// earlier tools keep theirs.
+pub fn render_declarations_with_total_budget(
+    tools: &[DeclaredTool],
+    per_tool_budget_tokens: usize,
+    total_budget_tokens: usize,
+) -> RenderedDeclarations {
+    let budget_chars = per_tool_budget_tokens.saturating_mul(crate::types::CHARS_PER_TOKEN);
+    let total_chars = total_budget_tokens.saturating_mul(crate::types::CHARS_PER_TOKEN);
     let mut rendered = Vec::with_capacity(tools.len());
     let mut dropped = Vec::new();
+    let mut pool_used = 0usize;
     for tool in tools {
         let tagged = format!(
             "{}(args: {}): Promise<unknown>;",
@@ -115,6 +141,12 @@ pub fn render_declarations_with_budget(
             }
             declaration = untagged;
         }
+        let sample_chars = sample(&declaration).chars().count();
+        if pool_used + sample_chars > total_chars {
+            dropped.push(tool.name.clone());
+            continue;
+        }
+        pool_used += sample_chars;
         rendered.push(RenderedTool {
             name: tool.name.clone(),
             js_name: tool.js_name.clone(),
@@ -765,6 +797,51 @@ mod tests {
         assert_eq!(
             sample,
             "Read a file.\n\ncodemode tool declaration:\n```ts\ndeclare const tools: { read(args: { path: string; }): Promise<unknown>; };\n```"
+        );
+    }
+
+    /// The shared total budget admits samples in input order (first come,
+    /// first served) and drops whole tools once the pool is spent: shrinking
+    /// the pool drops the LATER tools, never the earlier ones. Each sample
+    /// here is ~118 chars, so a 400-char pool (100 est-tokens) admits three
+    /// of the four.
+    #[test]
+    fn total_budget_admits_in_order_and_drops_later_tools() {
+        let description = "x".repeat(20);
+        let tools: Vec<DeclaredTool> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| tool(name, json!({"type": "string"}), &description))
+            .collect();
+        fn names(rendered: &RenderedDeclarations) -> Vec<&str> {
+            rendered.rendered.iter().map(|t| t.name.as_str()).collect()
+        }
+        let rendered = render_declarations_with_total_budget(&tools, 60, 100);
+        assert_eq!(names(&rendered), vec!["a", "b", "c"]);
+        assert_eq!(rendered.dropped, vec!["d".to_owned()]);
+
+        // A tighter pool keeps only the first tool.
+        let rendered = render_declarations_with_total_budget(&tools, 60, 40);
+        assert_eq!(names(&rendered), vec!["a"]);
+        assert_eq!(
+            rendered.dropped,
+            vec!["b".to_owned(), "c".to_owned(), "d".to_owned()]
+        );
+
+        // A per-tool-dropped tool consumes nothing from the pool: the rest
+        // share it undiminished.
+        let oversized = tool(
+            "huge",
+            json!({"type": "object", "properties": {"d": {"type": "string", "description": "y".repeat(1000)}}}),
+            &description,
+        );
+        let mut mixed = vec![oversized];
+        mixed.extend(tools);
+        let rendered = render_declarations_with_total_budget(&mixed, 60, 100);
+        assert_eq!(names(&rendered), vec!["a", "b", "c"]);
+        assert_eq!(
+            rendered.dropped,
+            vec!["huge".to_owned(), "d".to_owned()],
+            "drops stay in input order"
         );
     }
 }

@@ -1014,6 +1014,51 @@ mod tests {
         assert!(description.contains("Huge"), "named in the hint");
     }
 
+    /// The shared total declaration budget bounds the assembled description no
+    /// matter how many sizable siblings mount: later tools drop whole to the
+    /// name-only hint while earlier ones keep their declarations (first come,
+    /// first served). Ten ~2k-char samples would stack past 20k chars without
+    /// the cap; the shared pool is 3000 est-tokens (12k chars).
+    #[test]
+    fn many_sizable_siblings_keep_the_description_bounded() {
+        let trace = Arc::new(StdMutex::new(Vec::new()));
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"data": {"type": "string", "description": "x".repeat(2000)}}
+        });
+        let siblings: Vec<Arc<dyn AgentTool>> = (0..10)
+            .map(|i| {
+                fake_with_schema(
+                    &format!("Tool{i}"),
+                    false,
+                    0,
+                    Ok(serde_json::json!(1)),
+                    &trace,
+                    schema.clone(),
+                )
+            })
+            .collect();
+        let tool = CodemodeTool::new(siblings, BTreeMap::new());
+        let description = tool.description();
+        let total = description.chars().count();
+        assert!(
+            total < PROMPT.chars().count() + 12_000 + 2_000,
+            "the description must stay near the shared budget, got {total}"
+        );
+        assert!(
+            description.contains("Tool0("),
+            "the first tool keeps its declaration"
+        );
+        assert!(
+            !description.contains("Tool9("),
+            "a late tool drops whole: {description}"
+        );
+        assert!(
+            description.contains("Tool9"),
+            "the dropped tool is still named in the hint"
+        );
+    }
+
     /// A duplicate sibling name degrades to an unavailable tool with the
     /// reason in the description and an error result on execute — the
     /// assembly never dies for it.
