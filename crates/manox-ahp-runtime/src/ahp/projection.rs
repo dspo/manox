@@ -465,6 +465,16 @@ struct OpenTurn {
     /// of a streamed reply, whose tail deltas must rejoin the runs they
     /// streamed into instead of opening fresh parts.
     streamed_thinking: bool,
+    /// The open thinking run's durable clock: the journal timestamps of its
+    /// first and last deltas (`None` while no thinking run is open). The
+    /// run's settled duration — the anchor a client needs to label a folded
+    /// reasoning part "thought for Ns" after a reopen — is `last - first`,
+    /// so a replay recomputes the identical row. A run resumed over a seed
+    /// (a host restart mid-thinking) re-anchors at its first post-seed
+    /// delta and reports the resumed segment only.
+    thinking_started_at: Option<String>,
+    /// The clock's moving end: the latest thinking delta's journal timestamp.
+    thinking_last_at: Option<String>,
     /// The opening user message the turn carries: the `turnStart`'s carried
     /// pending user when there was one, else empty until the initiating user
     /// row lands. Recording the carried text is what keeps a later pre-content
@@ -494,6 +504,8 @@ impl OpenTurn {
             reasoning_part: None,
             streamed_text: false,
             streamed_thinking: false,
+            thinking_started_at: None,
+            thinking_last_at: None,
             calls: BTreeMap::new(),
             open_asks: Vec::new(),
         }
@@ -502,6 +514,38 @@ impl OpenTurn {
     fn close_runs(&mut self) {
         self.text_part = None;
         self.reasoning_part = None;
+    }
+
+    /// Journal-stamp one thinking delta onto the run's durable clock.
+    fn stamp_thinking(&mut self, timestamp: &str) {
+        if self.thinking_started_at.is_none() {
+            self.thinking_started_at = Some(timestamp.to_string());
+        }
+        self.thinking_last_at = Some(timestamp.to_string());
+    }
+
+    /// The thinking run's settled timing row (`None` when no run is open).
+    /// A read-only face for a turn already taken out of the fold — its clock
+    /// dies with it, so no clearing is needed.
+    fn thinking_timing_row(&self) -> Option<Value> {
+        let started_at = self.thinking_started_at.as_ref()?;
+        let last_at = self.thinking_last_at.as_ref()?;
+        Some(json!({
+            "partId": self.reasoning_part.clone()?,
+            "turnId": self.id.clone(),
+            "startedAt": started_at,
+            "durationMs": elapsed_ms(started_at, last_at),
+        }))
+    }
+
+    /// [`Self::thinking_timing_row`] for a turn that keeps living: the row is
+    /// returned once and the clock is cleared, so a restated run re-anchors
+    /// at its own first delta instead of inheriting a stale start.
+    fn take_thinking_timing(&mut self) -> Option<Value> {
+        let row = self.thinking_timing_row()?;
+        self.thinking_started_at = None;
+        self.thinking_last_at = None;
+        Some(row)
     }
 }
 
@@ -570,6 +614,11 @@ pub struct Translator {
     /// `aborted` — is the durable edge, and a host that died mid-run leaves
     /// the same `running` a fresh fold of its journal reads).
     runs: BTreeMap<String, RunRow>,
+    /// The metrics channel of the chat being folded, set by every `on_entry`
+    /// call. The reasoning-timing close sites hold only the chat uri and
+    /// cannot re-derive the extension channel from it, so the fold carries
+    /// the target alongside.
+    metrics: String,
 }
 
 /// One roster entry's identity, held between its rows.
@@ -939,6 +988,7 @@ impl Translator {
         let chat = Target::Chat.uri(chat_id, session_id);
         let session = Target::Session.uri(chat_id, session_id);
         let thread = Target::Thread.uri(chat_id, session_id);
+        self.metrics = Target::Metrics.uri(chat_id, session_id);
         let mut out = Vec::new();
         match entry {
             // ── transcript ───────────────────────────────────────────────
@@ -1908,7 +1958,7 @@ impl Translator {
                         }),
                     ));
                 }
-                if let Some(turn) = self.open.as_mut() {
+                let settled_timing = self.open.as_mut().and_then(|turn| {
                     // A run streamed on this reply keeps its slot across the
                     // row: the journal's write paths race (deltas ride the
                     // notice tap's actor queue, the settled row is written
@@ -1922,11 +1972,19 @@ impl Translator {
                     // boundary) still fire, so an open slot never reaches an
                     // unrelated response; a row that is itself the first
                     // writer closes the runs as before.
-                    if !streamed && !turn.streamed_thinking {
+                    let timing = if !streamed && !turn.streamed_thinking {
+                        let timing = turn.take_thinking_timing();
                         turn.close_runs();
-                    }
+                        timing
+                    } else {
+                        None
+                    };
                     turn.streamed_text = false;
                     turn.streamed_thinking = false;
+                    timing
+                });
+                if let Some(row) = settled_timing {
+                    self.push_reasoning_timing(out, row);
                 }
             }
             "tool" => {
@@ -2025,29 +2083,37 @@ impl Translator {
     ) {
         self.ensure_turn(entry, chat, out);
         let turn_id = self.turn_id();
-        let part_id = {
+        let (part_id, opening, settled_timing) = {
             let turn = self.open.as_mut().expect("ensure_turn opened one");
+            // A text delta closes any open thinking run and opens the reply's
+            // text: publish the run's settled timing before its part slot is
+            // dropped. Both stamps are journal timestamps, so a replay
+            // restates the identical row.
+            let settled_timing = if matches!(run, Run::Text) {
+                let timing = turn.take_thinking_timing();
+                turn.reasoning_part = None;
+                turn.streamed_text = true;
+                timing
+            } else {
+                turn.text_part = None;
+                turn.streamed_thinking = true;
+                turn.stamp_thinking(&entry.timestamp);
+                None
+            };
             let slot = match run {
-                Run::Text => {
-                    turn.reasoning_part = None;
-                    turn.streamed_text = true;
-                    &mut turn.text_part
-                }
-                Run::Thinking => {
-                    turn.text_part = None;
-                    turn.streamed_thinking = true;
-                    &mut turn.reasoning_part
-                }
+                Run::Text => &mut turn.text_part,
+                Run::Thinking => &mut turn.reasoning_part,
             };
             let opening = slot.is_none();
             if opening {
                 *slot = Some(format!("p-{}", entry.id));
             }
             let part_id = slot.clone().expect("the run is open");
-            Some((part_id, opening))
+            (part_id, opening, settled_timing)
+        };
+        if let Some(row) = settled_timing {
+            self.push_reasoning_timing(out, row);
         }
-        .expect("a turn is open");
-        let (part_id, opening) = part_id;
         if opening {
             let part = match run {
                 Run::Text => ResponsePart::Markdown(MarkdownResponsePart {
@@ -2106,9 +2172,17 @@ impl Translator {
     ) {
         self.ensure_turn(entry, chat, out);
         let turn_id = self.turn_id();
+        let settled_timing = {
+            let turn = self.open.as_mut().expect("ensure_turn opened one");
+            let timing = turn.take_thinking_timing();
+            turn.close_runs();
+            timing
+        };
+        if let Some(row) = settled_timing {
+            self.push_reasoning_timing(out, row);
+        }
         let first = {
             let turn = self.open.as_mut().expect("ensure_turn opened one");
-            turn.close_runs();
             let fresh = !turn.calls.contains_key(call_id);
             if fresh {
                 turn.calls
@@ -2503,6 +2577,13 @@ impl Translator {
         steer_boundary: bool,
         out: &mut Vec<Emitted>,
     ) {
+        // A thinking run still open at the turn boundary settles with it,
+        // whatever closer precedes the end: publish its timing before the
+        // terminal action. `open` is already taken out of the fold, so the
+        // read-only row face serves — the clock dies with the turn.
+        if let Some(row) = open.thinking_timing_row() {
+            self.push_reasoning_timing(out, row);
+        }
         let duration = elapsed_ms(&open.started_at, &entry.timestamp);
         let failed = matches!(outcome, Outcome::Failed(_));
         let mut meta = json!({"entryId": entry.id, "outcome": outcome.tag()});
@@ -2626,8 +2707,13 @@ impl Translator {
         meta: Value,
         out: &mut Vec<Emitted>,
     ) {
-        if let Some(turn) = self.open.as_mut() {
+        let settled_timing = self.open.as_mut().and_then(|turn| {
+            let timing = turn.take_thinking_timing();
             turn.close_runs();
+            timing
+        });
+        if let Some(row) = settled_timing {
+            self.push_reasoning_timing(out, row);
         }
         self.ensure_turn(entry, chat, out);
         let turn_id = self.turn_id();
@@ -3058,6 +3144,19 @@ impl Translator {
             .as_ref()
             .map(|turn| turn.id.clone())
             .unwrap_or_default()
+    }
+
+    /// Publish one settled thinking run's timing on the metrics channel.
+    /// AHP's `ReasoningResponsePart` carries text only, so the durable clock
+    /// rides the `x-manox` extension face keyed by the part id — the fold
+    /// emits it at the run's close (the other stream, a tool call, a note,
+    /// the settled row, or the turn boundary), and replay restates the
+    /// identical row.
+    fn push_reasoning_timing(&self, out: &mut Vec<Emitted>, row: Value) {
+        out.push(Emitted::new(
+            &self.metrics,
+            extension_action(ext::actions::REASONING_TIMING, json!({ "timing": row })),
+        ));
     }
 }
 
@@ -5150,6 +5249,128 @@ mod fold_semantics_tests {
         );
     }
 
+    /// A settled thinking run publishes its durable clock: closed by the
+    /// reply's first text delta, the timing row rides the metrics channel
+    /// keyed by the part id — the anchor a client needs to label a folded
+    /// reasoning part "thought for Ns" after a reopen. AHP's
+    /// `ReasoningResponsePart` carries text only, so this is the part's only
+    /// time face.
+    #[test]
+    fn a_thinking_run_closed_by_the_reply_text_publishes_its_timing() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "plan the ports"}]},
+                "origin": "rpc-1",
+            })),
+            kernel(json!({"type": "agent_thinking_delta", "id": "sentry-1",
+                          "delta": "weighing 443 vs 8443.",
+                          "timestamp": "2026-10-09T00:00:01.000Z"})),
+            kernel(json!({"type": "agent_thinking_delta", "id": "sentry-2",
+                          "delta": " 8443 needs the upstream too.",
+                          "timestamp": "2026-10-09T00:00:04.500Z"})),
+            kernel(json!({"type": "agent_text_delta", "id": "sentry-3",
+                          "delta": "Use 443.",
+                          "timestamp": "2026-10-09T00:00:05.000Z"})),
+        ];
+
+        let mut translator = Translator::new();
+        let mut reasoning_part_id = None;
+        let mut timing_rows = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatResponsePart(part) = &emitted.action
+                    && let ResponsePart::Reasoning(r) = &part.part
+                {
+                    reasoning_part_id = Some(r.id.clone());
+                }
+                if emitted.channel == "x-manox-metrics:/c-1" {
+                    timing_rows.push(serde_json::to_value(&emitted.action).unwrap());
+                }
+            }
+        }
+
+        let part_id = reasoning_part_id.expect("the run opened its reasoning part");
+        assert_eq!(
+            timing_rows.len(),
+            1,
+            "one settled run is one timing row: {timing_rows:?}"
+        );
+        let row = &timing_rows[0];
+        assert_eq!(
+            row["type"],
+            manox_ahp::ext::actions::REASONING_TIMING,
+            "the timing rides its declared action: {row}"
+        );
+        let timing = &row["timing"];
+        assert_eq!(timing["partId"], part_id, "keyed by the part id: {timing}");
+        assert_eq!(timing["turnId"], "t-sentry-1", "the opening turn: {timing}");
+        assert_eq!(
+            timing["startedAt"], "2026-10-09T00:00:01.000Z",
+            "anchored at the run's first delta: {timing}"
+        );
+        assert_eq!(
+            timing["durationMs"], 3500,
+            "last delta minus first, journal stamps only: {timing}"
+        );
+    }
+
+    /// A thinking-only reply has no text delta to close its run: the clock
+    /// closes at the turn boundary, and the timing still publishes — with
+    /// the run's own stamps, never the turn's duration.
+    #[test]
+    fn a_thinking_only_reply_publishes_its_timing_at_the_turn_boundary() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "think it over"}]},
+                "origin": "rpc-1",
+            })),
+            kernel(json!({"type": "agent_thinking_delta", "id": "sentry-1",
+                          "delta": "weighing the options.",
+                          "timestamp": "2026-10-09T00:00:01.000Z"})),
+            kernel(json!({"type": "agent_thinking_delta", "id": "sentry-2",
+                          "delta": " done.",
+                          "timestamp": "2026-10-09T00:00:09.000Z"})),
+            kernel(json!({"type": "turn_finish", "id": "sentry-3",
+                          "cancelled": false, "failed": false, "strandedSteerIds": [],
+                          "timestamp": "2026-10-09T00:00:20.000Z"})),
+        ];
+
+        let mut translator = Translator::new();
+        let mut reasoning_part_id = None;
+        let mut timing_rows = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatResponsePart(part) = &emitted.action
+                    && let ResponsePart::Reasoning(r) = &part.part
+                {
+                    reasoning_part_id = Some(r.id.clone());
+                }
+                if emitted.channel == "x-manox-metrics:/c-1" {
+                    timing_rows.push(serde_json::to_value(&emitted.action).unwrap());
+                }
+            }
+        }
+
+        let part_id = reasoning_part_id.expect("the run opened its reasoning part");
+        assert_eq!(
+            timing_rows.len(),
+            1,
+            "one row at the boundary: {timing_rows:?}"
+        );
+        let timing = &timing_rows[0]["timing"];
+        assert_eq!(timing["partId"], part_id);
+        assert_eq!(
+            timing["durationMs"], 8000,
+            "the run's own stamps, not the turn's 19s: {timing}"
+        );
+    }
+
     /// The thinking mirror: a reply that streamed only reasoning keeps its
     /// reasoning run across the streamed row, so a thinking tail that lost
     /// the write race rejoins the part instead of minting a second one. The
@@ -6374,6 +6595,17 @@ mod extension_gate_tests {
                 ext_actions::LEAF_CHANGED,
                 "x-manox-thread:/s-1",
             ),
+            (
+                // The closer of a thinking run: the prep deltas below opened
+                // one, this text delta closes it and publishes the run's
+                // settled timing.
+                kernel(
+                    json!({"type": "agent_text_delta", "id": "e-p3", "delta": "x",
+                              "timestamp": "2026-09-27T00:00:04.000Z"}),
+                ),
+                ext_actions::REASONING_TIMING,
+                "x-manox-metrics:/c-1",
+            ),
         ];
         // Client-dispatched: the action as the client sends it (no journal
         // producer exists; the runtime dispatch arms accept these directly).
@@ -6386,6 +6618,20 @@ mod extension_gate_tests {
 
         let mut state = XManoxState::default();
         let mut translator = Translator::new();
+        // The thinking run the REASONING_TIMING case closes: two deltas on
+        // distinct journal stamps, so the settled row has a real duration.
+        for prep in [
+            kernel(
+                json!({"type": "agent_thinking_delta", "id": "e-p1", "delta": "a",
+                          "timestamp": "2026-09-27T00:00:01.000Z"}),
+            ),
+            kernel(
+                json!({"type": "agent_thinking_delta", "id": "e-p2", "delta": "b",
+                          "timestamp": "2026-09-27T00:00:03.400Z"}),
+            ),
+        ] {
+            let _ = translator.on_entry("c-1", "s-1", 0, &prep);
+        }
         for (entry, tag, expected_channel) in &host_cases {
             assert!(ext_actions::ALL.contains(tag), "{tag} must stay declared");
             let emitted = translator.on_entry("c-1", "s-1", 0, entry);
@@ -6453,6 +6699,19 @@ mod extension_gate_tests {
                 alias: None,
                 active_tools: Some(vec!["bash".to_string()]),
                 order: Some(json!({"s-1": 1})),
+                reasoning_timings: Some(
+                    [(
+                        "p-e-p1".to_string(),
+                        json!({
+                            "partId": "p-e-p1",
+                            "turnId": "t-e-p1",
+                            "startedAt": "2026-09-27T00:00:01.000Z",
+                            "durationMs": 2400,
+                        }),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
             },
             "every extension-state field must be reachable from a live producer"
         );

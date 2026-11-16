@@ -80,6 +80,13 @@ pub struct XManoxState {
     /// alias upsert; the durable authority is the host's projects file).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<Value>,
+    /// Reasoning-timing registry view: reasoning part id → the settled
+    /// timing row (`turnId` / `startedAt` / `durationMs`). Like the other
+    /// keyed views this upserts by key and has no clear edge — a part's
+    /// timing is written once, at the run's close, and is bounded by the
+    /// session's reasoning-part count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_timings: Option<BTreeMap<String, Value>>,
 }
 
 /// What one extension action did to the state.
@@ -124,7 +131,9 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
     // report their own change instead.
     let keyed = matches!(
         tag,
-        super::actions::WORK_BACKGROUND_TASKS | super::actions::WORK_CHILD_RUNS
+        super::actions::WORK_BACKGROUND_TASKS
+            | super::actions::WORK_CHILD_RUNS
+            | super::actions::REASONING_TIMING
     );
     let before = (!keyed).then(|| state.clone());
     let mut registry_changed = false;
@@ -169,6 +178,18 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
                 && let Some(run_id) = run.get("runId").and_then(Value::as_str)
             {
                 registry_changed = upsert_row(&mut state.child_runs, run_id, run);
+            }
+        }
+        super::actions::REASONING_TIMING => {
+            // One timing row per closed reasoning run, upserted by `partId`
+            // (the projection emits the row once, at the run's close, so a
+            // replay restates the identical row). A row without a string
+            // `partId` cannot be keyed and is dropped; the producer shape is
+            // pinned by the runtime projection's reasoning-timing tests.
+            if let Some(row) = action.get("timing")
+                && let Some(part_id) = row.get("partId").and_then(Value::as_str)
+            {
+                registry_changed = upsert_row(&mut state.reasoning_timings, part_id, row);
             }
         }
         super::actions::WORK_ACTIVE_TOOLS => {
@@ -428,5 +449,55 @@ mod tests {
             "the client dispatch folds: {action}"
         );
         assert_eq!(state.order, Some(json!({"s-1": 1})));
+    }
+
+    #[test]
+    fn reasoning_timing_rows_upsert_the_registry_view_by_part_id() {
+        let row = json!({
+            "partId": "p-e1", "turnId": "t1",
+            "startedAt": "2026-01-01T00:00:00Z", "durationMs": 4200,
+        });
+        let action_for = |row: Value| json!({"type": "x-manox/reasoningTiming", "timing": row});
+        let mut state = XManoxState::default();
+        assert_eq!(
+            apply(&mut state, &action_for(row.clone())),
+            Outcome::Applied
+        );
+        assert_eq!(
+            state.reasoning_timings,
+            Some([("p-e1".to_string(), row)].into_iter().collect())
+        );
+
+        // A second run joins the registry; each part keeps its own row.
+        let other = json!({
+            "partId": "p-e2", "turnId": "t1",
+            "startedAt": "2026-01-01T00:05:00Z", "durationMs": 900,
+        });
+        assert_eq!(apply(&mut state, &action_for(other)), Outcome::Applied);
+        let registry = state
+            .reasoning_timings
+            .as_ref()
+            .expect("registry view populated");
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry["p-e2"]["durationMs"], 900);
+
+        // A row without a keyable `partId` cannot enter the view and does
+        // not disturb it (there is no clear edge on this action).
+        assert_eq!(
+            apply(&mut state, &json!({"type": "x-manox/reasoningTiming"})),
+            Outcome::NoOp
+        );
+        assert_eq!(
+            apply(&mut state, &action_for(json!({"durationMs": 1}))),
+            Outcome::NoOp
+        );
+        assert_eq!(
+            state
+                .reasoning_timings
+                .as_ref()
+                .expect("still populated")
+                .len(),
+            2
+        );
     }
 }
