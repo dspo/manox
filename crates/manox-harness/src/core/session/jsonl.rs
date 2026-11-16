@@ -2118,24 +2118,34 @@ mod tests {
 
     /// The journal has one on-disk format and no version axis: a file
     /// written before it is a foreign artifact, not a convertible one. It
-    /// fails open as ordinary damage — an untyped parse/integrity error, no
-    /// version vocabulary, no migration directive — and is left untouched.
+    /// fails open as ordinary damage — concretely, the pre-`seq` entry line
+    /// fails the chain's integrity check — with no version vocabulary, no
+    /// migration directive, and the file left untouched.
     #[tokio::test]
     async fn a_foreign_format_file_fails_as_ordinary_damage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let contents = concat!(
+            // An old writer's header: the `version` field this format no
+            // longer carries, tolerated as an unknown field and never judged.
             r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
             "\n",
         );
         tokio::fs::write(&path, contents).await.unwrap();
+        let result = JsonlSessionStorage::open(&path).await;
+        assert!(
+            result.is_err(),
+            "a foreign file is not readable, not convertible"
+        );
         let err = open_err(&path).await;
         assert!(
-            !err.contains("format v")
-                && !err.contains("migration")
-                && !err.contains("UnsupportedFormat"),
+            err.contains("missing its seq field"),
+            "the failure is the ordinary integrity check, not a version gate: {err}"
+        );
+        assert!(
+            !err.contains("format v") && !err.contains("migration"),
             "a foreign file is not sent to a migration: {err}"
         );
         assert_eq!(
@@ -2167,6 +2177,35 @@ mod tests {
         assert_eq!(
             records.iter().map(|r| r.entry.id()).collect::<Vec<_>>(),
             vec!["m1", "m2"]
+        );
+    }
+
+    /// An existing journal's header still opens. The wire header dropped its
+    /// `version` field, and an old writer's file carries one anyway — serde
+    /// tolerates the residue because `SessionHeader` has no
+    /// `deny_unknown_fields`. This pins the read side of the removal: any
+    /// future header strictness (a `deny_unknown_fields`, a renamed field)
+    /// would turn every journal on disk into "damage", and this is the test
+    /// that must fail first.
+    #[tokio::test]
+    async fn an_existing_v4_header_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let contents = concat!(
+            // Old writer's corpus: the `version` field is residue, not the
+            // current format's self-identification.
+            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parentId":null,"seq":0,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+        let storage = JsonlSessionStorage::open(&path).await.unwrap();
+        let storage = TestStorage::new(storage);
+        let records = storage.journal_range(0, u64::MAX).await.unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.entry.id()).collect::<Vec<_>>(),
+            vec!["m1"]
         );
     }
 

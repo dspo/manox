@@ -596,6 +596,9 @@ mod tests {
     /// around the colon: a message line written by an older writer (or a
     /// hand edit)
     /// with `type` NOT first, and with spaced members, still surfaces.
+    /// The `version` field in the header below is an old writer's residue,
+    /// not the current format's self-identification (the wire header no
+    /// longer carries one; readers tolerate it as an unknown field).
     #[tokio::test]
     async fn scan_finds_messages_regardless_of_key_order_and_spacing() {
         let dir = tempfile::tempdir().unwrap();
