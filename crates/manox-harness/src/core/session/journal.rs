@@ -65,14 +65,6 @@ pub enum JournalError {
     Closed,
     /// The cross-process fence stayed held past its budget.
     Busy { path: PathBuf, budget: Duration },
-    /// The file's header names a format this build does not read. The
-    /// journal has one on-disk format; an older file is converted by the
-    /// one-time operator migration, never by the runtime.
-    UnsupportedFormat {
-        path: PathBuf,
-        found: u32,
-        supported: u32,
-    },
     /// The append failed for any other reason.
     Failed(anyhow::Error),
 }
@@ -110,29 +102,6 @@ impl std::fmt::Display for JournalError {
                 "journal write fence stayed held for {budget:?}: {}",
                 path.display()
             ),
-            JournalError::UnsupportedFormat {
-                path,
-                found,
-                supported,
-            } => {
-                if *found > *supported {
-                    write!(
-                        f,
-                        "session journal {} is on format v{found}, written by a newer build; \
-                         this binary reads up to v{supported}. Upgrade the binary to open it",
-                        path.display()
-                    )
-                } else {
-                    write!(
-                        f,
-                        "session journal {} is on format v{found}; this build reads only \
-                         v{supported}. The file predates the current format and must be \
-                         converted by the one-time operator migration \
-                         (`script/migrate-journals.py`)",
-                        path.display()
-                    )
-                }
-            }
             JournalError::Failed(err) => write!(f, "{err:#}"),
         }
     }

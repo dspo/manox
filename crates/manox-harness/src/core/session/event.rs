@@ -1,4 +1,4 @@
-// The event vocabulary of the session log (Session Core, format v4).
+// The event vocabulary of the session log (Session Core).
 //
 // One serde vocabulary is the whole durable schema: the log line IS the
 // wire form of an `Event` wrapped in an `Envelope`. The AHP projection
@@ -235,7 +235,7 @@ pub enum Event {
         timestamp: DateTime<Utc>,
         target_id: Option<String>,
     },
-    // ── v4 journal vocabulary (architecture doc §C.2) ─────────────────────
+    // ── journal vocabulary (architecture doc §C.2) ─────────────────────
     //
     // Everything below extends the durable session log to the full
     // "every observable state change is an entry" surface (L3). The envelope

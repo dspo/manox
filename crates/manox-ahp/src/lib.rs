@@ -8,7 +8,7 @@
 //! [`Host`] over any AHP transport; the desktop uses the in-process transport,
 //! everything else the `/ahp` WebSocket route.
 //!
-//! Layering (architecture doc `docs/ahp-v3-architecture.md`):
+//! Layering (architecture doc `docs/ahp-architecture.md`):
 //!
 //! ```text
 //! manox-harness session jsonl (durable kernel records)

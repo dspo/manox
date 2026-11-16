@@ -9,10 +9,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Format version stamped into a session header. Bumped only when the
-/// header schema itself changes shape; the log carries its own evolution.
-pub const HEADER_FORMAT_VERSION: u32 = 1;
-
 /// Where the session came from. Root sessions are user conversations;
 /// subagent sessions are delegated children whose parent, spawning tool
 /// call, and run id are pinned in the header at spawn time.
@@ -84,7 +80,6 @@ pub struct AgentPreset {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionHeader {
-    pub format_version: u32,
     pub id: String,
     pub created_at: DateTime<Utc>,
     /// The directory the session was created under. Anchors the project
@@ -100,7 +95,6 @@ impl SessionHeader {
     /// A root-session header under `origin_cwd`.
     pub fn new_root(id: String, origin_cwd: String, created_at: DateTime<Utc>) -> Self {
         Self {
-            format_version: HEADER_FORMAT_VERSION,
             id,
             created_at,
             origin_cwd,
@@ -201,9 +195,8 @@ pub fn project_slug(cwd: &str) -> String {
 }
 
 /// The journal file name inside a core session directory (dsh's current
-/// generation name; the format version lives in the journal's header row,
-/// and a future format bump materializes the previous file as
-/// `session.v<N>.jsonl`, dsh's generation scheme).
+/// generation name; the journal has one on-disk format, so there is no
+/// generation suffix — a foreign file is damage, not a predecessor).
 pub const JOURNAL_FILE: &str = "session.jsonl";
 
 #[cfg(test)]
@@ -222,7 +215,6 @@ mod tests {
     fn root_header_round_trips_camel_case() {
         let header = root_header();
         let wire = serde_json::to_value(&header).unwrap();
-        assert_eq!(wire["formatVersion"], HEADER_FORMAT_VERSION);
         assert_eq!(wire["originCwd"], "/Users/x/work/manox");
         assert_eq!(wire["lineage"]["kind"], "root");
         assert!(wire["lineage"].get("parent").is_none());

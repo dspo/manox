@@ -673,7 +673,7 @@ impl AgentSession {
             .await
     }
 
-    /// Append a typed v4 journal entry by wire kind (§C.2); id, parent and
+    /// Append a typed journal entry by wire kind (§C.2); id, parent and
     /// timestamp are assigned at the session's single append point.
     pub async fn append_typed(
         &self,

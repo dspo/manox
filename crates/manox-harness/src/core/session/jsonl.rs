@@ -1,9 +1,8 @@
-// Append-only JSONL session storage (format version 4 — the one on-disk
-// journal format).
+// Append-only JSONL session storage (the one on-disk journal format).
 //
 // Layout of a session file (the caller picks the path — typically a
 // `timestamp_sessionId.jsonl` under a per-cwd directory):
-//   line 0 — a session header: `{"type":"session","version":4,"id":..,"timestamp":..,"cwd":..,"parentSession"?:..,"metadata"?:..}`
+//   line 0 — a session header: `{"type":"session","id":..,"timestamp":..,"cwd":..,"parentSession"?:..,"metadata"?:..}`
 //   line 1.. — session-tree entries, appended in occurrence order. A `leaf`
 //              entry records a cursor move to an older branch point
 //              (`targetId`); any other entry implicitly makes itself the
@@ -26,11 +25,10 @@
 // chain, so line order alone can never make a session unreadable.
 //
 // `open` takes the exact file path. A missing file is created with `metadata`
-// as its header; an existing file must begin with a valid v4 session header,
-// otherwise this errors rather than guessing at a repair. Any other format
-// version is rejected as [`JournalError::UnsupportedFormat`]: the journal has
-// one on-disk format, and older files are an operator migration, not a
-// runtime conversion.
+// as its header; an existing file must begin with a valid session header,
+// otherwise this errors rather than guessing at a repair. The journal has
+// one on-disk format; a file that does not parse as it is a foreign or
+// damaged artifact, not a convertible one.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -42,10 +40,6 @@ use tokio::sync::{Mutex, broadcast};
 use crate::session::journal::{JournalError, JournalWrite};
 use crate::session::{Event, SessionStorage};
 use serde_json::Value as JsonValue;
-
-/// Current on-disk session format version (v4: chain-dense `seq` on every
-/// entry, the journal of architecture doc §C).
-const FORMAT_VERSION: u32 = 4;
 
 /// Broadcast capacity for [`JournalEvent`] subscribers. A lagging subscriber
 /// gets [`broadcast::error::RecvError::Lagged`] and must resynchronize from a
@@ -97,7 +91,6 @@ struct SessionHeader {
     /// Discriminator fixed to `"session"`.
     #[serde(rename = "type")]
     type_tag: String,
-    version: u32,
     id: String,
     timestamp: chrono::DateTime<chrono::Utc>,
     cwd: String,
@@ -172,7 +165,6 @@ impl JsonlSessionStorage {
 
         let header = SessionHeader {
             type_tag: "session".into(),
-            version: FORMAT_VERSION,
             id: metadata.id.clone(),
             timestamp: metadata.created_at,
             cwd: metadata.cwd.clone(),
@@ -220,7 +212,6 @@ impl JsonlSessionStorage {
         }
         let header = SessionHeader {
             type_tag: "session".into(),
-            version: FORMAT_VERSION,
             id: metadata.id.clone(),
             timestamp: metadata.created_at,
             cwd: metadata.cwd.clone(),
@@ -243,7 +234,7 @@ impl JsonlSessionStorage {
 
     /// Open an existing session file at `path`.
     ///
-    /// The file must exist and begin with a valid v4 session header; this
+    /// The file must exist and begin with a valid session header; this
     /// errors rather than guessing at a repair. Unlike [`Self::create`], a
     /// missing or mis-typed path surfaces as an error so a recovery path can
     /// never silently materialize an empty session.
@@ -364,7 +355,7 @@ impl JsonlSessionStorage {
                     ),
                 },
             };
-            lines.push_str(&v4_line(entry, seq)?);
+            lines.push_str(&journal_line(entry, seq)?);
             batch_ids.insert(id.to_string());
             depths.insert(id.to_string(), seq);
             seqs.push(seq);
@@ -498,7 +489,7 @@ impl JsonlSessionStorage {
                 }
             }
         };
-        let line = v4_line(&entry, seq)?;
+        let line = journal_line(&entry, seq)?;
         // A deferred session materializes on the first assistant message: the
         // header plus every buffered entry are written in one shot, so the
         // on-disk order matches the in-memory index. Before
@@ -573,7 +564,6 @@ impl JsonlSessionStorage {
     async fn materialize_locked(&self, extra_line: Option<&str>) -> Result<u64, anyhow::Error> {
         let header = SessionHeader {
             type_tag: "session".into(),
-            version: FORMAT_VERSION,
             id: self.metadata.id.clone(),
             timestamp: self.metadata.created_at,
             cwd: self.metadata.cwd.clone(),
@@ -588,7 +578,7 @@ impl JsonlSessionStorage {
                 let seq = seq_index.get(entry.id()).copied().ok_or_else(|| {
                     anyhow::anyhow!("entry {} missing from seq index", entry.id())
                 })?;
-                content.push_str(&v4_line(entry, seq)?);
+                content.push_str(&journal_line(entry, seq)?);
             }
         }
         if let Some(extra) = extra_line {
@@ -630,7 +620,7 @@ impl JsonlSessionStorage {
         Ok(content.len() as u64)
     }
 
-    // ── v4 journal read face (§C.3) ────────────────────────────────────────
+    // ── journal read face (§C.3) ───────────────────────────────────────
 
     /// Subscribe to ordered journal appends. A lagging receiver sees
     /// [`broadcast::error::RecvError::Lagged`] and must resynchronize via a
@@ -707,10 +697,10 @@ impl JsonlSessionStorage {
     }
 }
 
-/// Serialize one entry as a v4 journal line: the entry's own fields plus the
+/// Serialize one entry as a journal line: the entry's own fields plus the
 /// stamped `seq` (§C.1). The envelope keys are exclusive (§C.1 rule), so
 /// inserting `seq` cannot collide with a payload field.
-fn v4_line(entry: &Event, seq: u64) -> Result<String, anyhow::Error> {
+fn journal_line(entry: &Event, seq: u64) -> Result<String, anyhow::Error> {
     let mut value = serde_json::to_value(entry)?;
     if let Some(obj) = value.as_object_mut() {
         obj.insert("seq".into(), JsonValue::from(seq));
@@ -721,15 +711,13 @@ fn v4_line(entry: &Event, seq: u64) -> Result<String, anyhow::Error> {
 /// Parse and wire-validate one session header line (without touching any
 /// entry line). The shared header half of `load`, extracted for the
 /// repository's bounded scans: a host-membership check or a list row needs
-/// the header only, at microsecond cost. A header on any other format
-/// version is rejected with [`JournalError::UnsupportedFormat`].
-pub fn parse_header_line(path: &Path, line: &[u8]) -> Result<JsonlSessionMetadata, anyhow::Error> {
+/// the header only, at microsecond cost.
+pub fn parse_header_line(line: &[u8]) -> Result<JsonlSessionMetadata, anyhow::Error> {
     let header: JsonValue =
         serde_json::from_slice(line).map_err(|e| anyhow::anyhow!("invalid session header: {e}"))?;
     validate_header_wire(&header)?;
     let header: SessionHeader = serde_json::from_value(header)
         .map_err(|e| anyhow::anyhow!("invalid session header: {e}"))?;
-    reject_unsupported_format(path, header.version)?;
     Ok(JsonlSessionMetadata {
         id: header.id,
         cwd: header.cwd,
@@ -737,20 +725,6 @@ pub fn parse_header_line(path: &Path, line: &[u8]) -> Result<JsonlSessionMetadat
         parent_session_path: header.parent_session,
         metadata: header.metadata,
     })
-}
-
-/// Reject a header naming a format other than the current one. The journal
-/// has exactly one on-disk format; a file written before it is converted by
-/// the one-time operator migration, never by the runtime.
-fn reject_unsupported_format(path: &Path, version: u32) -> Result<(), anyhow::Error> {
-    if version == FORMAT_VERSION {
-        return Ok(());
-    }
-    Err(anyhow::Error::from(JournalError::UnsupportedFormat {
-        path: path.to_path_buf(),
-        found: version,
-        supported: FORMAT_VERSION,
-    }))
 }
 
 /// Everything [`JsonlSessionStorage::load`] derives from one file's bytes.
@@ -798,7 +772,6 @@ fn parse_file(path: &Path, bytes: &[u8]) -> Result<ParsedFile, anyhow::Error> {
     validate_header_wire(&header)?;
     let header: SessionHeader = serde_json::from_value(header)
         .map_err(|e| anyhow::anyhow!("invalid session header: {e}"))?;
-    reject_unsupported_format(path, header.version)?;
     let metadata = JsonlSessionMetadata {
         id: header.id,
         cwd: header.cwd,
@@ -1069,22 +1042,17 @@ fn reparent_entry(entry: &Event, parent: Option<&str>) -> Result<Event, anyhow::
     Ok(serde_json::from_value(value)?)
 }
 
-/// Wire-level header checks on the raw JSON: type identity, a numeric
-/// version, non-empty id and cwd, and — the distinction serde's `Option`
-/// cannot make — a present-but-null `parentSession` or `metadata` is
-/// rejected while an absent one is fine. Shared by `load` (rejecting
-/// damaged files) and `create` (never writing a header its own `open` would
-/// reject). The version's VALUE is judged by
-/// [`reject_unsupported_format`] in the parse entry points.
+/// Wire-level header checks on the raw JSON: type identity, non-empty id
+/// and cwd, and — the distinction serde's `Option` cannot make — a
+/// present-but-null `parentSession` or `metadata` is rejected while an
+/// absent one is fine. Shared by `load` (rejecting damaged files) and
+/// `create` (never writing a header its own `open` would reject).
 fn validate_header_wire(value: &JsonValue) -> Result<(), anyhow::Error> {
     let obj = value
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("session header is not an object"))?;
     if obj.get("type").and_then(JsonValue::as_str) != Some("session") {
         anyhow::bail!("session file first line is not a session header");
-    }
-    if obj.get("version").and_then(JsonValue::as_u64).is_none() {
-        anyhow::bail!("session header is missing version");
     }
     match obj.get("id") {
         Some(JsonValue::String(id)) if !id.is_empty() => {}
@@ -1402,7 +1370,7 @@ mod tests {
     #[tokio::test]
     async fn torn_tail_tolerated_committed_corruption_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let header = "{\"type\":\"session\",\"version\":4,\"id\":\"tt-1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\",\"metadata\":{\"host\":\"manox\"}}";
+        let header = "{\"type\":\"session\",\"id\":\"tt-1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\",\"metadata\":{\"host\":\"manox\"}}";
         let valid = "{\"type\":\"model_change\",\"id\":\"tt-m0\",\"parentId\":null,\"seq\":0,\"timestamp\":\"2026-01-01T00:00:01Z\",\"provider\":\"p\",\"modelId\":\"m\"}";
         let torn = "{\"type\":\"model_ch";
 
@@ -1454,7 +1422,7 @@ mod tests {
     /// Stamp a hand-written fixture as a journal file: every entry line
     /// carries its chain depth as `seq`. Each fixture below is one linear
     /// chain written in order, so the depth is the line's position.
-    fn v4_bytes(contents: &str) -> String {
+    fn journal_bytes(contents: &str) -> String {
         let mut out = String::new();
         for (position, line) in contents.lines().enumerate() {
             if position == 0 {
@@ -2037,7 +2005,10 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(header_line.contains("\"type\":\"session\""));
-        assert!(header_line.contains("\"version\":4"));
+        assert!(
+            !header_line.contains("version"),
+            "the header carries no format-version field: {header_line}"
+        );
     }
 
     /// A header carrying `parentSession` and `metadata` must write those as
@@ -2119,7 +2090,8 @@ mod tests {
     async fn test_open_rejects_blank_first_line() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
-        let header = r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#;
+        let header =
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#;
         tokio::fs::write(&path, format!("\n{header}\n"))
             .await
             .unwrap();
@@ -2133,7 +2105,6 @@ mod tests {
         let path = dir.path().join("session.jsonl");
         let header = serde_json::json!({
             "type": "message",
-            "version": 4,
             "id": "x",
             "timestamp": chrono::Utc::now(),
             "cwd": "/t",
@@ -2145,70 +2116,12 @@ mod tests {
         assert!(err.contains("not a session header"), "{err}");
     }
 
-    /// The journal has one on-disk format: a header naming any other
-    /// version is a typed, actionable rejection — never a conversion.
+    /// The journal has one on-disk format and no version axis: a file
+    /// written before it is a foreign artifact, not a convertible one. It
+    /// fails open as ordinary damage — an untyped parse/integrity error, no
+    /// version vocabulary, no migration directive — and is left untouched.
     #[tokio::test]
-    async fn test_open_rejects_wrong_version() {
-        let dir = tempfile::tempdir().unwrap();
-        for version in [2u32, 3, 5] {
-            let path = dir.path().join(format!("v{version}.jsonl"));
-            let header = serde_json::json!({
-                "type": "session",
-                "version": version,
-                "id": "x",
-                "timestamp": chrono::Utc::now(),
-                "cwd": "/t",
-            });
-            tokio::fs::write(&path, format!("{header}\n"))
-                .await
-                .unwrap();
-            let err = JsonlSessionStorage::open(&path)
-                .await
-                .err()
-                .expect("a non-current format version must be rejected");
-            let typed = err
-                .downcast_ref::<JournalError>()
-                .unwrap_or_else(|| panic!("the rejection is typed: {err}"));
-            assert!(
-                matches!(
-                    typed,
-                    JournalError::UnsupportedFormat {
-                        found,
-                        supported: FORMAT_VERSION,
-                        ..
-                    } if *found == version
-                ),
-                "the error names what it found and what it reads: {typed:?}"
-            );
-            let message = err.to_string();
-            assert!(
-                message.contains(&format!("format v{version}")),
-                "the error names the found version: {message}"
-            );
-            if version < FORMAT_VERSION {
-                assert!(
-                    message.contains("predates the current format")
-                        && message.contains("one-time operator migration"),
-                    "an older file says to convert it: {message}"
-                );
-            } else {
-                assert!(
-                    message.contains("newer build") && message.contains("Upgrade the binary"),
-                    "a future file says to upgrade, not convert: {message}"
-                );
-                assert!(
-                    !message.contains("one-time operator migration"),
-                    "a future file must not be sent to the down-migration: {message}"
-                );
-            }
-        }
-    }
-
-    /// A file on an older journal format is rejected on open with the same
-    /// actionable error, and the file is left untouched (no conversion, no
-    /// rewrite).
-    #[tokio::test]
-    async fn a_v3_file_is_rejected_and_left_untouched() {
+    async fn a_foreign_format_file_fails_as_ordinary_damage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let contents = concat!(
@@ -2220,10 +2133,10 @@ mod tests {
         tokio::fs::write(&path, contents).await.unwrap();
         let err = open_err(&path).await;
         assert!(
-            err.contains("is on format v3")
-                && err.contains("this build reads only v4")
-                && err.contains("must be converted by the one-time operator migration"),
-            "the v3 rejection is actionable: {err}"
+            !err.contains("format v")
+                && !err.contains("migration")
+                && !err.contains("UnsupportedFormat"),
+            "a foreign file is not sent to a migration: {err}"
         );
         assert_eq!(
             tokio::fs::read_to_string(&path).await.unwrap(),
@@ -2232,13 +2145,13 @@ mod tests {
         );
     }
 
-    /// A v4 fixture opens and reads back its chain.
+    /// A session fixture opens and reads back its chain.
     #[tokio::test]
-    async fn a_v4_file_opens_and_reads() {
+    async fn a_session_file_opens_and_reads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"message","id":"m1","parentId":null,"seq":0,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
             "\n",
@@ -2508,7 +2421,7 @@ mod tests {
         // (camelCase thinkingLevel), and a message whose inner timestamp is
         // integer millis. No `leaf` entry.
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"model_change","id":"c1","parentId":null,"timestamp":"2026-05-28T07:13:46.617Z","provider":"anthropic","modelId":"claude-opus-4-7"}"#,
             "\n",
@@ -2517,7 +2430,9 @@ mod tests {
             r#"{"type":"message","id":"m1","parentId":"t1","timestamp":"2026-05-28T07:14:32.753Z","message":{"role":"user","content":[{"type":"text","text":"hello"}],"timestamp":1779952472751}}"#,
             "\n",
         );
-        tokio::fs::write(&path, v4_bytes(contents)).await.unwrap();
+        tokio::fs::write(&path, journal_bytes(contents))
+            .await
+            .unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
         let storage = TestStorage::new(storage);
@@ -2585,14 +2500,16 @@ mod tests {
         // Real sessions carry `custom` entries whose `data` is either a
         // plain string or a JSON object. Both must load and expose id/parentId.
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"custom","id":"x1","parentId":null,"timestamp":"2026-05-28T07:13:46.617Z","customType":"note","data":"a plain string"}"#,
             "\n",
             r#"{"type":"custom","id":"x2","parentId":"x1","timestamp":"2026-05-28T07:13:46.617Z","customType":"flag","data":{"on":true,"n":3}}"#,
             "\n",
         );
-        tokio::fs::write(&path, v4_bytes(contents)).await.unwrap();
+        tokio::fs::write(&path, journal_bytes(contents))
+            .await
+            .unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
         let storage = TestStorage::new(storage);
@@ -2650,7 +2567,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             // branch_summary: flat (summary is a string, fromId present),
             // not a nested object.
@@ -2676,7 +2593,9 @@ mod tests {
             r#"{"type":"leaf","id":"lf1","parentId":"cu1","timestamp":"2026-05-28T07:13:46.617Z","targetId":"b1"}"#,
             "\n",
         );
-        tokio::fs::write(&path, v4_bytes(contents)).await.unwrap();
+        tokio::fs::write(&path, journal_bytes(contents))
+            .await
+            .unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
         let storage = TestStorage::new(storage);
@@ -2898,7 +2817,7 @@ mod tests {
         // a compaction keeping from m2 onward (firstKeptEntryId, no tail
         // payload), then a post-compaction message. No `leaf` entry.
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"first question"}],"timestamp":1779952440000}}"#,
             "\n",
@@ -2911,7 +2830,9 @@ mod tests {
             r#"{"type":"message","id":"m4","parentId":"c1","timestamp":"2026-05-28T07:15:30.000Z","message":{"role":"user","content":[{"type":"text","text":"after compaction"}],"timestamp":1779952530000}}"#,
             "\n",
         );
-        tokio::fs::write(&path, v4_bytes(contents)).await.unwrap();
+        tokio::fs::write(&path, journal_bytes(contents))
+            .await
+            .unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
         let storage = TestStorage::new(storage);
@@ -2965,7 +2886,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"model_change","id":"mc","parentId":null,"timestamp":"2026-05-28T07:13:46.617Z","provider":"anthropic","modelId":"claude-opus-4-7"}"#,
             "\n",
@@ -2976,7 +2897,9 @@ mod tests {
             r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-05-28T07:14:10.000Z","message":{"role":"assistant","content":null,"model":"claude-opus-4-7","provider":"anthropic","api":"anthropic","stopReason":"stop","timestamp":1779952450000}}"#,
             "\n",
         );
-        tokio::fs::write(&path, v4_bytes(contents)).await.unwrap();
+        tokio::fs::write(&path, journal_bytes(contents))
+            .await
+            .unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
         let storage = TestStorage::new(storage);
@@ -3013,14 +2936,16 @@ mod tests {
         // The wire shape a real session file carries: kebab row name,
         // camelCase envelope, kebab `mode` value.
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"access_mode_change","id":"am1","parentId":null,"timestamp":"2026-05-28T07:13:46.617Z","mode":"sandbox"}"#,
             "\n",
             r#"{"type":"access_mode_change","id":"am2","parentId":"am1","timestamp":"2026-05-28T07:14:46.617Z","mode":"full-access"}"#,
             "\n",
         );
-        tokio::fs::write(&path, v4_bytes(contents)).await.unwrap();
+        tokio::fs::write(&path, journal_bytes(contents))
+            .await
+            .unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
         let storage = TestStorage::new(storage);
@@ -3073,15 +2998,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
             "\n",
             r#"{"type":"message","id":"m2","parentId":"ghost","timestamp":"2026-05-28T07:14:10.000Z","message":{"role":"user","content":[{"type":"text","text":"two"}],"timestamp":1779952450000}}"#,
             "\n",
         );
-        tokio::fs::write(&path, v4_bytes(contents)).await.unwrap();
-        // v4 load validation: the unknown parent surfaces at open, naming it.
+        tokio::fs::write(&path, journal_bytes(contents))
+            .await
+            .unwrap();
+        // Load validation: the unknown parent surfaces at open, naming it.
         let err = match JsonlSessionStorage::open(&path).await {
             Err(e) => e,
             Ok(_) => panic!("open must reject a session whose chain references an unknown parent"),
@@ -3118,7 +3045,7 @@ mod tests {
         // The inverted fixture: a child line lands before its parent while
         // every seq stays truthful.
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-09-11T08:25:14.336062Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-09-11T08:25:14.336062Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"message","id":"x","parentId":null,"timestamp":"2026-09-11T08:25:20.000Z","seq":0,"message":{"role":"user","content":[{"type":"text","text":"x"}],"timestamp":1770000000000}}"#,
             "\n",
@@ -3222,7 +3149,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-09-11T08:25:14.336062Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-09-11T08:25:14.336062Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"message","id":"x","parentId":null,"timestamp":"2026-09-11T08:25:20.000Z","seq":0,"message":{"role":"user","content":[{"type":"text","text":"x"}],"timestamp":1770000000000}}"#,
             "\n",
@@ -3293,14 +3220,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"message","id":"m1","parentId":"m2","timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
             "\n",
             r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-05-28T07:14:10.000Z","message":{"role":"user","content":[{"type":"text","text":"two"}],"timestamp":1779952450000}}"#,
             "\n",
         );
-        tokio::fs::write(&path, v4_bytes(contents)).await.unwrap();
+        tokio::fs::write(&path, journal_bytes(contents))
+            .await
+            .unwrap();
         let err = open_err(&path).await;
         assert!(err.contains("cycle"), "the error names the cycle: {err}");
     }
@@ -3402,14 +3331,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
             "\n",
             r#"{"type":"message","id":"m1","parentId":"m1","timestamp":"2026-05-28T07:14:10.000Z","message":{"role":"user","content":[{"type":"text","text":"two"}],"timestamp":1779952450000}}"#,
             "\n",
         );
-        tokio::fs::write(&path, v4_bytes(contents)).await.unwrap();
+        tokio::fs::write(&path, journal_bytes(contents))
+            .await
+            .unwrap();
         let err = JsonlSessionStorage::open(&path)
             .await
             .err()
@@ -3494,11 +3425,11 @@ mod tests {
         for (field, header) in [
             (
                 "id",
-                r#"{"type":"session","version":4,"id":"","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+                r#"{"type":"session","id":"","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             ),
             (
                 "cwd",
-                r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":""}"#,
+                r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":""}"#,
             ),
         ] {
             let path = dir.path().join(format!("bad-{field}.jsonl"));
@@ -3523,12 +3454,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"message","id":"m1","timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
             "\n",
         );
-        tokio::fs::write(&path, v4_bytes(contents)).await.unwrap();
+        tokio::fs::write(&path, journal_bytes(contents))
+            .await
+            .unwrap();
         let err = JsonlSessionStorage::open(&path)
             .await
             .err()
@@ -3543,12 +3476,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let contents = concat!(
-            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
             "\n",
             r#"{"type":"leaf","id":"leaf1","parentId":null,"timestamp":"2026-05-28T07:14:00.000Z"}"#,
             "\n",
         );
-        tokio::fs::write(&path, v4_bytes(contents)).await.unwrap();
+        tokio::fs::write(&path, journal_bytes(contents))
+            .await
+            .unwrap();
         let err = JsonlSessionStorage::open(&path)
             .await
             .err()
@@ -3564,11 +3499,11 @@ mod tests {
         for (field, header) in [
             (
                 "metadata",
-                r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj","metadata":null}"#,
+                r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj","metadata":null}"#,
             ),
             (
                 "parentSession",
-                r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj","parentSession":null}"#,
+                r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj","parentSession":null}"#,
             ),
         ] {
             let path = dir.path().join(format!("bad-{field}.jsonl"));
@@ -3603,8 +3538,8 @@ mod tests {
         }
     }
 
-    // ── v4 journal semantics (§C.1, L4/L5) ────────────────────────────────
-    mod v4 {
+    // ── journal semantics (§C.1, L4/L5) ───────────────────────────────
+    mod journal_semantics {
         use super::*;
 
         fn user_message(id: &str, parent: Option<&str>, text: &str) -> Event {
@@ -3679,7 +3614,7 @@ mod tests {
                 matches!(&range[2].entry, Event::ToolCall { call_id, .. } if call_id == "call-9")
             );
 
-            // Reopen: v4 header, dense stamped lines, same chain.
+            // Reopen: stamped dense lines, same chain.
             drop(storage);
             let reopened = JsonlSessionStorage::open(&path).await.unwrap();
             let reopened = TestStorage::new(reopened);
@@ -3904,7 +3839,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("session.jsonl");
             let contents = concat!(
-                r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+                r#"{"type":"session","id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
                 "\n",
                 r#"{"type":"message","id":"m1","parentId":null,"seq":0,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
                 "\n",
@@ -3914,7 +3849,7 @@ mod tests {
             tokio::fs::write(&path, contents).await.unwrap();
             let err = match JsonlSessionStorage::open(&path).await {
                 Err(e) => e,
-                Ok(_) => panic!("v4 load must reject a stored seq that diverges from chain depth"),
+                Ok(_) => panic!("load must reject a stored seq that diverges from chain depth"),
             };
             assert!(
                 err.to_string().contains("chain depth"),
@@ -4064,9 +3999,8 @@ mod tests {
     #[tokio::test]
     async fn message_lines_without_origin_key_deserialize_to_none() {
         let ts = "2020-01-01T00:00:01Z";
-        let header = |id: &str| {
-            format!(r#"{{"type":"session","version":4,"id":"{id}","cwd":"/t","timestamp":"{ts}"}}"#)
-        };
+        let header =
+            |id: &str| format!(r#"{{"type":"session","id":"{id}","cwd":"/t","timestamp":"{ts}"}}"#);
         // Build a message line from a real serialized `AgentMessage`,
         // deliberately omitting the `origin` key (the pre-T5b wire form).
         // `message` round-trips whatever the current `AgentMessage` repr is,
@@ -4105,14 +4039,14 @@ mod tests {
             error_message: None,
             timestamp: chrono::Utc::now(),
         };
-        let v4 = vec![
+        let lines = vec![
             header("s4"),
             message_line(0, "m1", None, AgentMessage::user("a")),
             message_line(1, "m2", Some("m1"), assistant),
         ];
 
         let dir = tempfile::tempdir().unwrap();
-        let (name, lines) = ("lines_without_origin.jsonl", v4);
+        let (name, lines) = ("lines_without_origin.jsonl", lines);
         let path = dir.path().join(name);
         // Assert the raw sample genuinely has no origin key before writing.
         assert!(

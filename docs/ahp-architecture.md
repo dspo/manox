@@ -26,7 +26,7 @@ manox-ahp host
    ├─ x-manox 扩展面（plan / work / metrics / thread / workspaces / commands）
    └─ resource* 最小面（工作目录围栏内）
            ▲ journal 条目全射翻译
-manox 内核 ThreadCore + Journal v4（磁盘 .jsonl，生态工具仍可直读）
+manox 内核 ThreadCore + Journal（磁盘 .jsonl，生态工具仍可直读）
 ```
 
 一句话：**journal（磁盘 .jsonl）是唯一 durable 权威；`manox-ahp` host 把 journal 追加全射翻译成
@@ -163,16 +163,11 @@ journal 的每一行都是持久事实：消息、工具、turn 边界、配置�
 - 身份只在 journal 首行 header 出现一次，此后永不改写；血缘（parent/toolCallId/runId/depth）是
   header 字段，不是可变旁册指针。
 
-### C.3 v4 读面
+### C.3 读面
 
-- 磁盘只有一个格式版本（`FORMAT_VERSION = 4`）；别的版本在 open 时以可操作的错误拒绝，
-  文件原样不动（转换是一次性 operator migration，运行时从不重写）。旧版本用
-  `python3 script/migrate-journals.py`（默认 dry-run，`--apply` 执行，`--backup` 指定备份；
-  同时把平铺 `sessions/` 归位到 core 布局、把命令文件里的 `$ARGUMENTS` 改写为
-  `{{ arguments }}`）。脚本默认 dry-run，替换前逐文件备份，对每个 journal 取非阻塞
-  `flock`：有活写者时显式跳过该文件而不是与其竞争；平铺副本比 core 新时报告冲突并保持
-  原样。未来版本（`found > 4`）不给转换建议，要求升级二进制。脚本属于格式所有者（本仓）
-  的一次性工具，桌面发行版需要在发布物/发布说明中提供或链接它。
+- 磁盘只有一种格式，没有版本轴：header 不携带版本字段，journal 没有 `FORMAT_VERSION`
+  门禁、没有版本化错误文案、没有迁移脚本。非本格式形状的文件在 open 时以普通损坏报错
+  （不是可转换的旧格式），文件原样不动。
 - 打开校验：header 必须合法；每条链的 parent 必须存在、无环、`seq` 等于链深；坏文件报错而不是
   猜一种修复。
 - 读接口：`journal_range` 以链序返回记录；活动 leaf 是**最后写入行**的 cursor（通常是文件序

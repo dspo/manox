@@ -930,7 +930,7 @@ impl<S: SessionStorage + 'static> Session<S> {
             .id)
     }
 
-    /// Append a typed v4 journal entry by its wire kind (§C.2). The payload
+    /// Append a typed journal entry by its wire kind (§C.2). The payload
     /// object's keys must match the variant's camelCase field names;
     /// `id`/`parentId`/`timestamp` are assigned by the writer so the chain
     /// stays single-writer. `message`/`compaction` are refused — they own
@@ -1735,7 +1735,7 @@ pub enum EntryType {
     Leaf,
     AnnotationSet,
     AnnotationRemoved,
-    // ── v4 journal vocabulary (§C.2) ──────────────────────────────────────
+    // ── journal vocabulary (§C.2) ──────────────────────────────────────
     UiNote,
     TurnStart,
     TurnFinish,
