@@ -125,6 +125,16 @@ pub mod actions {
     /// reopen. AHP's `ReasoningResponsePart` carries text only, so the timing
     /// rides here keyed by the part id. A reasoning part without a timing row
     /// predates the anchor — clients degrade to the durationless label.
+    ///
+    /// Two contract edges clients must know:
+    /// - a run resumed over a seed (host restart mid-thinking) keeps its
+    ///   part id but re-anchors at its first post-seed delta, so the
+    ///   reopened seconds are shorter than the run's real thinking time.
+    ///   That is the contract, not a bug — the pre-restart stamps are not
+    ///   in the replayed window.
+    /// - `durationMs: 0` means the run settled within the same millisecond
+    ///   as its first delta (<1ms). Clients hide the duration or render
+    ///   "<1s"; "thought for 0s" is a misreading.
     pub const REASONING_TIMING: &str = "x-manox/reasoningTiming";
 
     /// Every declared action.

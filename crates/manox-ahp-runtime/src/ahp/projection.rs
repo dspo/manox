@@ -538,13 +538,17 @@ impl OpenTurn {
         }))
     }
 
-    /// [`Self::thinking_timing_row`] for a turn that keeps living: the row is
-    /// returned once and the clock is cleared, so a restated run re-anchors
-    /// at its own first delta instead of inheriting a stale start.
+    /// [`Self::thinking_timing_row`] plus the whole run's close: the row is
+    /// returned once and the run is forgotten — clock AND part slot — so
+    /// "one settled run, one timing row, one part id" lives here rather than
+    /// at each close site's `close_runs()` discipline. The row is built
+    /// before the slot clears (it is keyed by the part id); a restated run
+    /// re-anchors at its own first delta under a fresh part.
     fn take_thinking_timing(&mut self) -> Option<Value> {
         let row = self.thinking_timing_row()?;
         self.thinking_started_at = None;
         self.thinking_last_at = None;
+        self.reasoning_part = None;
         Some(row)
     }
 }
@@ -617,7 +621,9 @@ pub struct Translator {
     /// The metrics channel of the chat being folded, set by every `on_entry`
     /// call. The reasoning-timing close sites hold only the chat uri and
     /// cannot re-derive the extension channel from it, so the fold carries
-    /// the target alongside.
+    /// the target alongside. Only `on_entry` sets it — `seed()` and
+    /// `open_with_id()` do not — and every emission path is reached from
+    /// inside an `on_entry` fold, so the uri is always the current chat's.
     metrics: String,
 }
 
@@ -2086,12 +2092,12 @@ impl Translator {
         let (part_id, opening, settled_timing) = {
             let turn = self.open.as_mut().expect("ensure_turn opened one");
             // A text delta closes any open thinking run and opens the reply's
-            // text: publish the run's settled timing before its part slot is
-            // dropped. Both stamps are journal timestamps, so a replay
-            // restates the identical row.
+            // text: publish the run's settled timing — `take` drops the part
+            // slot along with the clock — before the reply's own slot opens.
+            // Both stamps are journal timestamps, so a replay restates the
+            // identical row.
             let settled_timing = if matches!(run, Run::Text) {
                 let timing = turn.take_thinking_timing();
-                turn.reasoning_part = None;
                 turn.streamed_text = true;
                 timing
             } else {
@@ -5368,6 +5374,163 @@ mod fold_semantics_tests {
         assert_eq!(
             timing["durationMs"], 8000,
             "the run's own stamps, not the turn's 19s: {timing}"
+        );
+    }
+
+    /// The two most common in-flight closes in one realistic shape —
+    /// thinking → tool call → thinking → reply — each publishing its run's
+    /// row exactly once. The one way this design fails is a doubled row: the
+    /// registry upserts by part id, so a boundary restatement would
+    /// silently overwrite the first row with a later `last` stamp and
+    /// inflate the seconds. Every reasoning part id must appear exactly
+    /// once in the fold's metrics emissions.
+    #[test]
+    fn interleaved_thinking_runs_publish_exactly_one_row_per_part() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "plan the ports"}]},
+                "origin": "rpc-1",
+            })),
+            kernel(json!({"type": "agent_thinking_delta", "id": "sentry-1",
+                          "delta": "weighing 443 vs 8443.",
+                          "timestamp": "2026-10-09T00:00:01.000Z"})),
+            kernel(json!({"type": "agent_thinking_delta", "id": "sentry-2",
+                          "delta": "needs the upstream too.",
+                          "timestamp": "2026-10-09T00:00:01.500Z"})),
+            kernel(
+                json!({"type": "tool_call", "id": "sentry-3", "callId": "t-1",
+                          "name": "bash", "title": "run", "status": "running", "input": {},
+                          "timestamp": "2026-10-09T00:00:02.000Z"}),
+            ),
+            kernel(json!({"type": "agent_thinking_delta", "id": "sentry-4",
+                          "delta": "second round.",
+                          "timestamp": "2026-10-09T00:00:04.000Z"})),
+            kernel(json!({"type": "agent_thinking_delta", "id": "sentry-5",
+                          "delta": " settled on 443.",
+                          "timestamp": "2026-10-09T00:00:04.500Z"})),
+            kernel(json!({"type": "agent_text_delta", "id": "sentry-6",
+                          "delta": "Use 443.",
+                          "timestamp": "2026-10-09T00:00:05.000Z"})),
+            kernel(json!({"type": "turn_finish", "id": "sentry-7",
+                          "cancelled": false, "failed": false, "strandedSteerIds": [],
+                          "timestamp": "2026-10-09T00:00:20.000Z"})),
+        ];
+
+        let mut translator = Translator::new();
+        let mut reasoning_part_ids = Vec::new();
+        let mut timing_rows = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatResponsePart(part) = &emitted.action
+                    && let ResponsePart::Reasoning(r) = &part.part
+                {
+                    reasoning_part_ids.push(r.id.clone());
+                }
+                if emitted.channel == "x-manox-metrics:/c-1" {
+                    timing_rows.push(serde_json::to_value(&emitted.action).unwrap());
+                }
+            }
+        }
+
+        assert_eq!(
+            reasoning_part_ids,
+            ["p-sentry-1", "p-sentry-4"],
+            "two runs, two parts"
+        );
+        assert_eq!(
+            timing_rows.len(),
+            2,
+            "exactly one row per run — the turn boundary adds none: {timing_rows:?}"
+        );
+        let first = &timing_rows[0]["timing"];
+        let second = &timing_rows[1]["timing"];
+        assert_eq!(first["partId"], "p-sentry-1");
+        assert_eq!(first["durationMs"], 500, "closed by the tool call: {first}");
+        assert_eq!(second["partId"], "p-sentry-4");
+        assert_eq!(
+            second["durationMs"], 500,
+            "closed by the reply text: {second}"
+        );
+    }
+
+    /// The settled-row close: a streamed thinking run survives the settled
+    /// row that publishes its reply's text (the thinking mirror keeps the
+    /// part for a lost-race tail), and the NEXT settled row — with nothing
+    /// streamed since — is the closer. One part, one row, the run's own
+    /// stamps.
+    #[test]
+    fn a_streamed_run_closes_at_the_next_settled_row() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "plan the ports"}]},
+                "origin": "rpc-1",
+            })),
+            kernel(json!({"type": "agent_thinking_delta", "id": "sentry-1",
+                          "delta": "weighing 443 vs 8443.",
+                          "timestamp": "2026-10-09T00:00:01.000Z"})),
+            kernel(json!({"type": "agent_thinking_delta", "id": "sentry-2",
+                          "delta": " 8443 needs the upstream too.",
+                          "timestamp": "2026-10-09T00:00:04.500Z"})),
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-3",
+                "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "Use 443."}],
+                            "model": "test-model", "provider": "test", "api": "anthropic",
+                            "usage": {"input": 120, "output": 30}},
+                "timestamp": "2026-10-09T00:00:05.000Z"
+            })),
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-4",
+                "message": {"role": "assistant",
+                            "content": [{"type": "text", "text": "Done."}],
+                            "model": "test-model", "provider": "test", "api": "anthropic",
+                            "usage": {"input": 130, "output": 32}},
+                "timestamp": "2026-10-09T00:00:06.000Z"
+            })),
+            kernel(json!({"type": "turn_finish", "id": "sentry-5",
+                          "cancelled": false, "failed": false, "strandedSteerIds": [],
+                          "timestamp": "2026-10-09T00:00:20.000Z"})),
+        ];
+
+        let mut translator = Translator::new();
+        let mut reasoning_part_ids = Vec::new();
+        let mut timing_rows = Vec::new();
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatResponsePart(part) = &emitted.action
+                    && let ResponsePart::Reasoning(r) = &part.part
+                {
+                    reasoning_part_ids.push(r.id.clone());
+                }
+                if emitted.channel == "x-manox-metrics:/c-1" {
+                    timing_rows.push(serde_json::to_value(&emitted.action).unwrap());
+                }
+            }
+        }
+
+        assert_eq!(
+            reasoning_part_ids,
+            ["p-sentry-1"],
+            "the mirror keeps one part across the streamed row"
+        );
+        assert_eq!(
+            timing_rows.len(),
+            1,
+            "the run closes at the next settled row, once: {timing_rows:?}"
+        );
+        let timing = &timing_rows[0]["timing"];
+        assert_eq!(timing["partId"], "p-sentry-1");
+        assert_eq!(
+            timing["durationMs"], 3500,
+            "the run's own stamps, not the rows' timestamps: {timing}"
         );
     }
 

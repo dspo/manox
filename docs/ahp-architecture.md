@@ -54,7 +54,7 @@ L3–L12 不变式的逐条现状见 §C。
 | `ahp-terminal:/<id>` | terminal | `data`/`input`/`resized`/`claimed`/`exited`；多客户端同权 |
 | `x-manox-plan:/<chat-id>` | 执行计划文档 | `plan_update` 的投影 |
 | `x-manox-work:/<session-id>` | goal / 后台任务 / browser suites / 子代理树（depth/branch/agent_label）与常驻 child-run 名册 | AHP 缺口补齐 |
-| `x-manox-metrics:/<chat-id>` | 会话聚合 | turns/messages/per-model usage/成本/context%/git stats，按 cursor 变更推送 |
+| `x-manox-metrics:/<chat-id>` | 会话聚合 | turns/messages/per-model usage/成本/context%/git stats，按 cursor 变更推送；另有 reasoning 耗时锚点（partId → startedAt/durationMs） |
 | `x-manox-thread:/<session-id>` | thread 行 | pin、label、session info、leaf 游标 |
 | `x-manox-workspaces://` | `manox-workspace` 域 | 目录行 + 有序会话账 + 全局 archive 集 |
 | `x-manox-commands://` | 命令/skill 目录 | stateless 快照 + 变更通知 |
@@ -104,6 +104,7 @@ granted-root 围栏内）。
 - terminal：`terminal/data`、`terminal/claimed`、`terminal/exited`；
 - x-manox：`x-manox-plan/planChanged`；`x-manox-work/goalChanged`、`backgroundTasksChanged`、
   `childRunsChanged`、`browserSuitesChanged`、`activeToolsChanged`；`x-manox-metrics/changed`；
+  `x-manox/reasoningTiming`（reasoning 耗时锚点，partId → startedAt/durationMs）；
   `x-manox-workspaces/baseline|changed|removed`；`x-manox/baseline`；
   `x-manox/pinnedChanged`、`orderChanged`、`archivedChanged`、`aliasChanged`、`labelChanged`、
   `sessionInfoChanged`、`leafChanged`。
@@ -197,7 +198,7 @@ journal 的每一行都是持久事实：消息、工具、turn 边界、配置�
 |---|---|
 | `x-manox-plan:/<chat-id>` | 执行计划文档（`planChanged` ← journal `plan_update`）；plan 开关与 plan 评审不存在 |
 | `x-manox-work:/<session-id>` | goal、后台任务、browser suites 运行态、子代理树（depth/branch/agent_label）、常驻 child-run 名册 |
-| `x-manox-metrics:/<chat-id>` | 会话聚合：turns/messages、per-model usage、成本、context%、git stats，按 cursor 变更推送 |
+| `x-manox-metrics:/<chat-id>` | 会话聚合：turns/messages、per-model usage、成本、context%、git stats，按 cursor 变更推送；另有 reasoning 耗时锚点（`reasoningTiming`：partId → startedAt/durationMs） |
 | `x-manox-thread:/<session-id>` | thread 行：pin、label、session info、leaf 游标 |
 | `x-manox-workspaces://` | `manox-workspace` 域：目录行 + 有序会话账 + 全局 archive 集 |
 | `x-manox-commands://` | 命令/skill 目录：stateless 快照 + 变更通知 |
