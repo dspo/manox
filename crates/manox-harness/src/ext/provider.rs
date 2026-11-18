@@ -1,7 +1,8 @@
 //! Native provider registration: reads the cx-style provider config
-//! (`~/.manox/cx.providers.config.yaml` — this project's native
-//! provider format) and registers every provider × wire_api endpoint into
-//! the kernel's [`crate::core::ProviderRegistry`].
+//! (`$MANOX_HOME/cx.providers.config.yaml`, defaulting to
+//! `~/.manox/cx.providers.config.yaml` — this project's native provider
+//! format) and registers every provider × wire_api endpoint into the
+//! kernel's [`crate::core::ProviderRegistry`].
 //!
 //! Extension autonomy: this module owns
 //! its own config schema and credential resolution and hands the kernel
@@ -19,11 +20,12 @@ use serde::Deserialize;
 
 const CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
 
-/// The default provider config path: `$HOME/.manox/cx.providers.config.yaml`.
+/// The default provider config path:
+/// `$MANOX_HOME/cx.providers.config.yaml`, else
+/// `$HOME/.manox/cx.providers.config.yaml` (`.` when no home resolves).
 pub fn default_config_path() -> PathBuf {
-    dirs::home_dir()
+    crate::home::manox_home()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".manox")
         .join(CONFIG_FILE_NAME)
 }
 
@@ -705,6 +707,16 @@ fn effective_agents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The config follows `MANOX_HOME`: an embedder that relocates the state
+    /// root must not keep reading the old `$HOME/.manox` document.
+    #[test]
+    fn default_config_path_honors_manox_home_env() {
+        let _lock = crate::home::test_support::ENV_LOCK.lock().unwrap();
+        let root = Path::new("/tmp/manox-provider-config-home");
+        let _guard = crate::home::test_support::ManoxHomeGuard::set(root);
+        assert_eq!(default_config_path(), root.join(CONFIG_FILE_NAME));
+    }
 
     /// Fixture shaped like the live config: two providers sharing a model
     /// id, `[1m]` suffixes, an empty `{}` model entry, wire_apis

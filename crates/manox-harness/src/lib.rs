@@ -12,6 +12,11 @@
 pub mod core;
 pub mod ext;
 
+// The state-home resolver shared by both layers. Private: the host crate sits
+// above the harness, so it cannot be the common dependency, and this is not
+// part of the public surface (the host has `manox_agent::paths`).
+mod home;
+
 // Re-export core modules so downstream crates can use
 // `manox_harness::tools::bash::BashTool` etc.
 pub use core::agent;

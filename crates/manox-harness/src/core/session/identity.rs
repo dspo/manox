@@ -141,20 +141,18 @@ impl SessionHeader {
     }
 }
 
-/// Mint a fresh session id (the claim driver's `Mint` arm and the swarm's
-/// child-id mint share this).
 /// A session's directory under the core root
-/// (`~/.manox/core/<project-slug>/<id>`). The state home follows the same
-/// resolution the provider config uses (`$HOME/.manox`).
+/// (`<state home>/core/<project-slug>/<id>`). The state home follows the same
+/// resolution the provider config uses: `MANOX_HOME`, else `$HOME/.manox`,
+/// else the process cwd (`./.manox`, matching the pre-existing no-HOME path).
 pub fn core_session_dir_for(cwd: &str, id: &str) -> std::path::PathBuf {
-    let home = std::env::var_os("HOME")
-        .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
-    home.join(".manox")
-        .join("core")
-        .join(project_slug(cwd))
-        .join(id)
+    let root = crate::home::manox_home_from_env()
+        .unwrap_or_else(|| std::path::PathBuf::from(".").join(".manox"));
+    root.join("core").join(project_slug(cwd)).join(id)
 }
 
+/// Mint a fresh session id (the claim driver's `Mint` arm and the swarm's
+/// child-id mint share this).
 pub fn mint_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -202,6 +200,21 @@ pub const JOURNAL_FILE: &str = "session.jsonl";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Child session directories move with `MANOX_HOME`; a relocated root
+    /// must not leave subagent journals in the old `$HOME/.manox`.
+    #[test]
+    fn core_session_dir_honors_manox_home_env() {
+        let _lock = crate::home::test_support::ENV_LOCK.lock().unwrap();
+        let root = std::path::Path::new("/tmp/manox-session-home");
+        let _guard = crate::home::test_support::ManoxHomeGuard::set(root);
+        assert_eq!(
+            core_session_dir_for("/Users/x/work", "s-1"),
+            root.join("core")
+                .join(project_slug("/Users/x/work"))
+                .join("s-1")
+        );
+    }
 
     fn root_header() -> SessionHeader {
         SessionHeader::new_root(

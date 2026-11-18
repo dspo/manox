@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 
 /// File-effect policy for confined bash and the fs write fence: the access
 /// mode a call runs under. `sandbox` confines writes to the workspace root,
-/// the manox state home (`~/.manox`), and platform temp areas; `full-access`
-/// bypasses confinement. Persisted in the session sidecar (wire field
-/// `access_mode`, kebab values).
+/// the manox state home (`MANOX_HOME`, default `~/.manox`), and platform temp
+/// areas; `full-access` bypasses confinement. Persisted in the session
+/// sidecar (wire field `access_mode`, kebab values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AccessMode {
@@ -323,16 +323,18 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
-/// `$HOME/.manox` — the manox state home (plans, settings, sessions, agent
-/// definitions), part of the `sandbox` writable scope so session state such
-/// as plan files needs no escalation. `None` when the home dir
-/// does not resolve — the host then places its state under the process cwd,
-/// which the workspace root already admits. The host resolves its home from
-/// `$HOME` (cwd fallback), this uses `dirs::home_dir()` (passwd fallback) —
-/// the only divergence is with `$HOME` unset, where this admits the
-/// passwd-home `.manox`, a lexical root matching nothing unless it exists.
+/// The manox state home (plans, settings, sessions, agent definitions),
+/// part of the `sandbox` writable scope so session state such as plan files
+/// needs no escalation. `MANOX_HOME` overrides the root wholesale; the
+/// default is `$HOME/.manox`, with the platform passwd entry standing in when
+/// `HOME` is unset. `None` when no home resolves — the host then places its
+/// state under the process cwd, which the workspace root already admits.
+///
+/// The extension layer resolves this itself (`crate::home`) rather than
+/// calling `manox_agent::paths::manox_home`: the host crate depends on the
+/// harness, so the reverse import would invert the dependency.
 pub fn manox_home() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".manox"))
+    crate::home::manox_home()
 }
 
 /// The roots one confined execution may WRITE under — the sandbox mode's
@@ -514,6 +516,7 @@ mod tests {
 
     #[test]
     fn writable_roots_include_manox_home() {
+        let _lock = crate::home::test_support::ENV_LOCK.lock().unwrap();
         let Some(home) = manox_home() else {
             return; // no home dir to admit
         };
@@ -521,6 +524,18 @@ mod tests {
         assert!(roots.contains(&canonicalize_best_effort(&home)));
         // Full access is never fenced, so it has no root list.
         assert!(writable_roots(AccessMode::FullAccess, Path::new("/tmp/ws")).is_empty());
+    }
+
+    /// A relocated state root (an embedder's `MANOX_HOME`) is the path the
+    /// sandbox admits — the old `$HOME/.manox` fallback must not shadow it.
+    #[test]
+    fn manox_home_honors_manox_home_env() {
+        let _lock = crate::home::test_support::ENV_LOCK.lock().unwrap();
+        let root = Path::new("/tmp/manox-harness-env-home");
+        let _guard = crate::home::test_support::ManoxHomeGuard::set(root);
+        assert_eq!(manox_home(), Some(root.to_path_buf()));
+        let roots = writable_roots(AccessMode::Sandbox, Path::new("/tmp/ws"));
+        assert!(roots.contains(&canonicalize_best_effort(root)));
     }
 
     #[test]
