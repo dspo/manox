@@ -118,7 +118,9 @@ impl TaskEntry {
 
     /// Append one chunk to the ring. Returns whether the chunk was handed to
     /// the foreground receiver — i.e. a foreground call owns the task and the
-    /// chunk is the caller's to deliver (and tap).
+    /// chunk is the caller's to deliver (and tap). A failed send (receiver
+    /// already dropped on a cancel/abort path) reports `false`, so the drain
+    /// keeps the chunk's tap instead of dropping it.
     fn push(&self, stream: OutputStream, data: &[u8]) -> bool {
         let mut buf = self.buffer.lock().expect("buffer lock poisoned");
         let foreground_owned = if let Some(tx) = self
@@ -127,11 +129,11 @@ impl TaskEntry {
             .expect("foreground lock poisoned")
             .as_ref()
         {
-            let _ = tx.send(OutputChunk {
+            tx.send(OutputChunk {
                 stream,
                 bytes: data.to_vec(),
-            });
-            true
+            })
+            .is_ok()
         } else {
             false
         };
