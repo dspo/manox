@@ -93,6 +93,10 @@ pub mod config_keys {
     pub const ACCESS_MODE: &str = "accessMode";
     /// Network-access vocabulary string (`off`/`on`) for sandboxed bash.
     pub const NETWORK_ACCESS: &str = "networkAccess";
+    /// Per-session extra env for tool subprocesses (#1032): an object of
+    /// string → string, injected at spawn after the kernel-managed defaults
+    /// (which it cannot override).
+    pub const TOOL_ENV: &str = "toolEnv";
     /// Server-owned project path (`null` clears).
     pub const PROJECT: &str = "project";
     /// Effective working directory of this journal.

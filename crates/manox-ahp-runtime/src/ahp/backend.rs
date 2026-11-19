@@ -13,7 +13,7 @@
 //!   implementation of the turn loop. Anything not wired yet is refused loudly, as
 //!   the trait contract requires: a refused write must never look accepted.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -2042,6 +2042,7 @@ impl Backend for RuntimeBackend {
             reasoning_effort: intent_config.reasoning_effort,
             seed: None,
             working_directories,
+            tool_env: intent_config.tool_env,
         };
         self.server
             .create_session(&owner, intent)
@@ -3258,6 +3259,7 @@ const CREATE_CONFIG_KEYS: &[&str] = &[
     config_keys::MODEL,
     config_keys::REASONING_EFFORT,
     config_keys::ACCESS_MODE,
+    config_keys::TOOL_ENV,
 ];
 
 /// The three session-mutable picks a `createSession` intent carries.
@@ -3266,6 +3268,7 @@ struct CreateIntentConfig {
     model: Option<String>,
     access_mode: Option<String>,
     reasoning_effort: Option<String>,
+    tool_env: Option<BTreeMap<String, String>>,
 }
 
 /// Validate and decode `CreateSessionParams.config` before anything is
@@ -3287,10 +3290,12 @@ fn create_intent_config(params: &CreateSessionParams) -> Result<CreateIntentConf
             "config key `{key}` is not a create-session key on this host"
         )));
     }
-    // The declared schema types every mutable key as a string; a non-string
-    // value is a client bug the create must report, not a silent no-op.
+    // The declared schema types every mutable key as a string (toolEnv as
+    // an object of strings); a wrongly-typed value is a client bug the
+    // create must report, not a silent no-op.
     for key in CREATE_CONFIG_KEYS {
         if let Some(value) = config.get(*key)
+            && key != &config_keys::TOOL_ENV
             && !value.is_string()
         {
             return Err(HostError::InvalidParams(format!(
@@ -3298,6 +3303,19 @@ fn create_intent_config(params: &CreateSessionParams) -> Result<CreateIntentConf
             )));
         }
     }
+    let tool_env = match config.get(config_keys::TOOL_ENV) {
+        None => None,
+        Some(value) => {
+            let parsed = serde_json::from_value::<BTreeMap<String, String>>(value.clone())
+                .map_err(|e| {
+                    HostError::InvalidParams(format!(
+                        "config key `{}` must be an object of strings: {e}",
+                        config_keys::TOOL_ENV
+                    ))
+                })?;
+            Some(parsed)
+        }
+    };
     Ok(CreateIntentConfig {
         model: config
             .get(config_keys::MODEL)
@@ -3311,6 +3329,7 @@ fn create_intent_config(params: &CreateSessionParams) -> Result<CreateIntentConf
             .get(config_keys::REASONING_EFFORT)
             .and_then(Value::as_str)
             .map(str::to_string),
+        tool_env,
     })
 }
 
@@ -3419,6 +3438,60 @@ fn unix_to_rfc3339(secs: i64) -> String {
         .single()
         .map(|t| t.to_rfc3339())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod create_intent_config_tests {
+    use super::*;
+
+    fn params_with_config(config: serde_json::Value) -> CreateSessionParams {
+        serde_json::from_value(serde_json::json!({
+            "channel": "ahp-root:/",
+            "config": config,
+        }))
+        .expect("params shape")
+    }
+
+    /// #1032: `toolEnv` parses into the intent's per-session env map.
+    #[test]
+    fn tool_env_config_parses_into_the_intent() {
+        let config = create_intent_config(&params_with_config(serde_json::json!({
+            "model": "test/m",
+            "toolEnv": { "ZU_TTY": "/tmp/a-tty", "EXTRA": "1" },
+        })))
+        .unwrap();
+        assert_eq!(
+            config.tool_env,
+            Some(BTreeMap::from([
+                ("ZU_TTY".to_string(), "/tmp/a-tty".to_string()),
+                ("EXTRA".to_string(), "1".to_string()),
+            ]))
+        );
+    }
+
+    /// A wrongly-typed `toolEnv` is a client bug the create reports.
+    #[test]
+    fn non_string_tool_env_values_are_refused() {
+        let err = create_intent_config(&params_with_config(serde_json::json!({
+            "toolEnv": { "ZU_TTY": 7 },
+        })))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must be an object of strings"),
+            "{err}"
+        );
+    }
+
+    /// An unknown config key still refuses (the allowlist is unchanged).
+    #[test]
+    fn unknown_config_keys_still_refuse() {
+        let err = create_intent_config(&params_with_config(serde_json::json!({ "nope": "x" })))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a create-session key"),
+            "{err}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1336,7 +1336,7 @@ impl ThreadStore {
         &mut self,
         id: &str,
     ) -> Result<Option<ThreadHandle>, crate::session_lease::LeaseError> {
-        self.load_thread_with_roots(id, &[])
+        self.load_thread_with_roots(id, &[], &Default::default())
     }
 
     /// `load_thread` with a create's declared grant group folded in. A
@@ -1350,6 +1350,7 @@ impl ThreadStore {
         &mut self,
         id: &str,
         declared_roots: &[String],
+        tool_env: &crate::sandbox::ToolEnv,
     ) -> Result<Option<ThreadHandle>, crate::session_lease::LeaseError> {
         if let Some(weak) = self.live_threads.get(id)
             && let Some(handle) = ThreadHandle::upgrade(weak)
@@ -1377,8 +1378,14 @@ impl ThreadStore {
             }
         }
         self.flush_working_dirs_if_materialized(id);
-        let handle =
-            Thread::open_existing(ThreadId(id.to_string()), cwd, path.clone(), lease, &roots);
+        let handle = Thread::open_existing(
+            ThreadId(id.to_string()),
+            cwd,
+            path.clone(),
+            lease,
+            &roots,
+            Arc::clone(tool_env),
+        );
         // Re-surface the bound project from the sidecar so the chip shows it.
         if let Some(sum) = self.summary_by_id(id)
             && !sum.project.is_empty()

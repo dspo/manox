@@ -19,6 +19,7 @@
 use async_trait::async_trait;
 use manox_ahp::error::HostError;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::error::{RuntimeError, RuntimeErrorKind};
 
@@ -91,6 +92,11 @@ pub struct SessionIntent {
     /// each joins the granted-root set before the engine materializes. Empty
     /// keeps single-cwd behaviour.
     pub working_directories: Vec<String>,
+    /// Per-session extra env for tool subprocesses (#1032): injected at
+    /// spawn after the kernel-managed defaults (which it cannot override).
+    /// Memory-only by design — a cold restore cannot resurrect a
+    /// process-local value (a host PTY path), so the embedder re-intents.
+    pub tool_env: Option<BTreeMap<String, String>>,
 }
 
 /// How to fork one session.

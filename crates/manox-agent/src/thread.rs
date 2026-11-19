@@ -288,6 +288,9 @@ pub struct Thread {
     /// Extra granted working directories (multi-root); seeded into the
     /// engine's granted-root set at spawn (multi-working-dirs).
     extra_working_dirs: Vec<PathBuf>,
+    /// The session's per-subprocess env (#1032); re-armed on every lazy
+    /// engine respawn so a dead engine's replacement keeps the intent.
+    tool_env: crate::sandbox::ToolEnv,
     project: Option<PathBuf>,
     model: Option<HarnessModel>,
     access_mode: AccessMode,
@@ -829,6 +832,7 @@ impl Thread {
             pending_engine_events: None,
             engine_generation: 0,
             extra_working_dirs: Vec::new(),
+            tool_env: Default::default(),
         })
     }
 
@@ -836,7 +840,16 @@ impl Thread {
     /// the previous session. A multi-root create with no project rides its
     /// grant group in here too (construction-time, race-free).
     pub fn new_fresh(id: ThreadId, cwd: PathBuf, extra_granted_roots: &[PathBuf]) -> ThreadHandle {
-        Self::open(id, cwd, None, None, true, None, extra_granted_roots)
+        Self::open(
+            id,
+            cwd,
+            None,
+            None,
+            true,
+            None,
+            extra_granted_roots,
+            Default::default(),
+        )
     }
 
     /// Construct a thread bound to a project directory: a fresh session with
@@ -859,6 +872,7 @@ impl Thread {
             true,
             None,
             extra_granted_roots,
+            Default::default(),
         )
     }
 
@@ -874,6 +888,7 @@ impl Thread {
         path: PathBuf,
         lease: std::sync::Arc<crate::session_lease::LeaseEntry>,
         extra_granted_roots: &[PathBuf],
+        tool_env: crate::sandbox::ToolEnv,
     ) -> ThreadHandle {
         Self::open(
             id,
@@ -883,6 +898,7 @@ impl Thread {
             false,
             Some(lease),
             extra_granted_roots,
+            tool_env,
         )
     }
 
@@ -902,6 +918,7 @@ impl Thread {
         workspace
     }
 
+    #[allow(clippy::too_many_arguments)] // private open face: each parameter is a distinct restore input
     fn open(
         id: ThreadId,
         cwd: PathBuf,
@@ -910,6 +927,7 @@ impl Thread {
         fresh: bool,
         lease: Option<std::sync::Arc<crate::session_lease::LeaseEntry>>,
         extra_granted_roots: &[PathBuf],
+        tool_env: crate::sandbox::ToolEnv,
     ) -> ThreadHandle {
         // A genuinely new conversation with no project is the special
         // project: it runs in its own temporary workspace rather than in
@@ -948,6 +966,7 @@ impl Thread {
             goal_bridge.clone(),
             None,
             extra_granted_roots,
+            tool_env.clone(),
             lease,
         );
 
@@ -994,6 +1013,7 @@ impl Thread {
             pending_engine_events: None,
             engine_generation: 0,
             extra_working_dirs: extra_granted_roots.to_vec(),
+            tool_env: tool_env.clone(),
         });
         handle.set_restore_ready(restore_ready);
         drain_engine_notices(handle.clone(), events, 0);
@@ -1043,6 +1063,7 @@ impl Thread {
             self.goal_bridge.clone(),
             None,
             &self.extra_working_dirs,
+            self.tool_env.clone(),
             None,
         );
         if self.access_mode != AccessMode::default() {
@@ -1940,6 +1961,7 @@ impl Thread {
             None,
             Some(self.id.0.clone()),
             &[],
+            Default::default(),
             None,
         );
         if access_mode != AccessMode::default() {
@@ -1989,6 +2011,7 @@ impl Thread {
             pending_engine_events: None,
             engine_generation: 0,
             extra_working_dirs: Vec::new(),
+            tool_env: Default::default(),
         });
         handle.set_restore_ready(restore_ready);
         drain_engine_notices(handle.clone(), events, 0);
@@ -3115,6 +3138,7 @@ pub(crate) mod tests {
             pending_engine_events: None,
             engine_generation: 0,
             extra_working_dirs: Vec::new(),
+            tool_env: Default::default(),
         })
     }
 

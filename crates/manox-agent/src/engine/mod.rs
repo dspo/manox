@@ -430,6 +430,9 @@ struct EngineState {
     /// Prompt/Steer submit is refused with a readable error meanwhile.
     degraded: AtomicBool,
     degraded_reason: Mutex<Option<String>>,
+    /// The session's per-subprocess env (#1032), shared with every bash ops
+    /// instance this engine assembles (main + child snapshots + authority).
+    tool_env: crate::sandbox::ToolEnv,
 }
 
 impl EngineState {
@@ -552,6 +555,7 @@ pub fn spawn_engine(
     goal_bridge: Option<Arc<crate::goal_tools::GoalBridge>>,
     parent_session: Option<String>,
     extra_granted_roots: &[PathBuf],
+    tool_env: crate::sandbox::ToolEnv,
     lease: Option<std::sync::Arc<crate::session_lease::LeaseEntry>>,
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -662,6 +666,7 @@ pub fn spawn_engine(
         abort_grace_ms: AtomicU64::new(0),
         degraded: AtomicBool::new(false),
         degraded_reason: Mutex::new(None),
+        tool_env,
     });
     // The actor's own copy of the declared roots: the prompt's project-root
     // section is seeded from this construction-time snapshot, never from a
@@ -1220,6 +1225,7 @@ async fn run_actor(
             &notice_tx,
             state.goal_bridge.as_ref(),
             &state.granted_roots,
+            &state.tool_env,
             &project_roots,
             &thread_id,
             None,
@@ -1268,6 +1274,7 @@ async fn run_actor(
                 &notice_tx,
                 state.goal_bridge.as_ref(),
                 &state.granted_roots,
+                &state.tool_env,
                 &project_roots,
                 &thread_id,
                 parent_session.as_deref(),

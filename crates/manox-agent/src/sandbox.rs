@@ -29,6 +29,7 @@
 //! renderer via a host-injected `mode_resolver` closure, mirroring the
 //! existing `force_unsandboxed` injection pattern.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -628,6 +629,44 @@ fn inject_noninteractive_env(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// The env keys the kernel manages on every bash invocation: the login
+/// PATH, the non-interactive editor/pager defaults, and the network-route
+/// signals. A session's `tool_env` may only ADD variables — these are
+/// filtered at application (warned), never overridden.
+const KERNEL_MANAGED_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "GIT_EDITOR",
+    "EDITOR",
+    "GIT_PAGER",
+    "PAGER",
+    manox_harness::sandbox::NETWORK_DISABLED_ENV,
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+];
+
+/// Per-session extra env for tool subprocesses (`SessionIntent.tool_env`,
+/// #1032): shared by every bash execution path of one session.
+pub type ToolEnv = Arc<BTreeMap<String, String>>;
+
+/// Apply a session's `tool_env` onto a command under construction. Called
+/// last on every spawn-construction path so it can only add variables.
+pub(crate) fn apply_tool_env(
+    cmd: &mut tokio::process::Command,
+    tool_env: &BTreeMap<String, String>,
+) {
+    for (key, value) in tool_env {
+        if KERNEL_MANAGED_ENV_KEYS.contains(&key.as_str()) {
+            tracing::warn!(key = %key, "tool_env names a kernel-managed key; ignored");
+            continue;
+        }
+        cmd.env(key, value);
+    }
+}
+
 /// The login shell's PATH (cached), with a conservative fallback.
 // Consumers: the seatbelt/bwrap wrap paths + the unsandboxed backend.
 fn login_shell_path() -> String {
@@ -684,6 +723,8 @@ pub struct SandboxedBashOperations {
     /// the `mode_resolver` injection pattern — the kernel trait stays
     /// untouched.
     network_resolver: Arc<dyn Fn() -> NetworkRoute + Send + Sync>,
+    /// The session's `tool_env` (#1032), applied last on every spawn path.
+    tool_env: ToolEnv,
 }
 
 impl SandboxedBashOperations {
@@ -692,13 +733,23 @@ impl SandboxedBashOperations {
         granted_roots: crate::granted_roots::GrantedRoots,
         mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
         network_resolver: Arc<dyn Fn() -> NetworkRoute + Send + Sync>,
+        tool_env: ToolEnv,
     ) -> Self {
         Self {
             workspace: workspace.into(),
             granted_roots,
             mode_resolver,
             network_resolver,
+            tool_env,
         }
+    }
+
+    /// The last construction step of every spawn path: the session's
+    /// `tool_env` lands on the command (add-only — kernel-managed keys are
+    /// filtered inside [`apply_tool_env`]).
+    fn finish_command(&self, mut cmd: tokio::process::Command) -> tokio::process::Command {
+        apply_tool_env(&mut cmd, &self.tool_env);
+        cmd
     }
 
     /// The confinement policy for a call running in `cwd`: the session
@@ -741,14 +792,18 @@ impl SandboxedBashOperations {
         // unsandboxed backend would, so an empty writable-root set can never
         // become a denial-only jail.
         if (self.mode_resolver)() == AccessMode::FullAccess {
-            return UnsandboxedBashOperations::command(command, cwd);
+            return self.finish_command(UnsandboxedBashOperations::command_with_env(
+                command,
+                cwd,
+                &self.tool_env,
+            ));
         }
         #[cfg(target_os = "macos")]
         {
             let mode = (self.mode_resolver)();
             let route = (self.network_resolver)();
             match self.policy_for(cwd) {
-                Ok(policy) => policy.wrap_command(command, cwd, mode, route),
+                Ok(policy) => self.finish_command(policy.wrap_command(command, cwd, mode, route)),
                 Err(_) => refused(cwd),
             }
         }
@@ -769,7 +824,7 @@ impl SandboxedBashOperations {
                     {
                         bridge.spawn_detached(proxy_port);
                     }
-                    wrapped.command
+                    self.finish_command(wrapped.command)
                 }
                 Err(_) => refused(cwd),
             }
@@ -778,7 +833,7 @@ impl SandboxedBashOperations {
         {
             let mut c = tokio::process::Command::new("sh");
             c.arg("-c").arg(command).current_dir(cwd);
-            c
+            self.finish_command(c)
         }
     }
 }
@@ -804,14 +859,14 @@ impl BashOperations for SandboxedBashOperations {
             // Full access never renders a profile: an empty writable-root set
             // under the deny-default base is a read-only jail, so the
             // short-circuit lives here, structurally below backend selection.
-            let mut cmd = if mode == AccessMode::FullAccess {
-                UnsandboxedBashOperations::command(request.command, &cwd)
+            let mut cmd = self.finish_command(if mode == AccessMode::FullAccess {
+                UnsandboxedBashOperations::command_with_env(request.command, &cwd, &self.tool_env)
             } else {
                 // A policy that cannot be built (a symlinked writable root)
                 // fails the call closed — the command never runs unsandboxed.
                 let policy = self.policy_for(&cwd).map_err(ExecutionError::Other)?;
                 policy.wrap_command(request.command, &cwd, mode, route)
-            };
+            });
             cmd.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true);
@@ -834,7 +889,11 @@ impl BashOperations for SandboxedBashOperations {
             // Same full-access short-circuit as macOS: no bwrap, no netns
             // bridge, no seccomp face.
             if mode == AccessMode::FullAccess {
-                let mut cmd = UnsandboxedBashOperations::command(request.command, &cwd);
+                let mut cmd = self.finish_command(UnsandboxedBashOperations::command_with_env(
+                    request.command,
+                    &cwd,
+                    &self.tool_env,
+                ));
                 cmd.stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .kill_on_drop(true);
@@ -852,7 +911,7 @@ impl BashOperations for SandboxedBashOperations {
                 .writable_root_set(mode);
             let wrapped = linux::wrap_command(&roots, request.command, &cwd, route)
                 .map_err(ExecutionError::Other)?;
-            let mut cmd = wrapped.command;
+            let mut cmd = self.finish_command(wrapped.command);
             cmd.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true);
@@ -969,25 +1028,47 @@ async fn run_to_completion(
 /// confinement.
 pub struct UnsandboxedBashOperations {
     base_cwd: PathBuf,
+    /// The session's `tool_env` (#1032), applied last on every invocation —
+    /// it can only add variables (kernel-managed keys are filtered).
+    tool_env: ToolEnv,
 }
 
 impl UnsandboxedBashOperations {
     pub fn new(base_cwd: impl Into<PathBuf>) -> Self {
         Self {
             base_cwd: base_cwd.into(),
+            tool_env: Default::default(),
         }
     }
 
+    /// Stamp the session's per-subprocess env (#1032).
+    pub fn with_tool_env(mut self, tool_env: ToolEnv) -> Self {
+        self.tool_env = tool_env;
+        self
+    }
+
     /// The unconfined invocation for a command: `bash -c` with the login
-    /// PATH and the non-interactive editor/pager env. Shared by this
-    /// backend's `exec` and the background registry's escalated tasks, so an
-    /// escalated command runs in the same shell and environment however it
-    /// is launched.
-    pub fn command(command: &str, cwd: &Path) -> tokio::process::Command {
+    /// PATH and the non-interactive editor/pager env, then the session's
+    /// `tool_env`. Shared by this backend's `exec` and the background
+    /// registry's escalated tasks (including the static-callable
+    /// [`Self::command_with`] shape), so an escalated command runs in the
+    /// same shell and environment however it is launched.
+    pub fn command(&self, command: &str, cwd: &Path) -> tokio::process::Command {
+        Self::command_with_env(command, cwd, &self.tool_env)
+    }
+
+    /// [`Self::command`] for call sites that hold only the env map (no
+    /// backend instance — the registry's unconfined builder closure).
+    pub fn command_with_env(
+        command: &str,
+        cwd: &Path,
+        tool_env: &BTreeMap<String, String>,
+    ) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("bash");
         cmd.arg("-c").arg(command).current_dir(cwd);
         cmd.env("PATH", login_shell_path());
         inject_noninteractive_env(&mut cmd);
+        apply_tool_env(&mut cmd, tool_env);
         cmd
     }
 }
@@ -999,7 +1080,7 @@ impl BashOperations for UnsandboxedBashOperations {
             .cwd
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.base_cwd.clone());
-        let mut cmd = Self::command(request.command, &cwd);
+        let mut cmd = self.command(request.command, &cwd);
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -1323,6 +1404,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(&target),
             resolver(AccessMode::Sandbox),
             route_resolver(NetworkRoute::Direct),
+            Default::default(),
         );
         let cmd = ops.wrap_background("echo hi", &target);
         let std_cmd = cmd.as_std();
@@ -1347,6 +1429,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(&root),
             resolver(AccessMode::FullAccess),
             route_resolver(NetworkRoute::Direct),
+            Default::default(),
         );
         let std_cmd = ops.wrap_background("touch probe", &root).into_std();
         assert_eq!(
@@ -1375,6 +1458,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(&root),
             resolver(AccessMode::FullAccess),
             route_resolver(NetworkRoute::Direct),
+            Default::default(),
         );
         let probe = root.join("full-access-shortcut.txt");
         let _ = std::fs::remove_file(&probe);
@@ -1434,6 +1518,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(&root),
             resolver(AccessMode::Sandbox),
             route_resolver(NetworkRoute::Direct),
+            Default::default(),
         );
 
         // A confined write inside the project succeeds.
@@ -1486,6 +1571,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(&root),
             resolver(AccessMode::Sandbox),
             route_resolver(NetworkRoute::Direct),
+            Default::default(),
         );
 
         // The manox state home is writable under sandbox (plan files
@@ -1526,6 +1612,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(&root),
             resolver(AccessMode::Sandbox),
             route_resolver(NetworkRoute::Direct),
+            Default::default(),
         );
 
         // A write outside the workspace + temp areas is denied under sandbox.
@@ -1579,6 +1666,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(root),
             resolver(AccessMode::Sandbox),
             route_resolver(route),
+            Default::default(),
         );
         use manox_harness::tools::bash::BashOperations as _;
         ops.exec(BashExecRequest {
@@ -1697,6 +1785,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(&root),
             resolver(AccessMode::Sandbox),
             Arc::new(move || policy_for_resolver.route_for(NetworkAccess::On)),
+            Default::default(),
         );
         use manox_harness::tools::bash::BashOperations as _;
 
@@ -1788,5 +1877,161 @@ mod tests {
         };
         let err = ops.exec(req).await.expect_err("pre-cancelled token aborts");
         assert!(matches!(err, ExecutionError::Aborted), "{err:?}");
+    }
+
+    // ── tool_env (#1032) ─────────────────────────────────────────────
+
+    fn tool_env_map(pairs: &[(&str, &str)]) -> crate::sandbox::ToolEnv {
+        Arc::new(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    /// An explicit env value from a built command (`get_env` is not stable;
+    /// `get_envs` yields `(key, Option<value>)` pairs).
+    fn env_of<'a>(cmd: &'a std::process::Command, key: &str) -> Option<&'a std::ffi::OsStr> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+            .and_then(|(_, v)| v)
+    }
+
+    /// #1032 (1): the injected env reaches the tool subprocess, and two
+    /// sessions' maps never cross.
+    #[tokio::test]
+    async fn tool_env_reaches_unsandboxed_exec_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = UnsandboxedBashOperations::new(dir.path())
+            .with_tool_env(tool_env_map(&[("ZU_TTY", "session-a-tty")]));
+        let b = UnsandboxedBashOperations::new(dir.path())
+            .with_tool_env(tool_env_map(&[("ZU_TTY", "session-b-tty")]));
+        let request = || BashExecRequest {
+            command: "printf '%s' \"$ZU_TTY\"",
+            cwd: Some(dir.path()),
+            timeout: Some(Duration::from_secs(10)),
+            signal: CancellationToken::new(),
+            on_data: None,
+        };
+        let out_a = a.exec(request()).await.unwrap();
+        let out_b = b.exec(request()).await.unwrap();
+        assert_eq!(out_a.stdout, "session-a-tty");
+        assert_eq!(out_b.stdout, "session-b-tty");
+    }
+
+    /// #1032 (2): kernel-managed keys are filtered — the login PATH, the
+    /// non-interactive defaults, and the network-route signals survive a
+    /// hostile `tool_env` untouched; non-kernel keys land.
+    #[test]
+    fn tool_env_cannot_override_kernel_managed_keys() {
+        let hostile = tool_env_map(&[
+            ("PATH", "/evil"),
+            ("PAGER", "evil-pager"),
+            ("EDITOR", "evil-editor"),
+            ("HTTP_PROXY", "http://evil:1"),
+            (manox_harness::sandbox::NETWORK_DISABLED_ENV, "0"),
+            ("ZU_TTY", "fine"),
+        ]);
+        let ops = UnsandboxedBashOperations::new("/tmp").with_tool_env(hostile);
+        let cmd = ops.command("true", Path::new("/tmp"));
+        let std_cmd = cmd.as_std();
+        assert_eq!(
+            env_of(std_cmd, "PATH"),
+            Some(std::ffi::OsStr::new(login_shell_path().as_str())),
+            "the kernel PATH wins"
+        );
+        assert_ne!(
+            env_of(std_cmd, "PAGER"),
+            Some(std::ffi::OsStr::new("evil-pager")),
+            "the non-interactive default is not overridden"
+        );
+        assert_ne!(
+            env_of(std_cmd, "EDITOR"),
+            Some(std::ffi::OsStr::new("evil-editor")),
+            "the non-interactive default is not overridden"
+        );
+        assert_eq!(
+            env_of(std_cmd, "HTTP_PROXY"),
+            None,
+            "network-route signals are filtered"
+        );
+        assert_eq!(
+            env_of(std_cmd, manox_harness::sandbox::NETWORK_DISABLED_ENV),
+            None,
+            "the network-disabled signal is filtered"
+        );
+        assert_eq!(
+            env_of(std_cmd, "ZU_TTY"),
+            Some(std::ffi::OsStr::new("fine"))
+        );
+    }
+
+    /// #1032 (4): an empty `tool_env` produces exactly the command env the
+    /// no-env shape always built.
+    #[test]
+    fn empty_tool_env_matches_the_untouched_command() {
+        let plain = UnsandboxedBashOperations::new("/tmp");
+        let empty = UnsandboxedBashOperations::new("/tmp").with_tool_env(Default::default());
+        let a_cmd = plain.command("true", Path::new("/tmp"));
+        let b_cmd = empty.command("true", Path::new("/tmp"));
+        let a = a_cmd.as_std();
+        let b = b_cmd.as_std();
+        let mut a_envs: Vec<_> = a.get_envs().collect();
+        let mut b_envs: Vec<_> = b.get_envs().collect();
+        a_envs.sort();
+        b_envs.sort();
+        assert_eq!(a_envs, b_envs);
+    }
+
+    /// #1032 (3): the sandboxed wrap carries the env without widening the
+    /// profile — the rendered profile is byte-identical with and without a
+    /// `tool_env`, and the value reaches the confined subprocess.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn tool_env_rides_the_sandboxed_wrap_without_widening_the_profile() {
+        let root = project_root();
+        std::fs::create_dir_all(&root).ok();
+        let ops_plain = SandboxedBashOperations::new(
+            &root,
+            crate::granted_roots::GrantedRoots::new(&root),
+            resolver(AccessMode::Sandbox),
+            route_resolver(NetworkRoute::Direct),
+            Default::default(),
+        );
+        let ops_env = SandboxedBashOperations::new(
+            &root,
+            crate::granted_roots::GrantedRoots::new(&root),
+            resolver(AccessMode::Sandbox),
+            route_resolver(NetworkRoute::Direct),
+            tool_env_map(&[("ZU_TTY", "tty-under-seatbelt")]),
+        );
+        let mode = AccessMode::Sandbox;
+        let route = NetworkRoute::Direct;
+        assert_eq!(
+            ops_plain
+                .policy_for(&root)
+                .unwrap()
+                .render_seatbelt_with_params(mode, route),
+            ops_env
+                .policy_for(&root)
+                .unwrap()
+                .render_seatbelt_with_params(mode, route),
+            "the profile does not widen for a tool_env"
+        );
+        let request = |ops: &SandboxedBashOperations| {
+            let _ = ops;
+            BashExecRequest {
+                command: "printf '%s' \"$ZU_TTY\"",
+                cwd: Some(root.as_path()),
+                timeout: Some(Duration::from_secs(30)),
+                signal: CancellationToken::new(),
+                on_data: None,
+            }
+        };
+        let out_env = ops_env.exec(request(&ops_env)).await.unwrap();
+        assert_eq!(out_env.stdout, "tty-under-seatbelt");
+        let out_plain = ops_plain.exec(request(&ops_plain)).await.unwrap();
+        assert_eq!(out_plain.stdout, "", "no tool_env, no value");
     }
 }

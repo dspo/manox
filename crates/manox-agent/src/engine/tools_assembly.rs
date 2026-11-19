@@ -393,6 +393,9 @@ pub(super) struct ChildAssembly {
     /// The dispatching session's id — the output tap's routing id for the
     /// child's bash bytes (a Sailor's output belongs to the parent session).
     pub(super) session_id: String,
+    /// The dispatching session's per-subprocess env (#1032) — a Sailor's
+    /// bash rides the parent's tool_env.
+    pub(super) tool_env: crate::sandbox::ToolEnv,
 }
 
 impl ChildAssembly {
@@ -460,6 +463,7 @@ impl ChildAssembly {
                     self.granted_roots.clone(),
                     ops_mode,
                     ops_network,
+                    Arc::clone(&self.tool_env),
                 ))
             } else {
                 // No pin (or no OS backend to pin with — the confined face
@@ -815,6 +819,7 @@ pub(super) fn build_tools(
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     granted_roots: &crate::granted_roots::GrantedRoots,
+    tool_env: &crate::sandbox::ToolEnv,
     bus: &Arc<crate::steer_bus::AgentBus>,
     codemode_store: std::collections::BTreeMap<String, String>,
     active_tool_set: manox_harness::tools::codemode::ActiveToolSelection,
@@ -864,6 +869,7 @@ pub(super) fn build_tools(
             granted_roots.clone(),
             sandbox_mode_resolver,
             network_resolver,
+            Arc::clone(tool_env),
         ));
         let wrap_ops = Arc::clone(&ops);
         let wrap: manox_harness::bash::background::SandboxCommandBuilder =
@@ -871,8 +877,15 @@ pub(super) fn build_tools(
         // Escalated tasks run in the unsandboxed backend's own shell and
         // env, so `full-access` behaves the same whether the command
         // runs in the foreground or the background.
+        let unconfined_env = Arc::clone(tool_env);
         let unconfined: manox_harness::bash::background::SandboxCommandBuilder =
-            Arc::new(crate::sandbox::UnsandboxedBashOperations::command);
+            Arc::new(move |command, cwd| {
+                crate::sandbox::UnsandboxedBashOperations::command_with_env(
+                    command,
+                    cwd,
+                    &unconfined_env,
+                )
+            });
         background = Arc::new(
             BackgroundRegistry::new()
                 .with_sandbox(wrap)
@@ -900,8 +913,10 @@ pub(super) fn build_tools(
     // is already unsandboxed.
     let unsandboxed_ops: Option<Arc<dyn manox_harness::tools::bash::BashOperations>> =
         sandbox_available.then(|| {
-            let ops: Arc<dyn manox_harness::tools::bash::BashOperations> =
-                Arc::new(crate::sandbox::UnsandboxedBashOperations::new(cwd));
+            let ops: Arc<dyn manox_harness::tools::bash::BashOperations> = Arc::new(
+                crate::sandbox::UnsandboxedBashOperations::new(cwd)
+                    .with_tool_env(Arc::clone(tool_env)),
+            );
             ops
         });
     // Standing-mode resolver (the session mode, NOT the grant — the grant is
@@ -1195,6 +1210,7 @@ pub(super) fn build_tools(
         cwd: cwd.to_path_buf(),
         granted_roots: granted_roots.clone(),
         session_id: bus.owner_thread_id().to_string(),
+        tool_env: Arc::clone(tool_env),
     };
     let child_tools = child_assembly.build(None);
     let child_tool_factory: manox_harness::subagent::ChildToolFactory = {
@@ -1302,6 +1318,7 @@ pub(super) fn build_tools(
             sandbox_available,
             unsandboxed_ops.clone(),
             session_id.to_string(),
+            Arc::clone(tool_env),
         )));
     let spawn_provider = match model {
         Some(model) => spawn_provider.with_model(model.clone()),

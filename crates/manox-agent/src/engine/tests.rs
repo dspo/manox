@@ -1180,6 +1180,7 @@ fn test_engine_state() -> Arc<EngineState> {
         abort_grace_ms: AtomicU64::new(0),
         degraded: AtomicBool::new(false),
         degraded_reason: Mutex::new(None),
+        tool_env: Default::default(),
     })
 }
 
@@ -6692,6 +6693,7 @@ async fn a_sandbox_pinned_child_stays_confined_under_a_full_access_captain() {
         cwd: dir.path().to_path_buf(),
         granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()),
         session_id: "test-session".to_string(),
+        tool_env: Default::default(),
     };
     let declared = AgentPermissions {
         mode: PermissionMode::Sandbox,
@@ -6805,6 +6807,7 @@ fn child_snapshot_name_set_is_invariant_across_permission_declarations() {
         cwd: dir.path().to_path_buf(),
         granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()),
         session_id: "test-session".to_string(),
+        tool_env: Default::default(),
     };
     let names = |declaration: Option<AgentPermissions>| {
         let mut set: Vec<String> = assembly
@@ -6873,6 +6876,7 @@ async fn a_network_off_pinned_child_runs_confined_calls_with_the_network_closed(
         cwd: dir.path().to_path_buf(),
         granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()),
         session_id: "test-session".to_string(),
+        tool_env: Default::default(),
     };
     let ctx = subagent_test_ctx(dir.path());
     let net_off = AgentPermissions {
@@ -7252,6 +7256,7 @@ async fn armed_child_bash_escalates_one_call_through_the_parent_gate() {
         true,
         Some(unsandboxed),
         "test-session".to_string(),
+        Default::default(),
     );
     // arm() replaces the placeholder by name; what comes back is the armed
     // SubagentBashTool carrying this run's approver and grant cell.
@@ -7345,6 +7350,7 @@ async fn armed_child_bash_budget_spent_refuses_without_a_card() {
         true,
         Some(unsandboxed),
         "test-session".to_string(),
+        Default::default(),
     );
     let armed = authority.arm(
         "run-10",
@@ -7869,6 +7875,7 @@ async fn codemode_mounts_ungated_exactly_once_and_excludes_itself() {
         &notice_tx,
         None,
         &granted,
+        &Default::default(),
         &bus,
         Default::default(),
         ActiveToolMirror::default().getter(),

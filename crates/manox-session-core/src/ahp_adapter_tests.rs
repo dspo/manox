@@ -749,6 +749,7 @@ mod dispatch {
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
+            tool_env: None,
         };
         let inner = Arc::clone(server.ahp_inner());
         crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
@@ -803,6 +804,7 @@ mod dispatch {
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
+            tool_env: None,
         };
         let inner = Arc::clone(server.ahp_inner());
         crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
@@ -2494,6 +2496,7 @@ mod dispatch {
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
+            tool_env: None,
         };
         let inner = Arc::clone(server.ahp_inner());
         crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
@@ -2619,6 +2622,7 @@ mod dispatch {
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
+            tool_env: None,
         };
         let inner = Arc::clone(server.ahp_inner());
         crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
@@ -2858,6 +2862,7 @@ mod dispatch {
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
+            tool_env: None,
         };
         let inner = Arc::clone(server.ahp_inner());
         crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
@@ -4889,6 +4894,7 @@ mod create_intent {
             reasoning_effort: None,
             seed: Some(vec![serde_json::json!({"type": "text", "text": "hidden"})]),
             working_directories: Vec::new(),
+            tool_env: None,
         };
         let inner = Arc::clone(server.ahp_inner());
         crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
@@ -5710,6 +5716,7 @@ mod create_intent {
                 "text": "hidden context the client dropped before the first turn"
             })]),
             working_directories: vec![primary_string.clone(), secondary_string.clone()],
+            tool_env: None,
         };
         let inner = Arc::clone(server.ahp_inner());
         crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
@@ -6144,6 +6151,7 @@ mod teardown {
             reasoning_effort: None,
             seed: None,
             working_directories: Vec::new(),
+            tool_env: None,
         };
         let inner = Arc::clone(server.ahp_inner());
         crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)

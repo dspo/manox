@@ -557,7 +557,7 @@ pub(crate) async fn open_session(
     owner: &str,
     session_id: &str,
 ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
-    open_session_with_roots(inner, owner, session_id, &[]).await
+    open_session_with_roots(inner, owner, session_id, &[], &Default::default()).await
 }
 
 /// `open_session` with a create's declared grant group riding the cold
@@ -571,6 +571,7 @@ pub(crate) async fn open_session_with_roots(
     owner: &str,
     session_id: &str,
     declared_roots: &[String],
+    tool_env: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
     // Phase 1 (fast path): a live session is re-owned without any IO.
     if inner.sessions.lock().contains_key(session_id) {
@@ -582,7 +583,13 @@ pub(crate) async fn open_session_with_roots(
     // load the SAME `ThreadHandle` (the store's weak upgrade), and only phase
     // 3 decides who inserts.
     let thread = manox_agent::thread_store::global()
-        .with_mut(|s| s.load_thread_with_roots(session_id, declared_roots))
+        .with_mut(|s| {
+            s.load_thread_with_roots(
+                session_id,
+                declared_roots,
+                &std::sync::Arc::new(tool_env.clone()),
+            )
+        })
         .map_err(|error| {
             // Another process drives this session: its engine actor holds
             // the per-session write lease. Fail fast — the refusal carries
@@ -1060,6 +1067,10 @@ impl AgentServerInner {
                 }
             },
         };
+        // The per-session tool subprocess env (#1032) rides the open —
+        // memory-only by design: a cold restore cannot resurrect a
+        // process-local value (a host PTY path), so the embedder re-intents.
+        let tool_env = intent.tool_env.clone().unwrap_or_default();
         let effort = match intent.reasoning_effort.as_deref() {
             None => None,
             Some("high") => Some(ReasoningEffort::High),
@@ -1240,7 +1251,14 @@ impl AgentServerInner {
                 manox_agent::thread_store::global()
                     .with_mut(|s| s.set_working_directories(&session_id, dirs));
             }
-            open_session_with_roots(inner, owner, &session_id, &intent.working_directories).await?;
+            open_session_with_roots(
+                inner,
+                owner,
+                &session_id,
+                &intent.working_directories,
+                &tool_env,
+            )
+            .await?;
             // Explicit intent overrides on the opened thread (durable change
             // rows); absent fields keep what the seeded journal restores.
             let thread = inner

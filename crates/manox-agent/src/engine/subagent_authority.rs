@@ -304,6 +304,9 @@ pub(super) struct SubagentChildAuthority {
     /// The parent session's id — the output tap's routing id for a child
     /// run's bash bytes (they belong to the parent's conversation).
     parent_session_id: String,
+    /// The parent session's per-subprocess env (#1032) — a child run's bash
+    /// rides the parent's tool_env.
+    tool_env: crate::sandbox::ToolEnv,
 }
 
 impl SubagentChildAuthority {
@@ -314,6 +317,7 @@ impl SubagentChildAuthority {
         sandbox_available: bool,
         unsandboxed_ops: Option<Arc<dyn BashOperations>>,
         parent_session_id: String,
+        tool_env: crate::sandbox::ToolEnv,
     ) -> Self {
         Self {
             gate,
@@ -323,6 +327,7 @@ impl SubagentChildAuthority {
             unsandboxed_ops,
             edit_enforce_seen_lines: crate::settings::edit().enforce_seen_lines,
             parent_session_id,
+            tool_env,
         }
     }
 }
@@ -378,6 +383,7 @@ impl ChildAuthority for SubagentChildAuthority {
                 overlay.clone(),
                 mode_resolver,
                 route_resolver,
+                Arc::clone(&self.tool_env),
             ))
         } else {
             Arc::new(PersistentShellOperations::new(self.workspace.clone()))
@@ -703,6 +709,7 @@ mod tests {
             true,
             None,
             "test-session".to_string(),
+            Default::default(),
         );
         let tools: Vec<Arc<dyn HarnessAgentTool>> = vec![
             Arc::new(NamedTool("Read")),
