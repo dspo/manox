@@ -860,6 +860,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(root),
             resolver(mode),
             std::sync::Arc::new(move || super::NetworkRoute::Direct),
+            Default::default(),
         )
     }
 
@@ -995,6 +996,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(root),
             resolver(manox_harness::sandbox::AccessMode::Sandbox),
             std::sync::Arc::new(move || route),
+            Default::default(),
         )
     }
 
@@ -1136,6 +1138,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(root.path()),
             resolver(manox_harness::sandbox::AccessMode::Sandbox),
             std::sync::Arc::new(move || policy_for_resolver.route_for(NetworkAccess::On)),
+            Default::default(),
         );
 
         // Allowlisted: the tunnel carries it through the bridge.
@@ -1177,6 +1180,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(root.path()),
             resolver(manox_harness::sandbox::AccessMode::Sandbox),
             std::sync::Arc::new(move || policy_for_resolver.route_for(NetworkAccess::On)),
+            Default::default(),
         );
         // python binds loopback, answers one request, and the client (same
         // netns) reads it back: bind/listen/connect/accept all ride the

@@ -630,9 +630,13 @@ fn inject_noninteractive_env(cmd: &mut tokio::process::Command) {
 }
 
 /// The env keys the kernel manages on every bash invocation: the login
-/// PATH, the non-interactive editor/pager defaults, and the network-route
-/// signals. A session's `tool_env` may only ADD variables — these are
-/// filtered at application (warned), never overridden.
+/// PATH, the non-interactive editor/pager defaults, the network-route
+/// signals, and the shell-state switches (`BASH_ENV`/`IFS`/`SHELLOPTS`/
+/// ...). `LD_*`/`DYLD_*` are denied by prefix in [`apply_tool_env`]. A
+/// session's `tool_env` may only ADD variables — these are filtered at
+/// application (warned), never overridden. `tool_env` is host-provided
+/// rather than model-controlled, but these keys drive shell startup and
+/// dynamic-linker behavior, so they are denied as defense-in-depth.
 const KERNEL_MANAGED_ENV_KEYS: &[&str] = &[
     "PATH",
     "GIT_EDITOR",
@@ -643,9 +647,16 @@ const KERNEL_MANAGED_ENV_KEYS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
+    "NO_PROXY",
     "http_proxy",
     "https_proxy",
     "all_proxy",
+    "no_proxy",
+    "BASH_ENV",
+    "ENV",
+    "IFS",
+    "SHELLOPTS",
+    "BASHOPTS",
 ];
 
 /// Per-session extra env for tool subprocesses (`SessionIntent.tool_env`,
@@ -659,7 +670,10 @@ pub(crate) fn apply_tool_env(
     tool_env: &BTreeMap<String, String>,
 ) {
     for (key, value) in tool_env {
-        if KERNEL_MANAGED_ENV_KEYS.contains(&key.as_str()) {
+        if KERNEL_MANAGED_ENV_KEYS.contains(&key.as_str())
+            || key.starts_with("LD_")
+            || key.starts_with("DYLD_")
+        {
             tracing::warn!(key = %key, "tool_env names a kernel-managed key; ignored");
             continue;
         }
@@ -1921,8 +1935,9 @@ mod tests {
     }
 
     /// #1032 (2): kernel-managed keys are filtered — the login PATH, the
-    /// non-interactive defaults, and the network-route signals survive a
-    /// hostile `tool_env` untouched; non-kernel keys land.
+    /// non-interactive defaults, the network-route signals, the shell-state
+    /// switches, and the dynamic-linker prefixes survive a hostile
+    /// `tool_env` untouched; non-kernel keys land.
     #[test]
     fn tool_env_cannot_override_kernel_managed_keys() {
         let hostile = tool_env_map(&[
@@ -1931,6 +1946,12 @@ mod tests {
             ("EDITOR", "evil-editor"),
             ("HTTP_PROXY", "http://evil:1"),
             (manox_harness::sandbox::NETWORK_DISABLED_ENV, "0"),
+            ("NO_PROXY", "evil"),
+            ("BASH_ENV", "/evil/init"),
+            ("IFS", "evil-ifs"),
+            ("SHELLOPTS", "xtrace"),
+            ("LD_PRELOAD", "/evil.so"),
+            ("DYLD_INSERT_LIBRARIES", "/evil.dylib"),
             ("ZU_TTY", "fine"),
         ]);
         let ops = UnsandboxedBashOperations::new("/tmp").with_tool_env(hostile);
@@ -1960,6 +1981,36 @@ mod tests {
             env_of(std_cmd, manox_harness::sandbox::NETWORK_DISABLED_ENV),
             None,
             "the network-disabled signal is filtered"
+        );
+        assert_ne!(
+            env_of(std_cmd, "NO_PROXY"),
+            Some(std::ffi::OsStr::new("evil")),
+            "the no-proxy signal is not overridden"
+        );
+        assert_ne!(
+            env_of(std_cmd, "BASH_ENV"),
+            Some(std::ffi::OsStr::new("/evil/init")),
+            "the bash startup file hook is filtered"
+        );
+        assert_ne!(
+            env_of(std_cmd, "IFS"),
+            Some(std::ffi::OsStr::new("evil-ifs")),
+            "the word-splitting state is filtered"
+        );
+        assert_ne!(
+            env_of(std_cmd, "SHELLOPTS"),
+            Some(std::ffi::OsStr::new("xtrace")),
+            "the shell option state is filtered"
+        );
+        assert_ne!(
+            env_of(std_cmd, "LD_PRELOAD"),
+            Some(std::ffi::OsStr::new("/evil.so")),
+            "the dynamic-linker prefix family is filtered"
+        );
+        assert_ne!(
+            env_of(std_cmd, "DYLD_INSERT_LIBRARIES"),
+            Some(std::ffi::OsStr::new("/evil.dylib")),
+            "the dynamic-linker prefix family is filtered"
         );
         assert_eq!(
             env_of(std_cmd, "ZU_TTY"),
