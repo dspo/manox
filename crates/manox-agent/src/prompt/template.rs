@@ -10,7 +10,7 @@
 /// All built-in, model-visible prompt templates.
 ///
 /// Grouped by concern (system head, mode addendums, conversation wrappers,
-/// side-call system/user prompts, title instructions, command/skill wrappers,
+/// command/skill wrappers,
 /// tool descriptions). The ordering is purely editorial — the render order is
 /// decided by the boundary caller, not by this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,12 +36,6 @@ pub enum PromptTemplate {
     WrapperPeerMessage,
     WrapperToolDenied,
 
-    // --- side-call system + user prompts ---
-
-    // --- title generation ---
-    TitleFirstInstruction,
-    TitleTopicShiftInstruction,
-
     // --- command / skill wrappers ---
     SkillBody,
     // --- tool descriptions ---
@@ -64,8 +58,6 @@ impl PromptTemplate {
             Self::WrapperDenialBreakerDirective => "wrapper/denial_breaker_directive.tera.md",
             Self::WrapperPeerMessage => "wrapper/peer_message.tera.md",
             Self::WrapperToolDenied => "wrapper/tool_denied.tera.md",
-            Self::TitleFirstInstruction => "title/first.tera.md",
-            Self::TitleTopicShiftInstruction => "title/topic_shift.tera.md",
             Self::SkillBody => "wrapper/skill_body.tera.md",
         }
     }
@@ -75,7 +67,7 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 13] = [
+pub const ALL: [PromptTemplate; 11] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
     PromptTemplate::WrapperMaxTurnsSummary,
@@ -86,7 +78,5 @@ pub const ALL: [PromptTemplate; 13] = [
     PromptTemplate::WrapperDenialBreakerDirective,
     PromptTemplate::WrapperPeerMessage,
     PromptTemplate::WrapperToolDenied,
-    PromptTemplate::TitleFirstInstruction,
-    PromptTemplate::TitleTopicShiftInstruction,
     PromptTemplate::SkillBody,
 ];

@@ -18,7 +18,6 @@ use crate::paths;
 
 static CONTEXT_OPT: OnceLock<ContextOptimizationSettings> = OnceLock::new();
 static EDIT: OnceLock<EditSettings> = OnceLock::new();
-static SIDE_CALLS: OnceLock<SideCallsSettings> = OnceLock::new();
 /// Unlike the other tables, this one is **mutable at runtime**: the AHP
 /// enablement toggle writes it after every decision, so a read-modify-write
 /// cycle must see the previous toggle, not the startup snapshot. (A
@@ -26,11 +25,10 @@ static SIDE_CALLS: OnceLock<SideCallsSettings> = OnceLock::new();
 /// toggle in a session resurrected the first one on next launch.)
 static MCP_DISABLED: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
-/// Cache the optimization and side-call tables at startup.
+/// Cache the optimization tables at startup.
 pub fn init_optimization() {
     let s = load();
     let _ = CONTEXT_OPT.set(s.context_optimization);
-    let _ = SIDE_CALLS.set(s.side_calls);
     *MCP_DISABLED.write() = s.mcp.disabled.clone();
     let _ = EDIT.set(s.edit);
 }
@@ -43,11 +41,6 @@ pub fn context_optimization() -> ContextOptimizationSettings {
 /// Cached hashline Edit settings. Defaults when not yet initialized.
 pub fn edit() -> EditSettings {
     EDIT.get().copied().unwrap_or_default()
-}
-
-/// Cached side-call settings. Defaults when not yet initialized.
-pub fn side_calls() -> SideCallsSettings {
-    SIDE_CALLS.get().cloned().unwrap_or_default()
 }
 
 /// Cached list of disabled MCP server names (settings `[mcp] disabled`).
@@ -109,10 +102,6 @@ pub struct Settings {
     /// model-facing content.
     #[serde(default)]
     pub context_optimization: ContextOptimizationSettings,
-
-    /// Per-purpose side-call policies: title generation.
-    #[serde(default)]
-    pub side_calls: SideCallsSettings,
 
     /// MCP server switches (settings UI). The registry is built once at
     /// startup, so changes apply on the next launch.
@@ -292,131 +281,6 @@ pub enum CodeModeToggle {
     #[default]
     Off,
     Hybrid,
-}
-
-// ── side-call policy settings ────────────────────────────────────────
-
-/// Per-purpose side-call policies. Each key maps to a [`SideCallPolicy`];
-/// absent keys use the defaults below.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct SideCallsSettings {
-    #[serde(default)]
-    pub title: SideCallPolicy,
-}
-
-/// A side-call policy: which model, reasoning effort, output cap, and
-/// whether the call is enabled at all. An empty `model` reuses the main
-/// threadʼs active model. `max_output_tokens = 0` means uncapped.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
-pub struct SideCallPolicy {
-    /// Model id override. Empty → inherit the main model.
-    #[serde(default)]
-    pub model: String,
-    /// Reasoning effort: `low`, `medium`, `high`, or `xhigh` (ultracode).
-    /// `None` → no thinking (deterministic, fast).
-    #[serde(default)]
-    pub reasoning_effort: Option<String>,
-    /// Output token cap. `0` → no per-request override.
-    #[serde(default)]
-    pub max_output_tokens: u32,
-    /// Whether this side call runs at all.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-}
-
-fn default_enabled() -> bool {
-    true
-}
-
-impl SideCallsSettings {
-    /// Resolved title policy: user config overlaid on the title preset.
-    pub fn title_policy(&self) -> SideCallPolicy {
-        resolve_side_call_policy(&self.title, SideCallPolicy::title_default())
-    }
-}
-
-impl Default for SideCallPolicy {
-    fn default() -> Self {
-        Self {
-            model: String::new(),
-            reasoning_effort: None,
-            max_output_tokens: 0,
-            enabled: true,
-        }
-    }
-}
-
-/// Convert a resolved [`SideCallPolicy`]'s `max_output_tokens` into the
-/// `Option<u32>` that [`LanguageModelRequest::max_output_tokens`] expects.
-/// `0` (the default "no override" sentinel) maps to `None`.
-pub fn side_call_output_cap(policy: SideCallPolicy) -> Option<u32> {
-    if policy.max_output_tokens > 0 && policy.enabled {
-        Some(policy.max_output_tokens)
-    } else {
-        None
-    }
-}
-
-/// Preset defaults for each side-call purpose (used when the user hasn't
-/// configured a specific key).
-impl SideCallPolicy {
-    pub fn title_default() -> Self {
-        Self {
-            model: String::new(),
-            reasoning_effort: Some("low".into()),
-            max_output_tokens: 128,
-            enabled: true,
-        }
-    }
-}
-
-/// Resolve the configured effort. Empty preset strings are translated to the
-/// purpose default here so serde-facing settings stay backwards-compatible.
-pub fn side_call_effort(
-    policy: &SideCallPolicy,
-    default: crate::language_model::RequestReasoningEffort,
-) -> Option<crate::language_model::RequestReasoningEffort> {
-    let raw = policy.reasoning_effort.as_deref().unwrap_or("").trim();
-    let effort = match raw {
-        "" => default,
-        "low" => crate::language_model::RequestReasoningEffort::Low,
-        "medium" => crate::language_model::RequestReasoningEffort::Medium,
-        "high" => crate::language_model::RequestReasoningEffort::High,
-        "max" | "xhigh" => crate::language_model::RequestReasoningEffort::Max,
-        other => {
-            tracing::warn!(
-                effort = other,
-                "unknown side-call reasoning effort; using default"
-            );
-            default
-        }
-    };
-    Some(effort)
-}
-
-/// Resolve a side-call policy: user-configured fields win; empty/zero fields
-/// fall back to the per-purpose preset.
-pub fn resolve_side_call_policy(user: &SideCallPolicy, preset: SideCallPolicy) -> SideCallPolicy {
-    let model = if user.model.is_empty() {
-        preset.model
-    } else {
-        user.model.clone()
-    };
-    let reasoning_effort = user.reasoning_effort.clone().or(preset.reasoning_effort);
-    let max_output_tokens = if user.max_output_tokens == 0 {
-        preset.max_output_tokens
-    } else {
-        user.max_output_tokens
-    };
-    let enabled = user.enabled;
-    SideCallPolicy {
-        model,
-        reasoning_effort,
-        max_output_tokens,
-        enabled,
-    }
 }
 
 /// Load settings from `settings.toml`. Always returns a usable [`Settings`] —
@@ -661,7 +525,7 @@ default_model = "kept"
         );
     }
 
-    // ── context optimization / side-call tests ──────────────────────
+    // ── context optimization tests ──────────────────────────────────
 
     #[test]
     fn context_optimization_defaults_to_discovery_on() {
@@ -723,44 +587,6 @@ default_model = "kept"
     }
 
     #[test]
-    fn side_call_policy_defaults() {
-        let p = SideCallPolicy::default();
-        assert!(p.model.is_empty());
-        assert!(p.reasoning_effort.is_none());
-        assert_eq!(p.max_output_tokens, 0);
-        assert!(p.enabled);
-    }
-
-    #[test]
-    fn side_call_presets() {
-        assert_eq!(SideCallPolicy::title_default().max_output_tokens, 128);
-    }
-
-    #[test]
-    fn resolve_side_call_policy_user_wins() {
-        let user = SideCallPolicy {
-            model: "custom".into(),
-            reasoning_effort: Some("high".into()),
-            max_output_tokens: 500,
-            enabled: false,
-        };
-        let r = resolve_side_call_policy(&user, SideCallPolicy::title_default());
-        assert_eq!(r.model, "custom");
-        assert_eq!(r.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(r.max_output_tokens, 500);
-        assert!(!r.enabled);
-    }
-
-    #[test]
-    fn resolve_side_call_policy_falls_back() {
-        let user = SideCallPolicy::default(); // all empty/zero
-        let r = resolve_side_call_policy(&user, SideCallPolicy::title_default());
-        assert_eq!(r.max_output_tokens, 128);
-        assert!(r.enabled);
-        assert!(r.model.is_empty()); // preset's model is also empty
-    }
-
-    #[test]
     fn sandbox_network_allowlist_round_trips() {
         let raw = r#"
 ui_language = "en"
@@ -810,12 +636,8 @@ history_pruning = "shadow"
 compact_outputs = false
 code_mode = "off"
 
-[side_calls.title]
-max_output_tokens = 128
-
 "#;
         let s: Settings = toml::from_str(raw).unwrap();
         assert_eq!(s.context_optimization.tool_discovery, Toggle::Shadow);
-        assert_eq!(s.side_calls.title.max_output_tokens, 128);
     }
 }

@@ -1420,7 +1420,6 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
     let mut harness_model = test_model();
 
     let handle = session.handle();
-    let sessions_path = dir.path().join("sessions");
     let active_session_path = session.path().clone();
     let _journal_appender = session.journal_appender();
     let mut turn = TurnCommit::open(&session, &state, &notice_tx, &cwd);
@@ -1434,7 +1433,6 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
         &state,
         &notice_tx,
         &mut harness_model,
-        &sessions_path,
         &active_session_path,
     );
     let new_model = test_model_switched();
@@ -1690,7 +1688,6 @@ async fn parallel_tool_rounds_land_every_result() {
     let mut shutdown_after_run = false;
     let mut harness_model = test_model();
     let handle = session.handle();
-    let sessions_path = dir.path().join("sessions");
     let active_session_path = session.path().clone();
     let journal_appender = session.journal_appender();
 
@@ -1706,7 +1703,6 @@ async fn parallel_tool_rounds_land_every_result() {
         &state,
         &facade_tx,
         &mut harness_model,
-        &sessions_path,
         &active_session_path,
     );
     let appender_for_dump = std::sync::Arc::clone(&journal_appender);
@@ -1848,7 +1844,6 @@ async fn mid_run_journal_append_lands_immediately() {
     let mut harness_model = test_model();
 
     let handle = session.handle();
-    let sessions_path = dir.path().join("sessions");
     let active_session_path = session.path().clone();
     let journal_appender = session.journal_appender();
     let mut turn = TurnCommit::open(&session, &state, &notice_tx, &cwd);
@@ -1862,7 +1857,6 @@ async fn mid_run_journal_append_lands_immediately() {
         &state,
         &notice_tx,
         &mut harness_model,
-        &sessions_path,
         &active_session_path,
     );
 
@@ -2173,7 +2167,6 @@ async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
     let mut shutdown_after_run = false;
     let mut harness_model = test_model();
     let handle = session.handle();
-    let sessions_path = dir.path().join("sessions");
     let active_session_path = session.path().clone();
     let journal_appender = session.journal_appender();
     let journal_path = session.path().to_path_buf();
@@ -2190,7 +2183,6 @@ async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
         &state,
         &notice_tx,
         &mut harness_model,
-        &sessions_path,
         &active_session_path,
     );
 
@@ -2408,12 +2400,11 @@ struct K5Rig {
     shutdown_after_run: bool,
     harness_model: HarnessModel,
     handle: manox_harness::harness::HarnessHandle,
-    sessions_path: PathBuf,
     active_session_path: PathBuf,
 }
 
 impl K5Rig {
-    fn new(dir: &tempfile::TempDir, session: &AgentSession) -> Self {
+    fn new(session: &AgentSession) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
         let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
         K5Rig {
@@ -2425,7 +2416,6 @@ impl K5Rig {
             shutdown_after_run: false,
             harness_model: test_model(),
             handle: session.handle(),
-            sessions_path: dir.path().join("sessions"),
             active_session_path: session.path().clone(),
         }
     }
@@ -2489,7 +2479,7 @@ async fn accepted_user_entry_persists_before_the_run_and_the_middleware_skips_th
     .unwrap();
     assert_eq!(pinned.as_deref(), Some(accepted_id.as_str()));
 
-    let mut rig = K5Rig::new(&dir, &session);
+    let mut rig = K5Rig::new(&session);
     let mut turn = TurnCommit::open(&session, &rig.state, &rig.notice_tx, &cwd);
     let drive = drive_run(
         session.prompt("k5 accepted text"),
@@ -2501,7 +2491,6 @@ async fn accepted_user_entry_persists_before_the_run_and_the_middleware_skips_th
         &rig.state,
         &rig.notice_tx,
         &mut rig.harness_model,
-        &rig.sessions_path,
         &rig.active_session_path,
     )
     .await;
@@ -2582,7 +2571,7 @@ async fn kill_after_receipt_keeps_the_accepted_entry_and_origin() {
     .unwrap();
 
     let journal_path = session.path().clone();
-    let mut rig = K5Rig::new(&dir, &session);
+    let mut rig = K5Rig::new(&session);
     let mut turn = TurnCommit::open(&session, &rig.state, &rig.notice_tx, &cwd);
     // The probe wins the select and the drive_run future is dropped
     // WITHOUT releasing the park: everything after the receipt dies
@@ -2598,7 +2587,6 @@ async fn kill_after_receipt_keeps_the_accepted_entry_and_origin() {
             &rig.state,
             &rig.notice_tx,
             &mut rig.harness_model,
-            &rig.sessions_path,
             &rig.active_session_path,
         ) => panic!("the parked run must not finish before the probe"),
         _ = async {
@@ -2680,7 +2668,7 @@ async fn queued_submit_persists_at_drain_before_the_run() {
         "the drained Submit must be in the journal BEFORE the run starts"
     );
 
-    let mut rig = K5Rig::new(&dir, &session);
+    let mut rig = K5Rig::new(&session);
     let mut turn = TurnCommit::open(&session, &rig.state, &rig.notice_tx, &cwd);
     let drive = drive_run(
         session.prompt("drained text"),
@@ -2692,7 +2680,6 @@ async fn queued_submit_persists_at_drain_before_the_run() {
         &rig.state,
         &rig.notice_tx,
         &mut rig.harness_model,
-        &rig.sessions_path,
         &rig.active_session_path,
     )
     .await;
@@ -2770,7 +2757,7 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
         "an origin-less prompt keeps the middleware path"
     );
 
-    let mut rig = K5Rig::new(&dir, &session);
+    let mut rig = K5Rig::new(&session);
     let mut turn = TurnCommit::open(&session, &rig.state, &rig.notice_tx, &cwd);
     let drive = drive_run(
         session.prompt("fresh text"),
@@ -2782,7 +2769,6 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
         &rig.state,
         &rig.notice_tx,
         &mut rig.harness_model,
-        &rig.sessions_path,
         &rig.active_session_path,
     )
     .await;
@@ -2851,7 +2837,7 @@ async fn an_attributed_turn_writes_its_author_on_the_row() {
     }));
 
     let appender = session.journal_appender();
-    let mut rig = K5Rig::new(&dir, &session);
+    let mut rig = K5Rig::new(&session);
     let mut turn = TurnCommit::open(&session, &rig.state, &rig.notice_tx, &cwd);
     let drive = drive_run(
         session.prompt("[harness] the model switched"),
@@ -2863,7 +2849,6 @@ async fn an_attributed_turn_writes_its_author_on_the_row() {
         &rig.state,
         &rig.notice_tx,
         &mut rig.harness_model,
-        &rig.sessions_path,
         &rig.active_session_path,
     )
     .await;
@@ -2936,6 +2921,7 @@ async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
         .await
         .unwrap();
 
+    let sessions_path = dir.path().join("sessions");
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
     let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
     let state = test_engine_state();
@@ -2944,7 +2930,6 @@ async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
     let mut harness_model = test_model();
 
     let handle = session.handle();
-    let sessions_path = dir.path().join("sessions");
     let active_session_path = session.path().clone();
     let _journal_appender = session.journal_appender();
     let mut turn = TurnCommit::open(&session, &state, &notice_tx, &cwd);
@@ -2958,7 +2943,6 @@ async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
         &state,
         &notice_tx,
         &mut harness_model,
-        &sessions_path,
         &active_session_path,
     );
     let record = UiNoteRecord {
@@ -3240,7 +3224,6 @@ async fn a_panicking_run_future_is_caught_and_closes_failed() {
     let dir = tempfile::tempdir().unwrap();
     let session = steer_test_session(&dir).await;
     let cwd = dir.path().join("proj");
-    let sessions = dir.path().join("sessions");
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
     let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
     let state = test_engine_state();
@@ -3261,7 +3244,6 @@ async fn a_panicking_run_future_is_caught_and_closes_failed() {
         &state,
         &notice_tx,
         &mut harness_model,
-        &sessions,
         &session_path,
     )
     .await;
@@ -4687,7 +4669,7 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     // K2 cache repair: the diverging (here: empty) sidecar converges
     // toward the journal authority — INCLUDING the title (the repair
     // is enabled by the rename-route decision: a thread's sidecar
-    // title is written only by the journaled auto-title scheduler; the
+    // title is written only via the journaled rename route; the
     // direct writer `set_external_title` serves external TUI sessions,
     // which carry no journal chain and never reach this rebuild).
     let repaired = manox_harness::session_meta::load(&sessions, &live_path)
@@ -4909,7 +4891,7 @@ async fn restored_state_repairs_the_cache_without_resurrecting_a_config_copy() {
 
     // The cache converged toward the authority in the same pass —
     // the title INCLUDED (the rename-route decision: the thread
-    // sidecar title's only writer is the journaled auto-title
+    // sidecar title's only writer is the journaled rename route
     // scheduler, so a divergence is a stale cache, not a newer user
     // decision; external-session titles never reach this rebuild).
     let repaired = manox_harness::session_meta::load(&sessions, session.path())
@@ -5379,72 +5361,6 @@ async fn set_access_mode_writes_the_gate_before_the_actor_drains() {
         cmd_rx.try_recv().is_err(),
         "nothing else may ride the queue for one switch"
     );
-}
-
-/// K3 (L3) regression: the initial-title decision rides the same
-/// notice tap as the generated title — pre-fix only
-/// `SessionListDirty` fired, so the chain never carried a `title`
-/// entry for the initial title and the K2 rebuild stayed blind to it.
-#[tokio::test]
-async fn initial_title_decision_journals_through_the_tap() {
-    let dir = tempfile::tempdir().unwrap();
-    let sessions = dir.path().join("sessions");
-    let session = decision_rig_session(&dir).await;
-    let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
-
-    persist_initial_title(
-        &sessions,
-        session.path(),
-        "initial title".to_string(),
-        &notice_tx,
-    )
-    .await;
-
-    let meta = manox_harness::session_meta::load(&sessions, session.path())
-        .await
-        .unwrap();
-    assert_eq!(meta.title.as_deref(), Some("initial title"));
-
-    // First the sidebar refresh, then the TitleChanged notice whose
-    // tap mapping is the `title` row. Bounded: a missing emission must
-    // fail the test, not hang it.
-    let first = tokio::time::timeout(std::time::Duration::from_secs(5), notice_rx.recv())
-        .await
-        .unwrap_or_else(|_| panic!("the sidebar must refresh"))
-        .expect("the notice channel must stay open");
-    assert!(
-        matches!(first, BackendNotice::SessionListDirty),
-        "the refresh notice comes first"
-    );
-    let second = tokio::time::timeout(std::time::Duration::from_secs(5), notice_rx.recv())
-        .await
-        .unwrap_or_else(|_| panic!("the title decision must reach the notice face"))
-        .expect("the notice channel must stay open");
-    let BackendNotice::Event(event) = second else {
-        panic!("the title decision must ride a ThreadEvent notice");
-    };
-    let ThreadEvent::TitleChanged { title } = *event else {
-        panic!("expected TitleChanged");
-    };
-    assert_eq!(title, "initial title");
-    let (kind, payload) = durable_journal_payload(&ThreadEvent::TitleChanged { title })
-        .expect("the tap maps the decision to a typed row");
-    assert_eq!(kind, "title");
-    session
-        .journal_appender()
-        .append_typed(&kind, payload)
-        .await
-        .unwrap();
-    let rows = session.journal_range(0, u64::MAX).await.unwrap();
-    assert!(
-        rows.iter().any(|record| matches!(
-            &record.entry,
-            manox_harness::session::Event::Title { title, .. }
-                if title == "initial title"
-        )),
-        "the decision must land a title entry"
-    );
-    session.close().await.unwrap();
 }
 
 // ── #805 companion: embedder tools registered AFTER session assembly

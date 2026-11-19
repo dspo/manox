@@ -48,8 +48,6 @@ const TPL_WRAPPER_DENIAL_BREAKER_DIRECTIVE: &str =
     include_str!("templates/wrapper/denial_breaker_directive.tera.md");
 const TPL_WRAPPER_PEER_MESSAGE: &str = include_str!("templates/wrapper/peer_message.tera.md");
 const TPL_WRAPPER_TOOL_DENIED: &str = include_str!("templates/wrapper/tool_denied.tera.md");
-const TPL_TITLE_FIRST: &str = include_str!("templates/title/first.tera.md");
-const TPL_TITLE_TOPIC_SHIFT: &str = include_str!("templates/title/topic_shift.tera.md");
 const TPL_SKILL_BODY: &str = include_str!("templates/wrapper/skill_body.tera.md");
 
 /// `(PromptTemplate, source)` for every built-in template: the single source of
@@ -83,11 +81,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str)] = &[
     ),
     (PromptTemplate::WrapperPeerMessage, TPL_WRAPPER_PEER_MESSAGE),
     (PromptTemplate::WrapperToolDenied, TPL_WRAPPER_TOOL_DENIED),
-    (PromptTemplate::TitleFirstInstruction, TPL_TITLE_FIRST),
-    (
-        PromptTemplate::TitleTopicShiftInstruction,
-        TPL_TITLE_TOPIC_SHIFT,
-    ),
     (PromptTemplate::SkillBody, TPL_SKILL_BODY),
 ];
 
@@ -256,7 +249,6 @@ mod tests {
             PromptTemplate::WrapperMaxTokensDirective,
             PromptTemplate::WrapperUnfulfilledToolIntentNudge,
             PromptTemplate::WrapperToolDenied,
-            PromptTemplate::TitleFirstInstruction,
         ];
         for t in static_templates {
             let rendered = render_static(t).expect("template must render with empty context");
@@ -279,8 +271,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 13);
-        assert_eq!(REGISTRATIONS.len(), 13);
+        assert_eq!(template::ALL.len(), 11);
+        assert_eq!(REGISTRATIONS.len(), 11);
     }
 
     /// Every data-bearing template must fully substitute its variables against
@@ -391,19 +383,6 @@ mod tests {
                 .unwrap(),
                 PromptTemplate::WrapperPeerMessage,
             );
-            // Title topic-shift (uses a sentinel literal in data).
-            assert_clean(
-                &render(
-                    PromptTemplate::TitleTopicShiftInstruction,
-                    &crate::prompt::TopicShiftData {
-                        current_title: "t".to_string(),
-                        unchanged_sentinel: "UNCHANGED",
-                    },
-                )
-                .unwrap(),
-                PromptTemplate::TitleTopicShiftInstruction,
-            );
-
             // Skill body (both branches: with/without description and arguments).
             assert_clean(
                 &render(
@@ -496,6 +475,11 @@ mod tests {
 ## Tool preferences
 Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).
 Every file-system and Bash call must carry `cwd` as an array `[anchor, ...route]`: the first element re-anchors the session's default directory (`""` keeps the current one — anchor it to the repo/worktree root once and leave it there), the remaining elements only locate this call. Express the target in `path` relative to the anchor rather than stacking route elements. Never `cd` inside a Bash command to reach a directory — `cd` does not move the session's working directory; pass `cwd`.
+
+## Conversation title
+When the conversation's topic becomes clear — usually within your first response — and each time it materially shifts, set the session title by running:
+`printf '\033]2;%s\007' '<title>'`
+Constraints: short (at most 40 characters), single line, no surrounding quotes or Markdown in the title itself; match the user's language; keep distinguishing identifiers (issue/PR numbers, file names, commands). Do not re-emit an unchanged title. Emit it as a plain standalone `printf` — no redirection, no echoing it through other output — so hosts watching for the escape sequence receive it verbatim.
 
 ## Concurrency model
 Foreground tool calls (Bash without `run_in_background`) block this turn. Background Bash (`run_in_background: true`) returns a task id immediately and its completion arrives as a message that wakes the idle session — never use `sleep` or poll loops to wait for a background task. While it runs, keep working on independent steps; block on it with `BashOutput` (`wait: true`, `timeout_ms`) only when your next step genuinely needs its result (a CI run gating a merge, a build the next command consumes) — an expired wait leaves the task running. `TaskList` enumerates background tasks; `TaskStop` cancels one.

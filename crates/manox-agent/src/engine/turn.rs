@@ -399,7 +399,6 @@ pub(super) async fn run_turn(
                 state,
                 notice_tx,
                 harness_model,
-                sessions_dir,
                 &session_path,
             )
             .await
@@ -415,7 +414,6 @@ pub(super) async fn run_turn(
                 state,
                 notice_tx,
                 harness_model,
-                sessions_dir,
                 &session_path,
             )
             .await

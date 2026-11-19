@@ -222,7 +222,7 @@ AHP 原生 `session/activeClientSet` 携带 `activeClients[].tools`：注册即�
 ### D.5 宿主事件推送
 
 - `Models`：provider reload 时立即推 `root/agentsChanged`（不是等下一次列表）。
-- `ThreadsUpdated`：任何 summary 写（title auto-stamp、interacted_at、pin/archive/tag、rescan）
+- `ThreadsUpdated`：任何 summary 写（rename、interacted_at、pin/archive/tag、rescan）
   都推给每个连接，客户端无需 in-process store 订阅。
 - `SessionStatus`：由 session/chat 的 `status` 位集派生，不设独立事件。
 - `SessionCreated` / `SessionDisposed`：`root/sessionAdded|Removed` + `session/chatAdded`。

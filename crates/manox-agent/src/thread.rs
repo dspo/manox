@@ -273,7 +273,8 @@ pub enum ThreadEvent {
     /// The harness backend restored an existing session and the authoritative
     /// history is ready. The workspace rebuilds the conversation view.
     HistoryRestored,
-    /// The persisted display title changed (Title agent result); the facade
+    /// The persisted display title changed (rename route or an external
+    /// TUI writer); the facade
     /// mirrors it so every title surface re-derives from the same source.
     TitleChanged {
         title: String,
@@ -1616,7 +1617,7 @@ impl Thread {
             })
             .map(|t| {
                 let flat: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
-                crate::title::initial_title(&flat).unwrap_or_default()
+                initial_title(&flat).unwrap_or_default()
             })
             .unwrap_or_else(|| "manox".to_string())
     }
@@ -1782,9 +1783,6 @@ impl Thread {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.create_goal(objective, token_budget, max_rounds, actor)?;
         self.ensure_engine(self.project.clone());
-        if let Some(engine) = &self.engine {
-            engine.goal_started();
-        }
         self.pending_events
             .push(ThreadEvent::GoalChanged { goal: self.goal() });
         Ok(())
@@ -1823,9 +1821,6 @@ impl Thread {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.replace_goal(objective, token_budget, max_rounds, actor)?;
         self.ensure_engine(self.project.clone());
-        if let Some(engine) = &self.engine {
-            engine.goal_started();
-        }
         self.pending_events
             .push(ThreadEvent::GoalChanged { goal: self.goal() });
         Ok(())
@@ -2418,6 +2413,26 @@ fn drain_engine_notices(
 /// harness backend, which never spawns manox sub-agents.
 pub fn tool_title(name: &str, args: &serde_json::Value, _desc: Option<&str>) -> String {
     crate::engine::adapt::tool_title(name, args)
+}
+
+/// Cap for the mechanical display-title prefix.
+pub const TITLE_MAX_CHARS: usize = 40;
+
+/// Mechanical display-title prefix: the input collapsed to one line and
+/// capped at [`TITLE_MAX_CHARS`] Unicode characters with an ellipsis. Pure
+/// computation for [`Thread::display_title`]'s fallback — never persisted.
+fn initial_title(text: &str) -> Option<String> {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then(|| truncate_with_ellipsis(&collapsed, TITLE_MAX_CHARS))
+}
+
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    format!("{}…", text.chars().take(keep).collect::<String>())
 }
 
 // Shared helpers the compact/estimation path calls with the same signature as
@@ -4156,6 +4171,20 @@ pub(crate) mod tests {
             title: "标题镜像".into(),
         })));
         thread.read(|t| assert_eq!(t.display_title(), "标题镜像"));
+    }
+
+    /// The mechanical fallback collapses whitespace and caps Unicode length
+    /// with an ellipsis (the prefix shape every title surface relies on).
+    #[test]
+    fn initial_title_collapses_and_caps_unicode() {
+        assert_eq!(
+            initial_title("  hello\n world ").as_deref(),
+            Some("hello world")
+        );
+        let title = initial_title(&"界".repeat(50)).unwrap();
+        assert_eq!(title.chars().count(), TITLE_MAX_CHARS);
+        assert!(title.ends_with('…'));
+        assert_eq!(initial_title("   "), None);
     }
 
     /// A model identity for facade tests.

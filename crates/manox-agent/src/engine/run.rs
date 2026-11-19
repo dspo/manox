@@ -122,7 +122,6 @@ pub(super) async fn drive_run<F>(
     state: &Arc<EngineState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     harness_model: &mut HarnessModel,
-    sessions_dir: &Path,
     session_path: &Path,
 ) -> DriveOutcome
 where
@@ -279,21 +278,6 @@ where
                                 .reset(tokio::time::Instant::now() + state.abort_grace());
                         }
                         *state.journaled_thinking_level.lock().unwrap() = Some(wire);
-                    }
-                }
-                Some(SessionCmd::PersistGeneratedTitle {
-                    session_path: target,
-                    title,
-                }) if target == session_path => {
-                    if let Err(error) = persist_title(sessions_dir, &target, title.clone()).await {
-                        tracing::warn!(%error, "failed to persist Title agent result");
-                    } else {
-                        send_notice(notice_tx, BackendNotice::SessionListDirty, "session list dirty");
-                        // The facade mirrors the persisted title so the
-                        // title bar tracks the sidebar without a reload.
-                        send_notice(notice_tx, BackendNotice::Event(Box::new(
-                            ThreadEvent::TitleChanged { title },
-                        )), "title changed notice");
                     }
                 }
                 Some(SessionCmd::AppendUiNote(record)) => {
@@ -765,7 +749,6 @@ pub(super) fn subscribe_session(
     session: &AgentSession,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     live: Arc<Mutex<LiveTranscript>>,
-    title: TitleScheduler,
 ) -> manox_harness::agent::Subscription {
     let event_tx = notice_tx.clone();
     // Seed the live mirror with the completed transcript so a mid-run tick
@@ -782,7 +765,6 @@ pub(super) fn subscribe_session(
         let tx = event_tx.clone();
         let assistant_flag = std::sync::Arc::clone(&assistant_flag);
         let live = std::sync::Arc::clone(&live);
-        let title = title.clone();
         Box::pin(async move {
             // Mirror the in-flight transcript for the live-history ticker:
             // completed messages accumulate, the streaming partial replaces
@@ -814,7 +796,6 @@ pub(super) fn subscribe_session(
                     _ => {}
                 }
             }
-            title.observe(&event);
             for te in adapt::agent_event_to_thread_events(&event) {
                 send_notice(&tx, BackendNotice::Event(Box::new(te)), "engine notice");
             }

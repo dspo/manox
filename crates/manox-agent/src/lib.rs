@@ -54,7 +54,6 @@ pub mod subagent;
 pub mod subagent_restore;
 pub mod subagent_watchdog;
 pub mod team;
-pub mod title;
 pub mod tools;
 pub mod version;
 pub mod web_fetch;

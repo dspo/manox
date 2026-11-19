@@ -151,17 +151,6 @@ pub(crate) enum SessionCmd {
     /// transcript's plan tool calls are summarized away; the rail restores
     /// from the sidecar). `None` clears it (the model dropped its plan).
     PersistPlanSnapshot(Option<serde_json::Value>),
-    /// Persist the mechanical first-message title before the first provider
-    /// response (empty/image-only prompts leave the default title intact).
-    SetInitialTitle(String),
-    /// Persist an asynchronous Title-agent result through the session actor
-    /// so it cannot race other sidecar updates owned by the actor.
-    PersistGeneratedTitle {
-        session_path: PathBuf,
-        title: String,
-    },
-    /// A user-created/replaced Goal starts executing immediately.
-    GoalStarted,
     /// Wake the goal gate now (user resumed an active goal while the agent
     /// was idle): queue the next continuation round if owed.
     GoalGate,
@@ -906,9 +895,6 @@ impl ThreadEngine for Engine {
     }
 
     fn run(&self, prompt: String, images: Vec<manox_harness::types::ContentBlock>) {
-        if let Some(title) = crate::title::initial_title(&prompt) {
-            let _ = self.cmd_tx.send(SessionCmd::SetInitialTitle(title));
-        }
         let _ = self.cmd_tx.send(SessionCmd::Prompt {
             text: prompt,
             images,
@@ -987,10 +973,6 @@ impl ThreadEngine for Engine {
 
     fn persist_plan_snapshot(&self, snapshot: Option<serde_json::Value>) {
         let _ = self.cmd_tx.send(SessionCmd::PersistPlanSnapshot(snapshot));
-    }
-
-    fn goal_started(&self) {
-        let _ = self.cmd_tx.send(SessionCmd::GoalStarted);
     }
 
     /// Wake the goal gate (resume path): the actor queues the next
@@ -1372,35 +1354,12 @@ async fn run_actor(
     // The live-transcript mirror the listener maintains and the run ticker
     // reads; shared so mid-run history refreshes never borrow the session.
     let live_mirror: Arc<Mutex<LiveTranscript>> = Arc::new(Mutex::new(LiveTranscript::default()));
-    let restored_provider_responses = successful_provider_responses(session.harness_messages());
     // The journal-first restore rebuild: the active chain is the authority
     // for every field §C.2 entries carry, the sidecar fills the fields the
     // chain has never seen, and a diverging cache is repaired toward the
     // journal.
     let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
-    let title_scheduler = TitleScheduler::new(
-        runtime.clone(),
-        Arc::clone(&state.model),
-        Arc::clone(&live_mirror),
-        state.goal_bridge.clone(),
-        session.path().to_path_buf(),
-        session.session_id().to_string(),
-        cwd.clone(),
-        cmd_tx.clone(),
-        load_title_scheduler(
-            &sessions_dir,
-            session.path(),
-            restored_provider_responses,
-            restored_state.title.clone(),
-        )
-        .await,
-    );
-    let mut _subscription = subscribe_session(
-        &session,
-        &notice_tx,
-        Arc::clone(&live_mirror),
-        title_scheduler.clone(),
-    );
+    let mut _subscription = subscribe_session(&session, &notice_tx, Arc::clone(&live_mirror));
     let mut _harness_subscription = subscribe_harness_events(
         &mut session,
         sessions_dir.clone(),
@@ -1914,46 +1873,6 @@ async fn run_actor(
                     tracing::warn!(error = %err, "failed to persist plan snapshot");
                 }
             }
-            SessionCmd::SetInitialTitle(title) => {
-                let should_write = {
-                    let mut scheduler = title_scheduler.state.lock().unwrap();
-                    if scheduler.title.is_none() {
-                        scheduler.title = Some(title.clone());
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if should_write {
-                    persist_initial_title(&sessions_dir, session.path(), title, &notice_tx).await;
-                }
-            }
-            SessionCmd::PersistGeneratedTitle {
-                session_path,
-                title,
-            } => {
-                if session.path() == &session_path {
-                    if let Err(error) =
-                        persist_title(&sessions_dir, &session_path, title.clone()).await
-                    {
-                        tracing::warn!(%error, "failed to persist Title agent result");
-                    } else {
-                        send_notice(
-                            &notice_tx,
-                            BackendNotice::SessionListDirty,
-                            "session list dirty",
-                        );
-                        send_notice(
-                            &notice_tx,
-                            BackendNotice::Event(Box::new(ThreadEvent::TitleChanged { title })),
-                            "title changed notice",
-                        );
-                    }
-                }
-            }
-            SessionCmd::GoalStarted => {
-                title_scheduler.start_execution(crate::title::TitleWakeReason::GoalStarted);
-            }
             SessionCmd::GoalGate => {
                 // Resume path: a goal was re-armed while the agent was idle.
                 // Chain continuation rounds only when the gate actually owes
@@ -2048,24 +1967,7 @@ async fn run_actor(
                 // session's observable state (authority: its active chain;
                 // gap-fill: its sidecar).
                 let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
-                title_scheduler.retarget(
-                    path.clone(),
-                    session.session_id().to_string(),
-                    cwd.clone(),
-                    load_title_scheduler(
-                        &sessions_dir,
-                        &path,
-                        successful_provider_responses(session.harness_messages()),
-                        restored_state.title.clone(),
-                    )
-                    .await,
-                );
-                _subscription = subscribe_session(
-                    &session,
-                    &notice_tx,
-                    Arc::clone(&live_mirror),
-                    title_scheduler.clone(),
-                );
+                _subscription = subscribe_session(&session, &notice_tx, Arc::clone(&live_mirror));
                 _harness_subscription = subscribe_harness_events(
                     &mut session,
                     sessions_dir.to_path_buf(),
@@ -2166,358 +2068,6 @@ async fn run_actor(
     // still burning tokens.
     crate::background_task::cancel_all_for_thread(&thread_id).await;
     crate::background_task::cleanup_thread(&thread_id);
-}
-
-#[derive(Debug, Default)]
-struct TitleSchedulerState {
-    title: Option<String>,
-    in_flight: bool,
-    rerun: Option<crate::title::TitleWakeReason>,
-    wake: crate::title::TitleWakeState,
-    generation: u64,
-}
-
-impl TitleSchedulerState {
-    fn begin(&mut self, reason: crate::title::TitleWakeReason) -> bool {
-        if self.in_flight {
-            self.rerun = Some(reason);
-            false
-        } else {
-            self.in_flight = true;
-            true
-        }
-    }
-
-    fn finish(&mut self) -> Option<crate::title::TitleWakeReason> {
-        self.in_flight = false;
-        self.rerun.take()
-    }
-}
-
-#[derive(Debug, Default)]
-struct PersistedTitleScheduler {
-    title: Option<String>,
-    provider_responses: usize,
-}
-
-#[derive(Clone)]
-struct TitleScheduler {
-    state: Arc<Mutex<TitleSchedulerState>>,
-    runtime: ModelRuntime,
-    model: Arc<Mutex<Option<HarnessModel>>>,
-    live: Arc<Mutex<LiveTranscript>>,
-    goal: Option<Arc<crate::goal_tools::GoalBridge>>,
-    session_path: Arc<Mutex<PathBuf>>,
-    /// Session id the title side call attributes its provider request with —
-    /// endpoints that template `{{ session_id }}` into a required header
-    /// reject requests without it.
-    session_id: Arc<Mutex<String>>,
-    cwd: Arc<Mutex<PathBuf>>,
-    cmd_tx: mpsc::UnboundedSender<SessionCmd>,
-}
-
-impl TitleScheduler {
-    #[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct scheduler state
-    fn new(
-        runtime: ModelRuntime,
-        model: Arc<Mutex<Option<HarnessModel>>>,
-        live: Arc<Mutex<LiveTranscript>>,
-        goal: Option<Arc<crate::goal_tools::GoalBridge>>,
-        session_path: PathBuf,
-        session_id: String,
-        cwd: PathBuf,
-        cmd_tx: mpsc::UnboundedSender<SessionCmd>,
-        persisted: PersistedTitleScheduler,
-    ) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(TitleSchedulerState {
-                title: persisted.title,
-                wake: crate::title::TitleWakeState::restore(persisted.provider_responses, false),
-                ..Default::default()
-            })),
-            runtime,
-            model,
-            live,
-            goal,
-            session_path: Arc::new(Mutex::new(session_path)),
-            session_id: Arc::new(Mutex::new(session_id)),
-            cwd: Arc::new(Mutex::new(cwd)),
-            cmd_tx,
-        }
-    }
-
-    fn retarget(
-        &self,
-        session_path: PathBuf,
-        session_id: String,
-        cwd: PathBuf,
-        persisted: PersistedTitleScheduler,
-    ) {
-        *self.session_path.lock().unwrap() = session_path;
-        *self.session_id.lock().unwrap() = session_id;
-        *self.cwd.lock().unwrap() = cwd;
-        let generation = self.state.lock().unwrap().generation.wrapping_add(1);
-        *self.state.lock().unwrap() = TitleSchedulerState {
-            title: persisted.title,
-            wake: crate::title::TitleWakeState::restore(persisted.provider_responses, false),
-            generation,
-            ..Default::default()
-        };
-    }
-
-    fn observe(&self, event: &AgentEvent) {
-        match event {
-            AgentEvent::TurnStart => {
-                self.state.lock().unwrap().wake.turn_start();
-            }
-            AgentEvent::MessageEnd { message } => {
-                let AgentMessage::Assistant { stop_reason, .. } = &**message else {
-                    return;
-                };
-                if matches!(
-                    stop_reason,
-                    Some(
-                        manox_harness::types::StopReason::Error
-                            | manox_harness::types::StopReason::Aborted
-                    )
-                ) {
-                    return;
-                }
-                let reasons = self
-                    .state
-                    .lock()
-                    .unwrap()
-                    .wake
-                    .assistant_response(*stop_reason);
-                for reason in reasons {
-                    self.wake(reason);
-                }
-            }
-            AgentEvent::ToolExecutionEnd {
-                tool_name,
-                result,
-                is_error,
-                ..
-            } => {
-                if tool_name == crate::tools::CREATE_GOAL && !is_error {
-                    self.start_execution(crate::title::TitleWakeReason::GoalStarted);
-                } else if result.terminate {
-                    // `wake` re-locks the scheduler state, so the guard from
-                    // the scrutinee must drop first: an `if let` scrutinee
-                    // guard stays alive through the block and would
-                    // self-deadlock the non-reentrant std mutex.
-                    let reason = self.state.lock().unwrap().wake.tool_terminated();
-                    if let Some(reason) = reason {
-                        self.wake(reason);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn start_execution(&self, reason: crate::title::TitleWakeReason) {
-        self.state.lock().unwrap().wake.start_execution();
-        self.wake(reason);
-    }
-
-    fn wake(&self, reason: crate::title::TitleWakeReason) {
-        if !crate::settings::side_calls().title_policy().enabled {
-            return;
-        }
-        {
-            let mut state = self.state.lock().unwrap();
-            if !state.begin(reason) {
-                return;
-            }
-        }
-        let generation = self.state.lock().unwrap().generation;
-        let session_path = self.session_path.lock().unwrap().clone();
-        let scheduler = self.clone();
-        crate::runtime::handle().spawn(async move {
-            scheduler.run(reason, generation, session_path).await;
-        });
-    }
-
-    async fn run(
-        self,
-        reason: crate::title::TitleWakeReason,
-        generation: u64,
-        session_path: PathBuf,
-    ) {
-        let current = self.state.lock().unwrap().title.clone();
-        let messages = self.live.lock().unwrap().messages.clone();
-        let goal = self.goal.as_ref().and_then(|bridge| bridge.snapshot());
-        let source = crate::title::select_source(goal.as_ref(), &messages);
-        let request = crate::title::TitleRequest {
-            source,
-            current_title: current.clone(),
-            reason,
-        };
-        let model = self.model.lock().unwrap().clone();
-        let cwd = self.cwd.lock().unwrap().clone();
-        let session_id = self.session_id.lock().unwrap().clone();
-        let result = match model {
-            Some(model) => {
-                crate::title::run_title_agent(&self.runtime, &model, &cwd, &session_id, &request)
-                    .await
-            }
-            None => Ok(None),
-        };
-        let next = {
-            let mut state = self.state.lock().unwrap();
-            if state.generation != generation {
-                return;
-            }
-            if let Ok(Some(title)) = &result
-                && state.title.as_deref() != Some(title)
-            {
-                state.title = Some(title.clone());
-            }
-            state.finish()
-        };
-        match result {
-            Ok(Some(title)) if current.as_deref() != Some(title.as_str()) => {
-                let _ = self.cmd_tx.send(SessionCmd::PersistGeneratedTitle {
-                    session_path,
-                    title,
-                });
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(%error, ?reason, "Title agent failed; keeping current title")
-            }
-        }
-        if let Some(reason) = next {
-            self.wake(reason);
-        }
-    }
-}
-
-#[cfg(test)]
-mod title_scheduler_tests {
-    use super::*;
-    use crate::title::TitleWakeReason;
-
-    #[test]
-    fn in_flight_wakes_coalesce_to_the_latest_reason() {
-        let mut state = TitleSchedulerState::default();
-        assert!(state.begin(TitleWakeReason::FirstResponse));
-        assert!(!state.begin(TitleWakeReason::Stop));
-        assert!(!state.begin(TitleWakeReason::GoalStarted));
-        assert_eq!(state.finish(), Some(TitleWakeReason::GoalStarted));
-        assert!(!state.in_flight);
-    }
-
-    #[test]
-    fn tool_terminate_observe_releases_state_guard_before_wake() {
-        // Regression: the `if let` scrutinee guard from `state.lock()` stays
-        // alive through the block, so a `wake` call inside it self-deadlocked
-        // the non-reentrant std mutex when a terminate tool ended the turn.
-        let (tx, _rx) = mpsc::unbounded_channel::<SessionCmd>();
-        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(
-            |_model: &HarnessModel| -> Result<Arc<dyn manox_harness::agent_loop::StreamFn>, anyhow::Error> {
-                Err(anyhow::anyhow!("unused in this test"))
-            },
-        );
-        let scheduler = TitleScheduler::new(
-            ModelRuntime::new(resolver),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(LiveTranscript::default())),
-            None,
-            PathBuf::new(),
-            "sess_test".to_string(),
-            PathBuf::new(),
-            tx,
-            PersistedTitleScheduler::default(),
-        );
-        // Park `wake` at the begin gate so the fixed code returns without
-        // spawning a title run; the buggy code deadlocks on the re-lock
-        // before it ever reaches that gate.
-        scheduler.state.lock().unwrap().in_flight = true;
-        let event = AgentEvent::ToolExecutionEnd {
-            tool_call_id: "call-1".into(),
-            tool_name: "AskUserQuestion".into(),
-            result: manox_harness::tool::AgentToolResult {
-                content: vec![ContentBlock::Text {
-                    text: "plan submitted".into(),
-                    signature: None,
-                }],
-                details: None,
-                is_error: false,
-                usage: None,
-                added_tool_names: None,
-                terminate: true,
-            },
-            is_error: false,
-        };
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            scheduler.observe(&event);
-            let _ = done_tx.send(());
-        });
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("observe deadlocked on a terminate tool result");
-    }
-}
-
-async fn load_title_scheduler(
-    sessions_dir: &Path,
-    session_path: &Path,
-    provider_responses: usize,
-    journal_title: Option<String>,
-) -> PersistedTitleScheduler {
-    // The journal chain's title is the authority; the sidecar fills a
-    // chain that never saw a `title` entry.
-    let sidecar = manox_harness::session_meta::load(sessions_dir, session_path)
-        .await
-        .ok()
-        .and_then(|meta| meta.title)
-        .filter(|title| !title.trim().is_empty());
-    PersistedTitleScheduler {
-        title: journal_title.or(sidecar),
-        provider_responses,
-    }
-}
-
-fn successful_provider_responses(messages: &[AgentMessage]) -> usize {
-    messages
-        .iter()
-        .filter(|message| {
-            matches!(
-                message,
-                AgentMessage::Assistant {
-                    stop_reason,
-                    error_message: None,
-                    ..
-                } if !matches!(
-                    stop_reason,
-                    Some(manox_harness::types::StopReason::Error | manox_harness::types::StopReason::Aborted)
-                )
-            )
-        })
-        .count()
-}
-
-async fn persist_title(
-    sessions_dir: &Path,
-    session_path: &Path,
-    title: String,
-) -> Result<(), anyhow::Error> {
-    // Probe first (unlocked read): persisting an unchanged title would only
-    // churn the sidecar; the locked re-read inside `update` makes any race
-    // benign (title is last-write-wins either way).
-    let current = manox_harness::session_meta::load(sessions_dir, session_path)
-        .await
-        .unwrap_or_default();
-    if current.title.as_deref() == Some(title.as_str()) {
-        return Ok(());
-    }
-    manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
-        meta.title = Some(title.clone());
-    })
-    .await
 }
 
 async fn write_plan_snapshot_sidecar(
@@ -2799,7 +2349,7 @@ async fn rebuild_restored_state(
     // this rebuild, and their sidecar is desktop-authoritative by design
     // (the external process owns the session file, so a journaled rename
     // face does not apply and a cold journal append would race it). A
-    // thread's sidecar title is written only by the auto-title scheduler,
+    // thread's sidecar title is written only via the journaled rename route,
     // whose decision journals the `title` entry first — so a divergence
     // here is a stale cache and the chain re-stamps it. A chain that never
     // saw a title keeps the sidecar value (hole-fill; the scheduler seeds
@@ -3221,32 +2771,6 @@ async fn apply_access_mode(
         BackendNotice::Event(Box::new(ThreadEvent::AccessModeChanged { mode })),
         "access mode changed notice",
     );
-}
-
-/// Persist the initial-title decision (K3): the sidecar cache write, the
-/// sidebar refresh, and the `TitleChanged` notice whose tap emission
-/// journals the `title` entry (L3) — the same face the generated title
-/// rides — while the facade mirror tracks the title bar without a reload.
-async fn persist_initial_title(
-    sessions_dir: &Path,
-    session_path: &Path,
-    title: String,
-    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
-) {
-    if let Err(error) = persist_title(sessions_dir, session_path, title.clone()).await {
-        tracing::warn!(%error, "failed to persist initial title");
-    } else {
-        send_notice(
-            notice_tx,
-            BackendNotice::SessionListDirty,
-            "session list dirty",
-        );
-        send_notice(
-            notice_tx,
-            BackendNotice::Event(Box::new(ThreadEvent::TitleChanged { title })),
-            "title changed notice",
-        );
-    }
 }
 
 /// Mirror session usage into the engine state, reading the journal handle

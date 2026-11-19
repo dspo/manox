@@ -131,15 +131,6 @@ pub struct RecoveryFailureData {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct EmptyTurnNudgeData {}
 
-// --- title ---
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TopicShiftData {
-    pub current_title: String,
-    /// The literal `UNCHANGED` sentinel, so the template does not hardcode it.
-    pub unchanged_sentinel: &'static str,
-}
-
 // --- command / skill ---
 
 /// Skill turn body: optional description prefix + body + optional args.

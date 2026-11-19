@@ -247,36 +247,6 @@ pub fn default_model() -> Option<manox_harness::types::Model> {
         .or_else(|| models.into_iter().next())
 }
 
-/// Resolve a side-call model override (title generation). A
-/// non-empty `policy.model` reference (id or alias) resolved against the
-/// registry wins; an empty or unresolvable reference yields `None` so the
-/// caller inherits the session model — matching the `side_calls` contract
-/// ("Empty → inherit the main model").
-pub fn resolve_side_call_model(
-    policy: &crate::settings::SideCallPolicy,
-) -> Option<manox_harness::types::Model> {
-    resolve_side_call_model_in(&global(), policy)
-}
-
-/// Registry-injectable core of [`resolve_side_call_model`] (testable
-/// without the process-global registry).
-pub fn resolve_side_call_model_in(
-    registry: &manox_harness::ProviderRegistry,
-    policy: &crate::settings::SideCallPolicy,
-) -> Option<manox_harness::types::Model> {
-    let reference = policy.model.trim();
-    if reference.is_empty() {
-        return None;
-    }
-    let resolved = manox_harness::model_ref::resolve_model_ref(registry, reference);
-    if resolved.is_none() {
-        tracing::warn!(
-            reference = %reference,
-            "side-call model override did not resolve; inheriting the session model"
-        );
-    }
-    resolved
-}
 /// Model catalog mapping `{wire}:{name}` provider ids (e.g.
 /// `anthropic:DeepSeek`) to the current registration name `{name}-{wire}`
 /// (`DeepSeek-anthropic`). A host-side alias layer — the kernel catalog only
@@ -433,66 +403,5 @@ mod tests {
         // Unknown ids fall through to the default catalog chain.
         assert!(catalog.resolve("anthropic", "claude-sonnet-4-6").is_some());
         assert!(catalog.resolve("anthropic:DeepSeek", "nope").is_none());
-    }
-
-    fn register_model(registry: &ProviderRegistry, id: &str) {
-        registry
-            .register_provider(
-                &format!("p-{id}"),
-                ProviderConfig {
-                    name: Some("P".into()),
-                    base_url: Some("https://p.example".into()),
-                    api_key: Some("k".into()),
-                    api: Some(Api::AnthropicMessages),
-                    headers: None,
-                    auth_header: false,
-                    models: vec![ProviderModelConfig {
-                        id: id.into(),
-                        name: id.into(),
-                        reasoning: false,
-                        input: vec![],
-                        context_window: 1_000_000,
-                        max_tokens: 8_192,
-                        cost: Cost::default(),
-                        api: None,
-                        base_url: None,
-                        metadata: std::collections::HashMap::new(),
-                    }],
-                },
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn side_call_override_empty_inherits() {
-        let registry = ProviderRegistry::new();
-        register_model(&registry, "haiku");
-        // An empty override (the default) inherits the session model.
-        let policy = crate::settings::SideCallPolicy::default();
-        assert!(resolve_side_call_model_in(&registry, &policy).is_none());
-    }
-
-    #[test]
-    fn side_call_override_resolves_reference() {
-        let registry = ProviderRegistry::new();
-        register_model(&registry, "haiku");
-        let policy = crate::settings::SideCallPolicy {
-            model: "haiku".into(),
-            ..Default::default()
-        };
-        let resolved = resolve_side_call_model_in(&registry, &policy).unwrap();
-        assert_eq!(resolved.id, "haiku");
-    }
-
-    #[test]
-    fn side_call_override_unresolvable_inherits() {
-        let registry = ProviderRegistry::new();
-        register_model(&registry, "haiku");
-        // A reference that matches nothing falls back to the session model.
-        let policy = crate::settings::SideCallPolicy {
-            model: "no-such-model".into(),
-            ..Default::default()
-        };
-        assert!(resolve_side_call_model_in(&registry, &policy).is_none());
     }
 }
