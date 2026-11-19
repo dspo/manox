@@ -116,9 +116,12 @@ impl TaskEntry {
         self.touch();
     }
 
-    fn push(&self, stream: OutputStream, data: &[u8]) {
+    /// Append one chunk to the ring. Returns whether the chunk was handed to
+    /// the foreground receiver — i.e. a foreground call owns the task and the
+    /// chunk is the caller's to deliver (and tap).
+    fn push(&self, stream: OutputStream, data: &[u8]) -> bool {
         let mut buf = self.buffer.lock().expect("buffer lock poisoned");
-        if let Some(tx) = self
+        let foreground_owned = if let Some(tx) = self
             .foreground
             .lock()
             .expect("foreground lock poisoned")
@@ -128,7 +131,10 @@ impl TaskEntry {
                 stream,
                 bytes: data.to_vec(),
             });
-        }
+            true
+        } else {
+            false
+        };
         buf.extend_from_slice(data);
         let overflow = buf.len().saturating_sub(MAX_BUFFER_BYTES);
         if overflow > 0 {
@@ -139,6 +145,7 @@ impl TaskEntry {
         self.total_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
         self.touch();
+        foreground_owned
     }
 
     fn touch(&self) {
@@ -530,9 +537,14 @@ async fn drain_task(
     let mut carry: Vec<u8> = Vec::new();
     let tap = |id: &crate::core::TaskId, line: String| entry.tap_line(id, line);
     // The installed output tap observes each raw chunk at the append point —
-    // background bytes never flow through the foreground `on_data` slot, so
-    // this is their only leave-the-execution-machinery moment. Both streams
-    // fire, matching the foreground slot's semantics. No tap: untouched.
+    // except chunks a foreground call owns: those are delivered (and tapped)
+    // exactly once through the caller's composed `on_data` slot, and firing
+    // here would double-tap them. Once ownership is released
+    // (`release_foreground` — timeout promotion or explicit release), the
+    // drain is the only tap. The decision rides the same `foreground` lock
+    // acquisition as the forwarding in `push`, so a release racing the drain
+    // can never split one chunk across both paths. Both streams fire,
+    // matching the foreground slot's semantics. No tap: untouched.
     let output_tap = super::tap::current().map(|tap| {
         let id = super::tap::BashOutputTapId {
             session_id: output_tap_session,
@@ -540,7 +552,10 @@ async fn drain_task(
         };
         (tap, id)
     });
-    let fire_output_tap = |data: &[u8]| {
+    let fire_output_tap = |foreground_owned: bool, data: &[u8]| {
+        if foreground_owned {
+            return;
+        }
         if let Some((tap, id)) = &output_tap {
             tap(
                 super::tap::BashOutputTapId {
@@ -565,8 +580,8 @@ async fn drain_task(
                 }
                 Ok(n) => {
                     let data = &out_chunk[..n];
-                    entry.push(OutputStream::Stdout, data);
-                    fire_output_tap(data);
+                    let foreground_owned = entry.push(OutputStream::Stdout, data);
+                    fire_output_tap(foreground_owned, data);
                     emit_lines(&id, data, &mut carry, &tap);
                 }
             },
@@ -574,8 +589,8 @@ async fn drain_task(
                 Ok(0) | Err(_) => err_done = true,
                 Ok(n) => {
                     let data = &err_chunk[..n];
-                    entry.push(OutputStream::Stderr, data);
-                    fire_output_tap(data);
+                    let foreground_owned = entry.push(OutputStream::Stderr, data);
+                    fire_output_tap(foreground_owned, data);
                 }
             },
         }
@@ -1556,8 +1571,12 @@ mod sandbox_tests {
         );
     }
 
-    /// #1030 (5): every background spawn branch hands its raw chunks to the
-    /// installed output tap, each chunk carrying its own task id.
+    /// #1030 (5): every background spawn branch leaves the execution
+    /// machinery with its chunks tapped exactly once, each chunk carrying
+    /// its own task id. The `spawn` / `spawn_sandboxed` branches have no
+    /// foreground owner, so the drain is the tap; the `spawn_foreground`
+    /// branch is owned by its caller — the drain skips its window and the
+    /// foreground receiver holds the bytes instead.
     #[tokio::test]
     async fn output_tap_observes_background_spawns() {
         let store = crate::bash::tap::test_support::install();
@@ -1575,13 +1594,18 @@ mod sandbox_tests {
             .spawn_sandboxed("echo bg-sandboxed-marker", Path::new("/tmp"))
             .unwrap();
         registry.wait_exit(&id2).await.unwrap();
-        // The foreground-owned branch: same drain, ownership released once
-        // the exit is recorded.
-        let (id3, _chunks) = registry
+        // The foreground-owned branch: while the call owns the task the
+        // drain does not tap, so the bytes arrive through the receiver —
+        // released here, once the exit is recorded and every chunk is queued.
+        let (id3, mut chunks) = registry
             .spawn_foreground("echo bg-foreground-marker", Path::new("/tmp"), true)
             .unwrap();
         registry.wait_exit(&id3).await.unwrap();
         registry.release_foreground(&id3).unwrap();
+        let mut forwarded = Vec::new();
+        while let Ok(chunk) = chunks.try_recv() {
+            forwarded.extend_from_slice(&chunk.bytes);
+        }
 
         let records = crate::bash::tap::test_support::records_for(store, "tap-bg-session");
         let joined = String::from_utf8_lossy(
@@ -1600,10 +1624,14 @@ mod sandbox_tests {
             "spawn_sandboxed branch: {joined:?}"
         );
         assert!(
-            joined.contains("bg-foreground-marker"),
-            "spawn_foreground branch: {joined:?}"
+            !joined.contains("bg-foreground-marker"),
+            "foreground-owned bytes must not be tapped by the drain: {joined:?}"
         );
-        let ids = [id.0.as_str(), id2.0.as_str(), id3.0.as_str()];
+        assert!(
+            String::from_utf8_lossy(&forwarded).contains("bg-foreground-marker"),
+            "foreground-owned bytes arrive through the receiver: {forwarded:?}"
+        );
+        let ids = [id.0.as_str(), id2.0.as_str()];
         for want in ids {
             assert!(
                 records.iter().any(|r| r.id.exec_id == want),
@@ -1612,7 +1640,7 @@ mod sandbox_tests {
         }
         assert!(
             records.iter().all(|r| ids.contains(&r.id.exec_id.as_str())),
-            "no bytes outside this test's tasks: {records:?}"
+            "no bytes outside this test's tapped tasks: {records:?}"
         );
     }
 }

@@ -4253,9 +4253,9 @@ async fn subagent_bash_output_tap_routes_under_the_parent_session() {
     }
     // The process-wide recording tap: installed once per test binary,
     // records keyed by session id.
-    static STORE: std::sync::OnceLock<std::sync::Mutex<Vec<(Option<String>, String, Vec<u8>)>>> =
-        std::sync::OnceLock::new();
-    fn store() -> &'static std::sync::Mutex<Vec<(Option<String>, String, Vec<u8>)>> {
+    type TapRecords = std::sync::Mutex<Vec<(Option<String>, String, Vec<u8>)>>;
+    static STORE: std::sync::OnceLock<TapRecords> = std::sync::OnceLock::new();
+    fn store() -> &'static TapRecords {
         STORE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
     }
     std::sync::OnceLock::<()>::new().get_or_init(|| {

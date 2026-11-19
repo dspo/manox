@@ -2125,7 +2125,11 @@ mod tests {
     /// `sandbox_available = true`) — the main captain path. The shape routes
     /// `run_foreground_tracked`, which bypasses `BashOperations::exec`
     /// entirely (the backend panics if touched), and the tap still sees
-    /// every chunk with the routing id.
+    /// every chunk with the routing id. The registry is stamped like
+    /// assembly does, so the drain's tap and the composed slot's tap both
+    /// route under this session: the marker must land exactly once (the
+    /// foreground-owned chunks are the caller's to tap; the drain, which
+    /// only becomes the tap after release, must not repeat them).
     #[tokio::test]
     async fn output_tap_observes_tracked_foreground() {
         struct PanicOps;
@@ -2140,7 +2144,10 @@ mod tests {
         }
         let store = tap::test_support::install();
         tap::test_support::retain_except(store, "tap-tracked-session");
-        let registry = Arc::new(background::BackgroundRegistry::new());
+        let registry = Arc::new(
+            background::BackgroundRegistry::new()
+                .with_output_tap_session("tap-tracked-session".to_string()),
+        );
         let manager = orchestration::BackgroundManager::new(Arc::clone(&registry));
         let tool = BashTool::new(Arc::new(PanicOps), Arc::new(NoopRegistry))
             .with_manager(Arc::clone(&manager))
@@ -2165,9 +2172,10 @@ mod tests {
             "the tracked result assembles exactly as before"
         );
         let joined = tap_records(store, "tap-tracked-session");
-        assert!(
-            joined.contains("tap-tracked-marker"),
-            "the chunks are observed raw: {joined:?}"
+        assert_eq!(
+            joined.matches("tap-tracked-marker").count(),
+            1,
+            "foreground-owned chunks are tapped exactly once: {joined:?}"
         );
         let records = tap::test_support::records_for(store, "tap-tracked-session");
         assert!(

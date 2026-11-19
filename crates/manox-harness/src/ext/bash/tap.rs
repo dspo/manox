@@ -11,7 +11,10 @@
 //! variants compose the tap into the tool's `on_data` slot (tracked /
 //! plain / persistent / subagent), and background tasks fire it where the
 //! drain loop appends raw chunks (the spawn branches and their adopted
-//! derivatives all funnel through the same drain).
+//! derivatives all funnel through the same drain). A foreground call that
+//! owns a tracked task is the one tap for its window — the drain skips
+//! chunks still owned by a foreground receiver, so every chunk leaves the
+//! execution machinery exactly once.
 
 use std::sync::{Arc, OnceLock};
 
@@ -20,7 +23,10 @@ use std::sync::{Arc, OnceLock};
 /// `session_id` routes the bytes to the owning session's consumer (absent
 /// only for harness-standalone assemblies that have no session identity);
 /// `exec_id` distinguishes concurrent executions — a tool-call id in the
-/// foreground, a `bg_<ordinal>` task id in the background.
+/// foreground, a `bg_<ordinal>` task id in the background. `exec_id` is
+/// advisory only: parent and child sessions mint tool-call ids of the same
+/// shape and they can collide across sessions, so consumers must not treat
+/// it as a unique key — routing keys on `session_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BashOutputTapId {
     pub session_id: Option<String>,
