@@ -8,6 +8,7 @@
 pub mod background;
 pub mod orchestration;
 pub mod persistent;
+pub mod tap;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -80,6 +81,11 @@ const DESCRIPTION_PERSISTENT: &str = concat!(
      their timeout. ",
     description_tail!()
 );
+
+/// The composed foreground `on_data` slot when an output tap is installed:
+/// the tap observes the chunk, then the caller's streaming callback runs.
+/// Borrows the caller's callback for the call's duration.
+type ComposedOnData<'a> = Box<dyn Fn(&[u8]) + Send + Sync + 'a>;
 
 /// A foreground command's raw output, kept per stream and decoded once at
 /// the end so a multi-byte character split across reads stays whole.
@@ -190,6 +196,10 @@ pub struct BashTool {
     /// means no seatbelt to confine bash, so every call needs approval and
     /// background tasks stay bare.
     sandbox_available: bool,
+    /// The session identity stamped at assembly time for the installed
+    /// output tap's routing id (absent only in harness-standalone shapes).
+    /// Read once per call, never consulted when no tap is installed.
+    output_tap_session: Option<String>,
 }
 
 impl BashTool {
@@ -208,6 +218,7 @@ impl BashTool {
             escalation_approver: None,
             grant_cell: None,
             sandbox_available: false,
+            output_tap_session: None,
         }
     }
 
@@ -281,6 +292,14 @@ impl BashTool {
     pub fn with_manager(mut self, manager: Arc<BackgroundManager>) -> Self {
         self.registry = manager.registry.clone();
         self.manager = Some(manager);
+        self
+    }
+
+    /// Stamp the session identity the installed output tap routes foreground
+    /// chunks with (see [`tap`](#crate::ext::bash::tap)). Assembly-time only:
+    /// the id never changes for a tool instance.
+    pub fn with_output_tap_session(mut self, session_id: String) -> Self {
+        self.output_tap_session = Some(session_id);
         self
     }
 }
@@ -428,6 +447,25 @@ impl BashTool {
         ctx: &dyn ToolContext,
         on_data: Option<crate::core::tools::bash::BashDataCallback<'_>>,
     ) -> Result<AgentToolResult, ToolError> {
+        // The output tap rides the same slot as progress forwarding, so its
+        // bytes leave the execution machinery exactly where streamed chunks
+        // would. An installed tap upgrades the slot to `Some` (otherwise the
+        // tracked read loop captures without forwarding); with no tap the
+        // slot is untouched — byte-identical behavior.
+        let composed: Option<ComposedOnData<'_>> =
+            tap::current().map(|tap| -> ComposedOnData<'_> {
+                let id = tap::BashOutputTapId {
+                    session_id: self.output_tap_session.clone(),
+                    exec_id: tool_call_id.to_string(),
+                };
+                Box::new(move |data: &[u8]| {
+                    tap(id.clone(), data);
+                    if let Some(progress) = on_data {
+                        progress(data);
+                    }
+                })
+            });
+        let on_data = composed.as_deref();
         let command = params["command"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("command is required".into()))?;
@@ -2017,6 +2055,196 @@ mod tests {
             .status(&crate::core::TaskId(id.to_string()), 0)
             .unwrap();
         assert!(!status.is_running, "task finished");
+    }
+
+    // ── output tap (#1030) ────────────────────────────────────────────
+
+    /// Streams the invoked command's bytes through `on_data` so the tap
+    /// composition has chunks to observe on the ops-exec foreground path.
+    struct TapEchoOps;
+    #[async_trait::async_trait]
+    impl BashOperations for TapEchoOps {
+        async fn exec(
+            &self,
+            request: BashExecRequest<'_>,
+        ) -> Result<CommandResult, crate::core::env::ExecutionError> {
+            if let Some(on_data) = request.on_data {
+                on_data(request.command.as_bytes());
+            }
+            Ok(CommandResult {
+                stdout: request.command.to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+    }
+
+    fn tap_records(
+        store: &std::sync::Mutex<Vec<tap::test_support::Record>>,
+        session: &str,
+    ) -> String {
+        String::from_utf8_lossy(
+            &tap::test_support::records_for(store, session)
+                .iter()
+                .flat_map(|r| r.bytes.iter().copied())
+                .collect::<Vec<u8>>(),
+        )
+        .into_owned()
+    }
+
+    /// #1030 (2): the tap observes the plain foreground (ops exec) path with
+    /// the stamped session id and the tool-call id.
+    #[tokio::test]
+    async fn output_tap_observes_plain_foreground() {
+        let store = tap::test_support::install();
+        tap::test_support::retain_except(store, "tap-plain-session");
+        let tool = BashTool::new(Arc::new(TapEchoOps), Arc::new(NoopRegistry))
+            .with_output_tap_session("tap-plain-session".to_string());
+        let (ctx, _dir) = ctx();
+        tool.execute(
+            "call-plain",
+            serde_json::json!({"command": "tap-plain-marker", "cwd": [""]}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let joined = tap_records(store, "tap-plain-session");
+        assert!(
+            joined.contains("tap-plain-marker"),
+            "the chunk is observed: {joined:?}"
+        );
+        let records = tap::test_support::records_for(store, "tap-plain-session");
+        assert!(
+            records.iter().all(|r| r.id.exec_id == "call-plain"),
+            "every chunk carries the exec id: {records:?}"
+        );
+    }
+
+    /// #1030 (1): tracked foreground in the macOS shape (manager +
+    /// `sandbox_available = true`) — the main captain path. The shape routes
+    /// `run_foreground_tracked`, which bypasses `BashOperations::exec`
+    /// entirely (the backend panics if touched), and the tap still sees
+    /// every chunk with the routing id.
+    #[tokio::test]
+    async fn output_tap_observes_tracked_foreground() {
+        struct PanicOps;
+        #[async_trait::async_trait]
+        impl BashOperations for PanicOps {
+            async fn exec(
+                &self,
+                _request: BashExecRequest<'_>,
+            ) -> Result<CommandResult, crate::core::env::ExecutionError> {
+                panic!("the tracked foreground path must bypass ops")
+            }
+        }
+        let store = tap::test_support::install();
+        tap::test_support::retain_except(store, "tap-tracked-session");
+        let registry = Arc::new(background::BackgroundRegistry::new());
+        let manager = orchestration::BackgroundManager::new(Arc::clone(&registry));
+        let tool = BashTool::new(Arc::new(PanicOps), Arc::new(NoopRegistry))
+            .with_manager(Arc::clone(&manager))
+            .with_sandbox_available(true)
+            .with_output_tap_session("tap-tracked-session".to_string());
+        let (ctx, _dir) = ctx();
+        let result = tool
+            .execute(
+                "call-tracked",
+                serde_json::json!({
+                    "command": "echo tap-tracked-marker",
+                    "cwd": [""],
+                    "timeout": 10_000,
+                }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result_text(result).contains("tap-tracked-marker"),
+            "the tracked result assembles exactly as before"
+        );
+        let joined = tap_records(store, "tap-tracked-session");
+        assert!(
+            joined.contains("tap-tracked-marker"),
+            "the chunks are observed raw: {joined:?}"
+        );
+        let records = tap::test_support::records_for(store, "tap-tracked-session");
+        assert!(
+            records.iter().all(|r| r.id.exec_id == "call-tracked"),
+            "every chunk carries the exec id: {records:?}"
+        );
+    }
+
+    /// #1030 (3): the persistent-shell foreground path.
+    #[tokio::test]
+    async fn output_tap_observes_persistent_foreground() {
+        let store = tap::test_support::install();
+        tap::test_support::retain_except(store, "tap-persistent-session");
+        let (_ctx, dir) = ctx();
+        let tool = BashTool::new(
+            Arc::new(super::persistent::PersistentShellOperations::new(
+                dir.path().to_path_buf(),
+            )),
+            Arc::new(NoopRegistry),
+        )
+        .with_output_tap_session("tap-persistent-session".to_string());
+        let (ctx, _dir) = ctx();
+        tool.execute(
+            "call-persistent",
+            serde_json::json!({"command": "echo tap-persistent-marker", "cwd": [""]}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let joined = tap_records(store, "tap-persistent-session");
+        assert!(
+            joined.contains("tap-persistent-marker"),
+            "the persistent shell's chunks are observed: {joined:?}"
+        );
+        let records = tap::test_support::records_for(store, "tap-persistent-session");
+        assert!(
+            records.iter().all(|r| r.id.exec_id == "call-persistent"),
+            "every chunk carries the exec id: {records:?}"
+        );
+    }
+
+    /// #1030 (7): concurrent tools route bytes strictly by session id —
+    /// nothing crosses between sessions.
+    #[tokio::test]
+    async fn output_tap_routes_by_session_identity() {
+        let store = tap::test_support::install();
+        tap::test_support::retain_except(store, "tap-multi-a");
+        tap::test_support::retain_except(store, "tap-multi-b");
+        let tool_a = BashTool::new(Arc::new(TapEchoOps), Arc::new(NoopRegistry))
+            .with_output_tap_session("tap-multi-a".to_string());
+        let tool_b = BashTool::new(Arc::new(TapEchoOps), Arc::new(NoopRegistry))
+            .with_output_tap_session("tap-multi-b".to_string());
+        let (ctx_a, _d1) = ctx();
+        let (ctx_b, _d2) = ctx();
+        let (ra, rb) = tokio::join!(
+            tool_a.execute(
+                "call-a",
+                serde_json::json!({"command": "tap-multi-a-marker", "cwd": [""]}),
+                CancellationToken::new(),
+                &ctx_a,
+            ),
+            tool_b.execute(
+                "call-b",
+                serde_json::json!({"command": "tap-multi-b-marker", "cwd": [""]}),
+                CancellationToken::new(),
+                &ctx_b,
+            ),
+        );
+        ra.unwrap();
+        rb.unwrap();
+        let a = tap_records(store, "tap-multi-a");
+        let b = tap_records(store, "tap-multi-b");
+        assert!(a.contains("tap-multi-a-marker"), "session a bytes: {a:?}");
+        assert!(!a.contains("tap-multi-b-marker"), "no b bytes in a: {a:?}");
+        assert!(b.contains("tap-multi-b-marker"), "session b bytes: {b:?}");
+        assert!(!b.contains("tap-multi-a-marker"), "no a bytes in b: {b:?}");
     }
 }
 

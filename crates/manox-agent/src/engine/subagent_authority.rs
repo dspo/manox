@@ -301,6 +301,9 @@ pub(super) struct SubagentChildAuthority {
     sandbox_available: bool,
     unsandboxed_ops: Option<Arc<dyn BashOperations>>,
     edit_enforce_seen_lines: bool,
+    /// The parent session's id — the output tap's routing id for a child
+    /// run's bash bytes (they belong to the parent's conversation).
+    parent_session_id: String,
 }
 
 impl SubagentChildAuthority {
@@ -310,6 +313,7 @@ impl SubagentChildAuthority {
         parent_roots: crate::granted_roots::GrantedRoots,
         sandbox_available: bool,
         unsandboxed_ops: Option<Arc<dyn BashOperations>>,
+        parent_session_id: String,
     ) -> Self {
         Self {
             gate,
@@ -318,6 +322,7 @@ impl SubagentChildAuthority {
             sandbox_available,
             unsandboxed_ops,
             edit_enforce_seen_lines: crate::settings::edit().enforce_seen_lines,
+            parent_session_id,
         }
     }
 }
@@ -377,12 +382,18 @@ impl ChildAuthority for SubagentChildAuthority {
         } else {
             Arc::new(PersistentShellOperations::new(self.workspace.clone()))
         };
-        let mut bash = BashTool::new(bash_ops, Arc::new(BackgroundRegistry::new()))
-            .with_sandbox_available(self.sandbox_available)
-            .with_mode_resolver(Arc::clone(&standing_resolver))
-            .with_network_resolver(access_resolver)
-            .with_grant_cell(cell)
-            .with_escalation_approver(escalation.approver());
+        let mut bash = BashTool::new(
+            bash_ops,
+            Arc::new(
+                BackgroundRegistry::new().with_output_tap_session(self.parent_session_id.clone()),
+            ),
+        )
+        .with_sandbox_available(self.sandbox_available)
+        .with_output_tap_session(self.parent_session_id.clone())
+        .with_mode_resolver(Arc::clone(&standing_resolver))
+        .with_network_resolver(access_resolver)
+        .with_grant_cell(cell)
+        .with_escalation_approver(escalation.approver());
         if let Some(ops) = &self.unsandboxed_ops {
             bash = bash.with_unsandboxed_operations(Arc::clone(ops));
         }
@@ -691,6 +702,7 @@ mod tests {
             crate::granted_roots::GrantedRoots::new(dir.path()),
             true,
             None,
+            "test-session".to_string(),
         );
         let tools: Vec<Arc<dyn HarnessAgentTool>> = vec![
             Arc::new(NamedTool("Read")),

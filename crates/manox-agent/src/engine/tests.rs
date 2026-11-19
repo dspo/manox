@@ -4229,6 +4229,81 @@ async fn subagent_bash_refuses_background_but_allows_foreground() {
     assert_eq!(fg_text, "foreground-ok", "foreground reached the inner");
 }
 
+/// #1030 (4): a Sailor's bash bytes ride the inner tool's tap slot and
+/// route under the parent session id stamped at assembly — the child
+/// conversation's output belongs to the parent's panel.
+#[tokio::test]
+async fn subagent_bash_output_tap_routes_under_the_parent_session() {
+    struct TapFwdOps;
+    #[async_trait::async_trait]
+    impl manox_harness::tools::bash::BashOperations for TapFwdOps {
+        async fn exec(
+            &self,
+            request: manox_harness::tools::bash::BashExecRequest<'_>,
+        ) -> Result<manox_harness::env::CommandResult, manox_harness::env::ExecutionError> {
+            if let Some(on_data) = request.on_data {
+                on_data(request.command.as_bytes());
+            }
+            Ok(manox_harness::env::CommandResult {
+                stdout: request.command.to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+    }
+    // The process-wide recording tap: installed once per test binary,
+    // records keyed by session id.
+    static STORE: std::sync::OnceLock<std::sync::Mutex<Vec<(Option<String>, String, Vec<u8>)>>> =
+        std::sync::OnceLock::new();
+    fn store() -> &'static std::sync::Mutex<Vec<(Option<String>, String, Vec<u8>)>> {
+        STORE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+    std::sync::OnceLock::<()>::new().get_or_init(|| {
+        let _ = manox_harness::install_bash_output_tap(std::sync::Arc::new(|id, bytes| {
+            store().lock().unwrap().push((
+                id.session_id.clone(),
+                id.exec_id.clone(),
+                bytes.to_vec(),
+            ));
+        }));
+    });
+
+    let inner = manox_harness::bash::BashTool::new(
+        std::sync::Arc::new(TapFwdOps),
+        std::sync::Arc::new(manox_harness::BackgroundRegistry::new()),
+    )
+    .with_output_tap_session("tap-subagent-parent".to_string());
+    let tool = SubagentBashTool {
+        inner: Arc::new(inner),
+        escalation: None,
+    };
+    let ctx = manox_harness::tool::LocalToolContext::new(
+        Arc::new(manox_harness::env::TokioExecutionEnv::new(PathBuf::from(
+            "/tmp",
+        ))),
+        PathBuf::from("/tmp"),
+        Arc::new(manox_harness::tool::ToolState::new()),
+    );
+    tool.execute(
+        "call-sailor",
+        serde_json::json!({"command": "tap-sailor-marker", "cwd": ["/tmp"]}),
+        tokio_util::sync::CancellationToken::new(),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let guard = store().lock().unwrap();
+    let hits: Vec<_> = guard
+        .iter()
+        .filter(|(s, _, _)| s.as_deref() == Some("tap-subagent-parent"))
+        .collect();
+    assert!(
+        hits.iter().any(|(_, exec, bytes)| exec == "call-sailor"
+            && String::from_utf8_lossy(bytes).contains("tap-sailor-marker")),
+        "the sailor's bytes route under the parent session: {hits:?}"
+    );
+}
+
 #[test]
 fn subagent_bash_schema_strips_background_and_escalation_fields() {
     let tool = SubagentBashTool {
@@ -6074,6 +6149,7 @@ async fn child_bash_inherits_the_captains_live_mode() {
         inner: Arc::new(subagent_bash_tool(
             sandboxed,
             Arc::new(BackgroundRegistry::new()),
+            "test-session".to_string(),
             true,
             Arc::new(move || mode_gate.mode()),
             Arc::new(manox_harness::sandbox::NetworkAccess::default),
@@ -6615,6 +6691,7 @@ async fn a_sandbox_pinned_child_stays_confined_under_a_full_access_captain() {
         sandbox_available: true,
         cwd: dir.path().to_path_buf(),
         granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()),
+        session_id: "test-session".to_string(),
     };
     let declared = AgentPermissions {
         mode: PermissionMode::Sandbox,
@@ -6727,6 +6804,7 @@ fn child_snapshot_name_set_is_invariant_across_permission_declarations() {
         sandbox_available: true,
         cwd: dir.path().to_path_buf(),
         granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()),
+        session_id: "test-session".to_string(),
     };
     let names = |declaration: Option<AgentPermissions>| {
         let mut set: Vec<String> = assembly
@@ -6794,6 +6872,7 @@ async fn a_network_off_pinned_child_runs_confined_calls_with_the_network_closed(
         sandbox_available: true,
         cwd: dir.path().to_path_buf(),
         granted_roots: crate::granted_roots::GrantedRoots::new(dir.path()),
+        session_id: "test-session".to_string(),
     };
     let ctx = subagent_test_ctx(dir.path());
     let net_off = AgentPermissions {
@@ -7172,6 +7251,7 @@ async fn armed_child_bash_escalates_one_call_through_the_parent_gate() {
         crate::granted_roots::GrantedRoots::new(dir.path()),
         true,
         Some(unsandboxed),
+        "test-session".to_string(),
     );
     // arm() replaces the placeholder by name; what comes back is the armed
     // SubagentBashTool carrying this run's approver and grant cell.
@@ -7264,6 +7344,7 @@ async fn armed_child_bash_budget_spent_refuses_without_a_card() {
         crate::granted_roots::GrantedRoots::new(dir.path()),
         true,
         Some(unsandboxed),
+        "test-session".to_string(),
     );
     let armed = authority.arm(
         "run-10",

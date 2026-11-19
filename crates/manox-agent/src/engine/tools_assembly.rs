@@ -390,6 +390,9 @@ pub(super) struct ChildAssembly {
     pub(super) sandbox_available: bool,
     pub(super) cwd: std::path::PathBuf,
     pub(super) granted_roots: crate::granted_roots::GrantedRoots,
+    /// The dispatching session's id — the output tap's routing id for the
+    /// child's bash bytes (a Sailor's output belongs to the parent session).
+    pub(super) session_id: String,
 }
 
 impl ChildAssembly {
@@ -466,7 +469,8 @@ impl ChildAssembly {
             };
         let bash = subagent_bash_tool(
             ops,
-            Arc::new(BackgroundRegistry::new()),
+            Arc::new(BackgroundRegistry::new().with_output_tap_session(self.session_id.clone())),
+            self.session_id.clone(),
             self.sandbox_available,
             Arc::clone(&mode_resolver),
             network_resolver,
@@ -488,6 +492,7 @@ impl ChildAssembly {
 pub(super) fn subagent_bash_tool(
     operations: Arc<dyn manox_harness::tools::bash::BashOperations>,
     registry: Arc<BackgroundRegistry>,
+    session_id: String,
     sandbox_available: bool,
     mode_resolver: Arc<dyn Fn() -> AccessMode + Send + Sync>,
     network_resolver: Arc<dyn Fn() -> manox_harness::sandbox::NetworkAccess + Send + Sync>,
@@ -496,7 +501,8 @@ pub(super) fn subagent_bash_tool(
     let tool = BashTool::new(operations, registry)
         .with_sandbox_available(sandbox_available)
         .with_mode_resolver(mode_resolver)
-        .with_network_resolver(network_resolver);
+        .with_network_resolver(network_resolver)
+        .with_output_tap_session(session_id);
     match unsandboxed_operations {
         Some(ops) => tool.with_unsandboxed_operations(ops),
         None => tool,
@@ -870,7 +876,8 @@ pub(super) fn build_tools(
         background = Arc::new(
             BackgroundRegistry::new()
                 .with_sandbox(wrap)
-                .with_unconfined(unconfined),
+                .with_unconfined(unconfined)
+                .with_output_tap_session(session_id.to_string()),
         );
         ops
     } else {
@@ -910,6 +917,7 @@ pub(super) fn build_tools(
     let mut bash = BashTool::new(bash_ops, background.clone())
         .with_manager(Arc::clone(&manager))
         .with_sandbox_available(sandbox_available)
+        .with_output_tap_session(session_id.to_string())
         .with_mode_resolver(Arc::clone(&standing_resolver))
         .with_network_resolver(Arc::new(move || classifier_gate.network_route().access()))
         .with_grant_cell(grant_cell)
@@ -1186,6 +1194,7 @@ pub(super) fn build_tools(
         sandbox_available,
         cwd: cwd.to_path_buf(),
         granted_roots: granted_roots.clone(),
+        session_id: bus.owner_thread_id().to_string(),
     };
     let child_tools = child_assembly.build(None);
     let child_tool_factory: manox_harness::subagent::ChildToolFactory = {
@@ -1292,6 +1301,7 @@ pub(super) fn build_tools(
             granted_roots.clone(),
             sandbox_available,
             unsandboxed_ops.clone(),
+            session_id.to_string(),
         )));
     let spawn_provider = match model {
         Some(model) => spawn_provider.with_model(model.clone()),

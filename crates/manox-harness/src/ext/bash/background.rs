@@ -170,6 +170,10 @@ pub struct BackgroundRegistry {
     sandbox: Option<SandboxCommandBuilder>,
     /// Optional builder for unconfined tasks; absent, a bare `sh -c`.
     unconfined: Option<SandboxCommandBuilder>,
+    /// The session identity the installed output tap routes this registry's
+    /// chunks with (absent only in harness-standalone shapes). Captured once
+    /// at assembly; the drain loop reads it per spawn.
+    output_tap_session: Option<String>,
 }
 
 impl BackgroundRegistry {
@@ -178,7 +182,15 @@ impl BackgroundRegistry {
             tasks: Mutex::new(std::collections::HashMap::new()),
             sandbox: None,
             unconfined: None,
+            output_tap_session: None,
         }
+    }
+
+    /// Stamp the session identity the installed output tap routes this
+    /// registry's chunks with (see `crate::ext::bash::tap`).
+    pub fn with_output_tap_session(mut self, session_id: String) -> Self {
+        self.output_tap_session = Some(session_id);
+        self
     }
 
     /// Inject the unconfined command builder (escalated tasks).
@@ -333,7 +345,14 @@ impl BackgroundRegistry {
             .lock()
             .expect("tasks lock poisoned")
             .insert(id.0.clone(), Arc::clone(&entry));
-        tokio::spawn(drain_task(stdout, stderr, entry, id.clone()));
+        let output_tap_session = self.output_tap_session.clone();
+        tokio::spawn(drain_task(
+            stdout,
+            stderr,
+            entry,
+            id.clone(),
+            output_tap_session,
+        ));
         Ok(id)
     }
 
@@ -501,6 +520,7 @@ async fn drain_task(
     mut stderr: tokio::process::ChildStderr,
     entry: Arc<TaskEntry>,
     id: crate::core::TaskId,
+    output_tap_session: Option<String>,
 ) {
     use tokio::io::AsyncReadExt;
     let mut out_chunk = [0u8; 8192];
@@ -509,6 +529,28 @@ async fn drain_task(
     let mut err_done = false;
     let mut carry: Vec<u8> = Vec::new();
     let tap = |id: &crate::core::TaskId, line: String| entry.tap_line(id, line);
+    // The installed output tap observes each raw chunk at the append point —
+    // background bytes never flow through the foreground `on_data` slot, so
+    // this is their only leave-the-execution-machinery moment. Both streams
+    // fire, matching the foreground slot's semantics. No tap: untouched.
+    let output_tap = super::tap::current().map(|tap| {
+        let id = super::tap::BashOutputTapId {
+            session_id: output_tap_session,
+            exec_id: id.0.clone(),
+        };
+        (tap, id)
+    });
+    let fire_output_tap = |data: &[u8]| {
+        if let Some((tap, id)) = &output_tap {
+            tap(
+                super::tap::BashOutputTapId {
+                    session_id: id.session_id.clone(),
+                    exec_id: id.exec_id.clone(),
+                },
+                data,
+            );
+        }
+    };
     while !(out_done && err_done) {
         tokio::select! {
             n = stdout.read(&mut out_chunk), if !out_done => match n {
@@ -524,12 +566,17 @@ async fn drain_task(
                 Ok(n) => {
                     let data = &out_chunk[..n];
                     entry.push(OutputStream::Stdout, data);
+                    fire_output_tap(data);
                     emit_lines(&id, data, &mut carry, &tap);
                 }
             },
             n = stderr.read(&mut err_chunk), if !err_done => match n {
                 Ok(0) | Err(_) => err_done = true,
-                Ok(n) => entry.push(OutputStream::Stderr, &err_chunk[..n]),
+                Ok(n) => {
+                    let data = &err_chunk[..n];
+                    entry.push(OutputStream::Stderr, data);
+                    fire_output_tap(data);
+                }
             },
         }
     }
@@ -1506,6 +1553,66 @@ mod sandbox_tests {
             wrapped.load(Ordering::Relaxed),
             0,
             "trait spawn must not route through the wrapper"
+        );
+    }
+
+    /// #1030 (5): every background spawn branch hands its raw chunks to the
+    /// installed output tap, each chunk carrying its own task id.
+    #[tokio::test]
+    async fn output_tap_observes_background_spawns() {
+        let store = crate::bash::tap::test_support::install();
+        crate::bash::tap::test_support::retain_except(store, "tap-bg-session");
+        let registry =
+            BackgroundRegistry::new().with_output_tap_session("tap-bg-session".to_string());
+
+        // The trait (bare) branch and the sandboxed branch (no builder — the
+        // bare `sh -c` fallback stands in for the seatbelt on every platform).
+        let id = registry
+            .spawn("echo bg-plain-marker", Path::new("/tmp"))
+            .unwrap();
+        registry.wait_exit(&id).await.unwrap();
+        let id2 = registry
+            .spawn_sandboxed("echo bg-sandboxed-marker", Path::new("/tmp"))
+            .unwrap();
+        registry.wait_exit(&id2).await.unwrap();
+        // The foreground-owned branch: same drain, ownership released once
+        // the exit is recorded.
+        let (id3, _chunks) = registry
+            .spawn_foreground("echo bg-foreground-marker", Path::new("/tmp"), true)
+            .unwrap();
+        registry.wait_exit(&id3).await.unwrap();
+        registry.release_foreground(&id3).unwrap();
+
+        let records = crate::bash::tap::test_support::records_for(store, "tap-bg-session");
+        let joined = String::from_utf8_lossy(
+            &records
+                .iter()
+                .flat_map(|r| r.bytes.iter().copied())
+                .collect::<Vec<u8>>(),
+        )
+        .into_owned();
+        assert!(
+            joined.contains("bg-plain-marker"),
+            "spawn branch: {joined:?}"
+        );
+        assert!(
+            joined.contains("bg-sandboxed-marker"),
+            "spawn_sandboxed branch: {joined:?}"
+        );
+        assert!(
+            joined.contains("bg-foreground-marker"),
+            "spawn_foreground branch: {joined:?}"
+        );
+        let ids = [id.0.as_str(), id2.0.as_str(), id3.0.as_str()];
+        for want in ids {
+            assert!(
+                records.iter().any(|r| r.id.exec_id == want),
+                "task {want} is recorded: {records:?}"
+            );
+        }
+        assert!(
+            records.iter().all(|r| ids.contains(&r.id.exec_id.as_str())),
+            "no bytes outside this test's tasks: {records:?}"
         );
     }
 }

@@ -90,3 +90,4 @@ pub use core::types::{AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, A
 // Re-export ext's top-level `pub use` items.
 pub use ext::bash::background::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 pub use ext::bash::persistent::PersistentShellOperations;
+pub use ext::bash::tap::{BashOutputTap, BashOutputTapId, InstallError, install_bash_output_tap};
