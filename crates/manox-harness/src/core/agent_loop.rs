@@ -342,6 +342,9 @@ async fn run_loop_inner(
                         truncation_recoveries += 1;
                         // Same event shape as a normal executed round: the
                         // synthetic results get their matched Start/End pair.
+                        // The terminal path below skips this — its run ends
+                        // immediately, and the persistence tap journals the
+                        // typed `tool_call`/`tool_result` rows already.
                         for result in &terminated_results {
                             sink.emit(AgentEvent::MessageStart {
                                 message: Box::new(result.clone()),
@@ -354,17 +357,17 @@ async fn run_loop_inner(
                             context.messages.push(result.clone());
                             new_messages.push(result.clone());
                         }
+                        // Context-only: the nudge reaches the model through
+                        // the next request's message list and must NOT emit
+                        // MessageStart/End — the persistence middleware
+                        // journals every MessageEnd, so an emitted nudge
+                        // would land as a `user` row the fold cannot tell
+                        // from a steer: it partitions the transcript and
+                        // surfaces as a phantom user bubble. Restored
+                        // sessions lose the nudge text by design — the
+                        // journaled sweep results carry the same guidance.
                         let nudge = AgentMessage::user(TRUNCATION_RECOVERY_NUDGE);
-                        sink.emit(AgentEvent::MessageStart {
-                            message: Box::new(nudge.clone()),
-                        })
-                        .await?;
-                        context.messages.push(nudge.clone());
-                        new_messages.push(nudge.clone());
-                        sink.emit(AgentEvent::MessageEnd {
-                            message: Box::new(nudge),
-                        })
-                        .await?;
+                        context.messages.push(nudge);
                         recovered_truncation_results = Some(terminated_results);
                     }
                     false => {
@@ -428,7 +431,10 @@ async fn run_loop_inner(
             // A Length stop with nothing executable (the budget died in
             // thinking or prose) retries with the escalated budget instead
             // of settling the turn: the nudge anchors the continuation on
-            // the model's own truncated output.
+            // the model's own truncated output. Context-only, like the
+            // truncation-recovery nudge: an emitted nudge is journaled by
+            // the persistence middleware and folds as a steer — a phantom
+            // user row splitting the transcript.
             if tool_calls.is_empty()
                 && stop_reason == Some(StopReason::Length)
                 && length_escalations <= 3
@@ -437,16 +443,7 @@ async fn run_loop_inner(
                     "[harness] Your previous response was cut off at the output limit. \
                      Continue from where it stopped; keep tool-call arguments compact.",
                 );
-                sink.emit(AgentEvent::MessageStart {
-                    message: Box::new(nudge.clone()),
-                })
-                .await?;
-                context.messages.push(nudge.clone());
-                new_messages.push(nudge.clone());
-                sink.emit(AgentEvent::MessageEnd {
-                    message: Box::new(nudge.clone()),
-                })
-                .await?;
+                context.messages.push(nudge);
                 has_more_tool_calls = true;
             }
 
@@ -1771,15 +1768,29 @@ mod tests {
             budgets[1] > budgets[0],
             "the retry runs under a raised budget: {budgets:?}"
         );
-        // The continuation nudge is in the transcript ahead of the retry.
+        // The continuation nudge anchors the retry through the context only:
+        // it reaches the next request's message list but emits no lifecycle
+        // events — an emitted nudge is journaled by the persistence
+        // middleware and folds as a steer, splitting the transcript with a
+        // phantom user row.
+        let nudged = context.messages.iter().any(|m| {
+            matches!(m, AgentMessage::User { content, .. }
+                if matches!(content.first(), Some(ContentBlock::Text { text, .. })
+                    if text.contains("cut off at the output limit")))
+        });
+        assert!(nudged, "the harness anchored the continuation");
         let events = sink.events.lock().unwrap();
-        let nudged = events.iter().any(|e| {
-            matches!(e, AgentEvent::MessageEnd { message }
+        let journaled_nudge = events.iter().any(|e| {
+            matches!(e, AgentEvent::MessageStart { message }
+                | AgentEvent::MessageEnd { message }
                 if matches!(&**message, AgentMessage::User { content, .. }
                     if matches!(content.first(), Some(ContentBlock::Text { text, .. })
                         if text.contains("cut off at the output limit"))))
         });
-        assert!(nudged, "the harness anchored the continuation");
+        assert!(
+            !journaled_nudge,
+            "the nudge stays context-only and never reaches the transcript"
+        );
     }
 
     // ── Truncation safety: stop_reason == Length fails all tool calls ────────
@@ -2989,7 +3000,7 @@ mod tests {
             })
             .count();
         assert_eq!(sweeps, 1, "one truncation, one synthetic result");
-        let nudges = nudge_texts(&messages);
+        let nudges = nudge_texts(&context.messages);
         assert_eq!(nudges.len(), 1, "exactly one recovery nudge: {nudges:?}");
         assert!(
             nudges[0].contains("truncate again") && nudges[0].contains("smaller tool calls"),
@@ -3055,7 +3066,7 @@ mod tests {
             sweeps, 3,
             "original attempt plus one per recovery, then the terminal"
         );
-        let nudges = nudge_texts(&messages);
+        let nudges = nudge_texts(&context.messages);
         assert_eq!(
             nudges.len(),
             MAX_TRUNCATION_RECOVERIES,
@@ -3117,7 +3128,7 @@ mod tests {
             })
             .count();
         assert_eq!(sweeps, 2, "each truncation settled exactly once");
-        let nudges = nudge_texts(&messages);
+        let nudges = nudge_texts(&context.messages);
         assert_eq!(
             nudges.len(),
             2,
@@ -3158,7 +3169,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            nudge_texts(&messages).is_empty(),
+            nudge_texts(&context.messages).is_empty(),
             "a transport reset gets no continuation nudge"
         );
         assert!(
