@@ -137,6 +137,26 @@ pub async fn run_loop_continue(
     Ok(new_messages)
 }
 
+/// How many consecutive truncation terminals (`json error:` — tool-call
+/// arguments died mid-string at the model output limit) one run may recover
+/// from by feeding the sweep's guidance back and continuing in the turn.
+/// Two covers the observed real-world shape (retry one: still oversized;
+/// retry two: split small enough to fit); the counter only recharges on a
+/// round that did not end in a terminal error, and `max_turns` still bounds
+/// the run — a model that keeps re-issuing the same oversized payload
+/// terminates with the sweep's error results instead of spinning.
+const MAX_TRUNCATION_RECOVERIES: usize = 2;
+
+/// The continuation nudge injected after a recovered truncation. Invisible
+/// in the journal (kernel-injected user rows are context-only), it exists so
+/// the very next request anchors on the split doctrine instead of the
+/// model's own cut-off output.
+const TRUNCATION_RECOVERY_NUDGE: &str = "[harness] Your previous response was cut off at the \
+     model output limit while streaming tool-call arguments, so that call never executed. Do \
+     not re-issue the same payload — it will truncate again. Split the work across multiple \
+     smaller tool calls: produce the smallest complete unit first, then extend it with \
+     follow-up calls, keeping every single call's arguments well under the output limit.";
+
 /// The main loop logic shared by `run_loop` and `run_loop_continue`.
 async fn run_loop_inner(
     context: &mut AgentContext,
@@ -158,6 +178,10 @@ async fn run_loop_inner(
     // Turn-end gate budget: how many vetoes the gate may spend on this run
     // before a bare stop goes through.
     let mut turn_end_bounces: usize = 0;
+    // Consecutive truncation recoveries spent so far this run (see
+    // [`MAX_TRUNCATION_RECOVERIES`]); recharged by any round that does not
+    // end in a terminal error.
+    let mut truncation_recoveries: usize = 0;
 
     // Check for steering messages at start (may have been queued while idle).
     let mut pending_messages: Vec<AgentMessage> = config
@@ -279,58 +303,138 @@ async fn run_loop_inner(
                 length_escalations = 0;
             }
 
-            // An error or abort stop reason carries no tool calls; end the
-            // run without executing. Provider errors and local interrupts
-            // (abort, transport error) reach here as a terminal `Error`/
-            // `Aborted` message built by the stream error handler.
+            // An error or abort stop reason carries no executable tool calls.
+            // Provider errors and local interrupts (abort, transport error)
+            // reach here as a terminal `Error`/`Aborted` message built by the
+            // stream error handler.
+            let mut recovered_truncation_results: Option<Vec<AgentMessage>> = None;
             if matches!(
                 stop_reason,
                 Some(StopReason::Error) | Some(StopReason::Aborted)
             ) {
+                // A `json error:` terminal is input truncation at the model
+                // output limit: the stream died mid-tool-call-arguments and
+                // the calls never dispatched. The sweep below settles each
+                // dangling call with shrink/split guidance; instead of ending
+                // the run, feed that settlement back with a harness nudge and
+                // continue in the same turn — the model acts on the guidance
+                // immediately instead of the user re-prompting. The budget
+                // (see [`MAX_TRUNCATION_RECOVERIES`]) keeps a stubborn model
+                // bounded; an abort is never recovered — that is the user's
+                // own stop.
+                let truncated_arguments = stop_reason == Some(StopReason::Error)
+                    && !signal.is_cancelled()
+                    && truncation_recoveries < MAX_TRUNCATION_RECOVERIES
+                    && matches!(
+                        &message,
+                        AgentMessage::Assistant {
+                            error_message: Some(error),
+                            ..
+                        } if error.starts_with("json error:")
+                    );
                 // The terminating message may still carry tool calls the
                 // stream built before dying — they never dispatch, so give
                 // each one an explicit not-executed result instead of a
                 // permanent dangling call in the transcript.
                 let terminated_results = fail_tool_calls_from_terminated(&message, sink).await?;
-                context.messages.extend(terminated_results.clone());
-                new_messages.extend(terminated_results);
-                sink.emit(AgentEvent::TurnEnd {
-                    message: Box::new(message),
-                    tool_results: Vec::new(),
-                })
-                .await?;
-                sink.emit(AgentEvent::AgentEnd {
-                    messages: new_messages.clone(),
-                })
-                .await?;
-                return Ok(());
+                match truncated_arguments {
+                    true => {
+                        truncation_recoveries += 1;
+                        // Same event shape as a normal executed round: the
+                        // synthetic results get their matched Start/End pair.
+                        // The terminal path below skips this — its run ends
+                        // immediately, and the persistence tap journals the
+                        // typed `tool_call`/`tool_result` rows already.
+                        for result in &terminated_results {
+                            sink.emit(AgentEvent::MessageStart {
+                                message: Box::new(result.clone()),
+                            })
+                            .await?;
+                            sink.emit(AgentEvent::MessageEnd {
+                                message: Box::new(result.clone()),
+                            })
+                            .await?;
+                            context.messages.push(result.clone());
+                            new_messages.push(result.clone());
+                        }
+                        // Context-only: the nudge reaches the model through
+                        // the next request's message list and must NOT emit
+                        // MessageStart/End — the persistence middleware
+                        // journals every MessageEnd, so an emitted nudge
+                        // would land as a `user` row the fold cannot tell
+                        // from a steer: it partitions the transcript and
+                        // surfaces as a phantom user bubble. Restored
+                        // sessions lose the nudge text by design — the
+                        // journaled sweep results carry the same guidance.
+                        let nudge = AgentMessage::user(TRUNCATION_RECOVERY_NUDGE);
+                        context.messages.push(nudge);
+                        recovered_truncation_results = Some(terminated_results);
+                    }
+                    false => {
+                        context.messages.extend(terminated_results.clone());
+                        new_messages.extend(terminated_results);
+                        sink.emit(AgentEvent::TurnEnd {
+                            message: Box::new(message),
+                            tool_results: Vec::new(),
+                        })
+                        .await?;
+                        sink.emit(AgentEvent::AgentEnd {
+                            messages: new_messages.clone(),
+                        })
+                        .await?;
+                        return Ok(());
+                    }
+                }
             }
 
-            // Extract tool calls and execute them.
-            let tool_calls: Vec<(&str, &str, serde_json::Value)> = match &message {
-                AgentMessage::Assistant { content, .. } => content
-                    .iter()
-                    .filter_map(|block| {
-                        if let ContentBlock::ToolUse {
-                            id, name, input, ..
-                        } = block
-                        {
-                            Some((id.as_str(), name.as_str(), input.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
+            // A round that did not end in a terminal error recharges the
+            // truncation budget: only back-to-back truncation terminals spend
+            // it, so interleaved progress keeps the safety net available.
+            if stop_reason != Some(StopReason::Error) {
+                truncation_recoveries = 0;
+            }
+
+            // Extract tool calls and execute them. A recovered truncation
+            // round has nothing to execute — the dangling calls settled with
+            // the sweep above; the round continues on the injected nudge.
+            let tool_calls: Vec<(&str, &str, serde_json::Value)> =
+                if recovered_truncation_results.is_some() {
+                    Vec::new()
+                } else {
+                    match &message {
+                        AgentMessage::Assistant { content, .. } => content
+                            .iter()
+                            .filter_map(|block| {
+                                if let ContentBlock::ToolUse {
+                                    id, name, input, ..
+                                } = block
+                                {
+                                    Some((id.as_str(), name.as_str(), input.clone()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    }
+                };
 
             let mut tool_results: Vec<AgentMessage> = Vec::new();
             has_more_tool_calls = false;
+            // A recovered truncation continues on the injected nudge, with
+            // the sweep's synthetic results as the round's settled output.
+            if let Some(terminated_results) = recovered_truncation_results.take() {
+                tool_results = terminated_results;
+                has_more_tool_calls = true;
+            }
 
             // A Length stop with nothing executable (the budget died in
             // thinking or prose) retries with the escalated budget instead
             // of settling the turn: the nudge anchors the continuation on
-            // the model's own truncated output.
+            // the model's own truncated output. Context-only, like the
+            // truncation-recovery nudge: an emitted nudge is journaled by
+            // the persistence middleware and folds as a steer — a phantom
+            // user row splitting the transcript.
             if tool_calls.is_empty()
                 && stop_reason == Some(StopReason::Length)
                 && length_escalations <= 3
@@ -339,16 +443,7 @@ async fn run_loop_inner(
                     "[harness] Your previous response was cut off at the output limit. \
                      Continue from where it stopped; keep tool-call arguments compact.",
                 );
-                sink.emit(AgentEvent::MessageStart {
-                    message: Box::new(nudge.clone()),
-                })
-                .await?;
-                context.messages.push(nudge.clone());
-                new_messages.push(nudge.clone());
-                sink.emit(AgentEvent::MessageEnd {
-                    message: Box::new(nudge.clone()),
-                })
-                .await?;
+                context.messages.push(nudge);
                 has_more_tool_calls = true;
             }
 
@@ -1673,15 +1768,29 @@ mod tests {
             budgets[1] > budgets[0],
             "the retry runs under a raised budget: {budgets:?}"
         );
-        // The continuation nudge is in the transcript ahead of the retry.
+        // The continuation nudge anchors the retry through the context only:
+        // it reaches the next request's message list but emits no lifecycle
+        // events — an emitted nudge is journaled by the persistence
+        // middleware and folds as a steer, splitting the transcript with a
+        // phantom user row.
+        let nudged = context.messages.iter().any(|m| {
+            matches!(m, AgentMessage::User { content, .. }
+                if matches!(content.first(), Some(ContentBlock::Text { text, .. })
+                    if text.contains("cut off at the output limit")))
+        });
+        assert!(nudged, "the harness anchored the continuation");
         let events = sink.events.lock().unwrap();
-        let nudged = events.iter().any(|e| {
-            matches!(e, AgentEvent::MessageEnd { message }
+        let journaled_nudge = events.iter().any(|e| {
+            matches!(e, AgentEvent::MessageStart { message }
+                | AgentEvent::MessageEnd { message }
                 if matches!(&**message, AgentMessage::User { content, .. }
                     if matches!(content.first(), Some(ContentBlock::Text { text, .. })
                         if text.contains("cut off at the output limit"))))
         });
-        assert!(nudged, "the harness anchored the continuation");
+        assert!(
+            !journaled_nudge,
+            "the nudge stays context-only and never reaches the transcript"
+        );
     }
 
     // ── Truncation safety: stop_reason == Length fails all tool calls ────────
@@ -2631,7 +2740,8 @@ mod tests {
     /// and the failure surfaces as `ProviderError::Json` (whose `Display` is
     /// `"json error: …"`). This is input truncation at the output limit, not a
     /// transport reset, so the dangling call must be reported as truncated.
-    struct PartialToolCallThenJsonErrorStreamFn;
+    /// Each round mints a fresh call id — a real provider never re-uses one.
+    struct PartialToolCallThenJsonErrorStreamFn(std::sync::atomic::AtomicUsize);
 
     #[async_trait::async_trait]
     impl StreamFn for PartialToolCallThenJsonErrorStreamFn {
@@ -2641,9 +2751,11 @@ mod tests {
             _signal: CancellationToken,
             event_tx: mpsc::Sender<AgentEvent>,
         ) -> Result<AgentMessage, anyhow::Error> {
+            use std::sync::atomic::Ordering;
+            let round = self.0.fetch_add(1, Ordering::SeqCst);
             let message = AgentMessage::Assistant {
                 content: vec![ContentBlock::ToolUse {
-                    id: "call_trunc".into(),
+                    id: format!("call_trunc_{round}"),
                     name: "Write".into(),
                     input: serde_json::Value::Null,
                     thought_signature: None,
@@ -2676,9 +2788,9 @@ mod tests {
     }
 
     /// When tool-call arguments were truncated mid-stream (a `json error:`
-    /// terminal), re-issuing the same payload would truncate again — so the
-    /// dangling call's result must tell the model to shrink or split, not to
-    /// re-issue the same bytes.
+    /// terminal) and the recovery budget is exhausted, the run still
+    /// terminates with the sweep's shrink/split guidance — the no-spin
+    /// backstop behind the in-turn auto-continue.
     #[tokio::test]
     async fn terminated_turn_reports_truncated_tool_call_arguments() {
         let sink = MockSink::new();
@@ -2690,7 +2802,9 @@ mod tests {
             &mut context,
             &config,
             None,
-            Arc::new(PartialToolCallThenJsonErrorStreamFn),
+            Arc::new(PartialToolCallThenJsonErrorStreamFn(
+                std::sync::atomic::AtomicUsize::new(1),
+            )),
             &TestToolContext::new(),
             &sink,
         )
@@ -2699,7 +2813,7 @@ mod tests {
 
         let result = messages
             .iter()
-            .find(|m| matches!(m, AgentMessage::ToolResult { tool_call_id, .. } if tool_call_id == "call_trunc"))
+            .find(|m| matches!(m, AgentMessage::ToolResult { tool_call_id, .. } if tool_call_id.starts_with("call_trunc_")))
             .expect("truncated call got a synthetic result");
         let AgentMessage::ToolResult {
             is_error,
@@ -2727,6 +2841,361 @@ mod tests {
         assert!(
             text.contains("smaller"),
             "guidance must point at shrinking or splitting the payload, got: {text}"
+        );
+    }
+
+    /// A scripted stream round.
+    #[derive(Clone, Copy)]
+    enum ScriptRound {
+        /// Truncate: `json error:` terminal with a fresh call id — a real
+        /// provider never re-uses one.
+        Truncate,
+        /// A healthy, executable echo call so the loop continues.
+        Echo,
+        /// A healthy end-of-turn text reply.
+        Stop,
+    }
+
+    /// A scripted stream. Overrun repeats the last round.
+    struct ScriptedTruncationStreamFn {
+        rounds: Vec<ScriptRound>,
+        round: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedTruncationStreamFn {
+        fn new(rounds: Vec<ScriptRound>) -> Self {
+            Self {
+                rounds,
+                round: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for ScriptedTruncationStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            event_tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            use std::sync::atomic::Ordering;
+            let index = self.round.fetch_add(1, Ordering::SeqCst);
+            let round = self.rounds.get(index).copied().unwrap_or_else(|| {
+                *self
+                    .rounds
+                    .last()
+                    .expect("a scripted stream has at least one round")
+            });
+            let id = format!("call_script_{}", index + 1);
+            let (content, stop_reason, error_message) = match round {
+                ScriptRound::Echo => (
+                    vec![ContentBlock::ToolUse {
+                        id: format!("call_ok_{}", index + 1),
+                        name: "echo".into(),
+                        input: serde_json::json!({"message": "part done"}),
+                        thought_signature: None,
+                    }],
+                    Some(StopReason::ToolUse),
+                    None,
+                ),
+                ScriptRound::Stop => (
+                    vec![ContentBlock::Text {
+                        text: "split into smaller writes; done.".into(),
+                        signature: None,
+                    }],
+                    Some(StopReason::Stop),
+                    None,
+                ),
+                // The truncation partial carries the half-built call the
+                // terminal message preserves (and the sweep fails).
+                ScriptRound::Truncate => (
+                    vec![ContentBlock::ToolUse {
+                        id,
+                        name: "Write".into(),
+                        input: serde_json::Value::Null,
+                        thought_signature: None,
+                    }],
+                    None,
+                    None,
+                ),
+            };
+            let message = AgentMessage::Assistant {
+                content,
+                model: "mock".into(),
+                provider: "mock".into(),
+                api: "mock".into(),
+                response_model: None,
+                response_id: Some("resp_script".into()),
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason,
+                usage: Box::new(Usage::default()),
+                error_message,
+                timestamp: chrono::Utc::now(),
+            };
+            if !matches!(round, ScriptRound::Truncate) {
+                return Ok(message);
+            }
+            let _ = event_tx
+                .send(AgentEvent::MessageStart {
+                    message: Box::new(message.clone()),
+                })
+                .await;
+            let serde_err = serde_json::from_str::<serde_json::Value>(
+                "{\"path\": \"/tmp/x\", \"content\": \"trun",
+            )
+            .unwrap_err();
+            Err(crate::core::provider::ProviderError::Json(serde_err).into())
+        }
+    }
+
+    /// Text of every harness nudge in the run's new messages.
+    fn nudge_texts(messages: &[AgentMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::User { content, .. } => {
+                    content.iter().find_map(|block| match block {
+                        ContentBlock::Text { text, .. } if text.starts_with("[harness]") => {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A truncation terminal recovers in the same turn: the sweep settles the
+    /// dangling call, the harness nudge anchors the retry, and the next round
+    /// — succeeding — completes the run without the user re-prompting.
+    #[tokio::test]
+    async fn a_truncation_recovers_in_turn_when_the_next_round_succeeds() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let mut context = minimal_context();
+
+        let messages = run_loop(
+            &[AgentMessage::user("hi")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(ScriptedTruncationStreamFn::new(vec![
+                ScriptRound::Truncate,
+                ScriptRound::Stop,
+            ])),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let sweeps = messages
+            .iter()
+            .filter(|m| {
+                matches!(m, AgentMessage::ToolResult { tool_call_id, is_error: true, .. }
+                    if tool_call_id.starts_with("call_script_"))
+            })
+            .count();
+        assert_eq!(sweeps, 1, "one truncation, one synthetic result");
+        let nudges = nudge_texts(&context.messages);
+        assert_eq!(nudges.len(), 1, "exactly one recovery nudge: {nudges:?}");
+        assert!(
+            nudges[0].contains("truncate again") && nudges[0].contains("smaller tool calls"),
+            "the nudge carries the split doctrine: {}",
+            nudges[0]
+        );
+        // The run ended on the healthy round, not on the terminal error.
+        let last_assistant = messages
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                AgentMessage::Assistant {
+                    stop_reason,
+                    error_message,
+                    ..
+                } => Some((stop_reason, error_message)),
+                _ => None,
+            })
+            .expect("an assistant reply");
+        assert!(
+            !matches!(last_assistant.0, Some(StopReason::Error)),
+            "the run completes on the recovery round, got stop {last_assistant:?}"
+        );
+    }
+
+    /// A model that keeps re-issuing the same oversized payload spends the
+    /// recovery budget and then terminates: bounded rounds, no spin.
+    #[tokio::test]
+    async fn consecutive_truncations_terminate_once_the_budget_is_spent() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig {
+            // A broken budget would otherwise spin; max_turns turns a bug
+            // into a loud assertion failure instead of a hang.
+            max_turns: Some(10),
+            ..AgentLoopConfig::default()
+        };
+        let mut context = minimal_context();
+
+        let messages = run_loop(
+            &[AgentMessage::user("hi")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(ScriptedTruncationStreamFn::new(vec![
+                ScriptRound::Truncate,
+                ScriptRound::Truncate,
+                ScriptRound::Truncate,
+            ])),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let sweeps = messages
+            .iter()
+            .filter(|m| {
+                matches!(m, AgentMessage::ToolResult { tool_call_id, is_error: true, .. }
+                    if tool_call_id.starts_with("call_script_"))
+            })
+            .count();
+        assert_eq!(
+            sweeps, 3,
+            "original attempt plus one per recovery, then the terminal"
+        );
+        let nudges = nudge_texts(&context.messages);
+        assert_eq!(
+            nudges.len(),
+            MAX_TRUNCATION_RECOVERIES,
+            "the budget bounds the continuation attempts: {nudges:?}"
+        );
+        // The run ended through the terminal path: the sweep results land
+        // after their assistant, so the terminal is the last assistant.
+        let AgentMessage::Assistant {
+            stop_reason,
+            error_message,
+            ..
+        } = messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m, AgentMessage::Assistant { .. }))
+            .expect("a terminal assistant")
+        else {
+            unreachable!()
+        };
+        assert_eq!(*stop_reason, Some(StopReason::Error));
+        assert!(
+            error_message
+                .as_deref()
+                .is_some_and(|e| e.starts_with("json error:")),
+            "the terminal carries the truncation cause: {error_message:?}"
+        );
+    }
+
+    /// A healthy round between truncations recharges the budget: the safety
+    /// net is available again for a later truncation in the same run.
+    #[tokio::test]
+    async fn a_healthy_round_recharges_the_truncation_budget() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let mut context = minimal_context();
+
+        let messages = run_loop(
+            &[AgentMessage::user("hi")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(ScriptedTruncationStreamFn::new(vec![
+                ScriptRound::Truncate,
+                ScriptRound::Echo,
+                ScriptRound::Truncate,
+                ScriptRound::Stop,
+            ])),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let sweeps = messages
+            .iter()
+            .filter(|m| {
+                matches!(m, AgentMessage::ToolResult { tool_call_id, is_error: true, .. }
+                    if tool_call_id.starts_with("call_script_"))
+            })
+            .count();
+        assert_eq!(sweeps, 2, "each truncation settled exactly once");
+        let nudges = nudge_texts(&context.messages);
+        assert_eq!(
+            nudges.len(),
+            2,
+            "two truncations, each recovering on a recharged budget: {nudges:?}"
+        );
+        let last_assistant = messages
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                AgentMessage::Assistant { stop_reason, .. } => Some(stop_reason),
+                _ => None,
+            })
+            .expect("an assistant reply");
+        assert!(
+            !matches!(last_assistant, Some(StopReason::Error)),
+            "the run completes after both recoveries"
+        );
+    }
+
+    /// A transport reset (an `Error` terminal that is NOT a `json error:`)
+    /// never recovers — the turn ends after one round, no nudge injected.
+    #[tokio::test]
+    async fn a_non_truncation_terminal_terminates_without_recovery() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let mut context = minimal_context();
+
+        let messages = run_loop(
+            &[AgentMessage::user("hi")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(PartialToolCallThenFailStreamFn),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            nudge_texts(&context.messages).is_empty(),
+            "a transport reset gets no continuation nudge"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, AgentMessage::ToolResult { is_error: true, .. })),
+            "the dangling call still gets its not-executed result"
+        );
+        let AgentMessage::Assistant {
+            stop_reason,
+            error_message,
+            ..
+        } = messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m, AgentMessage::Assistant { .. }))
+            .expect("a terminal assistant")
+        else {
+            unreachable!()
+        };
+        assert_eq!(*stop_reason, Some(StopReason::Error));
+        assert!(
+            !error_message
+                .as_deref()
+                .is_some_and(|e| e.starts_with("json error:")),
+            "the terminal is a transport reset, not a truncation"
         );
     }
 
