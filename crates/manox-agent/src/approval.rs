@@ -687,10 +687,12 @@ pub(super) fn fence_roots(
 ///
 /// The call's effective cwd is the same `cwd` `[anchor, ...route]` resolution
 /// the tool itself will perform, peeked read-only so the fence does not
-/// advance the sticky cwd. A malformed or unresolvable `cwd` is an argument
-/// error, not a permission problem: surface the same instructional text the
-/// tool itself would return next instead of dressing it up as a sandbox
-/// denial that lures the model into an escalation it cannot benefit from.
+/// advance the sticky cwd. An omitted `cwd` judges the call at the
+/// conversation's directory — the directory the tool will actually run in. A
+/// present-but-malformed `cwd` is an argument error, not a permission
+/// problem: surface the same instructional text the tool itself would return
+/// next instead of dressing it up as a sandbox denial that lures the model
+/// into an escalation it cannot benefit from.
 pub(super) fn fs_write_verdict(
     tool_name: &str,
     params: &serde_json::Value,
@@ -1466,12 +1468,11 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
-    /// A gated Write whose `cwd` is missing reaches the fence (the schema
-    /// deliberately does not require the property) and must surface the
+    /// A gated Write whose `cwd` is present but malformed surfaces the
     /// instructional argument error — not a sandbox denial luring the model
     /// into an escalation — without running the tool.
     #[tokio::test]
-    async fn sandbox_missing_cwd_surfaces_the_instructional_error() {
+    async fn sandbox_malformed_cwd_surfaces_the_instructional_error() {
         let (gate, _rx) = gate_with_events();
         gate.set_mode(AccessMode::Sandbox);
         let (tool, ran) = gated_named("Write", true, false, Arc::clone(&gate));
@@ -1479,7 +1480,7 @@ mod tests {
         let err = tool
             .execute(
                 "c1",
-                serde_json::json!({ "path": "x.txt", "content": "y" }),
+                serde_json::json!({ "path": "x.txt", "content": "y", "cwd": "/tmp" }),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1487,11 +1488,47 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string()
-                .contains(manox_harness::tools::path_utils::CWD_REQUIRED_DOC),
+                .contains(manox_harness::tools::path_utils::CWD_HOWTO_DOC),
             "{err}"
         );
         assert!(!err.to_string().contains(&sandbox_denial()));
         assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
+    /// An omitted `cwd` is judged at the directory the tool itself will run
+    /// in (the peeked conversation cwd), so an in-workspace write runs and an
+    /// out-of-roots target is a sandbox denial — never an argument error.
+    #[tokio::test]
+    async fn sandbox_omitted_cwd_judges_at_the_conversation_directory() {
+        let (gate, _rx) = gate_with_events();
+        gate.set_mode(AccessMode::Sandbox);
+        let (tool, ran) = gated_named("Write", true, false, Arc::clone(&gate));
+        let ctx = tool_ctx();
+        tool.execute(
+            "c1",
+            serde_json::json!({ "path": "x.txt", "content": "y" }),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .expect("an omitted cwd inherits the session directory");
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+        let err = tool
+            .execute(
+                "c2",
+                serde_json::json!({ "path": "/etc/passwd", "content": "y" }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(&sandbox_denial()), "{err}");
+        assert!(
+            !err.to_string()
+                .contains(manox_harness::tools::path_utils::CWD_HOWTO_DOC)
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     /// A tool whose side effects are not filesystem writes declares it and
@@ -1527,7 +1564,8 @@ mod tests {
         gate.set_mode(AccessMode::Sandbox);
         let (tool, ran) = gated_named("mcp__srv__write_file", false, false, Arc::clone(&gate));
         let ctx = tool_ctx();
-        // No `cwd`: the path ruling refuses before the tool runs (fail-closed).
+        // No `cwd` — judged at the conversation's directory, the target is
+        // still out of roots, so the ruling refuses before the tool runs.
         let err = tool
             .execute(
                 "c1",
@@ -1537,11 +1575,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains(manox_harness::tools::path_utils::CWD_REQUIRED_DOC),
-            "{err}"
-        );
+        assert!(err.to_string().contains(&sandbox_denial()), "{err}");
         assert_eq!(ran.load(Ordering::SeqCst), 0);
 
         // With a cwd, an out-of-roots target is denied as a sandbox violation.

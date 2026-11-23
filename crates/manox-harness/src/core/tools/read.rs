@@ -316,19 +316,22 @@ mod tests {
         assert!(ctx.state.sticky_cwd.lock().unwrap().is_none());
     }
 
-    /// A call without `cwd` is rejected with the instructional error.
+    /// A call without `cwd` reads in the conversation's directory: the
+    /// anchor/route argument is optional, and omission is not an argument
+    /// error.
     #[tokio::test]
-    async fn missing_cwd_argument_is_rejected_as_invalid_arguments() {
+    async fn omitted_cwd_reads_in_the_conversation_directory() {
         let base = tempfile::tempdir().unwrap();
+        std::fs::write(base.path().join("note.txt"), "hello conversation\n").unwrap();
         let ctx = ctx_at(base.path().to_path_buf());
-        let err = read(&ReadTool, &ctx, serde_json::json!({"path": "any.txt"}))
+        let result = read(&ReadTool, &ctx, serde_json::json!({"path": "note.txt"}))
             .await
-            .unwrap_err();
-        match err {
-            crate::tool::ToolError::InvalidArguments(msg) => {
-                assert!(msg.contains("cwd is required"), "{msg}");
-            }
-            other => panic!("expected InvalidArguments, got {other:?}"),
-        }
+            .unwrap();
+        assert!(!result.is_error);
+        let crate::types::ContentBlock::Text { text, .. } = &result.content[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.contains("hello conversation"), "{text}");
+        assert!(ctx.state.sticky_cwd.lock().unwrap().is_none());
     }
 }

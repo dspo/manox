@@ -406,7 +406,7 @@ impl AgentTool for BashTool {
         serde_json::json!({
             "type": "object",
             "properties": properties,
-            "required": ["command", "cwd"]
+            "required": ["command"]
         })
     }
 
