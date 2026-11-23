@@ -605,6 +605,13 @@ enum Run {
 #[derive(Debug, Default)]
 pub struct Translator {
     open: Option<OpenTurn>,
+    /// The terminal `error` row of the turn currently open, parked for the
+    /// `turnFinish` that owns the close: journal order lands the error row
+    /// BEFORE the sweep that fails the turn's dangling tool calls, so closing
+    /// at the error row would orphan the sweep onto a synthetic turn — a
+    /// phantom empty user row plus a second, generic error notice. A failed
+    /// finish replays the park as its cause; every other close drops it.
+    parked_error: Option<ErrorInfo>,
     pending_user: VecDeque<PendingUser>,
     /// Directories already granted, so repeated `cwdChange` rows for the same path
     /// do not re-publish membership.
@@ -950,6 +957,7 @@ impl Translator {
     pub fn seed(&mut self, chat: &ChatState) {
         self.open = None;
         self.pending_user.clear();
+        self.parked_error = None;
         self.granted.clear();
         let Some(active) = &chat.active_turn else {
             return;
@@ -1083,19 +1091,24 @@ impl Translator {
                 ..
             } => {
                 let outcome = if *failed {
-                    Outcome::Failed(ErrorInfo {
+                    // A parked `error` row is the turn's real cause — replay it
+                    // instead of the generic verdict, so the transcript names
+                    // the json truncation / provider failure, not a tautology.
+                    let mut info = self.parked_error.take().unwrap_or_else(|| ErrorInfo {
                         error_type: "turn_failed".to_string(),
                         message: "the model turn failed".to_string(),
                         stack: None,
-                        // The stranded steer ids are the engine's own message ids,
-                        // not the pending-message ids published here, so they ride
-                        // `_meta` for forensics instead of driving a removal that
-                        // could never match.
-                        meta: Some(manox_meta(json!({
-                            "cancelled": cancelled,
-                            "strandedSteerIds": stranded_steer_ids,
-                        }))),
-                    })
+                        meta: None,
+                    });
+                    // The stranded steer ids are the engine's own message ids,
+                    // not the pending-message ids published here, so they ride
+                    // `_meta` for forensics instead of driving a removal that
+                    // could never match.
+                    info.meta = Some(manox_meta(json!({
+                        "cancelled": cancelled,
+                        "strandedSteerIds": stranded_steer_ids,
+                    })));
+                    Outcome::Failed(info)
                 } else if *cancelled {
                     Outcome::Cancelled {
                         reason: reason.clone(),
@@ -1133,17 +1146,25 @@ impl Translator {
             // agentic turn per tool round and minted a "stopped: …" notice
             // per round.
             Event::Stop { .. } => {}
-            Event::ErrorEvent { message, .. } => self.close_turn(
-                &chat,
-                &row,
-                Outcome::Failed(ErrorInfo {
-                    error_type: "agent_error".to_string(),
-                    message: message.clone(),
-                    stack: None,
-                    meta: None,
-                }),
-                &mut out,
-            ),
+            // A terminal `error` row parks on the open turn instead of closing
+            // it: journal order lands it BEFORE the sweep rows that fail the
+            // turn's dangling tool calls (arguments truncated at the output
+            // limit, a stream death mid-call), and closing here would orphan
+            // that sweep onto a synthetic turn — an empty placeholder user row
+            // plus a duplicate error notice. The `turnFinish` right behind the
+            // sweep closes the turn with this parked cause. An error row with
+            // no turn open (slash-command warnings and other non-turn chatter)
+            // stays the no-op it always was.
+            Event::ErrorEvent { message, .. } => {
+                if self.open.is_some() {
+                    self.parked_error = Some(ErrorInfo {
+                        error_type: "agent_error".to_string(),
+                        message: message.clone(),
+                        stack: None,
+                        meta: None,
+                    });
+                }
+            }
             Event::Retry {
                 attempt,
                 max_attempts,
@@ -2587,6 +2608,9 @@ impl Translator {
         steer_boundary: bool,
         out: &mut Vec<Emitted>,
     ) {
+        // A parked terminal error dies with the turn unless the failed finish
+        // already consumed it: it must never leak into a later turn's verdict.
+        self.parked_error = None;
         // A thinking run still open at the turn boundary settles with it,
         // whatever closer precedes the end: publish its timing before the
         // terminal action. `open` is already taken out of the fold, so the
@@ -3302,7 +3326,15 @@ fn no_user_row(entry: &Envelope) -> Message {
         attachments: None,
         model: None,
         agent: None,
-        meta: Some(manox_meta(json!({"noUserRow": true, "entryId": entry.id}))),
+        // The harness-author tag rides the same key real injected rows use,
+        // so a client whose phantom filter skips empty harness-authored
+        // openings (a synthetic turn boundary, never a prompt) skips this
+        // placeholder too.
+        meta: Some(manox_meta(json!({
+            "noUserRow": true,
+            "entryId": entry.id,
+            "author": "harness",
+        }))),
     }
 }
 
@@ -4403,6 +4435,135 @@ mod fold_semantics_tests {
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /// The journal shape a truncated-arguments termination writes: the
+    /// terminal `error` row lands BEFORE the sweep that fails the turn's
+    /// dangling tool call, and the `turnFinish` closes after the sweep. The
+    /// fold must keep the whole shape on ONE turn — the sweep rows are the
+    /// dying turn's own, not a synthetic successor's — and surface the error
+    /// row's real message as the turn's cause, exactly once.
+    #[test]
+    fn a_failed_turns_terminal_sweep_stays_on_the_dying_turn() {
+        let records = [
+            kernel(json!({
+                "type": "message", "id": "e-1",
+                "message": {"role": "user", "content": [{"type": "text", "text": "write the file"}]},
+                "origin": "rpc-submit",
+            })),
+            kernel(json!({"type": "turn_start", "id": "e-2"})),
+            kernel(json!({"type": "agent_text_delta", "id": "e-3", "delta": "writing."})),
+            kernel(json!({"type": "error", "id": "e-4",
+                          "message": "json error: EOF while parsing a string at line 1 column 35119"})),
+            kernel(
+                json!({"type": "tool_call", "id": "e-5", "callId": "t-1", "name": "Write",
+                          "title": "Write", "status": "running", "input": null}),
+            ),
+            kernel(
+                json!({"type": "tool_call", "id": "e-6", "callId": "t-1", "name": "Write",
+                          "title": "Write", "status": "error", "input": null}),
+            ),
+            kernel(json!({"type": "tool_result", "id": "e-7", "callId": "t-1",
+                          "output": "arguments were truncated mid-stream", "isError": true})),
+            kernel(json!({"type": "turn_finish", "id": "e-8",
+                          "cancelled": false, "failed": true, "strandedSteerIds": []})),
+        ];
+        let (emitted, state) = fold(&records);
+        assert_eq!(
+            state.turns.len(),
+            1,
+            "no synthetic successor turn for the sweep: {:?}",
+            state.turns
+        );
+        assert!(state.active_turn.is_none(), "the finish closed the turn");
+        let turn = &state.turns[0];
+        assert_eq!(
+            turn.message.text, "write the file",
+            "the dying turn keeps its opening row"
+        );
+        assert_eq!(turn.state, ahp_types::state::TurnState::Error);
+        assert!(
+            turn.response_parts
+                .iter()
+                .any(|part| matches!(part, ahp_types::state::ResponsePart::ToolCall(_))),
+            "the failed Write hangs on the dying turn: {:?}",
+            turn.response_parts
+        );
+        let errors: Vec<_> = turn
+            .response_parts
+            .iter()
+            .filter_map(|part| match part {
+                ahp_types::state::ResponsePart::Error(error) => Some(&error.error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "one error notice, not one per closing row: {:?}",
+            turn.response_parts
+        );
+        assert_eq!(errors[0].error_type, "agent_error");
+        assert_eq!(
+            errors[0].message, "json error: EOF while parsing a string at line 1 column 35119",
+            "the parked row's real cause, not the generic verdict"
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|emitted| matches!(emitted.action, StateAction::ChatTurnStarted(_)))
+                .count(),
+            1,
+            "the journal's own turnStart is the only one"
+        );
+    }
+
+    /// A failed finish with no parked `error` row keeps the generic verdict.
+    #[test]
+    fn a_failed_finish_without_an_error_row_reports_the_generic_verdict() {
+        let records = [
+            kernel(json!({
+                "type": "message", "id": "e-1",
+                "message": {"role": "user", "content": [{"type": "text", "text": "go"}]},
+                "origin": "rpc-submit",
+            })),
+            kernel(json!({"type": "turn_start", "id": "e-2"})),
+            kernel(json!({"type": "turn_finish", "id": "e-3",
+                          "cancelled": false, "failed": true, "strandedSteerIds": []})),
+        ];
+        let (_, state) = fold(&records);
+        let error = state.turns[0]
+            .response_parts
+            .iter()
+            .find_map(|part| match part {
+                ahp_types::state::ResponsePart::Error(error) => Some(&error.error),
+                _ => None,
+            })
+            .expect("the failed finish published an error part");
+        assert_eq!(error.error_type, "turn_failed");
+        assert_eq!(error.message, "the model turn failed");
+    }
+
+    /// The placeholder opening a synthetic turn mints is harness-authored, so
+    /// a client whose phantom filter skips empty harness-authored openings
+    /// renders no empty user bubble for it.
+    #[test]
+    fn a_synthetic_turns_placeholder_opening_is_harness_authored() {
+        let (emitted, _) = fold(&[kernel(json!({
+            "type": "tool_call", "id": "e-1", "callId": "t-1", "name": "bash",
+            "title": "run", "status": "running", "input": {},
+        }))]);
+        let started = emitted
+            .iter()
+            .find_map(|emitted| match &emitted.action {
+                StateAction::ChatTurnStarted(action) => Some(action),
+                _ => None,
+            })
+            .expect("the orphan row minted a turn");
+        let meta = &started.message.meta.as_ref().expect("meta present")[ext::META_KEY];
+        assert_eq!(meta["author"], json!("harness"));
+        assert_eq!(meta["noUserRow"], json!(true));
+        assert_eq!(started.message.text, "", "the placeholder stays empty");
     }
 
     /// A mid-run steer divides the transcript where it was injected.
