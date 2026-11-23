@@ -2012,7 +2012,16 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                     .append_cwd_change(&cwd.to_string_lossy())
                     .await?;
             }
-            self.persisted_cwd = sticky;
+            self.persisted_cwd = sticky.clone();
+        }
+        // The prompt's working-directory line follows the sticky cwd: a tool
+        // anchor that moved the conversation reaches the next turn's context
+        // instead of leaving the model reasoning from the directory the
+        // harness was assembled at. An unmoved directory keeps the rendered
+        // prompt — and the provider's cached prefix — intact.
+        if let Some(cwd) = sticky.filter(|cwd| *cwd != self.prompt_cwd) {
+            self.prompt_cwd = cwd;
+            self.rebuild_system_prompt();
         }
         Ok(())
     }
@@ -10354,6 +10363,142 @@ pub(crate) mod tests {
                 .iter()
                 .any(|m| matches!(m, AgentMessage::User { content, .. } if content.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if text == "SENTINEL_FROM_HOOK")))),
             "a mutated context from BeforeProviderRequest must reach the provider"
+        );
+    }
+
+    // Re-anchors the conversation's directory through the same `cwd`
+    // resolution every FS tool performs.
+    struct AnchorTool {
+        dir: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::AgentTool for AnchorTool {
+        fn name(&self) -> &str {
+            "anchor"
+        }
+        fn description(&self) -> &str {
+            "Anchors the conversation directory"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _params: serde_json::Value,
+            _signal: CancellationToken,
+            ctx: &dyn crate::tool::ToolContext,
+        ) -> Result<crate::tool::AgentToolResult, crate::tool::ToolError> {
+            crate::tools::path_utils::resolve_effective_cwd(
+                ctx,
+                Some(&serde_json::json!([self.dir.to_string_lossy()])),
+            )
+            .map_err(crate::tool::ToolError::InvalidArguments)?;
+            Ok(crate::tool::AgentToolResult::text("anchored"))
+        }
+    }
+
+    /// A tool call that moves the conversation's directory is visible to the
+    /// model on the next turn: the system prompt names the directory the
+    /// tools will run in, not the one the harness was assembled at.
+    #[tokio::test]
+    async fn prompt_working_directory_follows_a_tool_anchor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Call 0 issues the anchor tool call, call 1 answers it, call 2 is
+        // the next turn and records the prompt it was handed.
+        struct AnchorThenCaptureStreamFn {
+            call: AtomicUsize,
+            prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl StreamFn for AnchorThenCaptureStreamFn {
+            async fn stream(
+                &self,
+                context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                let n = self.call.fetch_add(1, Ordering::SeqCst);
+                if n == 2 {
+                    self.prompts
+                        .lock()
+                        .unwrap()
+                        .push(context.system_prompt.clone());
+                }
+                let (content, stop_reason) = if n == 0 {
+                    (
+                        vec![ContentBlock::ToolUse {
+                            id: "t1".into(),
+                            name: "anchor".into(),
+                            input: serde_json::json!({}),
+                            thought_signature: None,
+                        }],
+                        StopReason::ToolUse,
+                    )
+                } else {
+                    (
+                        vec![ContentBlock::Text {
+                            text: "ok".into(),
+                            signature: None,
+                        }],
+                        StopReason::Stop,
+                    )
+                };
+                Ok(AgentMessage::Assistant {
+                    content,
+                    model: "test".into(),
+                    provider: "test".into(),
+                    api: "test".into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    raw_stop_reason: None,
+                    stop_reason: Some(stop_reason),
+                    usage: Box::new(Usage::default()),
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                })
+            }
+        }
+
+        let assembly = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let prompts: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let session = Session::new(MemStorage::new());
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(AnchorThenCaptureStreamFn {
+                call: AtomicUsize::new(0),
+                prompts: Arc::clone(&prompts),
+            }),
+        )
+        .with_tool_cwd(assembly.path().to_path_buf())
+        .with_tools(Arc::from(vec![Arc::new(AnchorTool {
+            dir: worktree.path().to_path_buf(),
+        })
+            as Arc<dyn crate::tool::AgentTool>]));
+        harness.set_prompt_cwd(assembly.path().to_path_buf());
+        harness
+            .set_system_prompt_builder(|_tools, _resources, cwd| format!("cwd: {}", cwd.display()));
+
+        harness.prompt("move").await.unwrap();
+        harness.prompt("where are we").await.unwrap();
+
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "the next turn must reach the provider");
+        assert!(
+            prompts[0].contains(&worktree.path().display().to_string()),
+            "the next turn's prompt must name the anchored directory: {}",
+            prompts[0]
+        );
+        assert!(
+            !prompts[0].contains(&assembly.path().display().to_string()),
+            "the assembly directory must not survive the move: {}",
+            prompts[0]
         );
     }
 

@@ -37,7 +37,7 @@ This test MUST NOT assume any particular project layout. Do NOT read project-spe
 2. **Self-contained fixtures.** Create all test files in a temp directory (via `Bash` → `mktemp -d`). Never read project-specific files.
 3. **Clean up side effects.** Tools with persistent state must be cleaned up after verification:
    - Write/Edit: write to the temp dir, verify, then delete.
-   - Per-call cwd: every FS/Bash call takes `cwd: [anchor, ...route]` (required). Run a Bash call with `cwd: ["", "<scratch>"]`, verify a relative-path Read with the same `cwd` resolves there, and verify a following Read with `cwd: ["<scratch>"]` re-anchors the session's directory and still resolves.
+   - Per-call cwd: FS/Bash calls take `cwd: [anchor, ...route]`, optional — omitting it runs in the conversation's current directory. Run a Bash call with `cwd: ["", "<scratch>"]`, verify a relative-path Read with the same `cwd` resolves there, verify a Read that omits `cwd` resolves in that same (inherited) directory, and verify a following Read with `cwd: ["<scratch>"]` re-anchors the session's directory and still resolves.
    - CreateGoal: create a goal, verify, then clear it via UpdateGoal(complete) and verify.
    - Browser: open a tab, exercise read-only tools, then close it with WebExploreClose.
 4. **Parallel calls.** When tools in the same group are independent (e.g. Read + List + Grep + Glob), call them in parallel in one turn.

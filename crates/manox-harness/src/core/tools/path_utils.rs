@@ -10,32 +10,37 @@ use serde_json::Value as JsonValue;
 use crate::tool::ToolContext;
 
 /// Schema description shared by every FS/Bash tool's `cwd` property.
-pub const CWD_SCHEMA_DOC: &str = "Working directory for this call as `[anchor, ...route]` \
-(required — the call is rejected without it). The first element re-anchors the session's \
-default directory (\"\" keeps the current one); a RELATIVE anchor resolves against the \
-current anchor, so pass an absolute path to start from a known root. The remaining elements \
-locate this call without re-anchoring. A single element re-anchors and runs there. Prefer a \
-single-element `cwd` with the target expressed in `path` relative to it; add elements only \
-when this call's working directory is a distinct subdirectory of the anchor.";
+pub const CWD_SCHEMA_DOC: &str = "Optional working directory for this call as \
+`[anchor, ...route]`. Omit it to run in the conversation's current directory — the same as \
+`[\"\"]`. A non-empty first element re-anchors the conversation's default directory (a \
+relative anchor resolves against the current one, so pass an absolute path to start from a \
+known root). Remaining elements locate this call only, without re-anchoring. Prefer a single \
+element with the target expressed in `path`.";
 
-/// The rejection text for a missing or malformed `cwd` argument — it doubles
-/// as the model-facing how-to. Every cwd rejection funnels here: a MISSING
-/// cwd passes the (deliberately unrequired) schema property and is rejected
-/// at resolution — by the tool, or by the approval fence for the gated
-/// tools; a present-but-malformed shape is caught by the schema, and the
-/// pipeline rewrites that generic validation message to this text.
-pub const CWD_REQUIRED_DOC: &str = "cwd is required: pass [anchor, ...route] — the first element \
-is the session's new anchor directory (\"\" keeps the current one; a relative anchor \
-resolves against the current anchor, so use an absolute path to start from a known root), \
-later elements locate this call without re-anchoring. Example: \
-[\"~/projects/dspo/manox\", \"crates/manox-harness\"]";
+/// The instructional text for a present-but-malformed `cwd` argument — it
+/// doubles as the model-facing how-to, and names omission as the default so
+/// a model that guessed the shape wrong learns the cheap way out. Every
+/// malformed shape funnels here: the tool's own parse, and the pipeline
+/// rewriting the generic jsonschema message the schema's shape constraints
+/// produce.
+pub const CWD_HOWTO_DOC: &str = "invalid cwd: expected [anchor, ...route] — omit `cwd` to run \
+in the conversation's current directory. The first element is the conversation's new anchor \
+directory (\"\" keeps the current one; a relative anchor resolves against the current anchor, \
+so use an absolute path to start from a known root), later elements locate this call without \
+re-anchoring. Example: [\"~/projects/dspo/manox\", \"crates/manox-harness\"]";
+
+/// Whether `cwd` was left out of the call: absent, or JSON `null` (what an
+/// optional property becomes when a provider serializes its absence).
+/// Omission resolves to the conversation's current directory, exactly like
+/// the empty anchor `[""]`.
+pub fn cwd_is_omitted(value: Option<&JsonValue>) -> bool {
+    value.is_none_or(JsonValue::is_null)
+}
 
 /// Whether `value` is a present, well-formed `cwd` argument. The pipeline's
 /// schema-failure path uses this to tell a cwd-caused validation failure
-/// (present but malformed — rewritten to [`CWD_REQUIRED_DOC`]) from a
-/// failure in some other property (left as-is). A missing `cwd` is not
-/// shaped either, but it never reaches that path: the property is not
-/// `required`, so the schema admits the call and resolution rejects it.
+/// (present but malformed — rewritten to [`CWD_HOWTO_DOC`]) from a failure
+/// in some other property (left as-is).
 pub fn cwd_is_shaped(value: Option<&JsonValue>) -> bool {
     match value.and_then(|v| v.as_array()) {
         Some(items) => !items.is_empty() && items.iter().all(|v| v.is_string()),
@@ -46,28 +51,43 @@ pub fn cwd_is_shaped(value: Option<&JsonValue>) -> bool {
 /// The parsed `cwd` argument: `[anchor, ...route]`.
 struct CwdArg {
     /// First element: `""` keeps the current anchor; non-empty re-anchors the
-    /// session's default directory.
+    /// conversation's default directory.
     anchor: String,
     /// Remaining elements: joined onto the anchor to locate this call only.
     route: Vec<String>,
 }
 
-/// Parse the `cwd` argument. It must be a non-empty JSON array of strings;
-/// anything else (missing, non-array, empty array, non-string element) is
-/// rejected with the same instructional error.
+impl CwdArg {
+    /// What an omitted `cwd` means: the conversation's current directory,
+    /// with nothing re-anchored and nothing routed.
+    fn inherited() -> Self {
+        CwdArg {
+            anchor: String::new(),
+            route: Vec::new(),
+        }
+    }
+}
+
+/// Parse the `cwd` argument. Omission (see [`cwd_is_omitted`]) means the
+/// conversation's current directory. A present value must be a non-empty
+/// JSON array of strings; anything else (non-array, empty array, non-string
+/// element) is rejected with the instructional text.
 fn parse_cwd_arg(value: Option<&JsonValue>) -> Result<CwdArg, String> {
+    if cwd_is_omitted(value) {
+        return Ok(CwdArg::inherited());
+    }
     let Some(items) = value.and_then(|v| v.as_array()) else {
-        return Err(CWD_REQUIRED_DOC.to_string());
+        return Err(CWD_HOWTO_DOC.to_string());
     };
     let mut elements = items.iter();
     let anchor = elements
         .next()
         .and_then(|v| v.as_str())
-        .ok_or_else(|| CWD_REQUIRED_DOC.to_string())?;
+        .ok_or_else(|| CWD_HOWTO_DOC.to_string())?;
     let route = elements
         .map(|v| v.as_str().map(str::to_string))
         .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| CWD_REQUIRED_DOC.to_string())?;
+        .ok_or_else(|| CWD_HOWTO_DOC.to_string())?;
     Ok(CwdArg {
         anchor: anchor.to_string(),
         route,
@@ -87,8 +107,9 @@ pub fn peek_effective_cwd(
 }
 
 /// Resolve `(anchor_dir, call_dir)` for one `cwd` argument. `anchor_dir` is
-/// `None` when the anchor element is `""` — the session's default directory
-/// stays where it is.
+/// `None` when the anchor element is `""` — the conversation's default
+/// directory stays where it is. An omitted `cwd` parses as exactly that
+/// shape, so omission and `[""]` cannot diverge.
 ///
 /// The anchor resolves against the sticky cwd (the directory the last
 /// non-empty anchor set), falling back to the tool context's baseline (the
@@ -303,21 +324,39 @@ mod tests {
     }
 
     #[test]
-    fn missing_malformed_or_empty_cwd_is_rejected() {
+    fn omitted_cwd_runs_in_the_conversation_directory() {
+        let (base, work) = setup_dirs();
+        let (ctx, state) = ctx_at(base.path());
+        // Absent and JSON `null` are the same omission.
+        assert_eq!(resolve_effective_cwd(&ctx, None).unwrap(), base.path());
+        assert_eq!(
+            resolve_effective_cwd(&ctx, Some(&serde_json::Value::Null)).unwrap(),
+            base.path()
+        );
+        assert_eq!(sticky(&state), None, "omission never re-anchors");
+        // Omission inherits the directory an earlier anchor established.
+        resolve_effective_cwd(&ctx, cwd_arg(&[work.path().to_str().unwrap()]).as_ref()).unwrap();
+        assert_eq!(resolve_effective_cwd(&ctx, None).unwrap(), work.path());
+        // The read-only peek agrees without advancing anything.
+        assert_eq!(
+            peek_effective_cwd(&ctx, Some(&serde_json::Value::Null)).unwrap(),
+            work.path()
+        );
+    }
+
+    #[test]
+    fn malformed_or_empty_cwd_is_rejected() {
         let (base, _work) = setup_dirs();
         let (ctx, state) = ctx_at(base.path());
-        // Missing.
-        let err = resolve_effective_cwd(&ctx, None).unwrap_err();
-        assert!(err.contains("cwd is required"), "{err}");
         // Non-array.
         let err = resolve_effective_cwd(&ctx, Some(&serde_json::json!("/abs"))).unwrap_err();
-        assert!(err.contains("cwd is required"), "{err}");
+        assert!(err.contains("invalid cwd"), "{err}");
         // Empty array.
         let err = resolve_effective_cwd(&ctx, Some(&serde_json::json!([]))).unwrap_err();
-        assert!(err.contains("cwd is required"), "{err}");
+        assert!(err.contains("invalid cwd"), "{err}");
         // Non-string element.
         let err = resolve_effective_cwd(&ctx, Some(&serde_json::json!(["", 3]))).unwrap_err();
-        assert!(err.contains("cwd is required"), "{err}");
+        assert!(err.contains("invalid cwd"), "{err}");
         assert_eq!(sticky(&state), None);
     }
 

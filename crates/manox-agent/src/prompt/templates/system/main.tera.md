@@ -7,7 +7,7 @@
 
 ## Tool preferences
 Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).
-Every file-system and Bash call must carry `cwd` as an array `[anchor, ...route]`: the first element re-anchors the session's default directory (`""` keeps the current one — anchor it to the repo/worktree root once and leave it there), the remaining elements only locate this call. Express the target in `path` relative to the anchor rather than stacking route elements. Never `cd` inside a Bash command to reach a directory — `cd` does not move the session's working directory; pass `cwd`.
+File-system and Bash calls run in the conversation's current working directory unless `cwd` says otherwise: omit `cwd` for work in that directory, and pass it when this call targets another one (another checkout, a worktree, or a subdirectory you will keep working in). `cwd` is an array `[anchor, ...route]`: a non-empty first element re-anchors the conversation's default directory (`""` keeps the current one — anchor it to the repo/worktree root once and leave it there), the remaining elements only locate this call. Express the target in `path` relative to the anchor rather than stacking route elements. Never `cd` inside a Bash command to reach a directory — `cd` does not move the conversation's working directory; pass `cwd`.
 
 ## Conversation title
 When the conversation's topic becomes clear — usually within your first response — and each time it materially shifts, set the session title by running:

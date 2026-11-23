@@ -406,7 +406,7 @@ impl AgentTool for BashTool {
         serde_json::json!({
             "type": "object",
             "properties": properties,
-            "required": ["command", "cwd"]
+            "required": ["command"]
         })
     }
 
@@ -879,7 +879,8 @@ fn nudge_tool_preference(command: &str, ctx: &dyn ToolContext) -> String {
 
 /// Per-session-once nudge: a bare `cd` command (or one starting with `cd`)
 /// suggests the `cwd` array instead — the shell's `cd` does not move the
-/// session's working directory, so the model must carry locations in `cwd`.
+/// session's working directory, so the model must carry locations in `cwd`
+/// (omitting it keeps the conversation's current directory).
 fn nudge_cd_preference(command: &str, ctx: &dyn ToolContext) -> String {
     let trimmed = command.trim();
     if !(trimmed.starts_with("cd ") || trimmed == "cd") {
@@ -890,7 +891,8 @@ fn nudge_cd_preference(command: &str, ctx: &dyn ToolContext) -> String {
         return String::new(); // already shown this session
     }
     "\n\n[harness] tip: a `cd` inside a Bash command does not move this session's working \
-     directory. Pass the location with `cwd` instead — array form [anchor, ...route]: the \
+     directory. Pass the location with `cwd` instead — omit it to work in the \
+     conversation's current directory, or pass the array form [anchor, ...route]: the \
      first element re-anchors the session (\"\" keeps it), the rest locate just this call. \
      Example: {\"command\": \"cargo test\", \"cwd\": [\"~/projects/dspo/manox\", \
      \"crates/manox-harness\"]}."

@@ -320,13 +320,10 @@ mod tests {
         let schema = tool.parameters_schema();
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("pattern")));
-        // `cwd` is semantically required but deliberately absent from
-        // `required`: a MISSING cwd passes validation so the model sees the
-        // instructional how-to (from the tool, or the approval fence for the
-        // gated tools) instead of a generic jsonschema message. The shape
-        // itself is still declared — a present-but-malformed cwd is caught
-        // by the schema, and the pipeline rewrites that failure to the same
-        // how-to.
+        // `cwd` is optional — omission runs in the conversation's directory
+        // — so it stays out of `required`. The shape is still declared: a
+        // present-but-malformed cwd is caught by the schema, and the
+        // pipeline rewrites that failure to the instructional how-to.
         assert!(!required.iter().any(|v| v.as_str() == Some("cwd")));
         assert_eq!(schema["properties"]["cwd"]["type"], "array");
         assert_eq!(schema["properties"]["cwd"]["items"]["type"], "string");

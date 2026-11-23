@@ -745,18 +745,27 @@ async fn execute_one(
         });
     }
 
-    // Validate arguments against the tool's JSON Schema.
-    if let Err(e) = validate_tool_args(tool.parameters_schema(), args.clone()) {
-        // A present-but-malformed `cwd` dies here at the shape level; every
-        // cwd rejection is the instructional how-to, so rewrite the generic
-        // jsonschema message. A MISSING `cwd` passes validation — the
-        // property is deliberately not `required` — and is rejected with
-        // the same text at resolution (by the tool, or by the approval
-        // fence for the gated tools).
-        let message = if args.get("cwd").is_some()
+    // Validate arguments against the tool's JSON Schema. An omitted `cwd`
+    // can arrive as JSON `null` (a provider serializing an absent optional
+    // property); the FS schemas type the property as an array, so the copy
+    // handed to validation drops it — every consumer downstream reads
+    // omission, `null` included, as the conversation's directory. A
+    // present-but-malformed `cwd` dies here at the shape level instead;
+    // that shape failure is rewritten to the instructional how-to so the
+    // model never sees a generic jsonschema message.
+    let schema = tool.parameters_schema();
+    let mut validation_args = args.clone();
+    if crate::tools::path_utils::cwd_is_omitted(validation_args.get("cwd"))
+        && schema["properties"].get("cwd").is_some()
+        && let Some(object) = validation_args.as_object_mut()
+    {
+        object.remove("cwd");
+    }
+    if let Err(e) = validate_tool_args(schema, validation_args) {
+        let message = if !crate::tools::path_utils::cwd_is_omitted(args.get("cwd"))
             && !crate::tools::path_utils::cwd_is_shaped(args.get("cwd"))
         {
-            crate::tools::path_utils::CWD_REQUIRED_DOC.to_string()
+            crate::tools::path_utils::CWD_HOWTO_DOC.to_string()
         } else {
             e
         };
@@ -1106,19 +1115,16 @@ mod tests {
         }
     }
 
-    /// Every cwd rejection reaches the model as the instructional how-to,
-    /// end to end through the pipeline: a MISSING cwd passes the
-    /// deliberately-unrequired schema and dies at resolution; a
-    /// present-but-malformed one is caught by the schema and rewritten —
-    /// neither surfaces a generic jsonschema message.
+    /// A present-but-malformed `cwd` reaches the model as the instructional
+    /// how-to, end to end through the pipeline: the schema catches the shape
+    /// and the pipeline rewrites the generic jsonschema message.
     #[tokio::test]
-    async fn test_every_cwd_rejection_surfaces_the_howto() {
+    async fn test_malformed_cwd_surfaces_the_howto() {
         let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(crate::tools::read::ReadTool)];
         let ctx = MockCtx {
             state: ToolState::new(),
         };
         let cases = [
-            serde_json::json!({ "path": "f.txt" }),
             serde_json::json!({ "path": "f.txt", "cwd": "/tmp" }),
             serde_json::json!({ "path": "f.txt", "cwd": [] }),
             serde_json::json!({ "path": "f.txt", "cwd": ["", 3] }),
@@ -1141,9 +1147,48 @@ mod tests {
                 panic!("expected a text block");
             };
             assert!(
-                text.contains(crate::tools::path_utils::CWD_REQUIRED_DOC),
+                text.contains(crate::tools::path_utils::CWD_HOWTO_DOC),
                 "{text}"
             );
+            assert!(!text.contains("not of type"), "{text}");
+        }
+    }
+
+    /// An omitted `cwd` — absent, or JSON `null` as a provider serializes an
+    /// absent optional property — is not an argument error: the call reaches
+    /// the tool and runs in the conversation's directory.
+    #[tokio::test]
+    async fn test_omitted_cwd_reaches_the_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(ToolState::new());
+        let env = Arc::new(crate::env::TokioExecutionEnv::new(dir.path().to_path_buf()));
+        let ctx =
+            crate::tool::LocalToolContext::new(env, dir.path().to_path_buf(), Arc::clone(&state));
+        let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(crate::tools::read::ReadTool)];
+        for args in [
+            serde_json::json!({ "path": "missing.txt" }),
+            serde_json::json!({ "path": "missing.txt", "cwd": null }),
+        ] {
+            let (executed, _) = execute_tool_calls(
+                &[("c1", "Read", args)],
+                &tools,
+                CancellationToken::new(),
+                &ctx,
+                &AgentLoopConfig::default(),
+                &NullSink,
+                false,
+            )
+            .await
+            .unwrap();
+            // The file is absent, so the read fails — but at the filesystem,
+            // never as a `cwd` argument error.
+            assert!(executed[0].result.is_error);
+            let crate::types::ContentBlock::Text { text, .. } = &executed[0].result.content[0]
+            else {
+                panic!("expected a text block");
+            };
+            assert!(!text.contains("invalid cwd"), "{text}");
+            assert!(!text.contains("working directory does not exist"), "{text}");
             assert!(!text.contains("not of type"), "{text}");
         }
     }
