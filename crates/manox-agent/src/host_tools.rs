@@ -122,6 +122,14 @@ impl AgentTool for OpenExternalTool {
     fn requires_approval(&self, _params: &serde_json::Value) -> bool {
         true
     }
+    /// Opening surfaces something through the host's default handler — a
+    /// capability round trip, not an fs write. The tool takes no `cwd` and
+    /// touches no path the fence could prove inside the writable roots, so
+    /// the path ruling must not judge it (its authority is the host round
+    /// trip plus the approval hint above).
+    fn mutates_through_fs_paths(&self) -> bool {
+        false
+    }
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -237,6 +245,48 @@ mod tests {
         assert!(
             matches!(err, ToolError::ExecutionFailed(ref m) if m.contains("engine actor gone")),
             "got {err:?}"
+        );
+    }
+
+    /// `Open` takes no `cwd` and must stay callable without one at the
+    /// default (sandbox) access mode: the opener declares itself fs-free,
+    /// so the gate's path ruling never judges it. The round trip still
+    /// fails closed with the facade gone — that error proves the call got
+    /// past the fence (a refusal would carry the sandbox marker instead).
+    #[test]
+    fn open_passes_the_sandbox_gate_without_a_cwd() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx); // the facade is gone
+        let opener = OpenExternalTool { notice_tx: tx };
+        assert!(
+            !opener.mutates_through_fs_paths(),
+            "the opener declares itself fs-free"
+        );
+        let gate = crate::approval::ApprovalGate::new(
+            notice_tx(),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
+        gate.set_mode(crate::thread::AccessMode::Sandbox);
+        let gated = crate::approval::ApprovalGatedTool::new(Arc::new(opener), gate.into());
+        let err = rt
+            .block_on(async {
+                gated
+                    .execute(
+                        "tc-1",
+                        serde_json::json!({ "url": "https://example.com" }),
+                        CancellationToken::new(),
+                        &NullCtx,
+                    )
+                    .await
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::ExecutionFailed(ref m) if m.contains("engine actor gone")),
+            "the round trip's own failure, never a sandbox refusal: {err:?}"
         );
     }
 

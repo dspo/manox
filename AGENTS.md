@@ -131,7 +131,7 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`）�
 1. **通用 agent 内核能力 → crates/manox-harness/src/core**：任何 agent harness 都需要的机制，wire 名/事件形状/serde 保真（例：compaction 事件、`prompt(text,{images})`、steer 带图、Input hook）。
 2. **经内核拓展点可承载的业务能力 → manox-harness/src/ext**（不反向依赖宿主）。
 3. **宿主原创能力 → 宿主层**（例：审批门控、MCP、标题生成、斜杆路由）；内核只留缝隙（如 `AgentTool::requires_approval`），不代行政策。
-4. **定层偏离既有惯例必须显式注明理由**（写进 PR 的 Assumptions；例：manox-harness 的 MCP 工具比内建工具更保守地过审批门控）。
+4. **定层偏离既有惯例必须显式注明理由**（写进 PR 的 Assumptions；例：MCP 桥接工具先比内建工具更保守地过审批门控、后经 `mutates_through_fs_paths` 显式声明放开，收紧与放开两次偏离均在 PR 中注明）。
 
 ### 内核纪律红线
 

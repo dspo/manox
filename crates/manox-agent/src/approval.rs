@@ -640,9 +640,10 @@ impl ApprovalGatedTool {
         // would reject the call as a malformed argument) and touches no path
         // (so there is nothing to prove inside the writable roots). Such a
         // tool's authority is scoped elsewhere — the task registry is
-        // session-owned. Everything else, including unknown mutating tools and
-        // MCP tools whose schema comes from a remote server, keeps the
-        // fail-closed path ruling.
+        // session-owned, the opener rides the host round trip, and a bridged
+        // MCP tool's trust boundary is its user-configured server. Every
+        // mutating tool that does not declare itself fs-free — an unknown
+        // tool above all — keeps the fail-closed path ruling.
         if !self.inner.mutates_through_fs_paths() {
             return Ok(());
         }
@@ -1553,16 +1554,38 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
+    /// A bridged MCP tool rides the same admission: it declares itself
+    /// fs-free (the trust boundary is its user-configured server), so a
+    /// call without `cwd` reaches the tool at the default access mode
+    /// instead of dying in the path ruling.
+    #[tokio::test]
+    async fn sandbox_admits_an_mcp_bridged_tool_without_a_cwd() {
+        let (gate, _rx) = gate_with_events();
+        gate.set_mode(AccessMode::Sandbox);
+        let (tool, ran) = gated_declaring("mcp__srv__web_search", false, Arc::clone(&gate));
+        let ctx = tool_ctx();
+        tool.execute(
+            "c1",
+            serde_json::json!({ "query": "rust" }),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .expect("an MCP-bridged tool must run without a cwd under sandbox");
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
     /// The contract defaults to `true`: a mutating tool that does not declare
-    /// itself fs-free (an unknown tool, or an MCP write tool whose schema
-    /// comes from a remote server) keeps the fail-closed path ruling — it is
-    /// still judged as a path writer and never runs without a provable
-    /// target. This is the guard that keeps the fix from becoming a bypass.
+    /// itself fs-free (an unknown tool above all — remote schemas must never
+    /// buy the exemption by inference) keeps the fail-closed path ruling —
+    /// it is still judged as a path writer and never runs without a provable
+    /// target. This is the guard that keeps the declaration from becoming a
+    /// bypass.
     #[tokio::test]
     async fn sandbox_still_rules_on_undeclared_mutating_tools() {
         let (gate, _rx) = gate_with_events();
         gate.set_mode(AccessMode::Sandbox);
-        let (tool, ran) = gated_named("mcp__srv__write_file", false, false, Arc::clone(&gate));
+        let (tool, ran) = gated_named("remote__write_file", false, false, Arc::clone(&gate));
         let ctx = tool_ctx();
         // No `cwd` — judged at the conversation's directory, the target is
         // still out of roots, so the ruling refuses before the tool runs.
