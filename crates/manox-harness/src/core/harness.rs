@@ -1017,9 +1017,8 @@ pub struct AgentHarness<S: SessionStorage> {
     resources: HarnessResources,
     /// The cwd last made durable through a `cwd_change` entry. The assembly
     /// cwd initializes it (the header for a fresh session, the projected
-    /// effective cwd on restore), so a sticky cwd equal to it does not
-    /// re-append. Drives the flush in
-    /// [`AgentHarness::flush_pending_mutations_inner`].
+    /// effective cwd on restore), so a `SetCwd` onto the same directory
+    /// does not re-append.
     persisted_cwd: Option<std::path::PathBuf>,
 }
 
@@ -1161,8 +1160,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// noop guard) is carried over so in-session edit context survives a
     /// cwd re-pin or fork rebuild. The assembly cwd is what the session file
     /// durably records (header on create, projected `cwd_change` on
-    /// restore), so it seeds `persisted_cwd` — the first sticky-cwd flush
-    /// only writes when a tool call actually moved it.
+    /// restore), so it seeds `persisted_cwd` for `SetCwd` dedup.
     pub fn with_tool_cwd(mut self, cwd: std::path::PathBuf) -> Self {
         let env: Arc<dyn ExecutionEnv> = Arc::new(TokioExecutionEnv::new(cwd.clone()));
         let tool_state = self
@@ -1186,32 +1184,36 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.agent.tool_context().cwd()
     }
 
-    /// Point the session's hashline snapshot store at a persistent directory,
-    /// so a rebuilt store (app restart, session fork, worktree re-entry) can
-    /// rehydrate tags it never minted in memory.
-    /// Move the session's sticky working directory and make the move
-    /// durable immediately — the host-driven `SetCwd` path. Distinct from
-    /// the tool-side resolution (which advances the sticky and lets the
-    /// turn-boundary flush persist in order with the turn's messages):
-    /// a UI switch must survive a crash before any next turn, so the
-    /// `cwd_change` entry is appended here and `persisted_cwd` advances to
-    /// keep the next flush a no-op.
+    /// Move the session's working directory — the host-driven `SetCwd` path,
+    /// the only thing that can move it: a model's tool call locates itself
+    /// per call and never persists a move. The move is durable immediately
+    /// (the `cwd_change` entry lands here, `persisted_cwd` advances) because
+    /// a UI switch must survive a crash before any next turn, and the tool
+    /// context is re-pinned so every later call resolves against the new
+    /// directory. A context that does not own its state cannot be re-pinned
+    /// and stays where it is.
     pub async fn set_session_cwd(&mut self, cwd: std::path::PathBuf) -> Result<(), anyhow::Error> {
         if let Some(state) = self.agent.tool_context().tool_state_handle() {
-            *state.sticky_cwd.lock().expect("sticky cwd poisoned") = Some(cwd.clone());
+            let env: Arc<dyn ExecutionEnv> = Arc::new(TokioExecutionEnv::new(cwd.clone()));
+            let tool_ctx: Arc<dyn crate::tool::ToolContext> =
+                Arc::new(LocalToolContext::new(env, cwd.clone(), state));
+            self.agent.set_tool_ctx(tool_ctx);
         }
         self.session
             .append_cwd_change(&cwd.to_string_lossy())
             .await?;
         self.persisted_cwd = Some(cwd.clone());
-        // The prompt's working-directory line follows the move: the sticky
-        // cwd already moved the tools, and a prompt still naming the old
-        // directory leaves the model answering from a stale belief.
+        // The prompt's working-directory line follows the move: a prompt
+        // still naming the old directory leaves the model answering from a
+        // stale belief.
         self.prompt_cwd = cwd;
         self.rebuild_system_prompt();
         Ok(())
     }
 
+    /// Point the session's hashline snapshot store at a persistent directory,
+    /// so a rebuilt store (app restart, session fork, worktree re-entry) can
+    /// rehydrate tags it never minted in memory.
     pub fn set_snapshot_dir(&mut self, root: std::path::PathBuf) {
         self.agent
             .tool_context()
@@ -1993,35 +1995,6 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             }
             // The append succeeded: drop the entry and continue.
             self.control.pending_mutations.lock().unwrap().remove(0);
-        }
-        // Persist the sticky cwd when a tool call moved it since the last
-        // flush: one `cwd_change` entry per durable move, ordered after the
-        // turn's messages. `persisted_cwd` already holds the assembly cwd,
-        // so a session that never moved its working directory writes none.
-        let sticky = self
-            .agent
-            .tool_context()
-            .tool_state()
-            .sticky_cwd
-            .lock()
-            .expect("sticky cwd poisoned")
-            .clone();
-        if sticky != self.persisted_cwd {
-            if let Some(cwd) = &sticky {
-                self.session
-                    .append_cwd_change(&cwd.to_string_lossy())
-                    .await?;
-            }
-            self.persisted_cwd = sticky.clone();
-        }
-        // The prompt's working-directory line follows the sticky cwd: a tool
-        // anchor that moved the conversation reaches the next turn's context
-        // instead of leaving the model reasoning from the directory the
-        // harness was assembled at. An unmoved directory keeps the rendered
-        // prompt — and the provider's cached prefix — intact.
-        if let Some(cwd) = sticky.filter(|cwd| *cwd != self.prompt_cwd) {
-            self.prompt_cwd = cwd;
-            self.rebuild_system_prompt();
         }
         Ok(())
     }

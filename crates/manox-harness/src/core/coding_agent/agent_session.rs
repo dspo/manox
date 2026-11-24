@@ -764,11 +764,9 @@ impl AgentSession {
         &self.session_path
     }
 
-    /// Close the session: request shutdown, settle, and return the path. The
     /// The effective working directory the session path carries — the
-    /// header cwd, or the latest `cwd_change` entry when a tool call moved
-    /// the sticky cwd — falling back to the assembly cwd when projection
-    /// fails.
+    /// header cwd, or the latest `cwd_change` entry when the host moved the
+    /// directory — falling back to the assembly cwd when projection fails.
     pub async fn projected_cwd(&self) -> PathBuf {
         self.harness
             .session()
@@ -786,9 +784,9 @@ impl AgentSession {
         self.harness.system_prompt()
     }
 
-    /// Move the session's working directory (host-driven `SetCwd`): sticky
-    /// advance + an immediately durable `cwd_change` entry. See
-    /// [`AgentHarness::set_session_cwd`].
+    /// Move the session's working directory (host-driven `SetCwd`): the
+    /// tool context re-pins and an immediately durable `cwd_change` entry
+    /// lands. See [`AgentHarness::set_session_cwd`].
     pub async fn set_session_cwd(&mut self, cwd: PathBuf) -> Result<(), anyhow::Error> {
         self.harness.set_session_cwd(cwd).await
     }
@@ -1313,9 +1311,9 @@ impl AgentSessionBuilder {
         let repo = SessionRepository::new(&session_dir);
         let session = repo.open(&path).await?;
         // The effective cwd is the latest `cwd_change` on the path, falling
-        // back to the header (launch) directory. A sticky cwd pointing at a
-        // directory that no longer exists (a removed worktree) falls back to
-        // the header rather than assembling tools that cannot run anywhere.
+        // back to the header (launch) directory. A projected cwd pointing at
+        // a directory that no longer exists (a removed worktree) falls back
+        // to the header rather than assembling tools that cannot run anywhere.
         let header_cwd = std::path::PathBuf::from(session.storage().metadata.cwd.clone());
         let cwd = session
             .build_session_context()
@@ -1928,9 +1926,9 @@ mod tests {
         );
     }
 
-    /// The host-driven directory switch: sticky advances, the move is
-    /// immediately durable, and the next turn's flush does not duplicate
-    /// the entry.
+    /// The host-driven directory switch: the tool context re-pins, the move
+    /// is immediately durable, and a repeat switch onto the same directory
+    /// does not duplicate the entry.
     #[tokio::test]
     async fn set_session_cwd_is_durable_without_flush_duplication() {
         let dir = tempfile::tempdir().unwrap();
@@ -1994,7 +1992,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!result.is_error, "sticky cwd follows the switch");
+        assert!(
+            !result.is_error,
+            "the session resolves in the moved-to directory"
+        );
     }
 
     /// A multi-root create renders the project-root section into the live
@@ -2100,8 +2101,8 @@ mod tests {
             .await
             .unwrap();
         session.prompt("first").await.unwrap();
-        // A tool call moved the sticky cwd into the work directory; the move
-        // is durable as a `cwd_change` entry on the session path.
+        // The host moved the working directory into the work directory; the
+        // move is durable as a `cwd_change` entry on the session path.
         session
             .harness
             .session()

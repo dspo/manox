@@ -168,8 +168,9 @@ pub trait ThreadEngine: Send + Sync {
     /// Re-point the backend at an existing session file.
     fn open_session(&self, path: PathBuf);
 
-    /// Move the session's working directory (host-driven `SetCwd`): sticky
-    /// advance + a durable `cwd_change` entry. See [`SessionCmd::SetCwd`].
+    /// Move the session's working directory (host-driven `SetCwd`): the tool
+    /// context re-pins and a durable `cwd_change` entry lands. See
+    /// [`SessionCmd::SetCwd`].
     fn set_cwd(&self, path: PathBuf);
 
     /// The session file the backend currently drives, if any.

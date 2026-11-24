@@ -144,9 +144,9 @@ pub enum Event {
     /// A change of the working directory the following tool calls run in.
     ///
     /// The header cwd is immutable (append-only file), so this entry is the
-    /// durable witness of the per-call sticky cwd advancing — resolution chain
-    /// `explicit cwd argument → sticky → header cwd`. Restore projects the
-    /// latest one; tools do not project it into the transcript.
+    /// durable witness of a host-driven `SetCwd` — the only thing that moves
+    /// the directory. Restore projects the latest one; tool calls never
+    /// write it.
     #[serde(rename = "cwd_change", rename_all = "camelCase")]
     CwdChange {
         id: String,

@@ -573,13 +573,13 @@ impl BashTool {
 
         let mut output = assemble_output(result, head_lines, tail_lines);
 
-        // Per-session-once nudges: suggest native tools when the model reaches
-        // for raw grep/rg/find/ls, suggest background for long waits, and
-        // point at `cwd` when the command relies on a bare `cd`.
+        // Per-session nudges: suggest native tools when the model reaches
+        // for raw grep/rg/find/ls and suggest background for long waits;
+        // the cwd nudge leads the output (prepend_cd_nudge).
         if !run_in_background {
             output.push_str(&nudge_tool_preference(&command, ctx));
             output.push_str(&nudge_sleep_loop(&command, ctx));
-            output.push_str(&nudge_cd_preference(&command, ctx));
+            prepend_cd_nudge(&mut output, &command, ctx);
         }
 
         Ok(AgentToolResult::text(output))
@@ -665,7 +665,7 @@ impl BashTool {
             }
             out.push_str(&nudge_tool_preference(command, ctx));
             out.push_str(&nudge_sleep_loop(command, ctx));
-            out.push_str(&nudge_cd_preference(command, ctx));
+            prepend_cd_nudge(&mut out, command, ctx);
             return Ok(AgentToolResult::text(out));
         }
 
@@ -695,7 +695,7 @@ impl BashTool {
         }
         out.push_str(&nudge_tool_preference(command, ctx));
         out.push_str(&nudge_sleep_loop(command, ctx));
-        out.push_str(&nudge_cd_preference(command, ctx));
+        prepend_cd_nudge(&mut out, command, ctx);
         Ok(AgentToolResult::text(out))
     }
 
@@ -877,26 +877,79 @@ fn nudge_tool_preference(command: &str, ctx: &dyn ToolContext) -> String {
     )
 }
 
-/// Per-session-once nudge: a bare `cd` command (or one starting with `cd`)
-/// suggests the `cwd` array instead — the shell's `cd` does not move the
-/// session's working directory, so the model must carry locations in `cwd`
-/// (omitting it keeps the conversation's current directory).
+/// Parse a leading `cd <dir>` plus optional `&&`/`;` separator: returns
+/// `(dir, Some(rest))` for `cd <dir> && rest` and `cd <dir>; rest`,
+/// `(dir, None)` for a bare `cd <dir>`, and `("", None)` for a bare `cd`.
+/// `None` when the command does not start with `cd` or the naive split cut
+/// into a quoted segment — no trustworthy rewrite for that shape.
+fn leading_cd(command: &str) -> Option<(String, Option<String>)> {
+    let trimmed = command.trim();
+    if trimmed == "cd" {
+        return Some((String::new(), None));
+    }
+    let after = trimmed.strip_prefix("cd ")?;
+    let (dir_raw, rest) = match after.split_once("&&") {
+        Some((dir, rest)) => (dir, Some(rest.trim())),
+        None => after
+            .split_once(';')
+            .map_or((after, None), |(dir, rest)| (dir, Some(rest.trim()))),
+    };
+    let dir = dir_raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if dir.contains('"') || dir.contains('\'') {
+        return None;
+    }
+    Some((dir.to_string(), rest.map(str::to_string)))
+}
+
+/// Two-tier nudge for a command leading with `cd`: the first occurrence in a
+/// session carries the full `cwd` how-to, every later one a one-line
+/// reminder — both with the concrete rewrite when the command shapes as
+/// `cd <dir> [&&|;] rest`. The shell's `cd` moves only that command's
+/// directory, never the conversation's.
 fn nudge_cd_preference(command: &str, ctx: &dyn ToolContext) -> String {
     let trimmed = command.trim();
     if !(trimmed.starts_with("cd ") || trimmed == "cd") {
         return String::new();
     }
     let nf = &ctx.tool_state().nudge_flags;
-    if crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::CD_PREFERENCE) {
-        return String::new(); // already shown this session
+    let already = crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::CD_PREFERENCE);
+    let concrete = leading_cd(trimmed).and_then(|(dir, rest)| {
+        rest.filter(|r| !r.is_empty() && !r.contains('"'))
+            .filter(|_| !dir.is_empty() && !dir.contains('"'))
+            .map(|rest| (dir, rest))
+    });
+    match (already, concrete) {
+        (false, None) => "[harness] tip: a `cd` inside a Bash command does not move this \
+             session's working directory. Pass the location with `cwd` instead — omit it to \
+             work in the conversation's directory, or pass [dir, ...subdirs]; the argument \
+             locates this call only. Example: {\"command\": \"cargo test\", \
+             \"cwd\": [\"~/projects/dspo/manox\", \"crates/manox-harness\"]}."
+            .to_string(),
+        (true, None) => "[harness] prefer the `cwd` parameter over `cd`.".to_string(),
+        (false, Some((dir, rest))) => format!(
+            "[harness] tip: prefer `cwd` over \"cd {dir} && ...\" — the shell's cd does not \
+             move this session's working directory. This call as {{\"command\": \"{rest}\", \
+             \"cwd\": [\"{dir}\"]}}. `cwd` locates just this call; the conversation's \
+             directory never moves."
+        ),
+        (true, Some((dir, rest))) => {
+            format!("[harness] prefer cwd: {{\"command\": \"{rest}\", \"cwd\": [\"{dir}\"]}}.")
+        }
     }
-    "\n\n[harness] tip: a `cd` inside a Bash command does not move this session's working \
-     directory. Pass the location with `cwd` instead — omit it to work in the \
-     conversation's current directory, or pass the array form [anchor, ...route]: the \
-     first element re-anchors the session (\"\" keeps it), the rest locate just this call. \
-     Example: {\"command\": \"cargo test\", \"cwd\": [\"~/projects/dspo/manox\", \
-     \"crates/manox-harness\"]}."
-        .to_string()
+}
+
+/// Lead the output with the cd nudge — the hint goes before the command
+/// output, not after it.
+fn prepend_cd_nudge(output: &mut String, command: &str, ctx: &dyn ToolContext) {
+    let hint = nudge_cd_preference(command, ctx);
+    if hint.is_empty() {
+        return;
+    }
+    if output.is_empty() {
+        *output = hint;
+    } else {
+        *output = format!("{hint}\n\n{output}");
+    }
 }
 
 /// Per-session-once nudges for long-running foreground patterns.
@@ -1146,7 +1199,7 @@ mod tests {
         )
     }
 
-    /// A context rooted at a fresh real directory — sticky-cwd resolution
+    /// A context rooted at a fresh real directory — cwd resolution
     /// rejects a working directory that does not exist. The tempdir is kept
     /// for the test's lifetime.
     fn ctx() -> (crate::core::tool::LocalToolContext, tempfile::TempDir) {
@@ -1160,7 +1213,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         });
         let tool = BashTool::new(ops.clone(), Arc::new(NoopRegistry));
-        let (ctx, _dir) = ctx();
+        let (ctx, dir) = ctx();
         let work = tempfile::tempdir().expect("tempdir");
         let result = tool
             .execute(
@@ -1181,12 +1234,22 @@ mod tests {
             "cwd override reaches the backend"
         );
         assert!(!result.is_error);
-        // A single-element cwd re-anchors the session: the sticky advances to
-        // the anchor directory.
+        drop(calls);
+        // The override locates only this call: the next call without `cwd`
+        // runs in the conversation's directory again.
+        tool.execute(
+            "c2",
+            serde_json::json!({"command": "echo hi"}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let calls = ops.calls.lock().unwrap();
         assert_eq!(
-            ctx.tool_state().sticky_cwd.lock().unwrap().as_deref(),
-            Some(work.path()),
-            "sticky cwd follows the anchor"
+            calls[1].1.as_deref(),
+            Some(dir.path()),
+            "a cwd argument never persists to the next call"
         );
     }
 
@@ -1608,21 +1671,21 @@ mod tests {
         assert!(timeout.as_str().unwrap().contains("is killed"));
     }
 
-    /// A `cd` inside a command moves only the shell's directory for that
-    /// command — the session's sticky cwd never follows it.
+    /// Neither a `cwd` argument nor a `cd` inside a command persists: every
+    /// call resolves its directory from its own arguments alone.
     #[tokio::test]
-    async fn cd_inside_a_command_does_not_move_the_sticky_cwd() {
+    async fn no_call_persists_a_directory_move() {
         let ops = Arc::new(RecordingOps {
             calls: Mutex::new(Vec::new()),
         });
-        let tool = BashTool::new(ops, Arc::new(NoopRegistry));
+        let tool = BashTool::new(ops.clone(), Arc::new(NoopRegistry));
         let (ctx, dir) = ctx();
-        // Anchor once so the sticky holds a real value to protect.
+        let work = tempfile::tempdir().expect("tempdir");
         tool.execute(
             "c1",
             serde_json::json!({
-                "command": "echo start",
-                "cwd": [dir.path().to_string_lossy()],
+                "command": "cd somewhere && pwd",
+                "cwd": [work.path().to_string_lossy()],
             }),
             CancellationToken::new(),
             &ctx,
@@ -1631,25 +1694,33 @@ mod tests {
         .unwrap();
         tool.execute(
             "c2",
-            serde_json::json!({"command": "cd somewhere && pwd", "cwd": [""]}),
+            serde_json::json!({"command": "pwd"}),
             CancellationToken::new(),
             &ctx,
         )
         .await
         .unwrap();
+        let calls = ops.calls.lock().unwrap();
         assert_eq!(
-            ctx.tool_state().sticky_cwd.lock().unwrap().as_deref(),
+            calls[0].1.as_deref(),
+            Some(work.path()),
+            "the override reaches the backend"
+        );
+        assert_eq!(
+            calls[1].1.as_deref(),
             Some(dir.path()),
-            "the sticky stays at the anchor; the command's `cd` does not leak"
+            "nothing persists to the next call"
         );
     }
 
-    /// A `cd` command appends the cwd nudge exactly once per session.
+    /// A leading `cd` nudges every occurrence: the first carries the full
+    /// how-to with the concrete rewrite, later ones a one-line reminder —
+    /// and the hint leads the output. A non-cd command never carries it.
     #[tokio::test]
-    async fn cd_command_nudges_once_per_session() {
+    async fn cd_command_nudges_two_tier_and_leading() {
         let tool = BashTool::new(Arc::new(EchoOps), Arc::new(NoopRegistry));
         let (ctx, _dir) = ctx();
-        const TIP: &str = "[harness] tip: a `cd` inside a Bash command";
+        const FULL: &str = "[harness] tip: prefer `cwd` over \"cd sub && ...\"";
         let first = tool
             .execute(
                 "c1",
@@ -1659,23 +1730,44 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(output_text(&first).contains(TIP), "first cd nudges");
+        let text = output_text(&first);
+        assert!(text.contains(FULL), "first cd carries the full tip: {text}");
+        assert!(text.starts_with(FULL), "the hint leads the output: {text}");
         let second = tool
             .execute(
                 "c2",
+                serde_json::json!({"command": "cd other && ls", "cwd": [""]}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = output_text(&second);
+        assert!(
+            text.contains("[harness] prefer cwd: {\"command\": \"ls\", \"cwd\": [\"other\"]}."),
+            "a later cd carries the one-line rewrite: {text}"
+        );
+        assert!(
+            !text.contains("tip:"),
+            "the reminder stays one line: {text}"
+        );
+        let bare = tool
+            .execute(
+                "c3",
                 serde_json::json!({"command": "cd other", "cwd": [""]}),
                 CancellationToken::new(),
                 &ctx,
             )
             .await
             .unwrap();
+        let text = output_text(&bare);
         assert!(
-            !output_text(&second).contains(TIP),
-            "the nudge fires once per session"
+            text.contains("[harness] prefer the `cwd` parameter over `cd`."),
+            "a bare cd gets the generic reminder: {text}"
         );
         let unrelated = tool
             .execute(
-                "c3",
+                "c4",
                 serde_json::json!({"command": "echo hi", "cwd": [""]}),
                 CancellationToken::new(),
                 &ctx,
@@ -1683,7 +1775,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !output_text(&unrelated).contains(TIP),
+            !output_text(&unrelated).contains("[harness]"),
             "a non-cd command never carries the nudge"
         );
     }

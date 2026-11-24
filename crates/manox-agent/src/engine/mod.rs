@@ -156,9 +156,10 @@ pub(crate) enum SessionCmd {
     GoalGate,
     /// Re-point the session at an existing jsonl file.
     Open { path: PathBuf },
-    /// Move the session's working directory (host-driven `SetCwd`): the
-    /// sticky cwd advances and the move is durable as a `cwd_change`
-    /// entry — never the header cwd or the project binding.
+    /// Move the session's working directory (host-driven `SetCwd`): the tool
+    /// context re-pins and the move is durable as a `cwd_change` entry —
+    /// never the header cwd or the project binding. Tool calls cannot move
+    /// the directory; `cwd` locates one call only.
     SetCwd { path: PathBuf },
     /// Append a host UI annotation as a `custom` entry at the session leaf.
     /// The single actor queue makes send order the persist order, so a note
@@ -332,8 +333,7 @@ struct EngineState {
     active_tool_mirror: ActiveToolMirror,
     /// Session cmds that arrived mid-run but are not serviceable until the
     /// turn settles (e.g. `NewSession`/`Open`/`SetCwd` — the first two
-    /// rebuild the session, the third moves the sticky cwd a running turn's
-    /// tools are resolving against). drive_run
+    /// re-pins the tool context for the next turn). drive_run
     /// parks them here instead of dropping; the idle loop drains and
     /// re-queues them so the post-settle cmd dispatch runs the handler.
     pending_session_cmds: Mutex<Vec<SessionCmd>>,

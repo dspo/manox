@@ -76,8 +76,8 @@ pub trait ExecutionEnv: Send + Sync {
     ) -> Result<CommandResult, ExecutionError>;
 
     /// Execute a shell command in `cwd` with a timeout — the per-call
-    /// directory from sticky-cwd resolution, which may differ from the env's
-    /// pinned session cwd. Semantics otherwise match [`ExecutionEnv::exec`].
+    /// directory from the call's `cwd` resolution, which may differ from the
+    /// env's pinned session cwd. Semantics otherwise match [`ExecutionEnv::exec`].
     async fn exec_at(
         &self,
         command: &str,

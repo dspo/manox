@@ -645,9 +645,9 @@ pub(super) async fn project_turn(projection: &Projection) {
             return;
         }
     };
-    // The sticky cwd may have moved during the turn (a tool call with an
-    // explicit `cwd`, or a `cd` inside a command): report one `CwdChanged` per
-    // durable move so the facade mirror and the UI track the session tail.
+    // The journal tail may carry a host-driven `cwd_change` (a `SetCwd`):
+    // mirror it so the facade and the UI track the session tail. Tool calls
+    // never move the directory, so nothing here is model-driven.
     let projected = entries
         .iter()
         .rev()
