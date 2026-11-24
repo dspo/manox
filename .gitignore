@@ -1,6 +1,7 @@
 target/
 .issues/
 .zcode/
+.vscode/
 
 # agent 本地工作产物：本地保留、不托管进 git
 .claude/
