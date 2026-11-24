@@ -5,6 +5,12 @@ on:
   push:
     branches: [main]
 
+# Superseded runs (a new push to the same PR branch or main) are dead work:
+# cancel them instead of queueing full builds behind them.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -70,6 +76,12 @@ jobs:
 
       - name: Build napi binding
         run: cargo build -p manox-napi
+
+      # The lean napi edge (--no-default-features): the gated-off production
+      # arms (no MCP, no WS gateway) never compile under the
+      # full-configuration legs above — gates leg "libs" second half.
+      - name: Lean napi check
+        run: cargo check -p manox-napi --no-default-features --lib
 
       - name: Save target cache
         if: github.event_name == 'push' && success()

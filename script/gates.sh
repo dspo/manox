@@ -11,21 +11,22 @@
 #                   declaration in the repo (release bumps touch one line;
 #                   the v-tag ↔ manifest identity stays checkable)
 #   2. fmt        — cargo fmt --all -- --check
-#   3. prod-libs  — cargo check of the production lib units (no dev-deps,
-#                   no reverse-dependency feature enablement)
-#   4. lean-libs  — the lean napi edge (--no-default-features): the compile
-#                   gate for every cfg-gated-off production arm
-#   5. clippy     — cargo clippy --workspace --all-targets -- -D warnings,
+#   3. libs       — the two library-unit check shapes in one leg:
+#                   a) prod-libs: cargo check of the production lib units
+#                      (no dev-deps, no reverse-dependency feature enablement)
+#                   b) lean-libs: the lean napi edge (--no-default-features),
+#                      the compile gate for every cfg-gated-off production arm
+#   4. clippy     — cargo clippy --workspace --all-targets -- -D warnings,
 #                   under CI's own RUSTFLAGS (CI sets `-D warnings`, which
 #                   promotes `clippy::let_unit_value` and friends from
 #                   warnings to errors; without it this leg passed while CI
 #                   failed on a `let _ =` whose call returns `()`).
-#   6. test-real  — cargo test --workspace --all-targets --no-fail-fast
+#   5. test-real  — cargo test --workspace --all-targets --no-fail-fast
 #                   under the developer's real HOME
-#   7. test-clean — the same under a pristine temp HOME (the CI-equivalent
+#   6. test-clean — the same under a pristine temp HOME (the CI-equivalent
 #                   hermeticity leg: no ~/.manox config, no provider
 #                   registry, no session journals)
-#   8. examples   — the offline example smoke (crates/manox-harness/scripts/
+#   7. examples   — the offline example smoke (crates/manox-harness/scripts/
 #                   check_examples.sh): cargo test only COMPILES examples,
 #                   so a synthesized tool call that no longer satisfies a
 #                   tool's schema stays green here and only dies in CI's
@@ -69,19 +70,25 @@ run_leg() {
 
 run_leg "version" ./script/check_release_version.sh
 run_leg "fmt" cargo fmt --all -- --check
-# The production-unit shape: no dev-deps, no reverse-dependency feature
-# enablement — cfg-gated items whose consumers are all gated are
-# dead_code HERE, exactly the unit CI compiles (the a6df124e TEST_HOME
-# lesson: the local --all-targets unification can mask it).
-# (`manox-journal` was folded back into manox-harness; the stray -p made
-# this leg fail on every checkout that never had the crate.)
-run_leg "prod-libs" cargo check \
-    -p manox-agent -p manox-session-core -p manox-ahp -p manox-ahp-runtime \
-    -p manox-harness -p manox-napi --lib
-# The lean napi edge: the gated-off production arms (no MCP, no WS gateway)
-# never compile under the full-configuration legs above — this leg is their
-# compile gate (review #790).
-run_leg "lean-libs" cargo check -p manox-napi --no-default-features --lib
+# Two library-unit check shapes in one leg — both are cheap incremental
+# cargo checks and only meaningful as a pair ("the lib units compile, at
+# every feature shape CI can see").
+# a) The production-unit shape: no dev-deps, no reverse-dependency feature
+#    enablement — cfg-gated items whose consumers are all gated are
+#    dead_code HERE, exactly the unit CI compiles (the a6df124e TEST_HOME
+#    lesson: the local --all-targets unification can mask it).
+#    (`manox-journal` was folded back into manox-harness; the stray -p made
+#    this leg fail on every checkout that never had the crate.)
+# b) The lean napi edge: the gated-off production arms (no MCP, no WS
+#    gateway) never compile under the full-configuration legs above — this
+#    check is their compile gate (review #790). CI mirrors it in build.yml.
+lib_checks() {
+    cargo check \
+        -p manox-agent -p manox-session-core -p manox-ahp -p manox-ahp-runtime \
+        -p manox-harness -p manox-napi --lib &&
+    cargo check -p manox-napi --no-default-features --lib
+}
+run_leg "libs" lib_checks
 run_leg "clippy" env RUSTFLAGS="-D warnings" \
     cargo clippy --workspace --all-targets -- -D warnings
 run_leg "test-real" cargo test --workspace --all-targets --no-fail-fast
