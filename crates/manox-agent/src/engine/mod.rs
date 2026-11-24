@@ -325,7 +325,7 @@ struct EngineState {
     /// A browser-suite toggle that arrived mid-run; the running turn owns the
     /// session, so the toggle parks here and lands right after settle.
     pending_browser_suite: Mutex<Option<(BrowserSuite, bool)>>,
-    /// The CodemodeTool's nested-call admission source: the session's
+    /// The ToolsPipeTool's nested-call admission source: the session's
     /// authoritative active-tool selection, mirrored by the engine at every
     /// change (post-open, suite toggles, tool-refresh re-mounts). See
     /// [`tools_assembly::ActiveToolMirror`].
@@ -1210,10 +1210,10 @@ async fn run_actor(
         // The restore path passes no model override: `builder.open()`
         // projects the session's own model only when the builder carries
         // none, and the actor adopts
-        // it right after the open below. The codemode store replays the
+        // it right after the open below. The toolspipe store replays the
         // restored journal before the assembly (D8).
-        let codemode_store =
-            crate::codemode::codemode_store_from_journal(Some(&session_path)).await;
+        let toolspipe_store =
+            crate::toolspipe::toolspipe_store_from_journal(Some(&session_path)).await;
         let (builder, background, subagent_observer) = session_builder(
             &tool_cwd,
             &sessions_dir,
@@ -1230,7 +1230,7 @@ async fn run_actor(
             &thread_id,
             None,
             &bus,
-            codemode_store,
+            toolspipe_store,
             &state.active_tool_mirror,
         );
         // Published per assembly like the acceptance-time writer (the actor
@@ -1243,7 +1243,7 @@ async fn run_actor(
                 attach_prefix_gate(&mut s, &notice_tx, &thread_id);
                 adopt_session_model(&mut s, &mut harness_model, &state).await;
                 // The mirror follows the restored session before any command
-                // is served: Codemode's nested-call admission reads it, and
+                // is served: ToolsPipe's nested-call admission reads it, and
                 // the restored selection may differ from the assembly default.
                 state.active_tool_mirror.sync_from(&s);
                 restored = true;
@@ -1261,8 +1261,8 @@ async fn run_actor(
         None => {
             // A fresh spawn replays whatever journal the deferred session
             // already materialized (usually none — an empty store).
-            let codemode_store =
-                crate::codemode::codemode_store_from_journal(session_file.as_deref()).await;
+            let toolspipe_store =
+                crate::toolspipe::toolspipe_store_from_journal(session_file.as_deref()).await;
             let (builder, background, subagent_observer) = session_builder(
                 &cwd,
                 &sessions_dir,
@@ -1279,7 +1279,7 @@ async fn run_actor(
                 &thread_id,
                 parent_session.as_deref(),
                 &bus,
-                codemode_store,
+                toolspipe_store,
                 &state.active_tool_mirror,
             );
             // Published per assembly like the acceptance-time writer (the actor

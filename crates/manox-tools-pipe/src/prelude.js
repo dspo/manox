@@ -58,7 +58,7 @@
       typeof error.stack === "string"
         ? error.stack
             .split("\n")
-            .filter((line) => line.trim() && line.indexOf("manox-codemode-prelude.js") === -1)
+            .filter((line) => line.trim() && line.indexOf("manox-tools-pipe-prelude.js") === -1)
         : [];
     return [head].concat(frames).join("\n");
   }
@@ -133,7 +133,7 @@
     if (typeof def.declaration !== "string") return head;
     return (
       head +
-      "\n\ncodemode tool declaration:\n```ts\ndeclare const tools: { " +
+      "\n\ntoolspipe tool declaration:\n```ts\ndeclare const tools: { " +
       def.declaration +
       " };\n```"
     );

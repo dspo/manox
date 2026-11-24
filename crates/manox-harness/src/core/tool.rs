@@ -204,7 +204,7 @@ pub trait ToolContext: Send + Sync {
     /// The execution environment as an owned handle when the context owns
     /// one — together with [`Self::tool_state_handle`] this lets a tool
     /// rebuild an owned context and carry it across `tokio::spawn` boundaries
-    /// (the codemode bridge runs every nested tool call on a spawned task).
+    /// (the toolspipe bridge runs every nested tool call on a spawned task).
     /// Contexts that borrow rather than own return `None`.
     fn env_handle(&self) -> Option<std::sync::Arc<dyn crate::env::ExecutionEnv>> {
         None
@@ -1045,7 +1045,7 @@ mod tests {
             &self.state
         }
         // Owned handles, so tools that rebuild a context for spawned nested
-        // executions (codemode) work against the mock unchanged.
+        // executions (toolspipe) work against the mock unchanged.
         fn env_handle(&self) -> Option<Arc<dyn ExecutionEnv>> {
             Some(Arc::new(MockEnv))
         }
@@ -1817,12 +1817,12 @@ mod tests {
         assert!(idx("end:Bash") < idx("start:ReadC"), "{t:?}");
     }
 
-    /// Test 3b: a batch containing the real Codemode tool. Codemode declares
+    /// Test 3b: a batch containing the real ToolsPipe tool. ToolsPipe declares
     /// `Sequential` (its nested calls are invisible to this scheduler), so it
     /// must run strictly between its batch neighbors: the read before it
     /// completes first, the read after it waits for the script.
     #[tokio::test]
-    async fn test_codemode_batch_is_sequential() {
+    async fn test_toolspipe_batch_is_sequential() {
         let trace: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mk = |id: &'static str, name: &'static str, ro: bool| {
@@ -1836,7 +1836,7 @@ mod tests {
                 trace_id: id.to_string(),
             })
         };
-        let codemode = std::sync::Arc::new(crate::tools::codemode::CodemodeTool::new(
+        let toolspipe = std::sync::Arc::new(crate::tools::toolspipe::ToolsPipeTool::new(
             Vec::new(),
             Default::default(),
             std::sync::Arc::new(|| None::<Vec<String>>),
@@ -1844,7 +1844,7 @@ mod tests {
         let tools: Vec<std::sync::Arc<dyn AgentTool>> = vec![
             mk("ReadA", "ReadA", true),
             mk("ReadC", "ReadC", true),
-            codemode,
+            toolspipe,
         ];
         let ctx = MockCtx {
             state: ToolState::new(),
@@ -1853,7 +1853,7 @@ mod tests {
             call("c1", "ReadA", Some("/a")),
             (
                 "c2",
-                "Codemode",
+                "ToolsPipe",
                 serde_json::json!({"code": "text('script ran');"}),
             ),
             call("c3", "ReadC", Some("/c")),
@@ -1892,7 +1892,7 @@ mod tests {
         };
         assert!(
             idx("end:ReadA") < idx("start:ReadC"),
-            "Codemode barriers the batch: {t:?}"
+            "ToolsPipe barriers the batch: {t:?}"
         );
         assert!(
             idx("end:ReadA") < idx("end:ReadC"),

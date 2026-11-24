@@ -5844,7 +5844,7 @@ async fn withdrawn_registration_leaves_the_table_and_the_active_selection() {
     crate::embedder_tools::drop_provider_for_test();
 }
 
-/// The refresh's rewritten selection must reach the CodemodeTool's
+/// The refresh's rewritten selection must reach the ToolsPipeTool's
 /// nested-call admission source in the same breath: after the embedder
 /// refresh widens a narrowed selection, the engine's [`ActiveToolMirror`]
 /// reads exactly what `session.active_tool_names()` reports. Seeding the
@@ -7717,7 +7717,7 @@ async fn steer_surface_drives_the_full_run_lifecycle() {
     );
 }
 
-// ── Codemode: the script tool's host-side contract ─────────────────────────
+// ── ToolsPipe: the script tool's host-side contract ─────────────────────────
 //
 // D4/D18: the tool itself is ungated (it mutates nothing — every nested call
 // rides the wrapped sibling instance, so the gate sees the nested call like
@@ -7727,12 +7727,12 @@ async fn steer_surface_drives_the_full_run_lifecycle() {
 
 /// A mutating probe whose execution records itself: the stand-in for a
 /// gated tool a script may only reach through the host's verdict.
-struct CodemodeProbeTool {
+struct ToolsPipeProbeTool {
     ran: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[async_trait::async_trait]
-impl manox_harness::tool::AgentTool for CodemodeProbeTool {
+impl manox_harness::tool::AgentTool for ToolsPipeProbeTool {
     fn name(&self) -> &str {
         "Probe"
     }
@@ -7758,7 +7758,7 @@ impl manox_harness::tool::AgentTool for CodemodeProbeTool {
 }
 
 #[tokio::test]
-async fn codemode_nested_escalation_round_trip_inherits_the_gate() {
+async fn toolspipe_nested_escalation_round_trip_inherits_the_gate() {
     let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
     let model_slot = Arc::new(Mutex::new(None));
     let gate = Arc::new(ApprovalGate::new(
@@ -7777,13 +7777,13 @@ async fn codemode_nested_escalation_round_trip_inherits_the_gate() {
     let standing: Arc<dyn Fn() -> AccessMode + Send + Sync> =
         Arc::new(move || standing_gate.mode());
     let gated = crate::approval::ApprovalGatedTool::new(
-        Arc::new(CodemodeProbeTool {
+        Arc::new(ToolsPipeProbeTool {
             ran: Arc::clone(&ran),
         }),
         Arc::clone(&gate),
     )
     .with_escalation(approver, standing);
-    let codemode = manox_harness::tools::codemode::CodemodeTool::new(
+    let toolspipe = manox_harness::tools::toolspipe::ToolsPipeTool::new(
         vec![Arc::new(gated) as Arc<dyn HarnessAgentTool>],
         Default::default(),
         std::sync::Arc::new(|| None::<Vec<String>>),
@@ -7801,11 +7801,11 @@ async fn codemode_nested_escalation_round_trip_inherits_the_gate() {
     // The execution runs as a real task: the runtime must keep polling the
     // script (a local pinned future would starve while this test polls the
     // gate) so the nested call actually reaches the gate.
-    let codemode = Arc::new(codemode);
+    let toolspipe = Arc::new(toolspipe);
     let execution = {
-        let codemode = Arc::clone(&codemode);
+        let toolspipe = Arc::clone(&toolspipe);
         tokio::spawn(async move {
-            codemode
+            toolspipe
                 .execute(
                     "parent-call-1",
                     serde_json::json!({ "code": code }),
@@ -7847,7 +7847,7 @@ async fn codemode_nested_escalation_round_trip_inherits_the_gate() {
 }
 
 #[tokio::test]
-async fn codemode_mounts_ungated_exactly_once_and_excludes_itself() {
+async fn toolspipe_mounts_ungated_exactly_once_and_excludes_itself() {
     // build_tools reads the process provider registry snapshot; tests run
     // without a full `manox_agent::init`, so seed the empty registry.
     crate::provider_glue::init_for_test();
@@ -7860,7 +7860,7 @@ async fn codemode_mounts_ungated_exactly_once_and_excludes_itself() {
         Arc::clone(&model_slot),
     ));
     let question_gate = Arc::new(crate::questions::UserQuestionGate::new(notice_tx.clone()));
-    let bus = crate::steer_bus::AgentBus::new("codemode-assembly".into(), notice_tx.clone());
+    let bus = crate::steer_bus::AgentBus::new("toolspipe-assembly".into(), notice_tx.clone());
     let granted = crate::granted_roots::GrantedRoots::new(cwd.clone());
     let resolver: manox_harness::agent_loop::StreamResolver =
         Arc::new(|_m: &HarnessModel| Err(anyhow::anyhow!("assembly smoke; nothing streams")));
@@ -7869,7 +7869,7 @@ async fn codemode_mounts_ungated_exactly_once_and_excludes_itself() {
         &cwd,
         &runtime,
         Some(&test_model()),
-        "codemode-assembly",
+        "toolspipe-assembly",
         &gate,
         &question_gate,
         &notice_tx,
@@ -7884,30 +7884,30 @@ async fn codemode_mounts_ungated_exactly_once_and_excludes_itself() {
     assert_eq!(
         tools
             .iter()
-            .filter(|t| t.name() == crate::tools::CODEMODE)
+            .filter(|t| t.name() == crate::tools::TOOLS_PIPE)
             .count(),
         1,
-        "Codemode mounts exactly once"
+        "ToolsPipe mounts exactly once"
     );
-    let codemode = tools
+    let toolspipe = tools
         .iter()
-        .find(|t| t.name() == crate::tools::CODEMODE)
+        .find(|t| t.name() == crate::tools::TOOLS_PIPE)
         .unwrap();
     // The ungated proof, behaviorally: an ApprovalGatedTool around a
     // mutating tool answers `needs_gate` (requires_approval || !read_only)
-    // — a wrapped Codemode would answer true. The mounted tool answers
+    // — a wrapped ToolsPipe would answer true. The mounted tool answers
     // false, so it is the bare tool, not a wrapped one.
-    assert!(!codemode.requires_approval(&serde_json::json!({})));
+    assert!(!toolspipe.requires_approval(&serde_json::json!({})));
     // The sibling exclusion is visible in the rendered declarations: a
-    // `Codemode(` member would mean the tool nested itself.
+    // `ToolsPipe(` member would mean the tool nested itself.
     assert!(
-        !codemode.description().contains("Codemode("),
-        "Codemode must not appear among the script-callable declarations"
+        !toolspipe.description().contains("ToolsPipe("),
+        "ToolsPipe must not appear among the script-callable declarations"
     );
     // The mounted table's gated built-ins are all script-callable: spot one
     // wrapped instance the sandbox surface exposes.
     assert!(
-        codemode.description().contains("Write("),
+        toolspipe.description().contains("Write("),
         "the gated Write sibling must be script-callable"
     );
     // The mounted order keeps Glob/Ls ahead of Bash: the Bash hoist is the
@@ -7923,7 +7923,7 @@ async fn codemode_mounts_ungated_exactly_once_and_excludes_itself() {
     // shared 3000-token pool is first come, first served, and the bash
     // fan-out scenario must not lose Bash's declaration to the tools that
     // mount earlier.
-    let description = codemode.description();
+    let description = toolspipe.description();
     let bash_declaration = description
         .find("Bash(")
         .expect("the hoisted Bash sibling must keep its declaration");

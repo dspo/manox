@@ -6,7 +6,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-manox-codemode.workspace = true
+manox-tools-pipe.workspace = true
 async-channel.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["fs", "process", "time", "sync", "io-util", "macros", "rt-multi-thread"] }

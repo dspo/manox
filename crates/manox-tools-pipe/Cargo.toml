@@ -1,5 +1,5 @@
 [package]
-name = "manox-codemode"
+name = "manox-tools-pipe"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true

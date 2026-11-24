@@ -167,7 +167,7 @@ fn setup(
     })?;
 
     let mut prelude_options = EvalOptions::default();
-    prelude_options.filename = Some("manox-codemode-prelude.js".into());
+    prelude_options.filename = Some("manox-tools-pipe-prelude.js".into());
     let factory: Function = match ctx.eval_with_options(crate::PRELUDE, prelude_options) {
         Ok(factory) => factory,
         Err(_) => {
@@ -198,7 +198,7 @@ fn setup(
     // stacks match the source as written (the @options line was blanked).
     let wrapper = format!("(async (tools, console) => {{{}\n}})", params.code);
     let mut script_options = EvalOptions::default();
-    script_options.filename = Some("codemode.js".into());
+    script_options.filename = Some("toolspipe.js".into());
     let script_fn: Function = match ctx.eval_with_options(wrapper, script_options) {
         Ok(fn_value) => fn_value,
         Err(_) => {
