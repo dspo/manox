@@ -287,17 +287,18 @@ pub trait AgentTool: Send + Sync {
     ///
     /// The fs verdict is a *path* ruling: it resolves the call's effective
     /// `cwd` and proves each touched path inside the writable roots. Tools
-    /// whose mutations are not filesystem writes (session runtime state and
-    /// the like) cannot be judged that way — they take no `cwd` at all — so
-    /// they declare `false` here and are admitted without a path ruling.
-    /// That admission is safe because such a tool's authority is scoped by
-    /// something other than the filesystem (for the task tools: the
-    /// session-owned registry).
+    /// whose mutations are not filesystem writes (session runtime state, host
+    /// round trips, remote server processes) cannot be judged that way — they
+    /// take no `cwd` at all — so they declare `false` here and are admitted
+    /// without a path ruling. That admission is safe because such a tool's
+    /// authority is scoped by something other than the filesystem (for the
+    /// task tools: the session-owned registry).
     ///
-    /// Defaults to `true`: an unknown mutating tool keeps failing closed
-    /// under the fence, exactly as before this contract existed. In
-    /// particular MCP tools (whose schema comes from a remote server and
-    /// never carries manox's `cwd`) must NOT be inferred as fs-free.
+    /// Defaults to `true`: a mutating tool that declares nothing keeps
+    /// failing closed under the fence. The exemption is an explicit
+    /// declaration by the tool's own adapter — never inferred from a schema
+    /// (a remote schema, MCP's included, is attacker-shaped input and must
+    /// not buy its way past the fence).
     fn mutates_through_fs_paths(&self) -> bool {
         true
     }
