@@ -1,4 +1,4 @@
-//! manox-codemode —— QuickJS script sandbox with a tool bridge.
+//! manox-tools-pipe —— QuickJS script sandbox with a tool bridge.
 //!
 //! The model writes a JS script (an async function body) that runs in a
 //! QuickJS VM. The script's only capability that leaves the VM is
@@ -15,7 +15,7 @@
 //! [`sandbox`] (the VM thread). `prelude.js` is the in-VM environment
 //! contract.
 //!
-//! `CodemodeExecutor::execute` requires a tokio runtime context: nested tool
+//! `ToolsPipeExecutor::execute` requires a tokio runtime context: nested tool
 //! calls are spawned onto it.
 
 mod bridge;
@@ -38,8 +38,8 @@ use crate::source::ParsedSource;
 use crate::store::StoreSnapshot;
 
 pub use crate::types::{
-    CallRecord, CallStatus, CodemodeError, CodemodeErrorKind, CodemodeResult, OutputItem,
-    StoreWrites,
+    CallRecord, CallStatus, OutputItem, StoreWrites, ToolsPipeError, ToolsPipeErrorKind,
+    ToolsPipeResult,
 };
 
 /// The prelude evaluated inside every VM: the environment contract.
@@ -62,29 +62,29 @@ pub fn execution_slots() -> &'static Arc<Semaphore> {
 
 /// Acquire one process-wide execution slot, queueing in arrival order up to
 /// `timeout`. A timeout is a host-resource failure, not a script error, so it
-/// classifies as [`CodemodeErrorKind::Sandbox`].
+/// classifies as [`ToolsPipeErrorKind::Sandbox`].
 pub async fn acquire_execution_slot(
     timeout: Duration,
-) -> Result<tokio::sync::OwnedSemaphorePermit, CodemodeError> {
+) -> Result<tokio::sync::OwnedSemaphorePermit, ToolsPipeError> {
     let acquire = Semaphore::acquire_owned(Arc::clone(execution_slots()));
     match tokio::time::timeout(timeout, acquire).await {
         Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(_)) => Err(CodemodeError::sandbox(
-            "the codemode execution slot semaphore is closed; this is a runtime bug",
+        Ok(Err(_)) => Err(ToolsPipeError::sandbox(
+            "the toolspipe execution slot semaphore is closed; this is a runtime bug",
         )),
-        Err(_) => Err(CodemodeError::sandbox(format!(
-            "another codemode execution holds the process-wide slot; waited {}s",
+        Err(_) => Err(ToolsPipeError::sandbox(format!(
+            "another toolspipe execution holds the process-wide slot; waited {}s",
             timeout.as_secs()
         ))),
     }
 }
 
-/// A tool a codemode script can call via `tools.<name>(args)`. The crate has
+/// A tool a toolspipe script can call via `tools.<name>(args)`. The crate has
 /// no harness dependency: the caller adapts its own tool type to this surface.
 /// Failure is a plain error string — its text becomes the JS rejection the
 /// script sees.
 #[async_trait::async_trait]
-pub trait CodemodeTool: Send + Sync {
+pub trait ToolsPipeTool: Send + Sync {
     /// Tool name as the bridge exposes it: `tools["<name>"]` always works, and
     /// `tools.<js_name>` is the identifier-normalized spelling.
     fn name(&self) -> &str;
@@ -123,21 +123,21 @@ pub fn to_js_identifier(name: &str) -> String {
     identifier
 }
 
-/// Ready-to-run codemode executor: injects the tools a script may call and
+/// Ready-to-run toolspipe executor: injects the tools a script may call and
 /// renders their declarations once, at construction.
-pub struct CodemodeExecutor {
-    tools: HashMap<String, Arc<dyn CodemodeTool>>,
+pub struct ToolsPipeExecutor {
+    tools: HashMap<String, Arc<dyn ToolsPipeTool>>,
     /// Tool list in construction order with rendered declarations.
     declared: Vec<DeclaredTool>,
     rendered: RenderedDeclarations,
 }
 
-impl CodemodeExecutor {
+impl ToolsPipeExecutor {
     /// Build an executor over the given tools. Rejects duplicate names and
     /// names that normalize to the same script identifier — both would make
     /// `tools.<name>` ambiguous.
-    pub fn new(tools: Vec<Arc<dyn CodemodeTool>>) -> Result<Self, String> {
-        let mut map: HashMap<String, Arc<dyn CodemodeTool>> = HashMap::new();
+    pub fn new(tools: Vec<Arc<dyn ToolsPipeTool>>) -> Result<Self, String> {
+        let mut map: HashMap<String, Arc<dyn ToolsPipeTool>> = HashMap::new();
         let mut declared = Vec::with_capacity(tools.len());
         let mut seen_identifiers = std::collections::HashSet::new();
         for tool in tools {
@@ -185,7 +185,7 @@ impl CodemodeExecutor {
     /// directive, see [`source::parse_source`]). `store` is the initial
     /// snapshot (key -> serialized JSON); a successful execution returns its
     /// writes, a failed one returns none. Cancelling `cancel` ends the
-    /// execution with [`CodemodeErrorKind::Aborted`].
+    /// execution with [`ToolsPipeErrorKind::Aborted`].
     ///
     /// Executions are admitted through the process-wide slot cap
     /// ([`MAX_CONCURRENT_EXECUTIONS`]): arrivals queue in order and a wait
@@ -201,12 +201,12 @@ impl CodemodeExecutor {
         source: &str,
         store: &StoreSnapshot,
         cancel: CancellationToken,
-    ) -> CodemodeResult {
+    ) -> ToolsPipeResult {
         let queued_since = Instant::now();
         let ParsedSource { code, options } = match source::parse_source(source) {
             Ok(parsed) => parsed,
             Err(error) => {
-                return self.empty_result(queued_since, CodemodeError::script(error.message));
+                return self.empty_result(queued_since, ToolsPipeError::script(error.message));
             }
         };
         // The slot acquire is async and must stay on the tokio side, before
@@ -223,8 +223,8 @@ impl CodemodeExecutor {
             _ = cancel.cancelled() => {
                 return self.empty_result(
                     queued_since,
-                    CodemodeError {
-                        kind: CodemodeErrorKind::Aborted,
+                    ToolsPipeError {
+                        kind: ToolsPipeErrorKind::Aborted,
                         message: "Execution aborted".into(),
                         stack: None,
                     },
@@ -264,8 +264,8 @@ impl CodemodeExecutor {
         serde_json::to_string(&entries).expect("an array of values always serializes")
     }
 
-    fn empty_result(&self, started: Instant, error: CodemodeError) -> CodemodeResult {
-        CodemodeResult {
+    fn empty_result(&self, started: Instant, error: ToolsPipeError) -> ToolsPipeResult {
+        ToolsPipeResult {
             output: Vec::new(),
             text: String::new(),
             full_output: None,
@@ -285,7 +285,7 @@ impl CodemodeExecutor {
         started: Instant,
         options: &source::SourceOptions,
         outcome: ExecutionOutcome,
-    ) -> CodemodeResult {
+    ) -> ToolsPipeResult {
         let (mut value, mut writes, mut error) = (None, StoreWrites::default(), None);
         match outcome.terminal {
             Terminal::Done(DoneMessage::Ok {
@@ -297,7 +297,7 @@ impl CodemodeExecutor {
                     writes = parsed_writes;
                 }
                 Err(message) => {
-                    error = Some(CodemodeError::sandbox(format!(
+                    error = Some(ToolsPipeError::sandbox(format!(
                         "the sandbox bridge reported malformed store writes: {message}"
                     )))
                 }
@@ -307,21 +307,21 @@ impl CodemodeExecutor {
             }
             Terminal::Timeout => {
                 let budget = options.timeout_ms.unwrap_or(0);
-                error = Some(CodemodeError {
-                    kind: CodemodeErrorKind::Timeout,
+                error = Some(ToolsPipeError {
+                    kind: ToolsPipeErrorKind::Timeout,
                     message: format!("Execution timed out after {budget} ms"),
                     stack: None,
                 });
             }
             Terminal::Aborted => {
-                error = Some(CodemodeError {
-                    kind: CodemodeErrorKind::Aborted,
+                error = Some(ToolsPipeError {
+                    kind: ToolsPipeErrorKind::Aborted,
                     message: "Execution aborted".into(),
                     stack: None,
                 });
             }
             Terminal::Sandbox(message) => {
-                error = Some(CodemodeError::sandbox(message));
+                error = Some(ToolsPipeError::sandbox(message));
             }
         }
         let (text, full_output) = types::render_output(&outcome.output, options.max_output_tokens);
@@ -332,7 +332,7 @@ impl CodemodeExecutor {
         let total_calls = outcome.calls.len();
         let mut calls = outcome.calls;
         calls.truncate(types::MAX_RECORDED_CALLS);
-        CodemodeResult {
+        ToolsPipeResult {
             output: outcome.output,
             text,
             full_output,
@@ -349,11 +349,11 @@ impl CodemodeExecutor {
 /// Decode the prelude's error JSON (`{"name", "message", "stack"}` or
 /// `{"message"}`) into a script error. The name folds into the message so the
 /// four-way error kind stays the classification.
-fn script_error_from_json(error_json: &str) -> CodemodeError {
+fn script_error_from_json(error_json: &str) -> ToolsPipeError {
     let parsed: serde_json::Value = match serde_json::from_str(error_json) {
         Ok(parsed) => parsed,
         Err(error) => {
-            return CodemodeError::sandbox(format!(
+            return ToolsPipeError::sandbox(format!(
                 "the sandbox bridge reported a malformed script error: {error}"
             ));
         }
@@ -375,8 +375,8 @@ fn script_error_from_json(error_json: &str) -> CodemodeError {
     } else {
         format!("{name}: {message}")
     };
-    CodemodeError {
-        kind: CodemodeErrorKind::Script,
+    ToolsPipeError {
+        kind: ToolsPipeErrorKind::Script,
         message,
         stack,
     }
@@ -399,7 +399,7 @@ mod tests {
     fn script_error_json_folds_name_into_message() {
         let error =
             script_error_from_json(r#"{"name":"RangeError","message":"too big","stack":"at x"}"#);
-        assert_eq!(error.kind, CodemodeErrorKind::Script);
+        assert_eq!(error.kind, ToolsPipeErrorKind::Script);
         assert_eq!(error.message, "RangeError: too big");
         assert_eq!(error.stack.as_deref(), Some("at x"));
         let error = script_error_from_json(r#"{"message":"plain"}"#);

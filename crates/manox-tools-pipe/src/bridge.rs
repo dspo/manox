@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::CodemodeTool;
+use crate::ToolsPipeTool;
 use crate::sandbox::VmParams;
 use crate::types::{CallRecord, CallStatus, MAX_IN_FLIGHT_CALLS, OutputItem};
 
@@ -85,7 +85,7 @@ pub(crate) struct ExecutionOutcome {
 /// calls are spawned onto it).
 pub(crate) async fn run(
     params: VmParams,
-    tools: &HashMap<String, Arc<dyn CodemodeTool>>,
+    tools: &HashMap<String, Arc<dyn ToolsPipeTool>>,
     deadline: Option<Duration>,
     cancel: CancellationToken,
 ) -> ExecutionOutcome {
@@ -105,9 +105,9 @@ pub(crate) async fn run(
 
     let thread_interrupt = Arc::clone(&interrupt);
     let thread_handle = std::thread::Builder::new()
-        .name("manox-codemode-vm".into())
+        .name("manox-tools-pipe-vm".into())
         .spawn(move || crate::sandbox::run_vm(params, vm_tx.clone(), host_rx, thread_interrupt))
-        .map_err(|error| format!("the codemode VM thread could not be spawned: {error}"));
+        .map_err(|error| format!("the toolspipe VM thread could not be spawned: {error}"));
     let thread_handle = match thread_handle {
         Ok(handle) => handle,
         Err(message) => {
@@ -158,7 +158,7 @@ pub(crate) async fn run(
                 // The VM thread died without reporting (panic, or a crash send
                 // that raced the channel close).
                 None => {
-                    terminal = Some(Terminal::Sandbox("the codemode VM thread exited without reporting a result".into()))
+                    terminal = Some(Terminal::Sandbox("the toolspipe VM thread exited without reporting a result".into()))
                 }
             },
             _ = &mut deadline_sleep, if deadline_at.is_some() => {
@@ -211,7 +211,7 @@ struct CallDispatch<'a> {
     in_flight: &'a Arc<AtomicUsize>,
     call_root: &'a CancellationToken,
     result_tx: &'a std::sync::mpsc::Sender<HostToVm>,
-    tools: &'a HashMap<String, Arc<dyn CodemodeTool>>,
+    tools: &'a HashMap<String, Arc<dyn ToolsPipeTool>>,
 }
 
 impl CallDispatch<'_> {

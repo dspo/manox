@@ -1,4 +1,4 @@
-// Codemode tool — a JS script (an async function body) run in a QuickJS
+// ToolsPipe tool — a JS script (an async function body) run in a QuickJS
 // sandbox whose only outward capability is calling this session's other
 // tools.
 //
@@ -10,7 +10,7 @@
 // top-level dispatch: a sibling outside the live selection is rejected per
 // call (`None` = never narrowed = full set, the session's own semantics).
 // The bridge
-// (`manox-codemode`) runs nested calls on spawned tasks, so this side owns
+// (`manox-tools-pipe`) runs nested calls on spawned tasks, so this side owns
 // two seams the bridge cannot: an owned `ToolContext` (reinstalled per
 // execution from the incoming call's context) and the sequential-execution
 // declaration — the top-level DAG scheduler never sees nested calls, so a
@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use manox_codemode::CodemodeExecutor;
+use manox_tools_pipe::ToolsPipeExecutor;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +30,7 @@ use crate::types::ContentBlock;
 
 /// The static prose half of the description; the dynamic half (the siblings'
 /// TypeScript declarations) is appended at construction.
-const PROMPT: &str = include_str!("codemode_prompt.md");
+const PROMPT: &str = include_str!("toolspipe_prompt.md");
 
 /// A synchronous read of the session's authoritative active-tool selection,
 /// evaluated per nested call. `Some(names)` is the allowlist in force; `None`
@@ -40,7 +40,7 @@ pub type ActiveToolSelection = Arc<dyn Fn() -> Option<Vec<String>> + Send + Sync
 
 /// One sibling adapted to the bridge's tool trait. The adapter holds the
 /// per-execution call environment (parent call id + owned context) in a
-/// mutex cell: a `CodemodeTool` never runs two executions concurrently —
+/// mutex cell: a `ToolsPipeTool` never runs two executions concurrently —
 /// the top-level scheduler honors its `Sequential` declaration, and
 /// `AgentTool::execute` enforces the same exclusion locally with its run
 /// lock — so the cell has a single writer per execution and every nested
@@ -100,7 +100,7 @@ impl SiblingAdapter {
 }
 
 #[async_trait::async_trait]
-impl manox_codemode::CodemodeTool for SiblingAdapter {
+impl manox_tools_pipe::ToolsPipeTool for SiblingAdapter {
     fn name(&self) -> &str {
         self.tool.name()
     }
@@ -139,7 +139,7 @@ impl manox_codemode::CodemodeTool for SiblingAdapter {
                 Some(ctx) => (env.parent_call_id.clone(), Arc::clone(ctx)),
                 None => {
                     return Err(
-                        "the codemode tool has no execution context installed; this is a harness bug"
+                        "the toolspipe tool has no execution context installed; this is a harness bug"
                             .to_string(),
                     );
                 }
@@ -215,16 +215,16 @@ fn tool_result_value(result: &AgentToolResult) -> JsonValue {
     value
 }
 
-/// The session-facing Codemode tool. Construction renders the siblings'
+/// The session-facing ToolsPipe tool. Construction renders the siblings'
 /// declarations once; execution runs the script and folds the store.
-pub struct CodemodeTool {
-    executor: Result<CodemodeExecutor, String>,
+pub struct ToolsPipeTool {
+    executor: Result<ToolsPipeExecutor, String>,
     /// The adapted siblings, kept for the per-execution context install.
     adapters: Vec<Arc<SiblingAdapter>>,
     /// In-session store continuity: the snapshot the next execution starts
     /// from, updated with each successful execution's writes. Resume
     /// continuity is separate — the journal replay folds the same writes out
-    /// of the transcript at assembly (manox-agent `codemode` module).
+    /// of the transcript at assembly (manox-agent `toolspipe` module).
     store: std::sync::Mutex<BTreeMap<String, String>>,
     description: String,
     /// Per-instance execution mutex, held across install → run → store fold.
@@ -237,9 +237,9 @@ pub struct CodemodeTool {
     run_lock: tokio::sync::Mutex<()>,
 }
 
-impl CodemodeTool {
+impl ToolsPipeTool {
     /// Build the tool over the siblings a script may call — every mounted
-    /// tool EXCEPT Codemode itself (the caller assembles the list before
+    /// tool EXCEPT ToolsPipe itself (the caller assembles the list before
     /// pushing this tool, so the exclusion is structural). `initial_store`
     /// seeds the session's `store`/`load` map (the journal replay's fold; an
     /// empty map for a fresh session). The map type is the bridge's own
@@ -258,11 +258,11 @@ impl CodemodeTool {
             .map(|tool| SiblingAdapter::new(tool, &serial_slot, Arc::clone(&active_tool_set)))
             .map(Arc::new)
             .collect();
-        let bridge_tools: Vec<Arc<dyn manox_codemode::CodemodeTool>> = adapters
+        let bridge_tools: Vec<Arc<dyn manox_tools_pipe::ToolsPipeTool>> = adapters
             .iter()
-            .map(|adapter| Arc::clone(adapter) as Arc<dyn manox_codemode::CodemodeTool>)
+            .map(|adapter| Arc::clone(adapter) as Arc<dyn manox_tools_pipe::ToolsPipeTool>)
             .collect();
-        let executor = CodemodeExecutor::new(bridge_tools);
+        let executor = ToolsPipeExecutor::new(bridge_tools);
         let description = match &executor {
             Ok(executor) => {
                 let rendered = executor.rendered_declarations();
@@ -297,11 +297,11 @@ impl CodemodeTool {
                 description
             }
             Err(error) => format!(
-                "{PROMPT}\n\nThis Codemode instance is UNAVAILABLE: its sibling tool list is \
+                "{PROMPT}\n\nThis ToolsPipe instance is UNAVAILABLE: its sibling tool list is \
                  invalid ({error}). Calling it fails.\n"
             ),
         };
-        CodemodeTool {
+        ToolsPipeTool {
             executor,
             adapters,
             store: std::sync::Mutex::new(initial_store),
@@ -310,7 +310,7 @@ impl CodemodeTool {
         }
     }
 
-    /// The tool names callable from scripts, in declaration order — Codemode
+    /// The tool names callable from scripts, in declaration order — ToolsPipe
     /// itself is never among them (the sibling list is assembled without it).
     pub fn script_tool_names(&self) -> Vec<String> {
         match &self.executor {
@@ -325,9 +325,9 @@ impl CodemodeTool {
 }
 
 #[async_trait::async_trait]
-impl AgentTool for CodemodeTool {
+impl AgentTool for ToolsPipeTool {
     fn name(&self) -> &str {
-        "Codemode"
+        "ToolsPipe"
     }
 
     fn description(&self) -> &str {
@@ -383,7 +383,7 @@ impl AgentTool for CodemodeTool {
             Ok(executor) => executor,
             Err(error) => {
                 return Ok(AgentToolResult::error(format!(
-                    "Codemode is unavailable: {error}"
+                    "ToolsPipe is unavailable: {error}"
                 )));
             }
         };
@@ -422,7 +422,7 @@ impl AgentTool for CodemodeTool {
         // The @options the script declared (defaults when unset); a source
         // error fails the execution before anything else, so `None` here is
         // unobservable in a successful detail row.
-        let options = manox_codemode::source::parse_source(code)
+        let options = manox_tools_pipe::source::parse_source(code)
             .ok()
             .map(|parsed| {
                 serde_json::json!({
@@ -461,7 +461,7 @@ impl AgentTool for CodemodeTool {
         // Images cannot join the text block: they stay independent blocks,
         // preserving their relative output order, after the text.
         for item in &result.output {
-            if let manox_codemode::OutputItem::Image { data, mime_type } = item {
+            if let manox_tools_pipe::OutputItem::Image { data, mime_type } = item {
                 content.push(ContentBlock::Image {
                     data: data.clone(),
                     mime_type: mime_type.clone(),
@@ -504,7 +504,7 @@ impl AgentTool for CodemodeTool {
                 Err(error) => {
                     tracing::warn!(
                         error = %error,
-                        "could not persist the codemode full output; the truncated view stands"
+                        "could not persist the toolspipe full output; the truncated view stands"
                     );
                 }
             }
@@ -549,12 +549,12 @@ fn owned_context(ctx: &dyn ToolContext) -> Result<Arc<dyn ToolContext>, ToolErro
             state,
         ))),
         (None, Some(_)) => Err(ToolError::Other(
-            "the tool context does not own its environment; codemode nested calls need an owned \
+            "the tool context does not own its environment; toolspipe nested calls need an owned \
              context"
                 .into(),
         )),
         (_, None) => Err(ToolError::Other(
-            "the tool context does not own its tool state; codemode nested calls need an owned \
+            "the tool context does not own its tool state; toolspipe nested calls need an owned \
              context"
                 .into(),
         )),
@@ -581,19 +581,19 @@ fn write_full_output(tool_call_id: &str, full_output: &str) -> std::io::Result<s
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let path = std::env::temp_dir().join(format!("manox-codemode-{safe}-{nanos}.txt"));
+    let path = std::env::temp_dir().join(format!("manox-tools-pipe-{safe}-{nanos}.txt"));
     std::fs::write(&path, full_output)?;
     Ok(path)
 }
 
 /// The model-facing name of a failure kind (the same snake_case words the
 /// details row serializes).
-fn error_kind_name(kind: manox_codemode::CodemodeErrorKind) -> &'static str {
+fn error_kind_name(kind: manox_tools_pipe::ToolsPipeErrorKind) -> &'static str {
     match kind {
-        manox_codemode::CodemodeErrorKind::Script => "script",
-        manox_codemode::CodemodeErrorKind::Timeout => "timeout",
-        manox_codemode::CodemodeErrorKind::Aborted => "aborted",
-        manox_codemode::CodemodeErrorKind::Sandbox => "sandbox",
+        manox_tools_pipe::ToolsPipeErrorKind::Script => "script",
+        manox_tools_pipe::ToolsPipeErrorKind::Timeout => "timeout",
+        manox_tools_pipe::ToolsPipeErrorKind::Aborted => "aborted",
+        manox_tools_pipe::ToolsPipeErrorKind::Sandbox => "sandbox",
     }
 }
 
@@ -723,12 +723,12 @@ mod tests {
     }
 
     /// The body texts of one execution's non-console output items.
-    fn body_texts(result: &manox_codemode::CodemodeResult) -> Vec<String> {
+    fn body_texts(result: &manox_tools_pipe::ToolsPipeResult) -> Vec<String> {
         result
             .output
             .iter()
             .filter_map(|item| match item {
-                manox_codemode::OutputItem::Text {
+                manox_tools_pipe::OutputItem::Text {
                     text,
                     console: false,
                 } => Some(text.clone()),
@@ -738,10 +738,10 @@ mod tests {
     }
 
     async fn run_script(
-        tool: &CodemodeTool,
+        tool: &ToolsPipeTool,
         call_id: &str,
         code: &str,
-    ) -> manox_codemode::CodemodeResult {
+    ) -> manox_tools_pipe::ToolsPipeResult {
         let executor = tool.executor.as_ref().expect("executor builds");
         let owned = owned_context(&ctx()).unwrap();
         for adapter in &tool.adapters {
@@ -770,7 +770,7 @@ mod tests {
             Err("the file does not exist".to_string()),
             &trace,
         );
-        let tool = CodemodeTool::new(vec![echo, failing], BTreeMap::new(), unnarrowed());
+        let tool = ToolsPipeTool::new(vec![echo, failing], BTreeMap::new(), unnarrowed());
 
         // The happy path: the script sees the adapted result object —
         // output text, error flag, details — not the raw block list.
@@ -798,7 +798,7 @@ mod tests {
         assert!(result.error.is_none());
         assert_eq!(result.calls.len(), 1);
         assert_eq!(result.calls[0].name, "Boom");
-        assert_eq!(result.calls[0].status, manox_codemode::CallStatus::Error);
+        assert_eq!(result.calls[0].status, manox_tools_pipe::CallStatus::Error);
         assert_eq!(
             result.calls[0].error.as_deref(),
             Some("execution failed: the file does not exist")
@@ -845,7 +845,7 @@ mod tests {
                 panic!("deliberate boom");
             }
         }
-        let tool = CodemodeTool::new(vec![Arc::new(Panics)], BTreeMap::new(), unnarrowed());
+        let tool = ToolsPipeTool::new(vec![Arc::new(Panics)], BTreeMap::new(), unnarrowed());
         let result = run_script(
             &tool,
             "call-1",
@@ -858,7 +858,7 @@ mod tests {
             result.error
         );
         assert_eq!(result.calls.len(), 1);
-        assert_eq!(result.calls[0].status, manox_codemode::CallStatus::Error);
+        assert_eq!(result.calls[0].status, manox_tools_pipe::CallStatus::Error);
         assert_eq!(
             result.calls[0].error.as_deref(),
             Some("tool panicked: deliberate boom")
@@ -873,7 +873,7 @@ mod tests {
     async fn details_shape_is_stable_and_serializable() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
+        let tool = ToolsPipeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
 
         let result = tool
             .execute(
@@ -931,7 +931,7 @@ mod tests {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let seq_a = fake("SeqA", true, 60, Ok(serde_json::json!(1)), &trace);
         let seq_b = fake("SeqB", true, 60, Ok(serde_json::json!(2)), &trace);
-        let tool = CodemodeTool::new(vec![seq_a, seq_b], BTreeMap::new(), unnarrowed());
+        let tool = ToolsPipeTool::new(vec![seq_a, seq_b], BTreeMap::new(), unnarrowed());
         let result = run_script(
             &tool,
             "call-1",
@@ -988,7 +988,7 @@ mod tests {
                 Ok(AgentToolResult::text("passed"))
             }
         }
-        let tool = CodemodeTool::new(
+        let tool = ToolsPipeTool::new(
             vec![
                 Arc::new(BarrierSibling {
                     name: "ParA",
@@ -1016,17 +1016,17 @@ mod tests {
         );
     }
 
-    /// The script-tool surface excludes Codemode itself by construction, and
+    /// The script-tool surface excludes ToolsPipe itself by construction, and
     /// the description carries the prose and the declarations (with the
     /// dropped-tools hint absent while everything fits).
     #[test]
     fn description_carries_prose_and_declarations_without_self() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
+        let tool = ToolsPipeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
         let names = tool.script_tool_names();
         assert_eq!(names, vec!["Echo".to_string()]);
-        assert!(!names.contains(&"Codemode".to_string()));
+        assert!(!names.contains(&"ToolsPipe".to_string()));
         let description = tool.description();
         assert!(description.contains("async function body"), "prose present");
         assert!(description.contains("Echo("), "declaration present");
@@ -1060,7 +1060,7 @@ mod tests {
                 }
             }),
         );
-        let tool = CodemodeTool::new(vec![echo, oversized], BTreeMap::new(), unnarrowed());
+        let tool = ToolsPipeTool::new(vec![echo, oversized], BTreeMap::new(), unnarrowed());
         // A dropped sibling stays script-callable — only its inline
         // declaration is gone.
         assert_eq!(
@@ -1107,7 +1107,7 @@ mod tests {
                 )
             })
             .collect();
-        let tool = CodemodeTool::new(siblings, BTreeMap::new(), unnarrowed());
+        let tool = ToolsPipeTool::new(siblings, BTreeMap::new(), unnarrowed());
         let description = tool.description();
         let total = description.chars().count();
         assert!(
@@ -1136,7 +1136,7 @@ mod tests {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let a = fake("Dup", false, 0, Ok(serde_json::json!(1)), &trace);
         let b = fake("Dup", false, 0, Ok(serde_json::json!(2)), &trace);
-        let tool = CodemodeTool::new(vec![a, b], BTreeMap::new(), unnarrowed());
+        let tool = ToolsPipeTool::new(vec![a, b], BTreeMap::new(), unnarrowed());
         assert!(tool.executor.is_err());
         assert!(tool.script_tool_names().is_empty());
         assert!(tool.description().contains("UNAVAILABLE"));
@@ -1161,8 +1161,8 @@ mod tests {
     async fn store_updates_follow_successful_executions() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
-        async fn run(tool: &CodemodeTool, call_id: &str, code: &str) -> AgentToolResult {
+        let tool = ToolsPipeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
+        async fn run(tool: &ToolsPipeTool, call_id: &str, code: &str) -> AgentToolResult {
             tool.execute(
                 call_id,
                 serde_json::json!({ "code": code }),
@@ -1204,7 +1204,7 @@ mod tests {
     async fn initial_store_seeds_the_first_execution() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(
+        let tool = ToolsPipeTool::new(
             vec![echo],
             BTreeMap::from([("seed".to_string(), "\"planted\"".to_string())]),
             unnarrowed(),
@@ -1225,7 +1225,7 @@ mod tests {
     async fn truncated_full_output_reaches_a_temp_file() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
+        let tool = ToolsPipeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
         let result = tool
             .execute(
                 "call/big:1",
@@ -1248,7 +1248,7 @@ mod tests {
             .expect("utf8 file name")
             .to_owned();
         assert!(
-            name.starts_with("manox-codemode-call_big_1-") && name.ends_with(".txt"),
+            name.starts_with("manox-tools-pipe-call_big_1-") && name.ends_with(".txt"),
             "unique per-write name: {name}"
         );
         let persisted = std::fs::read_to_string(&path).expect("full output persisted");
@@ -1278,7 +1278,7 @@ mod tests {
     async fn inline_content_is_rendered_text_plus_image_blocks() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
+        let tool = ToolsPipeTool::new(vec![echo], BTreeMap::new(), unnarrowed());
         let code = "text('a'); console.log('c1'); text('b'); \
                     image('data:image/png;base64,iVBORw0KGgo=');";
         let result = tool
@@ -1314,7 +1314,7 @@ mod tests {
 
     /// A fresh session's authoritative selection is the mounted set minus the
     /// browser suite (the composer `+` menu keeps it dormant), and a script
-    /// must not pull `WebExploreOpen` through the codemode surface the user
+    /// must not pull `WebExploreOpen` through the toolspipe surface the user
     /// never enabled: the nested call is rejected with the composer-toggle
     /// message while an in-selection sibling stays callable.
     #[tokio::test]
@@ -1327,7 +1327,7 @@ mod tests {
         ])));
         let web = fake("WebExploreOpen", false, 0, Ok(serde_json::json!(1)), &trace);
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![web, echo], BTreeMap::new(), getter_from(&cell));
+        let tool = ToolsPipeTool::new(vec![web, echo], BTreeMap::new(), getter_from(&cell));
         let result = run_script(
             &tool,
             "c1",
@@ -1340,7 +1340,7 @@ mod tests {
         assert!(result.error.is_none(), "{:?}", result.error);
         assert_eq!(result.calls.len(), 2);
         assert_eq!(result.calls[0].name, "WebExploreOpen");
-        assert_eq!(result.calls[0].status, manox_codemode::CallStatus::Error);
+        assert_eq!(result.calls[0].status, manox_tools_pipe::CallStatus::Error);
         assert_eq!(
             result.calls[0].error.as_deref(),
             Some(
@@ -1348,7 +1348,7 @@ mod tests {
                  can toggle tools from the composer"
             ),
         );
-        assert_eq!(result.calls[1].status, manox_codemode::CallStatus::Ok);
+        assert_eq!(result.calls[1].status, manox_tools_pipe::CallStatus::Ok);
         assert_eq!(
             body_texts(&result),
             vec![format!(
@@ -1369,11 +1369,11 @@ mod tests {
             "WebExploreOpen".to_string(),
         ])));
         let web = fake("WebExploreOpen", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![web], BTreeMap::new(), getter_from(&cell));
+        let tool = ToolsPipeTool::new(vec![web], BTreeMap::new(), getter_from(&cell));
         let result = run_script(&tool, "c1", "await tools.WebExploreOpen({});").await;
         assert!(result.error.is_none(), "{:?}", result.error);
         assert_eq!(result.calls.len(), 1);
-        assert_eq!(result.calls[0].status, manox_codemode::CallStatus::Ok);
+        assert_eq!(result.calls[0].status, manox_tools_pipe::CallStatus::Ok);
         assert_eq!(result.calls[0].error, None);
     }
 
@@ -1384,11 +1384,11 @@ mod tests {
     async fn unnarrowed_selection_admits_every_sibling() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let web = fake("WebExploreOpen", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![web], BTreeMap::new(), unnarrowed());
+        let tool = ToolsPipeTool::new(vec![web], BTreeMap::new(), unnarrowed());
         let result = run_script(&tool, "c1", "await tools.WebExploreOpen({});").await;
         assert!(result.error.is_none(), "{:?}", result.error);
         assert_eq!(result.calls.len(), 1);
-        assert_eq!(result.calls[0].status, manox_codemode::CallStatus::Ok);
+        assert_eq!(result.calls[0].status, manox_tools_pipe::CallStatus::Ok);
     }
 
     /// The selection is read live per nested call: flipping the same tool
@@ -1400,8 +1400,8 @@ mod tests {
         let cell: SelectionCell = Arc::new(StdMutex::new(Some(vec!["Echo".to_string()])));
         let web = fake("WebExploreOpen", false, 0, Ok(serde_json::json!(1)), &trace);
         let echo = fake("Echo", false, 0, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![web, echo], BTreeMap::new(), getter_from(&cell));
-        let suite_status = |result: &manox_codemode::CodemodeResult| {
+        let tool = ToolsPipeTool::new(vec![web, echo], BTreeMap::new(), getter_from(&cell));
+        let suite_status = |result: &manox_tools_pipe::ToolsPipeResult| {
             result
                 .calls
                 .iter()
@@ -1412,19 +1412,19 @@ mod tests {
 
         // Off: rejected.
         let result = run_script(&tool, "c1", "await tools.WebExploreOpen({});").await;
-        assert_eq!(suite_status(&result), manox_codemode::CallStatus::Error);
+        assert_eq!(suite_status(&result), manox_tools_pipe::CallStatus::Error);
 
         // The composer toggle lands: the very next nested call admits.
         cell.lock()
             .unwrap()
             .replace(vec!["Echo".to_string(), "WebExploreOpen".to_string()]);
         let result = run_script(&tool, "c2", "await tools.WebExploreOpen({});").await;
-        assert_eq!(suite_status(&result), manox_codemode::CallStatus::Ok);
+        assert_eq!(suite_status(&result), manox_tools_pipe::CallStatus::Ok);
 
         // Toggled back off: rejected again, same instance.
         cell.lock().unwrap().replace(vec!["Echo".to_string()]);
         let result = run_script(&tool, "c3", "await tools.WebExploreOpen({});").await;
-        assert_eq!(suite_status(&result), manox_codemode::CallStatus::Error);
+        assert_eq!(suite_status(&result), manox_tools_pipe::CallStatus::Error);
     }
 
     /// The per-instance run lock makes the adapters' call-env invariant a
@@ -1437,7 +1437,7 @@ mod tests {
     async fn concurrent_executions_serialize_per_instance() {
         let trace = Arc::new(StdMutex::new(Vec::new()));
         let slow = fake("Slow", false, 60, Ok(serde_json::json!(1)), &trace);
-        let tool = CodemodeTool::new(vec![slow], BTreeMap::new(), unnarrowed());
+        let tool = ToolsPipeTool::new(vec![slow], BTreeMap::new(), unnarrowed());
         let code = serde_json::json!({"code": "await tools.Slow({});"});
         let test_ctx = ctx();
         let (a, b) = tokio::join!(

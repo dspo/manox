@@ -2396,9 +2396,9 @@ dependencies = [
  "image",
  "libc",
  "manox-agent",
- "manox-codemode",
  "manox-harness",
  "manox-providers",
+ "manox-tools-pipe",
  "markup5ever_rcdom",
  "parking_lot",
  "reqwest 0.12.28",
@@ -2475,18 +2475,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "manox-codemode"
-version = "0.13.0"
-dependencies = [
- "async-trait",
- "rquickjs",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "manox-harness"
 version = "0.13.0"
 dependencies = [
@@ -2505,7 +2493,7 @@ dependencies = [
  "ignore",
  "jsonschema",
  "libc",
- "manox-codemode",
+ "manox-tools-pipe",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -2596,6 +2584,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "manox-tools-pipe"
+version = "0.13.0"
+dependencies = [
+ "async-trait",
+ "rquickjs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

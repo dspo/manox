@@ -1,4 +1,4 @@
-//! Codemode source format: JavaScript with an optional first-line options
+//! ToolsPipe source format: JavaScript with an optional first-line options
 //! directive.
 //!
 //! ```js

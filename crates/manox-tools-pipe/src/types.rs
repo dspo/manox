@@ -1,8 +1,8 @@
-//! Result surface of a codemode execution: output items, call records, store
+//! Result surface of a toolspipe execution: output items, call records, store
 //! writes, and the four-way error classification.
 //!
 //! `execute` never returns `Err` for a failing script — failure is a result
-//! (`CodemodeResult.error`), so the caller always receives the partial output
+//! (`ToolsPipeResult.error`), so the caller always receives the partial output
 //! produced before the failure.
 
 use std::time::Duration;
@@ -22,7 +22,7 @@ pub const MAX_OUTPUT_ITEMS: usize = 100_000;
 pub const MAX_IN_FLIGHT_CALLS: usize = 32;
 /// Cap on the call records one result carries (`details.calls`): a script
 /// issuing more keeps only the first [`MAX_RECORDED_CALLS`] records in issue
-/// order, and `CodemodeResult::total_calls` counts every call it issued.
+/// order, and `ToolsPipeResult::total_calls` counts every call it issued.
 pub const MAX_RECORDED_CALLS: usize = 100;
 /// Estimated tokens of a string: one token per four characters.
 pub const CHARS_PER_TOKEN: usize = 4;
@@ -79,7 +79,7 @@ pub struct StoreWrites {
 /// Four-way classification of why an execution failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CodemodeErrorKind {
+pub enum ToolsPipeErrorKind {
     /// The script itself failed: syntax error, thrown error, output limits.
     Script,
     /// The `@options` `timeout_ms` deadline fired.
@@ -94,17 +94,17 @@ pub enum CodemodeErrorKind {
 /// Why an execution failed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodemodeError {
-    pub kind: CodemodeErrorKind,
+pub struct ToolsPipeError {
+    pub kind: ToolsPipeErrorKind,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<String>,
 }
 
-impl CodemodeError {
+impl ToolsPipeError {
     pub fn script(message: impl Into<String>) -> Self {
         Self {
-            kind: CodemodeErrorKind::Script,
+            kind: ToolsPipeErrorKind::Script,
             message: message.into(),
             stack: None,
         }
@@ -112,7 +112,7 @@ impl CodemodeError {
 
     pub fn sandbox(message: impl Into<String>) -> Self {
         Self {
-            kind: CodemodeErrorKind::Sandbox,
+            kind: ToolsPipeErrorKind::Sandbox,
             message: message.into(),
             stack: None,
         }
@@ -121,7 +121,7 @@ impl CodemodeError {
 
 /// Outcome of one execution.
 #[derive(Debug, Clone)]
-pub struct CodemodeResult {
+pub struct ToolsPipeResult {
     /// Output items in emission order, including whatever was produced before
     /// a failure.
     pub output: Vec<OutputItem>,
@@ -146,7 +146,7 @@ pub struct CodemodeResult {
     /// Store mutations; empty unless the execution succeeded.
     pub store_writes: StoreWrites,
     /// Why the execution failed, `None` on success.
-    pub error: Option<CodemodeError>,
+    pub error: Option<ToolsPipeError>,
     /// Wall-clock time of the run, from the moment an execution slot was
     /// granted (a process-wide queueing wait before that is excluded).
     /// Pre-slot failures — a source error, a queue timeout, or an abort while

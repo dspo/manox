@@ -1,4 +1,4 @@
-# manox-codemode
+# manox-tools-pipe
 
 QuickJS script sandbox with a tool bridge. The model writes a JS script (an
 async function body) that runs in a QuickJS VM; the script's only capability
@@ -6,9 +6,9 @@ that leaves the VM is `tools.<name>(args)` — calls into the tools injected at
 executor construction. Only the script's `text()`/`console` output and its
 `return` value reach the caller; the raw results of nested tool calls never
 enter the model's context. The crate has **zero manox-harness dependencies**:
-callers adapt their own tool type to [`CodemodeTool`].
+callers adapt their own tool type to [`ToolsPipeTool`].
 
-This README records the MR1 spike conclusions (PR1 of the codemode plan).
+This README records the MR1 spike conclusions (PR1 of the toolspipe plan).
 
 ## Spike conclusions
 
@@ -105,7 +105,7 @@ instead.
   (~1.39 MiB)**; debug profile: 2,582,904 bytes (~2.46 MiB). The archive is
   linked into whatever binary consumes the crate; there is no dynamic library
   and no runtime asset.
-- `libmanox_codemode.rlib` (release, this crate's own code + embedded
+- `libmanox_tools_pipe.rlib` (release, this crate's own code + embedded
   prelude): ~1.2 MiB including metadata; the linked-in increment for a
   consumer is dominated by the quickjs archive above. Consistent with the
   plan's ~1–2 MiB estimate and an order of magnitude under the RustPython
@@ -133,8 +133,8 @@ instead.
   and one-shot per execution; the threat model (model-written scripts, not
   memory-safe-attacker-proof) is unchanged.
 - **Result surface naming**: the soft output limit keeps head + tail with an
-  omission marker in `CodemodeResult.text` and carries the full text in
-  `CodemodeResult.full_output` (the plan: "全文单独放在结果结构里").
+  omission marker in `ToolsPipeResult.text` and carries the full text in
+  `ToolsPipeResult.full_output` (the plan: "全文单独放在结果结构里").
   `output` stays the raw item record, including partial output on failure.
   The soft budget counts text characters only; image bytes count toward the
   hard 16 Mi-char / 100k-item limits, which the prelude enforces mid-run.
@@ -147,14 +147,14 @@ instead.
 
 ## Library surface
 
-- [`CodemodeExecutor::new(Vec<Arc<dyn CodemodeTool>>)`] — rejects duplicate
+- [`ToolsPipeExecutor::new(Vec<Arc<dyn ToolsPipeTool>>)`] — rejects duplicate
   names and names that normalize to the same script identifier; renders the
   tools' TypeScript declarations once (per-tool budget 3000 est-tokens,
   `DEFAULT_DECLARATION_BUDGET_TOKENS`; first drops the constraint tags, then
   the whole tool).
-- [`CodemodeExecutor::execute(source, store, cancel)`] — requires a tokio
+- [`ToolsPipeExecutor::execute(source, store, cancel)`] — requires a tokio
   runtime context (nested calls are `tokio::spawn`ed). Never returns `Err`:
-  failures are `CodemodeResult.error` (kinds `script` / `timeout` /
+  failures are `ToolsPipeResult.error` (kinds `script` / `timeout` /
   `aborted` / `sandbox`), and every result carries the output produced before
   the failure. `store` in, `store_writes` out (empty unless the script
   succeeded); the crate never touches the disk.
@@ -166,10 +166,10 @@ instead.
 - Process-wide execution cap of 2 concurrent runs
   (`MAX_CONCURRENT_EXECUTIONS`) with a 60 s queue deadline
   (`EXECUTION_QUEUE_TIMEOUT`); a wait past it fails as a sandbox-class
-  result. `CodemodeResult.wall_time` starts at the slot grant, so queueing
+  result. `ToolsPipeResult.wall_time` starts at the slot grant, so queueing
   behind sibling executions never inflates the reported duration.
 - Call records cap at the first 100 (`MAX_RECORDED_CALLS`) in issue order
-  while `CodemodeResult.total_calls` carries the true issued count, so the
+  while `ToolsPipeResult.total_calls` carries the true issued count, so the
   result surface stays bounded no matter how far a script fans out.
 - Global in-flight cap of 32 nested calls (`MAX_IN_FLIGHT_CALLS`); overflow
   rejects immediately with an explanatory error. Per-tool sequential-execution
@@ -177,7 +177,7 @@ instead.
 
 ## Testing
 
-`cargo test -p manox-codemode` — 25 unit tests (source parsing, store
+`cargo test -p manox-tools-pipe` — 25 unit tests (source parsing, store
 writes decoding, declaration rendering snapshots, output rendering, error
 JSON shape) and 28 end-to-end tests against a live VM: isolation, true
 concurrency (`Promise.all` barrier), out-of-order result pairing,

@@ -13,11 +13,11 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use manox_codemode::declarations::DEFAULT_DECLARATION_BUDGET_TOKENS;
-use manox_codemode::store::StoreSnapshot;
-use manox_codemode::types::{CallStatus, OutputItem};
-use manox_codemode::{
-    CodemodeErrorKind, CodemodeExecutor, CodemodeResult, CodemodeTool, to_js_identifier,
+use manox_tools_pipe::declarations::DEFAULT_DECLARATION_BUDGET_TOKENS;
+use manox_tools_pipe::store::StoreSnapshot;
+use manox_tools_pipe::types::{CallStatus, OutputItem};
+use manox_tools_pipe::{
+    ToolsPipeErrorKind, ToolsPipeExecutor, ToolsPipeResult, ToolsPipeTool, to_js_identifier,
 };
 
 type ToolFuture = Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;
@@ -48,7 +48,7 @@ enum Response {
 }
 
 impl TestTool {
-    fn echo(name: &str) -> Arc<dyn CodemodeTool> {
+    fn echo(name: &str) -> Arc<dyn ToolsPipeTool> {
         Arc::new(Self {
             name: name.to_owned(),
             description: format!("Echoes its arguments back ({name})."),
@@ -58,7 +58,7 @@ impl TestTool {
         })
     }
 
-    fn value(name: &str, value: Value) -> Arc<dyn CodemodeTool> {
+    fn value(name: &str, value: Value) -> Arc<dyn ToolsPipeTool> {
         Arc::new(Self {
             name: name.to_owned(),
             description: format!("Returns a fixed value ({name})."),
@@ -68,7 +68,7 @@ impl TestTool {
         })
     }
 
-    fn error(name: &str, message: &str) -> Arc<dyn CodemodeTool> {
+    fn error(name: &str, message: &str) -> Arc<dyn ToolsPipeTool> {
         Arc::new(Self {
             name: name.to_owned(),
             description: format!("Always fails ({name})."),
@@ -78,7 +78,7 @@ impl TestTool {
         })
     }
 
-    fn slow(name: &str, delay_ms: u64) -> Arc<dyn CodemodeTool> {
+    fn slow(name: &str, delay_ms: u64) -> Arc<dyn ToolsPipeTool> {
         Arc::new(Self {
             name: name.to_owned(),
             description: format!("Sleeps then echoes ({name})."),
@@ -90,7 +90,7 @@ impl TestTool {
 }
 
 #[async_trait::async_trait]
-impl CodemodeTool for TestTool {
+impl ToolsPipeTool for TestTool {
     fn name(&self) -> &str {
         &self.name
     }
@@ -128,7 +128,7 @@ struct FnTool<F> {
 }
 
 #[async_trait::async_trait]
-impl<F> CodemodeTool for FnTool<F>
+impl<F> ToolsPipeTool for FnTool<F>
 where
     F: Fn(String, Value, CancellationToken) -> ToolFuture + Send + Sync,
 {
@@ -154,11 +154,11 @@ where
     }
 }
 
-fn executor_with(tools: Vec<Arc<dyn CodemodeTool>>) -> CodemodeExecutor {
-    CodemodeExecutor::new(tools).expect("valid tool set")
+fn executor_with(tools: Vec<Arc<dyn ToolsPipeTool>>) -> ToolsPipeExecutor {
+    ToolsPipeExecutor::new(tools).expect("valid tool set")
 }
 
-fn echo_executor() -> CodemodeExecutor {
+fn echo_executor() -> ToolsPipeExecutor {
     executor_with(vec![
         TestTool::echo("echo"),
         TestTool::value("answer", json!({"n": 42})),
@@ -168,13 +168,13 @@ fn echo_executor() -> CodemodeExecutor {
     ])
 }
 
-async fn run(executor: &CodemodeExecutor, source: &str) -> CodemodeResult {
+async fn run(executor: &ToolsPipeExecutor, source: &str) -> ToolsPipeResult {
     executor
         .execute(source, &StoreSnapshot::new(), CancellationToken::new())
         .await
 }
 
-fn text_items(result: &CodemodeResult) -> Vec<&str> {
+fn text_items(result: &ToolsPipeResult) -> Vec<&str> {
     result
         .output
         .iter()
@@ -188,7 +188,7 @@ fn text_items(result: &CodemodeResult) -> Vec<&str> {
         .collect()
 }
 
-fn joined_text(result: &CodemodeResult) -> String {
+fn joined_text(result: &ToolsPipeResult) -> String {
     text_items(result).join("\n")
 }
 
@@ -355,7 +355,7 @@ async fn cancellation_aborts_a_pure_js_loop() {
         .await;
     assert_eq!(
         result.error.as_ref().map(|error| error.kind),
-        Some(CodemodeErrorKind::Aborted)
+        Some(ToolsPipeErrorKind::Aborted)
     );
 }
 
@@ -397,7 +397,7 @@ async fn cancellation_aborts_a_script_awaiting_a_tool_result() {
         .await;
     assert_eq!(
         result.error.as_ref().map(|error| error.kind),
-        Some(CodemodeErrorKind::Aborted)
+        Some(ToolsPipeErrorKind::Aborted)
     );
     // The interrupted call is recorded as cancelled.
     assert_eq!(result.calls.len(), 1);
@@ -411,7 +411,7 @@ async fn timeout_deadline_ends_the_execution() {
     let result = run(&executor, source).await;
     assert_eq!(
         result.error.as_ref().map(|error| error.kind),
-        Some(CodemodeErrorKind::Timeout)
+        Some(ToolsPipeErrorKind::Timeout)
     );
     assert!(result.error.unwrap().message.contains("100 ms"));
     assert!(
@@ -425,7 +425,7 @@ async fn hang_detection_fails_a_script_nothing_can_resume() {
     let executor = echo_executor();
     let result = run(&executor, "await new Promise(() => {});").await;
     let error = result.error.expect("hang must fail");
-    assert_eq!(error.kind, CodemodeErrorKind::Script);
+    assert_eq!(error.kind, ToolsPipeErrorKind::Script);
     assert!(
         error.message.contains("never settle"),
         "message must explain the hang: {}",
@@ -535,7 +535,7 @@ async fn hard_output_char_limit_fails_the_script() {
     "#;
     let result = run(&executor, source).await;
     let error = result.error.expect("hard limit must fail");
-    assert_eq!(error.kind, CodemodeErrorKind::Script);
+    assert_eq!(error.kind, ToolsPipeErrorKind::Script);
     assert!(
         error.message.contains("16") && error.message.contains("characters"),
         "{}",
@@ -557,7 +557,7 @@ async fn hard_output_item_limit_fails_the_script() {
     "#;
     let result = run(&executor, source).await;
     let error = result.error.expect("hard limit must fail");
-    assert_eq!(error.kind, CodemodeErrorKind::Script);
+    assert_eq!(error.kind, ToolsPipeErrorKind::Script);
     assert!(
         error.message.contains("100000") && error.message.contains("calls"),
         "{}",
@@ -661,7 +661,7 @@ async fn options_drive_budget_and_timeout() {
     let error = options_error
         .error
         .expect("options without a body must fail");
-    assert_eq!(error.kind, CodemodeErrorKind::Script);
+    assert_eq!(error.kind, ToolsPipeErrorKind::Script);
     assert!(
         error
             .message
@@ -715,11 +715,11 @@ async fn failed_executions_produce_no_store_writes() {
     let error = result
         .error
         .expect("the thrown error must fail the execution");
-    assert_eq!(error.kind, CodemodeErrorKind::Script);
+    assert_eq!(error.kind, ToolsPipeErrorKind::Script);
     assert_eq!(error.message, "blew up after storing");
     assert_eq!(
         result.store_writes,
-        manox_codemode::types::StoreWrites::default(),
+        manox_tools_pipe::types::StoreWrites::default(),
         "failed runs never write"
     );
 }
@@ -911,10 +911,10 @@ async fn syntax_errors_fail_as_script_errors_with_line_info() {
     let source = "const ok = 1;\nthis is not javascript;\n";
     let result = run(&executor, source).await;
     let error = result.error.expect("a syntax error must fail");
-    assert_eq!(error.kind, CodemodeErrorKind::Script);
+    assert_eq!(error.kind, ToolsPipeErrorKind::Script);
     let location = error.stack.as_deref().unwrap_or_default();
     assert!(
-        location.contains("codemode.js:2") || error.message.contains("line 2"),
+        location.contains("toolspipe.js:2") || error.message.contains("line 2"),
         "the error should point at line 2: msg={:?} stack={:?}",
         error.message,
         error.stack
@@ -960,7 +960,7 @@ async fn process_slot_cap_admits_two_and_fails_a_queued_third() {
                     Ok(json!({"met": true})) as Result<Value, String>
                 }) as ToolFuture
             },
-        }) as Arc<dyn CodemodeTool>
+        }) as Arc<dyn ToolsPipeTool>
     };
     let executor_a = executor_with(vec![meet("meet_a", Arc::clone(&barrier))]);
     let executor_b = executor_with(vec![meet("meet_b", barrier)]);
@@ -983,9 +983,9 @@ async fn process_slot_cap_admits_two_and_fails_a_queued_third() {
     // parallel test's in-flight execution), then a queued acquire must time
     // out without running.
     let mut held = Vec::new();
-    for _ in 0..manox_codemode::MAX_CONCURRENT_EXECUTIONS {
+    for _ in 0..manox_tools_pipe::MAX_CONCURRENT_EXECUTIONS {
         loop {
-            match manox_codemode::execution_slots().try_acquire() {
+            match manox_tools_pipe::execution_slots().try_acquire() {
                 Ok(permit) => {
                     held.push(permit);
                     break;
@@ -994,9 +994,9 @@ async fn process_slot_cap_admits_two_and_fails_a_queued_third() {
             }
         }
     }
-    let queued = manox_codemode::acquire_execution_slot(Duration::from_millis(250)).await;
+    let queued = manox_tools_pipe::acquire_execution_slot(Duration::from_millis(250)).await;
     let error = queued.expect_err("a full quota must time out the queued acquire");
-    assert_eq!(error.kind, CodemodeErrorKind::Sandbox);
+    assert_eq!(error.kind, ToolsPipeErrorKind::Sandbox);
     assert!(
         error.message.contains("process-wide slot") && error.message.contains("waited"),
         "the queue timeout explains itself: {}",
@@ -1018,9 +1018,9 @@ async fn wall_time_excludes_the_queueing_wait() {
     // execution), start the run while it is parked, and release after a
     // dwell the run itself could not have taken.
     let mut held = Vec::new();
-    for _ in 0..manox_codemode::MAX_CONCURRENT_EXECUTIONS {
+    for _ in 0..manox_tools_pipe::MAX_CONCURRENT_EXECUTIONS {
         loop {
-            match manox_codemode::execution_slots().try_acquire() {
+            match manox_tools_pipe::execution_slots().try_acquire() {
                 Ok(permit) => {
                     held.push(permit);
                     break;
@@ -1060,7 +1060,7 @@ async fn call_records_cap_with_total_count_at_the_crate_exit() {
     assert!(result.error.is_none(), "{:?}", result.error);
     assert_eq!(
         result.calls.len(),
-        manox_codemode::types::MAX_RECORDED_CALLS,
+        manox_tools_pipe::types::MAX_RECORDED_CALLS,
         "the list keeps only the first records"
     );
     assert_eq!(result.total_calls, 120, "the true count survives the cap");

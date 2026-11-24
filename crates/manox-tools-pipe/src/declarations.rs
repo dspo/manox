@@ -124,7 +124,7 @@ pub fn render_declarations_with_total_budget(
         );
         let sample = |declaration: &str| -> String {
             format!(
-                "{}\n\ncodemode tool declaration:\n```ts\ndeclare const tools: {{ {} }};\n```",
+                "{}\n\ntoolspipe tool declaration:\n```ts\ndeclare const tools: {{ {} }};\n```",
                 tool.description.trim(),
                 declaration
             )
@@ -163,7 +163,7 @@ pub fn render_declarations_with_total_budget(
 pub fn tool_sample(rendered: &RenderedTool) -> String {
     match &rendered.declaration {
         Some(declaration) => format!(
-            "{}\n\ncodemode tool declaration:\n```ts\ndeclare const tools: {{ {} }};\n```",
+            "{}\n\ntoolspipe tool declaration:\n```ts\ndeclare const tools: {{ {} }};\n```",
             rendered.description.trim(),
             declaration
         ),
@@ -811,7 +811,7 @@ mod tests {
         let sample = tool_sample(&rendered);
         assert_eq!(
             sample,
-            "Read a file.\n\ncodemode tool declaration:\n```ts\ndeclare const tools: { read(args: { path: string; }): Promise<unknown>; };\n```"
+            "Read a file.\n\ntoolspipe tool declaration:\n```ts\ndeclare const tools: { read(args: { path: string; }): Promise<unknown>; };\n```"
         );
     }
 

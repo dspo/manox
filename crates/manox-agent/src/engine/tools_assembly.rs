@@ -768,13 +768,13 @@ impl BrowserSuite {
 }
 
 /// The session's authoritative active-tool selection, mirrored into a shared
-/// cell. The session itself cannot back the CodemodeTool's admission getter:
+/// cell. The session itself cannot back the ToolsPipeTool's admission getter:
 /// `build_tools` runs before the session exists (tools feed the builder), and
 /// the actor owns `AgentSession` by value (the run future borrows it
 /// `&mut`), so there is no handle a tool could capture. The mirror is the
 /// seam: the engine re-syncs the cell from the session at every authoritative
 /// change (post-open restore, browser-suite toggles, embedder re-mounts) and
-/// the mounted CodemodeTool reads it per nested call. Until the first sync
+/// the mounted ToolsPipeTool reads it per nested call. Until the first sync
 /// lands the cell reads `None` — the full-set, never-narrowed default.
 #[derive(Clone, Default)]
 pub(super) struct ActiveToolMirror {
@@ -782,9 +782,9 @@ pub(super) struct ActiveToolMirror {
 }
 
 impl ActiveToolMirror {
-    /// The read face the CodemodeTool carries: a fresh read per nested call,
+    /// The read face the ToolsPipeTool carries: a fresh read per nested call,
     /// so a suite toggled mid-session governs the very next script.
-    pub(super) fn getter(&self) -> manox_harness::tools::codemode::ActiveToolSelection {
+    pub(super) fn getter(&self) -> manox_harness::tools::toolspipe::ActiveToolSelection {
         let names = Arc::clone(&self.names);
         Arc::new(move || names.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
@@ -821,8 +821,8 @@ pub(super) fn build_tools(
     granted_roots: &crate::granted_roots::GrantedRoots,
     tool_env: &crate::sandbox::ToolEnv,
     bus: &Arc<crate::steer_bus::AgentBus>,
-    codemode_store: std::collections::BTreeMap<String, String>,
-    active_tool_set: manox_harness::tools::codemode::ActiveToolSelection,
+    toolspipe_store: std::collections::BTreeMap<String, String>,
+    active_tool_set: manox_harness::tools::toolspipe::ActiveToolSelection,
 ) -> (
     Vec<Arc<dyn HarnessAgentTool>>,
     Arc<BackgroundManager>,
@@ -1349,47 +1349,49 @@ pub(super) fn build_tools(
         Arc::clone(&subagent_observer),
         Arc::clone(&catalog),
     )));
-    // Codemode: a JS script (QuickJS sandbox) orchestrating the mounted
+    // ToolsPipe: a JS script (QuickJS sandbox) orchestrating the mounted
     // tools. Joins ungated like AskUserQuestion — it writes nothing itself
     // (the script's own store map is session runtime state), and every
     // nested call carries its own gate/lock/fence on the wrapped sibling
     // instances, so no approval surface is bypassed; the session's
     // active-tool selection governs nested calls too (each admission reads
     // the live selection via `active_tool_set`). The sibling list is the
-    // FULL mounted table cloned here at the tail — Codemode excluded by
+    // FULL mounted table cloned here at the tail — ToolsPipe excluded by
     // construction (the clone precedes the push), which also keeps a script
     // from invoking itself recursively. Mounted only in this main-session
-    // assembly: the child snapshot (D11) strips the codemode surface, and a
+    // assembly: the child snapshot (D11) strips the toolspipe surface, and a
     // later embedder registration (refresh_embedder_tools) reaches the top
     // level but not the script's list until the next assembly.
-    let mut codemode_siblings = tools.clone();
+    let mut toolspipe_siblings = tools.clone();
     // Declaration-pool priority: the shared 3000-token declaration budget is
     // first come, first served over this list's order, and bash fan-out is
-    // the dominant codemode scenario — hoist Bash ahead of Glob/Ls (which
+    // the dominant toolspipe scenario — hoist Bash ahead of Glob/Ls (which
     // mount earlier and would otherwise spend the pool first, dropping
     // Bash's declaration to the discovery hint) without disturbing the
     // mounted table's order above.
-    if let Some(bash_at) = codemode_siblings
+    if let Some(bash_at) = toolspipe_siblings
         .iter()
         .position(|t| t.name() == crate::tools::BASH)
-        && let Some(glob_at) = codemode_siblings
+        && let Some(glob_at) = toolspipe_siblings
             .iter()
             .position(|t| matches!(t.name(), crate::tools::GLOB | crate::tools::LS))
         && bash_at > glob_at
     {
-        let bash = codemode_siblings.remove(bash_at);
+        let bash = toolspipe_siblings.remove(bash_at);
         // Re-locate the target: the removal shifted every index after it.
-        let glob_at = codemode_siblings
+        let glob_at = toolspipe_siblings
             .iter()
             .position(|t| matches!(t.name(), crate::tools::GLOB | crate::tools::LS))
-            .unwrap_or(codemode_siblings.len());
-        codemode_siblings.insert(glob_at, bash);
+            .unwrap_or(toolspipe_siblings.len());
+        toolspipe_siblings.insert(glob_at, bash);
     }
-    tools.push(Arc::new(manox_harness::tools::codemode::CodemodeTool::new(
-        codemode_siblings,
-        codemode_store,
-        active_tool_set,
-    )));
+    tools.push(Arc::new(
+        manox_harness::tools::toolspipe::ToolsPipeTool::new(
+            toolspipe_siblings,
+            toolspipe_store,
+            active_tool_set,
+        ),
+    ));
     (tools, manager, subagent_observer)
 }
 
@@ -1415,7 +1417,7 @@ pub(super) fn build_tools(
 /// session keeps that behavior without persisting anything). Fail-soft:
 /// a rejected re-mount logs and the turn runs on the existing table. The
 /// engine's [`ActiveToolMirror`] follows the rewritten selection in the
-/// same breath, so Codemode's nested-call admission never trails a
+/// same breath, so ToolsPipe's nested-call admission never trails a
 /// refresh.
 pub(super) async fn refresh_embedder_tools(
     session: &mut AgentSession,
@@ -1537,7 +1539,7 @@ pub(super) async fn refresh_embedder_tools(
             );
         }
     }
-    // The rewritten selection is the CodemodeTool's nested-call admission
+    // The rewritten selection is the ToolsPipeTool's nested-call admission
     // source: sync the mirror in the same breath, rejection or not — the
     // sync re-reads the session's truth either way.
     mirror.sync_from(session);
@@ -1704,7 +1706,7 @@ pub(super) async fn refresh_mcp_tools(
         }
     }
     // Same as the embedder refresh: the rewritten selection is the
-    // CodemodeTool's nested-call admission source, so the mirror follows in
+    // ToolsPipeTool's nested-call admission source, so the mirror follows in
     // the same breath, rejection or not.
     mirror.sync_from(session);
 }

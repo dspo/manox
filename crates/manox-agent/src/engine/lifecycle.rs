@@ -147,7 +147,7 @@ pub(super) async fn apply_browser_suite(
     if let Err(err) = session.set_active_tools(names).await {
         tracing::warn!(error = %err, "failed to toggle browser tool suite");
     }
-    // Codemode's nested-call admission reads this mirror per call, so the
+    // ToolsPipe's nested-call admission reads this mirror per call, so the
     // suite toggle must govern the very next script.
     mirror.sync_from(session);
 }
@@ -338,7 +338,7 @@ pub(super) fn session_builder(
     thread_id: &str,
     parent_session: Option<&str>,
     bus: &Arc<crate::steer_bus::AgentBus>,
-    codemode_store: std::collections::BTreeMap<String, String>,
+    toolspipe_store: std::collections::BTreeMap<String, String>,
     active_tool_mirror: &ActiveToolMirror,
 ) -> (
     manox_harness::coding_agent::AgentSessionBuilder,
@@ -357,7 +357,7 @@ pub(super) fn session_builder(
         granted_roots,
         tool_env,
         bus,
-        codemode_store,
+        toolspipe_store,
         active_tool_mirror.getter(),
     );
     // One observer wiring per session: the host task center sees
@@ -547,9 +547,9 @@ pub(super) async fn rebuild_session(
         .unwrap_or_else(|| fallback_cwd.to_path_buf());
     // Like the startup restore, a session swap passes no model override so
     // the opened session's own persisted model wins; the actor adopts it
-    // right after the open. The codemode store replays the target journal's
+    // right after the open. The toolspipe store replays the target journal's
     // tool rows before assembly hands the snapshot to the tool (D8).
-    let codemode_store = crate::codemode::codemode_store_from_journal(Some(path)).await;
+    let toolspipe_store = crate::toolspipe::toolspipe_store_from_journal(Some(path)).await;
     let (builder, background, subagent_observer) = session_builder(
         &cwd,
         sessions_dir,
@@ -566,7 +566,7 @@ pub(super) async fn rebuild_session(
         thread_id,
         None,
         bus,
-        codemode_store,
+        toolspipe_store,
         &state.active_tool_mirror,
     );
     // Published per assembly like the acceptance-time writer: the actor's
@@ -585,7 +585,7 @@ pub(super) async fn rebuild_session(
             adopt_session_model(&mut s, harness_model, state).await;
             *session = s;
             // The mirror follows the swapped session before the actor serves
-            // any command: Codemode's nested-call admission reads it, and the
+            // any command: ToolsPipe's nested-call admission reads it, and the
             // restored selection may differ from the assembly default.
             state.active_tool_mirror.sync_from(session);
             // The rebuilt session owns a new storage: its own journal relay.

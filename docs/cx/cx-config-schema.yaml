@@ -1,7 +1,7 @@
 # cx 配置文件结构（推荐版）
 # 用户运行时路径：~/.manox/cx.providers.config.yaml
-# 仓库内的脱敏示例与镜像 schema（manox-app 仓）：
-#   crates/manox-ext-agents/config/{providers.example.yaml,cx.providers.config.schema.yaml}
+# 脱敏示例与镜像 schema 在下游仓 dspo/manox-app 维护（ext-agents 随
+# pre-manox-app-split 拆分迁出本仓）。
 #
 # 设计目标：
 # 1. Provider 表达“厂商 / 服务商”
@@ -50,6 +50,16 @@ agents:
     wire_apis: ["enum: anthropic | responses | completions"]
     env:
       VAR_NAME: "string (optional; 启动时注入的环境变量，仅用于配置值，不要存放密钥——密钥请用 apikey_source 或专用 env 文件)"
+
+# ChatGPT.app 注入设置（Settings → 外部工具 → ChatGPT.app 面板读写）。
+# 段缺省（未配置）= 全部按默认态处理。仅写 config.toml，不开调试端口、
+# 不做 CDP 时用 model_injection: single。
+chatgpt_app:
+  env:
+    VAR_NAME: "string (optional; 注入 ChatGPT.app 子进程的额外环境变量（代理、特性开关等）；cx 托管的保留键（CODEX_HOME / CX_MODEL / provider env_key 等）在启动注入时被忽略；不要存放密钥）"
+  nickname: "string (optional; provider 展示昵称：配置后注入前把 provider 名称替换为该昵称（写进 config.toml 的 [model_providers.*] name 与启动摘要）；缺省保持 provider 本名）"
+  supports_websockets: "bool (optional; 写进注入 config.toml 的 [model_providers.*] 段 supports_websockets；缺省按 false 处理——自定义 provider 普遍不支持 WS 流式）"
+  model_injection: "enum: list | single (optional; default list；list = 经 CDP 注入完整自定义模型列表到 renderer 模型选择器；single = 仅经 config.toml 注入单个默认模型（官方机制））"
 
 # VS Code 注入设置（Settings → 外部工具 → Visual Studio Code.app 面板读写）。
 # 「打开 VS Code」（工具菜单 / 侧边栏单一入口 / CLI TUI）无 provider/model

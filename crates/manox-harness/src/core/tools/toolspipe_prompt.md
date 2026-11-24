@@ -9,7 +9,7 @@ conversation: only what the script `text()`-prints, `console`-logs, or
 filtering the results down before they reach the context.
 
 Prefer the ordinary declarative parallelism first: issuing several tool calls
-in one batch already runs them concurrently. Use Codemode only when the next
+in one batch already runs them concurrently. Use ToolsPipe only when the next
 call depends on a previous result — dynamic fan-out, filtering or aggregating
 large outputs (grep/read over many files, many bash probes), or branching on
 results — so the bulk never reaches the context at all.
@@ -32,7 +32,7 @@ Environment contract:
   `<console_output>` block.
 - `image(v)` — attach an image (base64 data URL, or `{ data, mimeType }`).
 - `store(key, value)` / `load(key)` — a small persistent JSON map carried by
-  the session across Codemode calls; `store(key, undefined)` deletes.
+  the session across ToolsPipe calls; `store(key, undefined)` deletes.
   The map survives compression: compaction rewrites only the conversation
   context, and the stored data replays from the raw journal rows.
 - First line `// @options: {"max_output_tokens": N, "timeout_ms": N}` —
