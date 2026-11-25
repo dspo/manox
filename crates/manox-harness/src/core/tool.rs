@@ -27,6 +27,10 @@ pub mod nudge {
     pub const GH_WATCH: u8 = 1 << 3;
     /// Bit 4: bare `cd` in a Bash command → pass the location via `cwd`.
     pub const CD_PREFERENCE: u8 = 1 << 4;
+    /// Bit 5: absolute FS target inside a git repo/worktree or the
+    /// conversation's directory → relative-addressing form shown in full
+    /// once, one-line after.
+    pub const FS_PATH_PREFERENCE: u8 = 1 << 5;
 
     /// Check whether `flag` has been shown in this session.
     pub fn has(nudge_flags: &std::sync::Mutex<u8>, flag: u8) -> bool {
@@ -64,16 +68,11 @@ pub struct ToolState {
     /// again produces no change increments the count so the edit tool can
     /// escalate out of a spin.
     pub noop_edits: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (u64, u32)>>,
-    /// The directory the last non-empty `cwd` anchor set — the `sticky cwd`
-    /// every path tool inherits as the base for anchor/route resolution.
-    /// Advanced only by `path_utils::resolve_effective_cwd` when a call's
-    /// anchor element is non-empty; `None` until then, so resolution starts
-    /// from the session cwd.
-    pub sticky_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// Per-session nudge flags: each bit marks a nudge type that has been shown
     /// this session, so nudges fire at most once per session. Bit 0 = grep
     /// native tool preference, bit 1 = sleep nudge, bit 2 = poll loop nudge,
-    /// bit 3 = gh watch nudge, bit 4 = cd preference nudge.
+    /// bit 3 = gh watch nudge, bit 4 = cd preference nudge, bit 5 = FS
+    /// relative-path nudge.
     pub nudge_flags: std::sync::Mutex<u8>,
 }
 
@@ -84,7 +83,6 @@ impl ToolState {
             mutation_queue: FileMutationQueue::new(),
             clipboard: std::sync::Mutex::new(Vec::new()),
             noop_edits: std::sync::Mutex::new(std::collections::HashMap::new()),
-            sticky_cwd: std::sync::Mutex::new(None),
             nudge_flags: std::sync::Mutex::new(0),
         }
     }
@@ -97,7 +95,6 @@ impl ToolState {
             mutation_queue: FileMutationQueue::new(),
             clipboard: std::sync::Mutex::new(Vec::new()),
             noop_edits: std::sync::Mutex::new(std::collections::HashMap::new()),
-            sticky_cwd: std::sync::Mutex::new(None),
             nudge_flags: std::sync::Mutex::new(0),
         }
     }
@@ -291,17 +288,18 @@ pub trait AgentTool: Send + Sync {
     ///
     /// The fs verdict is a *path* ruling: it resolves the call's effective
     /// `cwd` and proves each touched path inside the writable roots. Tools
-    /// whose mutations are not filesystem writes (session runtime state and
-    /// the like) cannot be judged that way — they take no `cwd` at all — so
-    /// they declare `false` here and are admitted without a path ruling.
-    /// That admission is safe because such a tool's authority is scoped by
-    /// something other than the filesystem (for the task tools: the
-    /// session-owned registry).
+    /// whose mutations are not filesystem writes (session runtime state, host
+    /// round trips, remote server processes) cannot be judged that way — they
+    /// take no `cwd` at all — so they declare `false` here and are admitted
+    /// without a path ruling. That admission is safe because such a tool's
+    /// authority is scoped by something other than the filesystem (for the
+    /// task tools: the session-owned registry).
     ///
-    /// Defaults to `true`: an unknown mutating tool keeps failing closed
-    /// under the fence, exactly as before this contract existed. In
-    /// particular MCP tools (whose schema comes from a remote server and
-    /// never carries manox's `cwd`) must NOT be inferred as fs-free.
+    /// Defaults to `true`: a mutating tool that declares nothing keeps
+    /// failing closed under the fence. The exemption is an explicit
+    /// declaration by the tool's own adapter — never inferred from a schema
+    /// (a remote schema, MCP's included, is attacker-shaped input and must
+    /// not buy its way past the fence).
     fn mutates_through_fs_paths(&self) -> bool {
         true
     }
@@ -886,6 +884,21 @@ async fn execute_one(
         result = after(&result);
     }
 
+    // Harness path nudge: an absolute FS target teaches the relative form —
+    // repo-root-anchored `cwd` inside a git repo/worktree, a relative `path`
+    // inside the conversation's directory. Its own leading text block so it
+    // survives any host-side content shaping downstream.
+    let nudge = crate::tools::path_utils::fs_path_nudge(tool_name, args, ctx);
+    if !nudge.is_empty() {
+        result.content.insert(
+            0,
+            ContentBlock::Text {
+                text: nudge,
+                signature: None,
+            },
+        );
+    }
+
     let result_message = make_tool_result_message(&id, &name, &result);
     sink.emit(AgentEvent::ToolExecutionEnd {
         tool_call_id: id.clone(),
@@ -1191,6 +1204,58 @@ mod tests {
             assert!(!text.contains("working directory does not exist"), "{text}");
             assert!(!text.contains("not of type"), "{text}");
         }
+    }
+
+    /// An absolute `path` into a git repository reaches the model with the
+    /// repo-path nudge as its own leading text block, end to end through the
+    /// pipeline.
+    #[tokio::test]
+    async fn test_repo_path_nudge_prepends_to_fs_results() {
+        let base = tempfile::tempdir().unwrap();
+        let repo = base.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let target = repo.join("src").join("lib.rs");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "content\n").unwrap();
+        let env = Arc::new(crate::env::TokioExecutionEnv::new(
+            base.path().to_path_buf(),
+        ));
+        let ctx = crate::tool::LocalToolContext::new(
+            env,
+            base.path().to_path_buf(),
+            Arc::new(ToolState::new()),
+        );
+        let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(crate::tools::read::ReadTool)];
+        let (executed, _) = execute_tool_calls(
+            &[(
+                "c1",
+                "Read",
+                serde_json::json!({ "path": target.to_string_lossy() }),
+            )],
+            &tools,
+            CancellationToken::new(),
+            &ctx,
+            &AgentLoopConfig::default(),
+            &NullSink,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!executed[0].result.is_error);
+        assert!(
+            executed[0].result.content.len() >= 2,
+            "the nudge rides its own leading block"
+        );
+        let crate::types::ContentBlock::Text { text, .. } = &executed[0].result.content[0] else {
+            panic!("expected a text block");
+        };
+        assert!(text.contains("lives inside the git repository"), "{text}");
+        // The file body still follows as the last block.
+        let Some(crate::types::ContentBlock::Text { text, .. }) = executed[0].result.content.last()
+        else {
+            panic!("expected a trailing text block");
+        };
+        assert!(text.contains("content"), "{text}");
     }
 
     #[tokio::test]

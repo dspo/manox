@@ -213,8 +213,8 @@ pub enum ThreadEvent {
     GoalChanged {
         goal: Option<crate::goal::ThreadGoal>,
     },
-    /// The session's effective working directory moved (per-call cwd
-    /// resolution advanced the sticky cwd; durable as a `cwd_change`).
+    /// The session's working directory moved (a host-driven `SetCwd`; durable
+    /// as a `cwd_change`). Tool calls never move it — `cwd` locates one call.
     CwdChanged {
         path: String,
     },
@@ -2106,7 +2106,7 @@ impl Thread {
     /// where the user is about to start) and the move rides the same
     /// durable `cwd_change` entry, which lands as the first row when the
     /// session materializes. An interacted session keeps its binding and
-    /// only advances the sticky cwd through that entry.
+    /// only moves the working directory through that entry.
     pub fn set_cwd(&mut self, path: PathBuf) {
         if !self.has_interacted() {
             self.cwd = path.clone();

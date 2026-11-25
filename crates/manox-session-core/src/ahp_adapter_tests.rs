@@ -2210,7 +2210,7 @@ mod dispatch {
                 std::path::PathBuf::from("/work/granted"),
                 std::path::PathBuf::from("/work/granted-later"),
             ],
-            "an interacted session advances its sticky cwd in place"
+            "an interacted session moves its working directory in place"
         );
 
         // A non-file URI cannot name a grant, and must not be accepted as one.

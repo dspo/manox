@@ -306,7 +306,7 @@ mod tests {
     }
 
     fn ctx_with_env(env: Arc<dyn ExecutionEnv>) -> LocalToolContext {
-        // A real directory: sticky-cwd resolution rejects a working directory
+        // A real directory: cwd resolution rejects a working directory
         // that does not exist. The tempdir is intentionally kept for the
         // process lifetime — it outlives the context it backs.
         let cwd = tempfile::tempdir().expect("tempdir").keep();

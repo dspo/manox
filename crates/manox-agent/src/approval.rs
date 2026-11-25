@@ -640,9 +640,10 @@ impl ApprovalGatedTool {
         // would reject the call as a malformed argument) and touches no path
         // (so there is nothing to prove inside the writable roots). Such a
         // tool's authority is scoped elsewhere — the task registry is
-        // session-owned. Everything else, including unknown mutating tools and
-        // MCP tools whose schema comes from a remote server, keeps the
-        // fail-closed path ruling.
+        // session-owned, the opener rides the host round trip, and a bridged
+        // MCP tool's trust boundary is its user-configured server. Every
+        // mutating tool that does not declare itself fs-free — an unknown
+        // tool above all — keeps the fail-closed path ruling.
         if !self.inner.mutates_through_fs_paths() {
             return Ok(());
         }
@@ -685,11 +686,10 @@ pub(super) fn fence_roots(
 /// way the refusal carries the authorized root set the verdict judged
 /// against, so a denial names where access IS allowed.
 ///
-/// The call's effective cwd is the same `cwd` `[anchor, ...route]` resolution
-/// the tool itself will perform, peeked read-only so the fence does not
-/// advance the sticky cwd. An omitted `cwd` judges the call at the
-/// conversation's directory — the directory the tool will actually run in. A
-/// present-but-malformed `cwd` is an argument error, not a permission
+/// The call's effective cwd is the same `cwd` `[dir, ...subdirs]` resolution
+/// the tool itself will perform — pure, so the fence judges exactly the
+/// directory the call runs in. An omitted `cwd` judges the call at the
+/// conversation's directory. A present-but-malformed `cwd` is an argument
 /// problem: surface the same instructional text the tool itself would return
 /// next instead of dressing it up as a sandbox denial that lures the model
 /// into an escalation it cannot benefit from.
@@ -700,7 +700,8 @@ pub(super) fn fs_write_verdict(
     granted_roots: Option<&crate::granted_roots::GrantedRoots>,
     deny: &dyn Fn(&[std::path::PathBuf]) -> ToolError,
 ) -> Result<(), ToolError> {
-    let cwd = match manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd")) {
+    let cwd = match manox_harness::tools::path_utils::resolve_effective_cwd(ctx, params.get("cwd"))
+    {
         Ok(cwd) => cwd,
         Err(e) => return Err(ToolError::InvalidArguments(e)),
     };
@@ -763,14 +764,15 @@ pub(super) fn fs_write_verdict(
 /// The nearest existing ancestor of the call's write target — the root an
 /// approved escalation covers, for the host gate and the subagent fence
 /// alike. Resolved with the same chain the tool itself will use (the `cwd`
-/// `[anchor, ...route]` array, peeked read-only so a fence neither advances
-/// the sticky cwd nor re-anchors it).
+/// `[dir, ...subdirs]` array — a pure per-call resolution, so the fence and
+/// the tool cannot disagree about where the call lands).
 pub(crate) fn fs_call_target_root(
     tool_name: &str,
     params: &serde_json::Value,
     ctx: &dyn ToolContext,
 ) -> Option<std::path::PathBuf> {
-    let cwd = manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd")).ok()?;
+    let cwd =
+        manox_harness::tools::path_utils::resolve_effective_cwd(ctx, params.get("cwd")).ok()?;
     let target = match tool_name {
         "Write" => {
             let path = params.get("path")?.as_str()?;
@@ -1103,7 +1105,7 @@ mod tests {
     }
 
     /// An escalation-approved root widens the fs fence for the rest of the
-    /// session: while the sticky cwd is an unrelated directory, a Write
+    /// session: while the session works in an unrelated directory, a Write
     /// under the approved root passes the verdict. The target sits outside
     /// every default writable root so only the accumulated root can admit
     /// it.
@@ -1169,7 +1171,7 @@ mod tests {
 
     /// The create's multi-root grant group fences exactly like the session
     /// cwd: writes under the SECONDARY granted root pass the verdict while
-    /// the sticky cwd stays in the primary, and an out-of-roots target is
+    /// the session cwd stays in the primary, and an out-of-roots target is
     /// refused with a denial that lists the authorized roots — the refusal
     /// names where access IS allowed.
     #[tokio::test]
@@ -1553,16 +1555,38 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
+    /// A bridged MCP tool rides the same admission: it declares itself
+    /// fs-free (the trust boundary is its user-configured server), so a
+    /// call without `cwd` reaches the tool at the default access mode
+    /// instead of dying in the path ruling.
+    #[tokio::test]
+    async fn sandbox_admits_an_mcp_bridged_tool_without_a_cwd() {
+        let (gate, _rx) = gate_with_events();
+        gate.set_mode(AccessMode::Sandbox);
+        let (tool, ran) = gated_declaring("mcp__srv__web_search", false, Arc::clone(&gate));
+        let ctx = tool_ctx();
+        tool.execute(
+            "c1",
+            serde_json::json!({ "query": "rust" }),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .expect("an MCP-bridged tool must run without a cwd under sandbox");
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
     /// The contract defaults to `true`: a mutating tool that does not declare
-    /// itself fs-free (an unknown tool, or an MCP write tool whose schema
-    /// comes from a remote server) keeps the fail-closed path ruling — it is
-    /// still judged as a path writer and never runs without a provable
-    /// target. This is the guard that keeps the fix from becoming a bypass.
+    /// itself fs-free (an unknown tool above all — remote schemas must never
+    /// buy the exemption by inference) keeps the fail-closed path ruling —
+    /// it is still judged as a path writer and never runs without a provable
+    /// target. This is the guard that keeps the declaration from becoming a
+    /// bypass.
     #[tokio::test]
     async fn sandbox_still_rules_on_undeclared_mutating_tools() {
         let (gate, _rx) = gate_with_events();
         gate.set_mode(AccessMode::Sandbox);
-        let (tool, ran) = gated_named("mcp__srv__write_file", false, false, Arc::clone(&gate));
+        let (tool, ran) = gated_named("remote__write_file", false, false, Arc::clone(&gate));
         let ctx = tool_ctx();
         // No `cwd` — judged at the conversation's directory, the target is
         // still out of roots, so the ruling refuses before the tool runs.

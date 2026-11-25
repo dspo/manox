@@ -86,7 +86,7 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 - 生态根：`~/.claude/`（`manox_agent::paths::claude_home()`）。用户技能 `~/.claude/skills/`、斜杠命令 `~/.claude/commands/`、子 agent 定义 `~/.claude/agents/`、规则 `~/.claude/rules/`（与 CLAUDE.md 层级一同由 `claude_md.rs` 装载）；插件与市场存储亦在此根下（见 `plugin.rs`）。
 - LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/manox-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；本仓库只读这个路径，旧根 `~/.config/cx/` 的迁移由 host 负责
 - 线程列表/注释卡不落 SQLite（本仓的 SQLite 只承载 `~/.manox/core/objects.db` 的对话/项目对象行）：UI 注释卡 = journal `custom` 行（`manox_ui_note`）、右侧页签注册表 = 客户端内存（不在本仓库）、终端注册表 = 无（wire 终端不复存在）、列表扫描 = header/首条消息的有界读取、token 用量 = 事件派生（`metrics` 行 → `x-manox-metrics`）、项目注册表 = `~/.manox/core/projects.json`（有序 `ProjectEntry` 数组：path + alias；顺序有意义，手动移动重写顺序）。
-- 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；新建会话 thread id == session id，指针服务于既有 journal 的打开/恢复；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`manox_agent::thread_registry`；跨进程 RMW 经 per-file flock 串行化）。工作目录随工具调用流动：`cwd` 可选，省略即会话当前目录（与 `[""]` 同义），非空 anchor 推进 sticky 并落 `cwd_change` 条目（turn 边界 flush），prompt 的目录行随 sticky 更新；无 worktree 会话 fork；多工作目录会话经 `CreateSession.workingDirectories` seed granted-root 围栏。
+- 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；新建会话 thread id == session id，指针服务于既有 journal 的打开/恢复；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`manox_agent::thread_registry`；跨进程 RMW 经 per-file flock 串行化）。工作目录纯定位：工具调用的 `cwd` 是 `[dir, ...subdirs]`，只定位本次调用、永不改变会话目录，省略即会话当前目录；会话目录只由 host `SetCwd` 移动（durable `cwd_change`，tool context re-pin，prompt 目录行随之更新），模型不能移动它；无 worktree 会话 fork；多工作目录会话经 `CreateSession.workingDirectories` seed granted-root 围栏。
 - 会话（core 布局，dsh 对齐）：`~/.manox/core/--<projectKey>--/<session-id>/` —— `session.jsonl`（唯一 durable 事件日志；首行即 header，单格式无版本轴）。`<projectKey>` 是 `originCwd` 的 dsh `projectKey` 编码（`/`、`\`、`:` 折叠为 `-`、`[A-Za-z0-9._-]` 原样保留大小写、其余码点 `~XXXX` 转义、`--`…`--` 包裹、内段 251 上限；`manox_harness::session::identity::project_slug`）——桶是存储局部性不是身份，journal header 的 `cwd` 才是事实。派生/显示状态（pin/archive/errored/title/tag/工作目录授权/交互时间戳/read 两输入 last_settled_at+last_viewed_at——read 是派生事实不在 journal，翻转由宿主 publish 到 session 通道，客户端只声明查看）= `~/.manox/core/--<projectKey>--/cache/<id>.json`（会话目录只留 journal 与锁，dsh storages/projcache 的关注点分离；`manox_harness::session_meta`）。`~/.manox/core/projects.json` 是项目注册表。`~/.manox/sessions/` 平铺树**不读**（无迁移、无兼容读）。
 - 子代理会话：`~/.manox/core/--<projectKey>--/<run-id>/`（run id == 子会话 id == 子 chat id；持久化、不进侧栏）
 - 外部会话：`~/.manox/external-sessions/`（外部 CLI 会话由 manox-app 侧的 cx 驱动，目录约定在本仓库文档维护）
@@ -131,7 +131,7 @@ manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`）�
 1. **通用 agent 内核能力 → crates/manox-harness/src/core**：任何 agent harness 都需要的机制，wire 名/事件形状/serde 保真（例：compaction 事件、`prompt(text,{images})`、steer 带图、Input hook）。
 2. **经内核拓展点可承载的业务能力 → manox-harness/src/ext**（不反向依赖宿主）。
 3. **宿主原创能力 → 宿主层**（例：审批门控、MCP、标题生成、斜杆路由）；内核只留缝隙（如 `AgentTool::requires_approval`），不代行政策。
-4. **定层偏离既有惯例必须显式注明理由**（写进 PR 的 Assumptions；例：manox-harness 的 MCP 工具比内建工具更保守地过审批门控）。
+4. **定层偏离既有惯例必须显式注明理由**（写进 PR 的 Assumptions；例：MCP 桥接工具先比内建工具更保守地过审批门控、后经 `mutates_through_fs_paths` 显式声明放开，收紧与放开两次偏离均在 PR 中注明）。
 
 ### 内核纪律红线
 

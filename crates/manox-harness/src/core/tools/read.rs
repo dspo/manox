@@ -250,14 +250,15 @@ mod tests {
         .await
     }
 
-    /// An anchor-only `cwd` resolves the relative path against the anchored
-    /// directory and advances the sticky, so the next call with an empty
-    /// anchor inherits it.
+    /// An anchored `cwd` resolves the relative path against the anchored
+    /// directory — and only for that call: the next call is back at the
+    /// conversation's directory.
     #[tokio::test]
-    async fn explicit_cwd_resolves_relative_paths_and_advances_sticky() {
+    async fn explicit_cwd_resolves_relative_paths_for_that_call_only() {
         let base = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir_in(base.path()).unwrap();
         std::fs::write(work.path().join("note.txt"), "hello worktree\n").unwrap();
+        std::fs::write(base.path().join("conv.txt"), "hello conversation\n").unwrap();
         let ctx = ctx_at(base.path().to_path_buf());
 
         let result = read(
@@ -277,26 +278,28 @@ mod tests {
             other => panic!("expected text block, got {other:?}"),
         }
 
-        // Sticky advanced: an empty anchor keeps the worktree directory for
-        // the next call.
+        // The anchor locates only its own call: the next call with an empty
+        // anchor reads in the conversation's directory, not the anchored one.
         let inherited = read(
             &ReadTool,
             &ctx,
-            serde_json::json!({"path": "note.txt", "cwd": [""]}),
+            serde_json::json!({"path": "conv.txt", "cwd": [""]}),
         )
         .await
         .unwrap();
         assert!(!inherited.is_error);
-        assert_eq!(
-            ctx.state.sticky_cwd.lock().unwrap().as_deref(),
-            Some(work.path())
-        );
+        match &inherited.content[0] {
+            crate::types::ContentBlock::Text { text, .. } => {
+                assert!(text.contains("hello conversation"), "{text}");
+            }
+            other => panic!("expected text block, got {other:?}"),
+        }
     }
 
-    /// A cwd anchor pointing at a directory that does not exist fails before
-    /// any file access and leaves the sticky untouched.
+    /// A cwd argument pointing at a directory that does not exist fails
+    /// before any file access.
     #[tokio::test]
-    async fn missing_cwd_fails_without_advancing_sticky() {
+    async fn missing_cwd_fails_before_any_file_access() {
         let base = tempfile::tempdir().unwrap();
         let gone = base.path().join("gone");
         let ctx = ctx_at(base.path().to_path_buf());
@@ -313,12 +316,10 @@ mod tests {
             }
             other => panic!("expected InvalidArguments, got {other:?}"),
         }
-        assert!(ctx.state.sticky_cwd.lock().unwrap().is_none());
     }
 
     /// A call without `cwd` reads in the conversation's directory: the
-    /// anchor/route argument is optional, and omission is not an argument
-    /// error.
+    /// argument is optional, and omission is not an error.
     #[tokio::test]
     async fn omitted_cwd_reads_in_the_conversation_directory() {
         let base = tempfile::tempdir().unwrap();
@@ -332,6 +333,5 @@ mod tests {
             panic!("expected text block");
         };
         assert!(text.contains("hello conversation"), "{text}");
-        assert!(ctx.state.sticky_cwd.lock().unwrap().is_none());
     }
 }

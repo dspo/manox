@@ -1017,9 +1017,8 @@ pub struct AgentHarness<S: SessionStorage> {
     resources: HarnessResources,
     /// The cwd last made durable through a `cwd_change` entry. The assembly
     /// cwd initializes it (the header for a fresh session, the projected
-    /// effective cwd on restore), so a sticky cwd equal to it does not
-    /// re-append. Drives the flush in
-    /// [`AgentHarness::flush_pending_mutations_inner`].
+    /// effective cwd on restore), so a `SetCwd` onto the same directory
+    /// does not re-append.
     persisted_cwd: Option<std::path::PathBuf>,
 }
 
@@ -1161,8 +1160,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// noop guard) is carried over so in-session edit context survives a
     /// cwd re-pin or fork rebuild. The assembly cwd is what the session file
     /// durably records (header on create, projected `cwd_change` on
-    /// restore), so it seeds `persisted_cwd` — the first sticky-cwd flush
-    /// only writes when a tool call actually moved it.
+    /// restore), so it seeds `persisted_cwd` for `SetCwd` dedup.
     pub fn with_tool_cwd(mut self, cwd: std::path::PathBuf) -> Self {
         let env: Arc<dyn ExecutionEnv> = Arc::new(TokioExecutionEnv::new(cwd.clone()));
         let tool_state = self
@@ -1186,32 +1184,57 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.agent.tool_context().cwd()
     }
 
-    /// Point the session's hashline snapshot store at a persistent directory,
-    /// so a rebuilt store (app restart, session fork, worktree re-entry) can
-    /// rehydrate tags it never minted in memory.
-    /// Move the session's sticky working directory and make the move
-    /// durable immediately — the host-driven `SetCwd` path. Distinct from
-    /// the tool-side resolution (which advances the sticky and lets the
-    /// turn-boundary flush persist in order with the turn's messages):
-    /// a UI switch must survive a crash before any next turn, so the
-    /// `cwd_change` entry is appended here and `persisted_cwd` advances to
-    /// keep the next flush a no-op.
+    /// Move the session's working directory — the host-driven `SetCwd` path,
+    /// the only thing that can move it: a model's tool call locates itself
+    /// per call and never persists a move. The move is durable immediately
+    /// (the `cwd_change` entry lands here, `persisted_cwd` advances) because
+    /// a UI switch must survive a crash before any next turn, and the tool
+    /// context is re-pinned so every later call resolves against the new
+    /// directory.
+    ///
+    /// A context that cannot be re-pinned — a foreign/embedder context that
+    /// does not expose its state, or an execution environment that cannot be
+    /// re-rooted without losing host-specific isolation — refuses the move
+    /// instead. The journal append happens only after that proof, so a failed
+    /// append and an un-rebindable context both leave the journal, the
+    /// prompt, and the tools on the same old directory; a session can never
+    /// split between the directory it reports and the one its calls run in.
     pub async fn set_session_cwd(&mut self, cwd: std::path::PathBuf) -> Result<(), anyhow::Error> {
-        if let Some(state) = self.agent.tool_context().tool_state_handle() {
-            *state.sticky_cwd.lock().expect("sticky cwd poisoned") = Some(cwd.clone());
-        }
+        let Some(state) = self.agent.tool_context().tool_state_handle() else {
+            anyhow::bail!(
+                "cannot move the session directory: the tool context does not expose its state"
+            );
+        };
+        let Some(env) = self.agent.tool_context().env_handle() else {
+            anyhow::bail!(
+                "cannot move the session directory: the tool context does not expose its \
+                 execution environment"
+            );
+        };
+        let Some(env) = env.rebased(&cwd) else {
+            anyhow::bail!(
+                "cannot move the session directory: the execution environment cannot be \
+                 re-rooted at {}",
+                cwd.display()
+            );
+        };
         self.session
             .append_cwd_change(&cwd.to_string_lossy())
             .await?;
+        self.agent
+            .set_tool_ctx(Arc::new(LocalToolContext::new(env, cwd.clone(), state)));
         self.persisted_cwd = Some(cwd.clone());
-        // The prompt's working-directory line follows the move: the sticky
-        // cwd already moved the tools, and a prompt still naming the old
-        // directory leaves the model answering from a stale belief.
+        // The prompt's working-directory line follows the move: a prompt
+        // still naming the old directory leaves the model answering from a
+        // stale belief.
         self.prompt_cwd = cwd;
         self.rebuild_system_prompt();
         Ok(())
     }
 
+    /// Point the session's hashline snapshot store at a persistent directory,
+    /// so a rebuilt store (app restart, session fork, worktree re-entry) can
+    /// rehydrate tags it never minted in memory.
     pub fn set_snapshot_dir(&mut self, root: std::path::PathBuf) {
         self.agent
             .tool_context()
@@ -1993,35 +2016,6 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             }
             // The append succeeded: drop the entry and continue.
             self.control.pending_mutations.lock().unwrap().remove(0);
-        }
-        // Persist the sticky cwd when a tool call moved it since the last
-        // flush: one `cwd_change` entry per durable move, ordered after the
-        // turn's messages. `persisted_cwd` already holds the assembly cwd,
-        // so a session that never moved its working directory writes none.
-        let sticky = self
-            .agent
-            .tool_context()
-            .tool_state()
-            .sticky_cwd
-            .lock()
-            .expect("sticky cwd poisoned")
-            .clone();
-        if sticky != self.persisted_cwd {
-            if let Some(cwd) = &sticky {
-                self.session
-                    .append_cwd_change(&cwd.to_string_lossy())
-                    .await?;
-            }
-            self.persisted_cwd = sticky.clone();
-        }
-        // The prompt's working-directory line follows the sticky cwd: a tool
-        // anchor that moved the conversation reaches the next turn's context
-        // instead of leaving the model reasoning from the directory the
-        // harness was assembled at. An unmoved directory keeps the rendered
-        // prompt — and the provider's cached prefix — intact.
-        if let Some(cwd) = sticky.filter(|cwd| *cwd != self.prompt_cwd) {
-            self.prompt_cwd = cwd;
-            self.rebuild_system_prompt();
         }
         Ok(())
     }
@@ -10366,8 +10360,8 @@ pub(crate) mod tests {
         );
     }
 
-    // Re-anchors the conversation's directory through the same `cwd`
-    // resolution every FS tool performs.
+    // Locates one call through the same `cwd` resolution every FS tool
+    // performs — and must not move the conversation's directory.
     struct AnchorTool {
         dir: std::path::PathBuf,
     }
@@ -10378,7 +10372,7 @@ pub(crate) mod tests {
             "anchor"
         }
         fn description(&self) -> &str {
-            "Anchors the conversation directory"
+            "Locates one call in another directory"
         }
         fn parameters_schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object"})
@@ -10395,15 +10389,15 @@ pub(crate) mod tests {
                 Some(&serde_json::json!([self.dir.to_string_lossy()])),
             )
             .map_err(crate::tool::ToolError::InvalidArguments)?;
-            Ok(crate::tool::AgentToolResult::text("anchored"))
+            Ok(crate::tool::AgentToolResult::text("located"))
         }
     }
 
-    /// A tool call that moves the conversation's directory is visible to the
-    /// model on the next turn: the system prompt names the directory the
-    /// tools will run in, not the one the harness was assembled at.
+    /// A tool call's `cwd` locates that one call and never moves the
+    /// conversation's directory: the next turn's prompt still names the
+    /// session directory, never the call's target.
     #[tokio::test]
-    async fn prompt_working_directory_follows_a_tool_anchor() {
+    async fn prompt_working_directory_ignores_a_tool_cwd() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         // Call 0 issues the anchor tool call, call 1 answers it, call 2 is
@@ -10484,6 +10478,9 @@ pub(crate) mod tests {
         harness.set_prompt_cwd(assembly.path().to_path_buf());
         harness
             .set_system_prompt_builder(|_tools, _resources, cwd| format!("cwd: {}", cwd.display()));
+        // Force the builder's first render so the pre-call prompt states the
+        // session directory (the assertion below compares against it).
+        harness.set_initial_active_tools(vec!["anchor".into()]);
 
         harness.prompt("move").await.unwrap();
         harness.prompt("where are we").await.unwrap();
@@ -10491,15 +10488,136 @@ pub(crate) mod tests {
         let prompts = prompts.lock().unwrap();
         assert_eq!(prompts.len(), 1, "the next turn must reach the provider");
         assert!(
-            prompts[0].contains(&worktree.path().display().to_string()),
-            "the next turn's prompt must name the anchored directory: {}",
+            prompts[0].contains(&assembly.path().display().to_string()),
+            "the prompt keeps the session directory after a tool `cwd`: {}",
             prompts[0]
         );
         assert!(
-            !prompts[0].contains(&assembly.path().display().to_string()),
-            "the assembly directory must not survive the move: {}",
+            !prompts[0].contains(&worktree.path().display().to_string()),
+            "a tool `cwd` must not move the conversation's directory: {}",
             prompts[0]
         );
+    }
+
+    /// `SetCwd` re-roots the environment in place: the session's tool state
+    /// survives (snapshots, mutation queue, nudges stay coherent) and the
+    /// environment itself is rebased rather than replaced by a fresh local
+    /// one.
+    #[tokio::test]
+    async fn set_session_cwd_rebinds_the_existing_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let moved = dir.path().join("moved");
+        std::fs::create_dir_all(&moved).unwrap();
+        let mut harness = AgentHarness::new(
+            Session::new(MemStorage::new()),
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        let state = harness.tool_state_handle().expect("local ctx owns state");
+        harness.set_session_cwd(moved.clone()).await.unwrap();
+        assert_eq!(harness.tool_cwd(), moved.as_path());
+        assert_eq!(
+            harness.agent().tool_context().env().cwd(),
+            moved.as_path(),
+            "the environment itself is rebased, not swapped for the local host"
+        );
+        assert!(
+            Arc::ptr_eq(&state, &harness.tool_state_handle().expect("state kept")),
+            "the same tool state survives the move"
+        );
+    }
+
+    /// A context that does not expose its state cannot be re-pinned: the move
+    /// is refused before the journal is touched, so the reported directory
+    /// and the directory calls run in never diverge.
+    #[tokio::test]
+    async fn set_session_cwd_refuses_a_context_it_cannot_rebind() {
+        struct BorrowingCtx {
+            env: TokioExecutionEnv,
+            state: crate::tool::ToolState,
+        }
+        impl crate::tool::ToolContext for BorrowingCtx {
+            fn env(&self) -> &dyn ExecutionEnv {
+                &self.env
+            }
+            fn cwd(&self) -> &std::path::Path {
+                self.env.cwd()
+            }
+            fn tool_state(&self) -> &crate::tool::ToolState {
+                &self.state
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        let moved = dir.path().join("moved");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&moved).unwrap();
+        let mut harness = AgentHarness::new(
+            Session::new(MemStorage::new()),
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness.agent_mut().set_tool_ctx(Arc::new(BorrowingCtx {
+            env: TokioExecutionEnv::new(old.clone()),
+            state: crate::tool::ToolState::new(),
+        }));
+        let err = harness.set_session_cwd(moved).await.unwrap_err();
+        assert!(
+            err.to_string().contains("does not expose its state"),
+            "{err}"
+        );
+        assert_eq!(harness.tool_cwd(), old.as_path());
+    }
+
+    /// The environment half has the same guard: a context that owns its
+    /// state but not its environment is refused rather than pushed onto the
+    /// local host environment.
+    #[tokio::test]
+    async fn set_session_cwd_refuses_a_context_without_its_environment() {
+        struct StateOnlyCtx {
+            env: TokioExecutionEnv,
+            state: Arc<crate::tool::ToolState>,
+        }
+        impl crate::tool::ToolContext for StateOnlyCtx {
+            fn env(&self) -> &dyn ExecutionEnv {
+                &self.env
+            }
+            fn cwd(&self) -> &std::path::Path {
+                self.env.cwd()
+            }
+            fn tool_state(&self) -> &crate::tool::ToolState {
+                &self.state
+            }
+            fn tool_state_handle(&self) -> Option<Arc<crate::tool::ToolState>> {
+                Some(Arc::clone(&self.state))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        let moved = dir.path().join("moved");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&moved).unwrap();
+        let mut harness = AgentHarness::new(
+            Session::new(MemStorage::new()),
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness.agent_mut().set_tool_ctx(Arc::new(StateOnlyCtx {
+            env: TokioExecutionEnv::new(old.clone()),
+            state: Arc::new(crate::tool::ToolState::new()),
+        }));
+        let err = harness.set_session_cwd(moved).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not expose its execution environment"),
+            "{err}"
+        );
+        assert_eq!(harness.tool_cwd(), old.as_path());
     }
 
     #[tokio::test]

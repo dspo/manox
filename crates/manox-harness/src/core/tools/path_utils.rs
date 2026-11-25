@@ -11,11 +11,12 @@ use crate::tool::ToolContext;
 
 /// Schema description shared by every FS/Bash tool's `cwd` property.
 pub const CWD_SCHEMA_DOC: &str = "Optional working directory for this call as \
-`[anchor, ...route]`. Omit it to run in the conversation's current directory — the same as \
-`[\"\"]`. A non-empty first element re-anchors the conversation's default directory (a \
-relative anchor resolves against the current one, so pass an absolute path to start from a \
-known root). Remaining elements locate this call only, without re-anchoring. Prefer a single \
-element with the target expressed in `path`.";
+`[dir, ...subdirs]`. Omit it to run in the conversation's directory — the same as \
+`[\"\"]`. Elements join in order (`PathBuf::join` semantics): an absolute element \
+resets the base, a relative first element resolves against the conversation's \
+directory. The argument locates this call only — it never changes the \
+conversation's directory. Prefer a single element with the target expressed in \
+`path`.";
 
 /// The instructional text for a present-but-malformed `cwd` argument — it
 /// doubles as the model-facing how-to, and names omission as the default so
@@ -23,11 +24,11 @@ element with the target expressed in `path`.";
 /// malformed shape funnels here: the tool's own parse, and the pipeline
 /// rewriting the generic jsonschema message the schema's shape constraints
 /// produce.
-pub const CWD_HOWTO_DOC: &str = "invalid cwd: expected [anchor, ...route] — omit `cwd` to run \
-in the conversation's current directory. The first element is the conversation's new anchor \
-directory (\"\" keeps the current one; a relative anchor resolves against the current anchor, \
-so use an absolute path to start from a known root), later elements locate this call without \
-re-anchoring. Example: [\"~/projects/dspo/manox\", \"crates/manox-harness\"]";
+pub const CWD_HOWTO_DOC: &str = "invalid cwd: expected [dir, ...subdirs] — omit `cwd` to run \
+in the conversation's directory. Elements join in order (an absolute element resets the \
+base; a relative first element resolves against the conversation's directory). The \
+argument locates this call only and never changes the conversation's directory. \
+Example: [\"crates/manox-harness\"]";
 
 /// Whether `cwd` was left out of the call: absent, or JSON `null` (what an
 /// optional property becomes when a provider serializes its absence).
@@ -48,30 +49,30 @@ pub fn cwd_is_shaped(value: Option<&JsonValue>) -> bool {
     }
 }
 
-/// The parsed `cwd` argument: `[anchor, ...route]`.
+/// The parsed `cwd` argument: `[dir, ...subdirs]`.
 struct CwdArg {
-    /// First element: `""` keeps the current anchor; non-empty re-anchors the
-    /// conversation's default directory.
-    anchor: String,
-    /// Remaining elements: joined onto the anchor to locate this call only.
-    route: Vec<String>,
+    /// First element: `""` means the conversation's directory; a relative
+    /// element resolves against it; an absolute element replaces it.
+    dir: String,
+    /// Remaining elements: joined onto the first in order.
+    subdirs: Vec<String>,
 }
 
 impl CwdArg {
-    /// What an omitted `cwd` means: the conversation's current directory,
-    /// with nothing re-anchored and nothing routed.
+    /// What an omitted `cwd` means: the conversation's directory, nothing
+    /// joined.
     fn inherited() -> Self {
         CwdArg {
-            anchor: String::new(),
-            route: Vec::new(),
+            dir: String::new(),
+            subdirs: Vec::new(),
         }
     }
 }
 
 /// Parse the `cwd` argument. Omission (see [`cwd_is_omitted`]) means the
-/// conversation's current directory. A present value must be a non-empty
-/// JSON array of strings; anything else (non-array, empty array, non-string
-/// element) is rejected with the instructional text.
+/// conversation's directory. A present value must be a non-empty JSON array
+/// of strings; anything else (non-array, empty array, non-string element) is
+/// rejected with the instructional text.
 fn parse_cwd_arg(value: Option<&JsonValue>) -> Result<CwdArg, String> {
     if cwd_is_omitted(value) {
         return Ok(CwdArg::inherited());
@@ -80,61 +81,41 @@ fn parse_cwd_arg(value: Option<&JsonValue>) -> Result<CwdArg, String> {
         return Err(CWD_HOWTO_DOC.to_string());
     };
     let mut elements = items.iter();
-    let anchor = elements
+    let dir = elements
         .next()
         .and_then(|v| v.as_str())
         .ok_or_else(|| CWD_HOWTO_DOC.to_string())?;
-    let route = elements
+    let subdirs = elements
         .map(|v| v.as_str().map(str::to_string))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| CWD_HOWTO_DOC.to_string())?;
     Ok(CwdArg {
-        anchor: anchor.to_string(),
-        route,
+        dir: dir.to_string(),
+        subdirs,
     })
 }
 
-/// Resolve the effective working directory for one tool call without
-/// advancing the sticky cwd — the read-only half of
-/// [`resolve_effective_cwd`], for surfaces that must predict the call's
-/// directory without disturbing it (the approval fence runs before the
-/// tool's own resolution).
-pub fn peek_effective_cwd(
+/// Resolve the working directory one tool call runs in. Pure: the result
+/// derives from the call's arguments and the conversation's directory alone
+/// — nothing persists across calls, so concurrent calls cannot interfere and
+/// the model can always predict where its call runs. The approval fence and
+/// the tools share this one resolution.
+///
+/// `cwd` is the array `[dir, ...subdirs]`: elements join in order with
+/// `PathBuf::join` semantics — an absolute element resets the base, a
+/// relative first element resolves against the conversation's directory,
+/// `~` expands to the home directory. The joined directory must exist:
+/// every consumer (path joins, shell spawns) needs a real directory.
+pub fn resolve_effective_cwd(
     ctx: &dyn ToolContext,
     value: Option<&JsonValue>,
 ) -> Result<PathBuf, String> {
-    Ok(resolve_dirs(ctx, value)?.1)
-}
-
-/// Resolve `(anchor_dir, call_dir)` for one `cwd` argument. `anchor_dir` is
-/// `None` when the anchor element is `""` — the conversation's default
-/// directory stays where it is. An omitted `cwd` parses as exactly that
-/// shape, so omission and `[""]` cannot diverge.
-///
-/// The anchor resolves against the sticky cwd (the directory the last
-/// non-empty anchor set), falling back to the tool context's baseline (the
-/// session cwd); `~` expands to the home directory and a relative anchor
-/// resolves against that base. Route elements join onto the anchor in order
-/// with `PathBuf::join` semantics — an absolute element resets the base. The
-/// anchor and the joined call directory must both exist: every consumer
-/// (path joins, shell spawns) needs a real directory, and a missing target
-/// (a removed worktree) must not poison the sticky cwd.
-fn resolve_dirs(
-    ctx: &dyn ToolContext,
-    value: Option<&JsonValue>,
-) -> Result<(Option<PathBuf>, PathBuf), String> {
     let arg = parse_cwd_arg(value)?;
-    let tool_state = ctx.tool_state();
-    let sticky = tool_state
-        .sticky_cwd
-        .lock()
-        .expect("sticky cwd poisoned")
-        .clone();
-    let base = sticky.unwrap_or_else(|| ctx.cwd().to_path_buf());
-    let anchor_dir = if arg.anchor.is_empty() {
-        None
+    let base = ctx.cwd().to_path_buf();
+    let head = if arg.dir.is_empty() {
+        base
     } else {
-        let expanded = expand_tilde(&arg.anchor);
+        let expanded = expand_tilde(&arg.dir);
         let path = Path::new(&expanded);
         let dir = if path.is_absolute() {
             path.to_path_buf()
@@ -147,10 +128,10 @@ fn resolve_dirs(
                 dir.display()
             ));
         }
-        Some(dir)
+        dir
     };
-    let mut call_dir = anchor_dir.clone().unwrap_or_else(|| base.clone());
-    for element in &arg.route {
+    let mut call_dir = head;
+    for element in &arg.subdirs {
         let expanded = expand_tilde(element);
         let path = Path::new(&expanded);
         call_dir = if path.is_absolute() {
@@ -164,27 +145,6 @@ fn resolve_dirs(
             "working directory does not exist: {}",
             call_dir.display()
         ));
-    }
-    Ok((anchor_dir, call_dir))
-}
-
-/// Resolve the effective working directory for one tool call and advance the
-/// session's sticky cwd to the call's anchor directory.
-///
-/// `cwd` is the array `[anchor, ...route]`: a non-empty anchor re-anchors the
-/// sticky cwd (to the anchor directory itself — route elements only locate
-/// this call); an empty anchor keeps it. The returned directory is where this
-/// call runs (anchor joined with the route). See [`resolve_dirs`].
-pub fn resolve_effective_cwd(
-    ctx: &dyn ToolContext,
-    value: Option<&JsonValue>,
-) -> Result<PathBuf, String> {
-    let (anchor_dir, call_dir) = resolve_dirs(ctx, value)?;
-    if let Some(anchor_dir) = anchor_dir {
-        *ctx.tool_state()
-            .sticky_cwd
-            .lock()
-            .expect("sticky cwd poisoned") = Some(anchor_dir);
     }
     Ok(call_dir)
 }
@@ -270,6 +230,177 @@ pub fn resolve_safe(path_str: &str, cwd: &Path) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
+/// Nearest enclosing git repository root of `target`: the first ancestor
+/// carrying a `.git` entry. The entry may be a directory (a normal repo) or
+/// a file (a linked worktree) — both count. Lexical walk, no git binary.
+fn git_repo_root(target: &Path) -> Option<PathBuf> {
+    target
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// The FS tools the path nudge governs — every tool whose file targets are
+/// resolved against the call's working directory.
+fn is_fs_path_tool(name: &str) -> bool {
+    matches!(name, "Read" | "Write" | "Edit" | "Grep" | "Glob" | "Ls")
+}
+
+/// The file targets one FS tool call addresses, tilde-expanded. `Edit` has
+/// no `path` argument — its targets are the patch's file headers. Only
+/// absolute targets qualify for the nudge; a relative one already carries
+/// its location the intended way.
+fn fs_targets(tool_name: &str, args: &JsonValue) -> Vec<PathBuf> {
+    let expand = |path: &Path| PathBuf::from(expand_tilde(&path.to_string_lossy()));
+    match tool_name {
+        "Edit" => {
+            let Some(patch) = args.get("patch").and_then(|v| v.as_str()) else {
+                return Vec::new();
+            };
+            let Ok(parsed) = crate::hashline::parse_patch(patch) else {
+                return Vec::new();
+            };
+            parsed.files.iter().map(|file| expand(&file.path)).collect()
+        }
+        "Read" | "Write" | "Grep" | "Glob" | "Ls" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|path| vec![expand(Path::new(path))])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// The directory an absolute target should be addressed against. A git
+/// repository/worktree root wins over the conversation's directory: the
+/// repo-root form is the portable one (the same path works from any
+/// checkout of the tree), while a non-repo target inside the conversation's
+/// directory is addressed against it directly.
+#[derive(PartialEq)]
+enum PathBase {
+    Conversation,
+    Repo(PathBuf),
+}
+
+/// Resolve `(base, relative-path)` for one absolute target. `None` when the
+/// target sits under neither a repository nor the conversation's directory.
+fn base_and_relative(target: &Path, cwd: &Path) -> Option<(PathBase, String)> {
+    let target = crate::sandbox::canonicalize_best_effort(target);
+    let cwd = crate::sandbox::canonicalize_best_effort(cwd);
+    if let Some(root) = git_repo_root(&target)
+        && let Ok(rel) = target.strip_prefix(&root)
+    {
+        return Some((PathBase::Repo(root), rel.to_string_lossy().into_owned()));
+    }
+    let rel = target.strip_prefix(&cwd).ok()?;
+    Some((PathBase::Conversation, rel.to_string_lossy().into_owned()))
+}
+
+/// Model-facing nudge for absolute FS targets: a git repository/worktree
+/// target teaches the repo-root-anchored `cwd` form; an absolute target
+/// merely inside the conversation's directory teaches the relative `path`
+/// form. Two-tier — the first qualifying call in a session carries the full
+/// how-to, every later one a one-line reminder with the concrete rewrite. A
+/// non-empty `cwd` argument means the model already carries locations the
+/// intended way and is never nudged.
+pub fn fs_path_nudge(tool_name: &str, args: &JsonValue, ctx: &dyn ToolContext) -> String {
+    if !is_fs_path_tool(tool_name) {
+        return String::new();
+    }
+    if let Some(items) = args.get("cwd").and_then(|v| v.as_array())
+        && items
+            .first()
+            .and_then(|v| v.as_str())
+            .is_some_and(|anchor| !anchor.is_empty())
+    {
+        return String::new();
+    }
+    let targets = fs_targets(tool_name, args);
+    if targets.is_empty() || !targets.iter().all(|target| target.is_absolute()) {
+        return String::new();
+    }
+    let cwd = ctx.cwd();
+    // Every target must share one base — one rewrite serves the whole call.
+    let mut selected: Option<(PathBase, String, &PathBuf)> = None;
+    for target in &targets {
+        let Some((base, rel)) = base_and_relative(target, cwd) else {
+            return String::new();
+        };
+        // A target equal to its base has no shorter form.
+        if rel.is_empty() {
+            return String::new();
+        }
+        match &selected {
+            None => selected = Some((base, rel, target)),
+            Some((chosen, _, _)) if *chosen != base => return String::new(),
+            Some(_) => {}
+        }
+    }
+    let Some((base, rel, first)) = selected else {
+        return String::new();
+    };
+    let base_str = match &base {
+        PathBase::Conversation => cwd.to_string_lossy().into_owned(),
+        PathBase::Repo(root) => root.to_string_lossy().into_owned(),
+    };
+    let path_str = first.to_string_lossy();
+    if base_str.contains('"') || rel.contains('"') {
+        return String::new(); // the rewrite example would not be quotable
+    }
+    let nf = &ctx.tool_state().nudge_flags;
+    let already = crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::FS_PATH_PREFERENCE);
+
+    // A patch carries its own path syntax: teach the `cwd` split without
+    // pretending a `path` field exists.
+    if tool_name == "Edit" {
+        let location = match &base {
+            PathBase::Conversation => {
+                format!("inside the conversation's directory \"{base_str}\"")
+            }
+            PathBase::Repo(_) => format!("inside the git repository at \"{base_str}\""),
+        };
+        return if already {
+            format!("[harness] prefer `cwd` with relative patch paths (base \"{base_str}\").")
+        } else {
+            format!(
+                "[harness] tip: the patch addresses \"{path_str}\" by absolute path {location} — \
+                 pass that directory as `cwd` and write the patch's file paths relative to it. \
+                 `cwd` locates this call only and never moves the conversation's directory."
+            )
+        };
+    }
+
+    match base {
+        PathBase::Conversation => {
+            if already {
+                format!("[harness] prefer a conversation-relative path: {{\"path\": \"{rel}\"}}.")
+            } else {
+                format!(
+                    "[harness] tip: \"{path_str}\" is inside the conversation's directory \
+                     \"{base_str}\" — pass the location relative to it: \
+                     {{\"path\": \"{rel}\"}}. Use `cwd` when this call targets another tree; \
+                     it locates this call only and never moves the conversation's directory."
+                )
+            }
+        }
+        PathBase::Repo(root) => {
+            let root_str = root.to_string_lossy();
+            if already {
+                format!(
+                    "[harness] prefer a repo-relative path: \
+                     {{\"cwd\": [\"{root_str}\"], \"path\": \"{rel}\"}}."
+                )
+            } else {
+                format!(
+                    "[harness] tip: \"{path_str}\" lives inside the git repository at \
+                     \"{root_str}\" — prefer paths relative to the repository root: \
+                     {{\"cwd\": [\"{root_str}\"], \"path\": \"{rel}\"}}."
+                )
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,10 +413,6 @@ mod tests {
             LocalToolContext::new(env, dir.to_path_buf(), std::sync::Arc::clone(&state)),
             state,
         )
-    }
-
-    fn sticky(state: &ToolState) -> Option<PathBuf> {
-        state.sticky_cwd.lock().unwrap().clone()
     }
 
     #[test]
@@ -326,28 +453,23 @@ mod tests {
     #[test]
     fn omitted_cwd_runs_in_the_conversation_directory() {
         let (base, work) = setup_dirs();
-        let (ctx, state) = ctx_at(base.path());
+        let (ctx, _state) = ctx_at(base.path());
         // Absent and JSON `null` are the same omission.
         assert_eq!(resolve_effective_cwd(&ctx, None).unwrap(), base.path());
         assert_eq!(
             resolve_effective_cwd(&ctx, Some(&serde_json::Value::Null)).unwrap(),
             base.path()
         );
-        assert_eq!(sticky(&state), None, "omission never re-anchors");
-        // Omission inherits the directory an earlier anchor established.
+        // A prior call's directory never persists: resolution is a pure
+        // function of the arguments and the conversation's directory.
         resolve_effective_cwd(&ctx, cwd_arg(&[work.path().to_str().unwrap()]).as_ref()).unwrap();
-        assert_eq!(resolve_effective_cwd(&ctx, None).unwrap(), work.path());
-        // The read-only peek agrees without advancing anything.
-        assert_eq!(
-            peek_effective_cwd(&ctx, Some(&serde_json::Value::Null)).unwrap(),
-            work.path()
-        );
+        assert_eq!(resolve_effective_cwd(&ctx, None).unwrap(), base.path());
     }
 
     #[test]
     fn malformed_or_empty_cwd_is_rejected() {
         let (base, _work) = setup_dirs();
-        let (ctx, state) = ctx_at(base.path());
+        let (ctx, _state) = ctx_at(base.path());
         // Non-array.
         let err = resolve_effective_cwd(&ctx, Some(&serde_json::json!("/abs"))).unwrap_err();
         assert!(err.contains("invalid cwd"), "{err}");
@@ -357,109 +479,183 @@ mod tests {
         // Non-string element.
         let err = resolve_effective_cwd(&ctx, Some(&serde_json::json!(["", 3]))).unwrap_err();
         assert!(err.contains("invalid cwd"), "{err}");
-        assert_eq!(sticky(&state), None);
     }
 
     #[test]
-    fn empty_anchor_keeps_the_base_and_never_advances_sticky() {
+    fn empty_dir_element_means_the_conversation_directory() {
         let (base, _work) = setup_dirs();
-        let (ctx, state) = ctx_at(base.path());
+        let (ctx, _state) = ctx_at(base.path());
         let effective = resolve_effective_cwd(&ctx, cwd_arg(&[""]).as_ref()).unwrap();
         assert_eq!(effective, base.path());
-        assert_eq!(sticky(&state), None, "an empty anchor never re-anchors");
-        // Peek agrees and stays read-only.
-        let peeked = peek_effective_cwd(&ctx, cwd_arg(&[""]).as_ref()).unwrap();
-        assert_eq!(peeked, base.path());
     }
 
     #[test]
-    fn single_element_anchor_reanchors_and_advances_sticky() {
+    fn single_element_locates_this_call_only() {
         let (base, work) = setup_dirs();
-        let (ctx, state) = ctx_at(base.path());
+        let (ctx, _state) = ctx_at(base.path());
         let arg = cwd_arg(&[work.path().to_str().unwrap()]);
         let effective = resolve_effective_cwd(&ctx, arg.as_ref()).unwrap();
         assert_eq!(effective, work.path());
-        assert_eq!(sticky(&state), Some(work.path().to_path_buf()));
-        // The next call with an empty anchor inherits the advanced sticky.
-        let inherited = resolve_effective_cwd(&ctx, cwd_arg(&[""]).as_ref()).unwrap();
-        assert_eq!(inherited, work.path());
+        // The next call is back at the conversation's directory.
+        let next = resolve_effective_cwd(&ctx, cwd_arg(&[""]).as_ref()).unwrap();
+        assert_eq!(next, base.path());
     }
 
     #[test]
-    fn relative_anchor_resolves_against_sticky() {
-        let (base, work) = setup_dirs();
-        let sub = work.path().join("nested");
+    fn relative_first_element_resolves_against_the_conversation_directory() {
+        let (base, _work) = setup_dirs();
+        let sub = base.path().join("nested");
         std::fs::create_dir(&sub).unwrap();
-        let (ctx, state) = ctx_at(base.path());
-        resolve_effective_cwd(&ctx, cwd_arg(&[work.path().to_str().unwrap()]).as_ref()).unwrap();
+        let (ctx, _state) = ctx_at(base.path());
         let effective = resolve_effective_cwd(&ctx, cwd_arg(&["nested"]).as_ref()).unwrap();
         assert_eq!(effective, sub);
-        assert_eq!(sticky(&state), Some(sub));
     }
 
     #[test]
-    fn route_locates_the_call_without_moving_sticky() {
+    fn subdirs_join_onto_the_first_element() {
         let (base, work) = setup_dirs();
         let nested = work.path().join("nested");
         std::fs::create_dir(&nested).unwrap();
-        let (ctx, state) = ctx_at(base.path());
+        let (ctx, _state) = ctx_at(base.path());
         let arg = cwd_arg(&[work.path().to_str().unwrap(), "nested"]);
         let effective = resolve_effective_cwd(&ctx, arg.as_ref()).unwrap();
-        assert_eq!(effective, nested, "the call runs in anchor + route");
-        assert_eq!(
-            sticky(&state),
-            Some(work.path().to_path_buf()),
-            "the sticky advances to the anchor, not the route directory"
-        );
+        assert_eq!(effective, nested);
     }
 
     #[test]
-    fn empty_anchor_with_absolute_route_keeps_the_anchor() {
+    fn empty_head_with_absolute_second_element_still_locates() {
         let (base, work) = setup_dirs();
-        let (ctx, state) = ctx_at(base.path());
+        let (ctx, _state) = ctx_at(base.path());
         let arg = cwd_arg(&["", work.path().to_str().unwrap()]);
         let effective = resolve_effective_cwd(&ctx, arg.as_ref()).unwrap();
         assert_eq!(effective, work.path());
-        assert_eq!(sticky(&state), None, "an empty anchor never re-anchors");
     }
 
     #[test]
-    fn absolute_route_element_resets_the_base() {
+    fn absolute_element_resets_the_base() {
         let (base, work) = setup_dirs();
-        let (ctx, state) = ctx_at(base.path());
+        let (ctx, _state) = ctx_at(base.path());
         let arg = cwd_arg(&[base.path().to_str().unwrap(), work.path().to_str().unwrap()]);
         let effective = resolve_effective_cwd(&ctx, arg.as_ref()).unwrap();
-        assert_eq!(effective, work.path(), "the absolute route resets the base");
-        assert_eq!(sticky(&state), Some(base.path().to_path_buf()));
-    }
-
-    #[test]
-    fn nonempty_anchor_advances_even_with_an_absolute_route() {
-        let (base, work) = setup_dirs();
-        let anchor = base.path().join("anchor");
-        std::fs::create_dir(&anchor).unwrap();
-        let (ctx, state) = ctx_at(base.path());
-        let arg = cwd_arg(&["anchor", work.path().to_str().unwrap()]);
-        let effective = resolve_effective_cwd(&ctx, arg.as_ref()).unwrap();
         assert_eq!(effective, work.path());
-        assert_eq!(sticky(&state), Some(anchor), "the anchor still re-anchors");
     }
 
     #[test]
-    fn missing_directory_is_rejected_and_keeps_sticky() {
+    fn missing_directory_is_rejected() {
         let (base, work) = setup_dirs();
-        let (ctx, state) = ctx_at(base.path());
-        // A missing anchor.
+        let (ctx, _state) = ctx_at(base.path());
+        // A missing first element.
         let gone = work.path().join("gone");
         let err =
             resolve_effective_cwd(&ctx, cwd_arg(&[gone.to_str().unwrap()]).as_ref()).unwrap_err();
         assert!(err.contains("working directory does not exist"), "{err}");
-        // A missing route segment.
+        // A missing joined segment.
         let err = resolve_effective_cwd(&ctx, cwd_arg(&["", "gone"]).as_ref()).unwrap_err();
         assert!(err.contains("working directory does not exist"), "{err}");
-        // A failed resolution must not advance the sticky.
-        assert_eq!(sticky(&state), None);
-        let effective = resolve_effective_cwd(&ctx, cwd_arg(&[""]).as_ref()).unwrap();
-        assert_eq!(effective, base.path());
+    }
+
+    #[test]
+    fn repo_path_nudge_full_then_short() {
+        let (base, _work) = setup_dirs();
+        let repo = base.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let deep = repo.join("crates").join("app").join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("lib.rs"), "x").unwrap();
+        let target = deep.join("lib.rs");
+        let abs = target.to_str().unwrap();
+        let (ctx, _state) = ctx_at(base.path());
+        let args = serde_json::json!({ "path": abs });
+        let first = fs_path_nudge("Read", &args, &ctx);
+        assert!(first.contains("lives inside the git repository"), "{first}");
+        assert!(
+            first.contains("prefer paths relative to the repository root"),
+            "{first}"
+        );
+        let second = fs_path_nudge("Read", &args, &ctx);
+        assert!(second.contains("prefer a repo-relative path"), "{second}");
+        assert!(!second.contains("lives inside"), "{second}");
+    }
+
+    /// An absolute path inside the conversation's directory (and outside any
+    /// git repository) teaches the relative `path` form — the repo-root form
+    /// needs a repository to anchor.
+    #[test]
+    fn conversation_relative_nudge_for_absolute_path_inside_cwd() {
+        let (base, _work) = setup_dirs();
+        let plain = base.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("f.txt"), "x").unwrap();
+        let (ctx, _state) = ctx_at(base.path());
+        let args = serde_json::json!({ "path": plain.join("f.txt").to_str().unwrap() });
+        let first = fs_path_nudge("Read", &args, &ctx);
+        assert!(
+            first.contains("inside the conversation's directory"),
+            "{first}"
+        );
+        assert!(first.contains("{\"path\": \"plain/f.txt\"}"), "{first}");
+        assert!(
+            first.contains("Use `cwd` when this call targets another tree"),
+            "{first}"
+        );
+        let second = fs_path_nudge("Read", &args, &ctx);
+        assert!(
+            second.contains("prefer a conversation-relative path: {\"path\": \"plain/f.txt\"}"),
+            "{second}"
+        );
+    }
+
+    /// `Edit` carries its targets in the patch's file headers, not a `path`
+    /// field: an absolute patch path still teaches the `cwd` split.
+    #[test]
+    fn edit_patch_absolute_paths_nudge() {
+        let (base, _work) = setup_dirs();
+        let repo = base.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        let patch = format!("[{}#000000]\nINS.TAIL:\n+y", repo.join("f.txt").display());
+        let (ctx, _state) = ctx_at(base.path());
+        let args = serde_json::json!({ "patch": patch });
+        let first = fs_path_nudge("Edit", &args, &ctx);
+        assert!(
+            first.contains("the patch addresses") && first.contains("inside the git repository"),
+            "{first}"
+        );
+        assert!(first.contains("pass that directory as `cwd`"), "{first}");
+        let second = fs_path_nudge("Edit", &args, &ctx);
+        assert!(
+            second.contains("prefer `cwd` with relative patch paths"),
+            "{second}"
+        );
+    }
+
+    #[test]
+    fn fs_path_nudge_negative_cases() {
+        let (base, _work) = setup_dirs();
+        let plain = base.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("f.txt"), "x").unwrap();
+        let (ctx, _state) = ctx_at(base.path());
+        // Relative path: already located the intended way.
+        let rel = serde_json::json!({ "path": "f.txt" });
+        assert_eq!(fs_path_nudge("Read", &rel, &ctx), "");
+        // Non-FS tool.
+        let args = serde_json::json!({ "path": plain.join("f.txt").to_str().unwrap() });
+        assert_eq!(fs_path_nudge("Bash", &args, &ctx), "");
+        // Away from both the conversation's directory and any repo.
+        let outside = serde_json::json!({ "path": "/etc/hosts" });
+        assert_eq!(fs_path_nudge("Read", &outside, &ctx), "");
+        // Non-empty anchor: the model already carries the directory itself.
+        let repo = base.path().join("repo2");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        let anchored = serde_json::json!({
+            "path": repo.join("f.txt").to_str().unwrap(),
+            "cwd": [repo.to_str().unwrap()],
+        });
+        assert_eq!(fs_path_nudge("Read", &anchored, &ctx), "");
+        // The repo root itself has no shorter form.
+        let root_only = serde_json::json!({ "path": repo.to_str().unwrap() });
+        assert_eq!(fs_path_nudge("Read", &root_only, &ctx), "");
     }
 }

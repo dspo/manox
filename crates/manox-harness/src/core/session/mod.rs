@@ -654,7 +654,7 @@ impl<S: SessionStorage + 'static> Session<S> {
 
     /// Append a `cwd_change` entry and return the entry ID.
     ///
-    /// The sticky cwd a path carries round-trips through these entries:
+    /// The directory the host moved to round-trips through these entries:
     /// restore projects the latest one as the session's effective working
     /// directory (the header cwd stays the launch directory forever).
     pub async fn append_cwd_change(&self, cwd: &str) -> Result<String, anyhow::Error> {
@@ -1448,7 +1448,7 @@ mod tests {
             active_tool_names,
             Some(vec!["Read".to_string(), "Bash".to_string()])
         );
-        // The latest cwd_change wins — the sticky cwd the path ends at.
+        // The latest cwd_change wins — the directory the path ends at.
         assert_eq!(cwd, Some("/tmp/wt-late".to_string()));
     }
 

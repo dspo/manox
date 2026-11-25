@@ -75,7 +75,16 @@ impl AgentTool for McpTool {
     fn description(&self) -> &str {
         &self.description
     }
-
+    /// A bridged tool's side effects live inside the server process, which
+    /// manox neither instruments nor confines: the fs fence can never prove
+    /// containment for them, and the server already runs unsandboxed from
+    /// its own init (user-configured `mcp.json` — the trust boundary is the
+    /// server configuration, not the per-call path ruling). The tool takes
+    /// no `cwd`; refusing every call under the sandbox mode added no
+    /// confinement, only a dead MCP surface at the default access mode.
+    fn mutates_through_fs_paths(&self) -> bool {
+        false
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         // rmcp stores input_schema as Arc<JsonObject>. Convert to a
         // Value::Object; if `properties` is missing or null, insert an empty

@@ -13,6 +13,11 @@
 //! `requires_approval` and ride the owning thread's `AccessMode` (the
 //! engine wraps them in `ApprovalGatedTool`), so the outbound trust axis is
 //! governed by the same mode that gates `Bash` / `Write`.
+//!
+//! The write axis also declares `mutates_through_fs_paths() == false`: a
+//! browser op takes no `cwd` and its effect lives in the webview, not the
+//! filesystem, so the sandbox path ruling has nothing to prove. Its
+//! authority is the host round trip plus the approval hint.
 
 use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use schemars::JsonSchema;
@@ -230,6 +235,10 @@ impl AgentTool for WebExploreOpenTool {
     fn requires_approval(&self, _params: &serde_json::Value) -> bool {
         true
     }
+    // Browser state, not the filesystem: nothing for the path fence to judge.
+    fn mutates_through_fs_paths(&self) -> bool {
+        false
+    }
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -270,6 +279,10 @@ impl AgentTool for WebExploreNavigateTool {
     }
     fn requires_approval(&self, _params: &serde_json::Value) -> bool {
         true
+    }
+    // Browser state, not the filesystem: nothing for the path fence to judge.
+    fn mutates_through_fs_paths(&self) -> bool {
+        false
     }
     async fn execute(
         &self,
@@ -383,6 +396,10 @@ impl AgentTool for WebExploreClickTool {
     fn requires_approval(&self, _params: &serde_json::Value) -> bool {
         true
     }
+    // Browser state, not the filesystem: nothing for the path fence to judge.
+    fn mutates_through_fs_paths(&self) -> bool {
+        false
+    }
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -424,6 +441,10 @@ impl AgentTool for WebExploreTypeTool {
     fn requires_approval(&self, _params: &serde_json::Value) -> bool {
         true
     }
+    // Browser state, not the filesystem: nothing for the path fence to judge.
+    fn mutates_through_fs_paths(&self) -> bool {
+        false
+    }
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -464,6 +485,10 @@ impl AgentTool for WebExploreScrollTool {
     }
     fn requires_approval(&self, _params: &serde_json::Value) -> bool {
         true
+    }
+    // Browser state, not the filesystem: nothing for the path fence to judge.
+    fn mutates_through_fs_paths(&self) -> bool {
+        false
     }
     async fn execute(
         &self,
@@ -545,6 +570,10 @@ impl AgentTool for WebExploreYieldTool {
     fn requires_approval(&self, _params: &serde_json::Value) -> bool {
         true
     }
+    // Browser state, not the filesystem: nothing for the path fence to judge.
+    fn mutates_through_fs_paths(&self) -> bool {
+        false
+    }
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -588,6 +617,10 @@ impl AgentTool for WebExploreCloseTool {
     fn requires_approval(&self, _params: &serde_json::Value) -> bool {
         true
     }
+    // Browser state, not the filesystem: nothing for the path fence to judge.
+    fn mutates_through_fs_paths(&self) -> bool {
+        false
+    }
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -612,6 +645,7 @@ mod tests {
     use super::*;
     use manox_harness::env::TokioExecutionEnv;
     use manox_harness::tool::{LocalToolContext, ToolState};
+    use std::sync::Arc;
 
     fn tool_ctx() -> LocalToolContext {
         LocalToolContext::new(
@@ -696,6 +730,25 @@ mod tests {
             WebExploreYieldTool::new(notice_tx.clone()).requires_approval(&serde_json::json!({}))
         );
         assert!(WebExploreCloseTool::new(notice_tx).requires_approval(&serde_json::json!({})));
+        // Every browser write declares itself fs-free: it takes no `cwd`, so
+        // without the declaration the sandbox path ruling's default arm
+        // refuses the whole write axis at the default access mode.
+        let write_tools: Vec<Arc<dyn AgentTool>> = vec![
+            Arc::new(WebExploreOpenTool::new(mpsc::unbounded_channel().0)),
+            Arc::new(WebExploreNavigateTool::new(mpsc::unbounded_channel().0)),
+            Arc::new(WebExploreClickTool::new(mpsc::unbounded_channel().0)),
+            Arc::new(WebExploreTypeTool::new(mpsc::unbounded_channel().0)),
+            Arc::new(WebExploreScrollTool::new(mpsc::unbounded_channel().0)),
+            Arc::new(WebExploreYieldTool::new(mpsc::unbounded_channel().0)),
+            Arc::new(WebExploreCloseTool::new(mpsc::unbounded_channel().0)),
+        ];
+        for tool in write_tools {
+            assert!(
+                !tool.mutates_through_fs_paths(),
+                "{} must stay callable without a cwd under the path fence",
+                tool.name()
+            );
+        }
     }
 
     /// A cancelled run settles the round trip as `Aborted` before any reply
