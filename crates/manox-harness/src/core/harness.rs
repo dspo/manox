@@ -10339,8 +10339,8 @@ pub(crate) mod tests {
         );
     }
 
-    // Re-anchors the conversation's directory through the same `cwd`
-    // resolution every FS tool performs.
+    // Locates one call through the same `cwd` resolution every FS tool
+    // performs — and must not move the conversation's directory.
     struct AnchorTool {
         dir: std::path::PathBuf,
     }
@@ -10351,7 +10351,7 @@ pub(crate) mod tests {
             "anchor"
         }
         fn description(&self) -> &str {
-            "Anchors the conversation directory"
+            "Locates one call in another directory"
         }
         fn parameters_schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object"})
@@ -10368,15 +10368,15 @@ pub(crate) mod tests {
                 Some(&serde_json::json!([self.dir.to_string_lossy()])),
             )
             .map_err(crate::tool::ToolError::InvalidArguments)?;
-            Ok(crate::tool::AgentToolResult::text("anchored"))
+            Ok(crate::tool::AgentToolResult::text("located"))
         }
     }
 
-    /// A tool call that moves the conversation's directory is visible to the
-    /// model on the next turn: the system prompt names the directory the
-    /// tools will run in, not the one the harness was assembled at.
+    /// A tool call's `cwd` locates that one call and never moves the
+    /// conversation's directory: the next turn's prompt still names the
+    /// session directory, never the call's target.
     #[tokio::test]
-    async fn prompt_working_directory_follows_a_tool_anchor() {
+    async fn prompt_working_directory_ignores_a_tool_cwd() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         // Call 0 issues the anchor tool call, call 1 answers it, call 2 is
@@ -10457,6 +10457,9 @@ pub(crate) mod tests {
         harness.set_prompt_cwd(assembly.path().to_path_buf());
         harness
             .set_system_prompt_builder(|_tools, _resources, cwd| format!("cwd: {}", cwd.display()));
+        // Force the builder's first render so the pre-call prompt states the
+        // session directory (the assertion below compares against it).
+        harness.set_initial_active_tools(vec!["anchor".into()]);
 
         harness.prompt("move").await.unwrap();
         harness.prompt("where are we").await.unwrap();
@@ -10464,13 +10467,13 @@ pub(crate) mod tests {
         let prompts = prompts.lock().unwrap();
         assert_eq!(prompts.len(), 1, "the next turn must reach the provider");
         assert!(
-            prompts[0].contains(&worktree.path().display().to_string()),
-            "the next turn's prompt must name the anchored directory: {}",
+            prompts[0].contains(&assembly.path().display().to_string()),
+            "the prompt keeps the session directory after a tool `cwd`: {}",
             prompts[0]
         );
         assert!(
-            !prompts[0].contains(&assembly.path().display().to_string()),
-            "the assembly directory must not survive the move: {}",
+            !prompts[0].contains(&worktree.path().display().to_string()),
+            "a tool `cwd` must not move the conversation's directory: {}",
             prompts[0]
         );
     }

@@ -27,9 +27,10 @@ pub mod nudge {
     pub const GH_WATCH: u8 = 1 << 3;
     /// Bit 4: bare `cd` in a Bash command → pass the location via `cwd`.
     pub const CD_PREFERENCE: u8 = 1 << 4;
-    /// Bit 5: absolute FS `path` inside a git repo → repo-root-anchored
-    /// `cwd` form shown in full once, one-line after.
-    pub const FS_REPO_PATH: u8 = 1 << 5;
+    /// Bit 5: absolute FS target inside a git repo/worktree or the
+    /// conversation's directory → relative-addressing form shown in full
+    /// once, one-line after.
+    pub const FS_PATH_PREFERENCE: u8 = 1 << 5;
 
     /// Check whether `flag` has been shown in this session.
     pub fn has(nudge_flags: &std::sync::Mutex<u8>, flag: u8) -> bool {
@@ -71,7 +72,7 @@ pub struct ToolState {
     /// this session, so nudges fire at most once per session. Bit 0 = grep
     /// native tool preference, bit 1 = sleep nudge, bit 2 = poll loop nudge,
     /// bit 3 = gh watch nudge, bit 4 = cd preference nudge, bit 5 = FS
-    /// repo-path nudge.
+    /// relative-path nudge.
     pub nudge_flags: std::sync::Mutex<u8>,
 }
 
@@ -883,10 +884,11 @@ async fn execute_one(
         result = after(&result);
     }
 
-    // Harness repo-path nudge: an absolute `path` into a git repo/worktree
-    // teaches the repo-root-anchored `cwd` form. Its own leading text block
-    // so it survives any host-side content shaping downstream.
-    let nudge = crate::tools::path_utils::repo_path_nudge(tool_name, args, ctx);
+    // Harness path nudge: an absolute FS target teaches the relative form —
+    // repo-root-anchored `cwd` inside a git repo/worktree, a relative `path`
+    // inside the conversation's directory. Its own leading text block so it
+    // survives any host-side content shaping downstream.
+    let nudge = crate::tools::path_utils::fs_path_nudge(tool_name, args, ctx);
     if !nudge.is_empty() {
         result.content.insert(
             0,

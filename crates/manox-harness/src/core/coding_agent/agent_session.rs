@@ -2042,9 +2042,9 @@ mod tests {
     }
 
     /// The system prompt's working-directory line follows a host-driven
-    /// `SetCwd`: the sticky cwd alone moves the tools, and a prompt still
-    /// naming the claim-time directory leaves the model answering from a
-    /// stale belief (the "current cwd" question answered wrong).
+    /// `SetCwd` — the only move there is. A prompt still naming the
+    /// claim-time directory leaves the model answering from a stale belief
+    /// (the "current cwd" question answered wrong).
     #[tokio::test]
     async fn set_session_cwd_rerenders_the_system_prompt() {
         let dir = tempfile::tempdir().unwrap();

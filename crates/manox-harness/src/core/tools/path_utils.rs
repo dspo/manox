@@ -240,19 +240,70 @@ fn git_repo_root(target: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The FS tools the repo-path nudge governs — every tool whose `path`
-/// argument is resolved against the call's working directory.
+/// The FS tools the path nudge governs — every tool whose file targets are
+/// resolved against the call's working directory.
 fn is_fs_path_tool(name: &str) -> bool {
     matches!(name, "Read" | "Write" | "Edit" | "Grep" | "Glob" | "Ls")
 }
 
-/// Model-facing nudge for an absolute `path` argument that resolves inside a
-/// git repository or worktree: teaches the repo-root-anchored `cwd` form as
-/// the cheaper carrier. Two-tier — the first qualifying call in a session
-/// carries the full how-to, every later one a one-line reminder with the
-/// concrete rewrite. A non-empty `cwd` anchor means the model already
-/// carries locations the intended way and is never nudged.
-pub fn repo_path_nudge(tool_name: &str, args: &JsonValue, ctx: &dyn ToolContext) -> String {
+/// The file targets one FS tool call addresses, tilde-expanded. `Edit` has
+/// no `path` argument — its targets are the patch's file headers. Only
+/// absolute targets qualify for the nudge; a relative one already carries
+/// its location the intended way.
+fn fs_targets(tool_name: &str, args: &JsonValue) -> Vec<PathBuf> {
+    let expand = |path: &Path| PathBuf::from(expand_tilde(&path.to_string_lossy()));
+    match tool_name {
+        "Edit" => {
+            let Some(patch) = args.get("patch").and_then(|v| v.as_str()) else {
+                return Vec::new();
+            };
+            let Ok(parsed) = crate::hashline::parse_patch(patch) else {
+                return Vec::new();
+            };
+            parsed.files.iter().map(|file| expand(&file.path)).collect()
+        }
+        "Read" | "Write" | "Grep" | "Glob" | "Ls" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|path| vec![expand(Path::new(path))])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// The directory an absolute target should be addressed against. A git
+/// repository/worktree root wins over the conversation's directory: the
+/// repo-root form is the portable one (the same path works from any
+/// checkout of the tree), while a non-repo target inside the conversation's
+/// directory is addressed against it directly.
+#[derive(PartialEq)]
+enum PathBase {
+    Conversation,
+    Repo(PathBuf),
+}
+
+/// Resolve `(base, relative-path)` for one absolute target. `None` when the
+/// target sits under neither a repository nor the conversation's directory.
+fn base_and_relative(target: &Path, cwd: &Path) -> Option<(PathBase, String)> {
+    let target = crate::sandbox::canonicalize_best_effort(target);
+    let cwd = crate::sandbox::canonicalize_best_effort(cwd);
+    if let Some(root) = git_repo_root(&target)
+        && let Ok(rel) = target.strip_prefix(&root)
+    {
+        return Some((PathBase::Repo(root), rel.to_string_lossy().into_owned()));
+    }
+    let rel = target.strip_prefix(&cwd).ok()?;
+    Some((PathBase::Conversation, rel.to_string_lossy().into_owned()))
+}
+
+/// Model-facing nudge for absolute FS targets: a git repository/worktree
+/// target teaches the repo-root-anchored `cwd` form; an absolute target
+/// merely inside the conversation's directory teaches the relative `path`
+/// form. Two-tier — the first qualifying call in a session carries the full
+/// how-to, every later one a one-line reminder with the concrete rewrite. A
+/// non-empty `cwd` argument means the model already carries locations the
+/// intended way and is never nudged.
+pub fn fs_path_nudge(tool_name: &str, args: &JsonValue, ctx: &dyn ToolContext) -> String {
     if !is_fs_path_tool(tool_name) {
         return String::new();
     }
@@ -264,40 +315,89 @@ pub fn repo_path_nudge(tool_name: &str, args: &JsonValue, ctx: &dyn ToolContext)
     {
         return String::new();
     }
-    let Some(path_str) = args.get("path").and_then(|v| v.as_str()) else {
-        return String::new();
-    };
-    let expanded = expand_tilde(path_str);
-    let target = PathBuf::from(&expanded);
-    if !target.is_absolute() {
+    let targets = fs_targets(tool_name, args);
+    if targets.is_empty() || !targets.iter().all(|target| target.is_absolute()) {
         return String::new();
     }
-    let Some(root) = git_repo_root(&target) else {
-        return String::new();
-    };
-    let Ok(rel) = target.strip_prefix(&root) else {
-        return String::new();
-    };
-    // The repo root itself has no shorter form — anchoring adds nothing.
-    if rel.as_os_str().is_empty() {
-        return String::new();
+    let cwd = ctx.cwd();
+    // Every target must share one base — one rewrite serves the whole call.
+    let mut selected: Option<(PathBase, String, &PathBuf)> = None;
+    for target in &targets {
+        let Some((base, rel)) = base_and_relative(target, cwd) else {
+            return String::new();
+        };
+        // A target equal to its base has no shorter form.
+        if rel.is_empty() {
+            return String::new();
+        }
+        match &selected {
+            None => selected = Some((base, rel, target)),
+            Some((chosen, _, _)) if *chosen != base => return String::new(),
+            Some(_) => {}
+        }
     }
-    let root_str = root.to_string_lossy();
-    let rel_str = rel.to_string_lossy();
-    if root_str.contains('"') || rel_str.contains('"') {
+    let Some((base, rel, first)) = selected else {
+        return String::new();
+    };
+    let base_str = match &base {
+        PathBase::Conversation => cwd.to_string_lossy().into_owned(),
+        PathBase::Repo(root) => root.to_string_lossy().into_owned(),
+    };
+    let path_str = first.to_string_lossy();
+    if base_str.contains('"') || rel.contains('"') {
         return String::new(); // the rewrite example would not be quotable
     }
     let nf = &ctx.tool_state().nudge_flags;
-    if crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::FS_REPO_PATH) {
-        format!(
-            "[harness] prefer a repo-relative path: {{\"cwd\": [\"{root_str}\"], \"path\": \"{rel_str}\"}}."
-        )
-    } else {
-        format!(
-            "[harness] tip: \"{path_str}\" lives inside the git repository at \"{root_str}\" — \
-             prefer paths relative to the repository root: \
-             {{\"cwd\": [\"{root_str}\"], \"path\": \"{rel_str}\"}}."
-        )
+    let already = crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::FS_PATH_PREFERENCE);
+
+    // A patch carries its own path syntax: teach the `cwd` split without
+    // pretending a `path` field exists.
+    if tool_name == "Edit" {
+        let location = match &base {
+            PathBase::Conversation => {
+                format!("inside the conversation's directory \"{base_str}\"")
+            }
+            PathBase::Repo(_) => format!("inside the git repository at \"{base_str}\""),
+        };
+        return if already {
+            format!("[harness] prefer `cwd` with relative patch paths (base \"{base_str}\").")
+        } else {
+            format!(
+                "[harness] tip: the patch addresses \"{path_str}\" by absolute path {location} — \
+                 pass that directory as `cwd` and write the patch's file paths relative to it. \
+                 `cwd` locates this call only and never moves the conversation's directory."
+            )
+        };
+    }
+
+    match base {
+        PathBase::Conversation => {
+            if already {
+                format!("[harness] prefer a conversation-relative path: {{\"path\": \"{rel}\"}}.")
+            } else {
+                format!(
+                    "[harness] tip: \"{path_str}\" is inside the conversation's directory \
+                     \"{base_str}\" — pass the location relative to it: \
+                     {{\"path\": \"{rel}\"}}. Use `cwd` when this call targets another tree; \
+                     it locates this call only and never moves the conversation's directory."
+                )
+            }
+        }
+        PathBase::Repo(root) => {
+            let root_str = root.to_string_lossy();
+            if already {
+                format!(
+                    "[harness] prefer a repo-relative path: \
+                     {{\"cwd\": [\"{root_str}\"], \"path\": \"{rel}\"}}."
+                )
+            } else {
+                format!(
+                    "[harness] tip: \"{path_str}\" lives inside the git repository at \
+                     \"{root_str}\" — prefer paths relative to the repository root: \
+                     {{\"cwd\": [\"{root_str}\"], \"path\": \"{rel}\"}}."
+                )
+            }
+        }
     }
 }
 
@@ -466,32 +566,85 @@ mod tests {
         let abs = target.to_str().unwrap();
         let (ctx, _state) = ctx_at(base.path());
         let args = serde_json::json!({ "path": abs });
-        let first = repo_path_nudge("Read", &args, &ctx);
+        let first = fs_path_nudge("Read", &args, &ctx);
         assert!(first.contains("lives inside the git repository"), "{first}");
         assert!(
             first.contains("prefer paths relative to the repository root"),
             "{first}"
         );
-        let second = repo_path_nudge("Read", &args, &ctx);
+        let second = fs_path_nudge("Read", &args, &ctx);
         assert!(second.contains("prefer a repo-relative path"), "{second}");
         assert!(!second.contains("lives inside"), "{second}");
     }
 
+    /// An absolute path inside the conversation's directory (and outside any
+    /// git repository) teaches the relative `path` form — the repo-root form
+    /// needs a repository to anchor.
     #[test]
-    fn repo_path_nudge_negative_cases() {
+    fn conversation_relative_nudge_for_absolute_path_inside_cwd() {
         let (base, _work) = setup_dirs();
         let plain = base.path().join("plain");
         std::fs::create_dir(&plain).unwrap();
         std::fs::write(plain.join("f.txt"), "x").unwrap();
         let (ctx, _state) = ctx_at(base.path());
-        // Not a repo.
         let args = serde_json::json!({ "path": plain.join("f.txt").to_str().unwrap() });
-        assert_eq!(repo_path_nudge("Read", &args, &ctx), "");
-        // Relative path.
+        let first = fs_path_nudge("Read", &args, &ctx);
+        assert!(
+            first.contains("inside the conversation's directory"),
+            "{first}"
+        );
+        assert!(first.contains("{\"path\": \"plain/f.txt\"}"), "{first}");
+        assert!(
+            first.contains("Use `cwd` when this call targets another tree"),
+            "{first}"
+        );
+        let second = fs_path_nudge("Read", &args, &ctx);
+        assert!(
+            second.contains("prefer a conversation-relative path: {\"path\": \"plain/f.txt\"}"),
+            "{second}"
+        );
+    }
+
+    /// `Edit` carries its targets in the patch's file headers, not a `path`
+    /// field: an absolute patch path still teaches the `cwd` split.
+    #[test]
+    fn edit_patch_absolute_paths_nudge() {
+        let (base, _work) = setup_dirs();
+        let repo = base.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        let patch = format!("[{}#000000]\nINS.TAIL:\n+y", repo.join("f.txt").display());
+        let (ctx, _state) = ctx_at(base.path());
+        let args = serde_json::json!({ "patch": patch });
+        let first = fs_path_nudge("Edit", &args, &ctx);
+        assert!(
+            first.contains("the patch addresses") && first.contains("inside the git repository"),
+            "{first}"
+        );
+        assert!(first.contains("pass that directory as `cwd`"), "{first}");
+        let second = fs_path_nudge("Edit", &args, &ctx);
+        assert!(
+            second.contains("prefer `cwd` with relative patch paths"),
+            "{second}"
+        );
+    }
+
+    #[test]
+    fn fs_path_nudge_negative_cases() {
+        let (base, _work) = setup_dirs();
+        let plain = base.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("f.txt"), "x").unwrap();
+        let (ctx, _state) = ctx_at(base.path());
+        // Relative path: already located the intended way.
         let rel = serde_json::json!({ "path": "f.txt" });
-        assert_eq!(repo_path_nudge("Read", &rel, &ctx), "");
+        assert_eq!(fs_path_nudge("Read", &rel, &ctx), "");
         // Non-FS tool.
-        assert_eq!(repo_path_nudge("Bash", &args, &ctx), "");
+        let args = serde_json::json!({ "path": plain.join("f.txt").to_str().unwrap() });
+        assert_eq!(fs_path_nudge("Bash", &args, &ctx), "");
+        // Away from both the conversation's directory and any repo.
+        let outside = serde_json::json!({ "path": "/etc/hosts" });
+        assert_eq!(fs_path_nudge("Read", &outside, &ctx), "");
         // Non-empty anchor: the model already carries the directory itself.
         let repo = base.path().join("repo2");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -500,9 +653,9 @@ mod tests {
             "path": repo.join("f.txt").to_str().unwrap(),
             "cwd": [repo.to_str().unwrap()],
         });
-        assert_eq!(repo_path_nudge("Read", &anchored, &ctx), "");
+        assert_eq!(fs_path_nudge("Read", &anchored, &ctx), "");
         // The repo root itself has no shorter form.
         let root_only = serde_json::json!({ "path": repo.to_str().unwrap() });
-        assert_eq!(repo_path_nudge("Read", &root_only, &ctx), "");
+        assert_eq!(fs_path_nudge("Read", &root_only, &ctx), "");
     }
 }
