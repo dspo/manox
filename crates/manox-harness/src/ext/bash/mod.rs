@@ -1227,14 +1227,15 @@ mod tests {
             )
             .await
             .unwrap();
-        let calls = ops.calls.lock().unwrap();
-        assert_eq!(
-            calls[0].1,
-            Some(work.path().to_path_buf()),
-            "cwd override reaches the backend"
-        );
+        {
+            let calls = ops.calls.lock().unwrap();
+            assert_eq!(
+                calls[0].1,
+                Some(work.path().to_path_buf()),
+                "cwd override reaches the backend"
+            );
+        }
         assert!(!result.is_error);
-        drop(calls);
         // The override locates only this call: the next call without `cwd`
         // runs in the conversation's directory again.
         tool.execute(
