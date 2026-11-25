@@ -5,6 +5,7 @@
 // testable via mocks.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -33,6 +34,18 @@ pub struct FileInfo {
 pub trait ExecutionEnv: Send + Sync {
     /// The current working directory for relative path resolution.
     fn cwd(&self) -> &Path;
+
+    /// Rebuild this environment rooted at `cwd`, when the environment can be
+    /// re-rooted without losing host-specific state (a remote sandbox, a
+    /// memoized handle, an embedder's own isolation layer).
+    ///
+    /// The host-driven `SetCwd` uses this to re-pin the session without
+    /// swapping the execution surface: an environment that cannot answer
+    /// keeps the old directory and the move is refused, never silently
+    /// replaced with the local host.
+    fn rebased(&self, _cwd: &Path) -> Option<Arc<dyn ExecutionEnv>> {
+        None
+    }
 
     /// Resolve a path to an absolute form.
     async fn absolute_path(&self, path: &Path) -> Result<PathBuf, FileError>;
@@ -145,6 +158,12 @@ impl TokioExecutionEnv {
 impl ExecutionEnv for TokioExecutionEnv {
     fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    /// The local environment is fully described by its cwd, so re-rooting is
+    /// a fresh value with no host state to lose.
+    fn rebased(&self, cwd: &Path) -> Option<Arc<dyn ExecutionEnv>> {
+        Some(Arc::new(TokioExecutionEnv::new(cwd.to_path_buf())))
     }
 
     fn join_path(&self, parts: &[&str]) -> PathBuf {
@@ -424,6 +443,15 @@ mod tests {
 
     fn test_env() -> TokioExecutionEnv {
         TokioExecutionEnv::new(std::env::temp_dir())
+    }
+
+    /// The local environment is fully described by its cwd, so SetCwd can
+    /// re-root it without swapping the execution surface.
+    #[test]
+    fn tokio_env_rebases_at_the_new_directory() {
+        let env = TokioExecutionEnv::new("/old");
+        let rebased = env.rebased(Path::new("/new")).expect("local env rebases");
+        assert_eq!(rebased.cwd(), Path::new("/new"));
     }
 
     #[tokio::test]

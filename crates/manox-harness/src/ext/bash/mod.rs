@@ -470,13 +470,14 @@ impl BashTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("command is required".into()))?;
         let timeout_ms = params["timeout"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MS);
-        // Sticky-cwd resolution: `cwd` is `[anchor, ...route]` — a non-empty
-        // anchor re-anchors the session's default directory, the route
-        // locates this call only. The persistent shell re-pins to the
-        // resolved directory before each exec, so a `cd` inside a command
-        // never leaks into the session's working directory.
+        // Locational cwd resolution: `cwd` is `[dir, ...subdirs]`, a pure
+        // per-call join over the conversation's directory — it never moves
+        // the session. The persistent shell re-pins to the resolved
+        // directory before each exec, so a `cd` inside a command never
+        // leaks into the session's working directory either.
         let run_cwd = crate::core::tools::path_utils::resolve_effective_cwd(ctx, params.get("cwd"))
             .map_err(ToolError::InvalidArguments)?;
+        let cwd_is_explicit = has_explicit_cwd(&params);
         let run_in_background = params["run_in_background"].as_bool().unwrap_or(false);
         let head_lines = params["head_lines"].as_u64().map(|v| v as usize);
         let tail_lines = params["tail_lines"].as_u64().map(|v| v as usize);
@@ -533,8 +534,17 @@ impl BashTool {
         if let Some(manager) = self.manager.as_ref().filter(|_| self.promotes_on_timeout()) {
             return self
                 .run_foreground_tracked(
-                    manager, &command, &run_cwd, timeout_ms, head_lines, tail_lines, effective,
-                    signal, on_data, ctx,
+                    manager,
+                    &command,
+                    &run_cwd,
+                    timeout_ms,
+                    head_lines,
+                    tail_lines,
+                    effective,
+                    signal,
+                    on_data,
+                    cwd_is_explicit,
+                    ctx,
                 )
                 .await;
         }
@@ -579,7 +589,7 @@ impl BashTool {
         if !run_in_background {
             output.push_str(&nudge_tool_preference(&command, ctx));
             output.push_str(&nudge_sleep_loop(&command, ctx));
-            prepend_cd_nudge(&mut output, &command, ctx);
+            prepend_cd_nudge(&mut output, &command, cwd_is_explicit, ctx);
         }
 
         Ok(AgentToolResult::text(output))
@@ -605,6 +615,7 @@ impl BashTool {
         effective: AccessMode,
         signal: CancellationToken,
         on_data: Option<crate::core::tools::bash::BashDataCallback<'_>>,
+        cwd_is_explicit: bool,
         ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         // Same confinement decision as the backend dispatch: an escalated
@@ -665,7 +676,7 @@ impl BashTool {
             }
             out.push_str(&nudge_tool_preference(command, ctx));
             out.push_str(&nudge_sleep_loop(command, ctx));
-            prepend_cd_nudge(&mut out, command, ctx);
+            prepend_cd_nudge(&mut out, command, cwd_is_explicit, ctx);
             return Ok(AgentToolResult::text(out));
         }
 
@@ -695,7 +706,7 @@ impl BashTool {
         }
         out.push_str(&nudge_tool_preference(command, ctx));
         out.push_str(&nudge_sleep_loop(command, ctx));
-        prepend_cd_nudge(&mut out, command, ctx);
+        prepend_cd_nudge(&mut out, command, cwd_is_explicit, ctx);
         Ok(AgentToolResult::text(out))
     }
 
@@ -877,71 +888,84 @@ fn nudge_tool_preference(command: &str, ctx: &dyn ToolContext) -> String {
     )
 }
 
-/// Parse a leading `cd <dir>` plus optional `&&`/`;` separator: returns
-/// `(dir, Some(rest))` for `cd <dir> && rest` and `cd <dir>; rest`,
-/// `(dir, None)` for a bare `cd <dir>`, and `("", None)` for a bare `cd`.
-/// `None` when the command does not start with `cd` or the naive split cut
-/// into a quoted segment — no trustworthy rewrite for that shape.
-fn leading_cd(command: &str) -> Option<(String, Option<String>)> {
+/// The target of a leading `cd` command: the token after `cd`, up to the
+/// next command separator. `None` when the command does not lead with `cd`
+/// with a target (`cd` alone has nothing to relocate). Only used to decide
+/// whether the target is a location a `cwd` argument can name directly —
+/// the nudge never reproduces it.
+fn leading_cd_target(command: &str) -> Option<&str> {
     let trimmed = command.trim();
-    if trimmed == "cd" {
-        return Some((String::new(), None));
-    }
     let after = trimmed.strip_prefix("cd ")?;
-    let (dir_raw, rest) = match after.split_once("&&") {
-        Some((dir, rest)) => (dir, Some(rest.trim())),
-        None => after
-            .split_once(';')
-            .map_or((after, None), |(dir, rest)| (dir, Some(rest.trim()))),
-    };
-    let dir = dir_raw.trim().trim_matches('"').trim_matches('\'').trim();
-    if dir.contains('"') || dir.contains('\'') {
-        return None;
-    }
-    Some((dir.to_string(), rest.map(str::to_string)))
+    let end = after.find(['&', ';']).unwrap_or(after.len());
+    Some(after[..end].trim())
 }
 
-/// Two-tier nudge for a command leading with `cd`: the first occurrence in a
-/// session carries the full `cwd` how-to, every later one a one-line
-/// reminder — both with the concrete rewrite when the command shapes as
-/// `cd <dir> [&&|;] rest`. The shell's `cd` moves only that command's
-/// directory, never the conversation's.
-fn nudge_cd_preference(command: &str, ctx: &dyn ToolContext) -> String {
-    let trimmed = command.trim();
-    if !(trimmed.starts_with("cd ") || trimmed == "cd") {
+/// Whether `target` names a location as-is: absolute (`/...`) or
+/// home-relative (`~`, `~/...`), with nothing the shell would expand. A
+/// quoted literal is accepted after stripping the pair; `$VAR`, globs,
+/// backticks, escapes, and `~user` are refused — the tip must never teach a
+/// spelling that resolves somewhere else.
+fn is_static_location(target: &str) -> bool {
+    let target = target.trim_matches('"').trim_matches('\'').trim();
+    if target.is_empty() || target.contains(['"', '\'', '$', '`', '*', '?', '[', '{', '}', '\\']) {
+        return false;
+    }
+    target == "~" || target.starts_with("~/") || target.starts_with('/')
+}
+
+/// Whether the call carries an explicit location. Omission, JSON `null`, and
+/// the single empty element `[""]` all mean the conversation's directory —
+/// the only shapes the tip fires on. Anything else (including subdirs after
+/// an empty head) locates this call elsewhere and is left alone.
+fn has_explicit_cwd(params: &JsonValue) -> bool {
+    match params.get("cwd") {
+        None | Some(JsonValue::Null) => false,
+        Some(JsonValue::Array(items)) => {
+            !(items.len() == 1 && items[0].as_str().is_some_and(str::is_empty))
+        }
+        Some(_) => true,
+    }
+}
+
+/// Two-tier textual nudge for a leading `cd` whose target is a static
+/// absolute/home location, on a call that carries no explicit location.
+///
+/// It deliberately proposes no rewritten arguments: the tip names the `cwd`
+/// parameter as the replacement for the `cd` and nothing else, so it cannot
+/// teach a spelling that diverges from what the shell would do. Any other
+/// shape (relative target, explicit `cwd`, expansion, bare `cd`) stays
+/// silent — a wrong concrete hint is worse than no hint.
+fn nudge_cd_preference(command: &str, cwd_is_explicit: bool, ctx: &dyn ToolContext) -> String {
+    if cwd_is_explicit {
+        return String::new();
+    }
+    let Some(target) = leading_cd_target(command) else {
+        return String::new();
+    };
+    if !is_static_location(target) {
         return String::new();
     }
     let nf = &ctx.tool_state().nudge_flags;
     let already = crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::CD_PREFERENCE);
-    let concrete = leading_cd(trimmed).and_then(|(dir, rest)| {
-        rest.filter(|r| !r.is_empty() && !r.contains('"'))
-            .filter(|_| !dir.is_empty() && !dir.contains('"'))
-            .map(|rest| (dir, rest))
-    });
-    match (already, concrete) {
-        (false, None) => "[harness] tip: a `cd` inside a Bash command does not move this \
-             session's working directory. Pass the location with `cwd` instead — omit it to \
-             work in the conversation's directory, or pass [dir, ...subdirs]; the argument \
-             locates this call only. Example: {\"command\": \"cargo test\", \
-             \"cwd\": [\"~/projects/dspo/manox\", \"crates/manox-harness\"]}."
-            .to_string(),
-        (true, None) => "[harness] prefer the `cwd` parameter over `cd`.".to_string(),
-        (false, Some((dir, rest))) => format!(
-            "[harness] tip: prefer `cwd` over \"cd {dir} && ...\" — the shell's cd does not \
-             move this session's working directory. This call as {{\"command\": \"{rest}\", \
-             \"cwd\": [\"{dir}\"]}}. `cwd` locates just this call; the conversation's \
-             directory never moves."
-        ),
-        (true, Some((dir, rest))) => {
-            format!("[harness] prefer cwd: {{\"command\": \"{rest}\", \"cwd\": [\"{dir}\"]}}.")
-        }
+    if already {
+        "[harness] prefer the `cwd` parameter over a leading `cd`.".to_string()
+    } else {
+        "[harness] a leading `cd` only changes that command's own shell — it does not move \
+         the session's working directory. Put the directory in the `cwd` parameter instead: \
+         it locates this call only and never moves the conversation's directory."
+            .to_string()
     }
 }
 
 /// Lead the output with the cd nudge — the hint goes before the command
 /// output, not after it.
-fn prepend_cd_nudge(output: &mut String, command: &str, ctx: &dyn ToolContext) {
-    let hint = nudge_cd_preference(command, ctx);
+fn prepend_cd_nudge(
+    output: &mut String,
+    command: &str,
+    cwd_is_explicit: bool,
+    ctx: &dyn ToolContext,
+) {
+    let hint = nudge_cd_preference(command, cwd_is_explicit, ctx);
     if hint.is_empty() {
         return;
     }
@@ -1714,62 +1738,108 @@ mod tests {
         );
     }
 
-    /// A leading `cd` nudges every occurrence: the first carries the full
-    /// how-to with the concrete rewrite, later ones a one-line reminder —
-    /// and the hint leads the output. A non-cd command never carries it.
+    /// The cd nudge is textual and narrowly triggered: only a leading `cd`
+    /// to a static absolute/home location on a call that carries no explicit
+    /// location. It proposes no rewritten arguments, so it cannot teach a
+    /// spelling that diverges from the shell's own behaviour.
     #[tokio::test]
-    async fn cd_command_nudges_two_tier_and_leading() {
+    async fn cd_nudge_is_text_only_and_narrowly_triggered() {
         let tool = BashTool::new(Arc::new(EchoOps), Arc::new(NoopRegistry));
-        let (ctx, _dir) = ctx();
-        const FULL: &str = "[harness] tip: prefer `cwd` over \"cd sub && ...\"";
+        let (ctx, dir) = ctx();
+        // The subdirs-after-empty-head case must resolve to a real directory.
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        const FULL: &str = "[harness] a leading `cd` only changes that command's own shell";
+        const SHORT: &str = "[harness] prefer the `cwd` parameter over a leading `cd`.";
+
+        // First qualifying call: absolute target, no `cwd` argument at all.
         let first = tool
             .execute(
                 "c1",
-                serde_json::json!({"command": "cd sub && pwd", "cwd": [""]}),
+                serde_json::json!({"command": "cd /tmp && pwd"}),
                 CancellationToken::new(),
                 &ctx,
             )
             .await
             .unwrap();
         let text = output_text(&first);
-        assert!(text.contains(FULL), "first cd carries the full tip: {text}");
         assert!(text.starts_with(FULL), "the hint leads the output: {text}");
+        assert!(
+            text.contains("Put the directory in the `cwd` parameter instead"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("{\"command\""),
+            "the tip proposes no argument rewrite: {text}"
+        );
+
+        // A later qualifying call (home-relative target) gets the one-liner.
         let second = tool
             .execute(
                 "c2",
-                serde_json::json!({"command": "cd other && ls", "cwd": [""]}),
+                serde_json::json!({"command": "cd ~/proj && ls", "cwd": [""]}),
                 CancellationToken::new(),
                 &ctx,
             )
             .await
             .unwrap();
         let text = output_text(&second);
-        assert!(
-            text.contains("[harness] prefer cwd: {\"command\": \"ls\", \"cwd\": [\"other\"]}."),
-            "a later cd carries the one-line rewrite: {text}"
-        );
-        assert!(
-            !text.contains("tip:"),
-            "the reminder stays one line: {text}"
-        );
-        let bare = tool
+        assert!(text.contains(SHORT), "the reminder is one line: {text}");
+        assert!(!text.contains("only changes"), "{text}");
+
+        // A relative target is not statically relocatable: silent.
+        let relative = tool
             .execute(
                 "c3",
-                serde_json::json!({"command": "cd other", "cwd": [""]}),
+                serde_json::json!({"command": "cd sub && pwd"}),
                 CancellationToken::new(),
                 &ctx,
             )
             .await
             .unwrap();
-        let text = output_text(&bare);
         assert!(
-            text.contains("[harness] prefer the `cwd` parameter over `cd`."),
-            "a bare cd gets the generic reminder: {text}"
+            !output_text(&relative).contains("[harness]"),
+            "a relative cd is never nudged"
         );
+
+        // An explicit location — including subdirs after an empty head — is
+        // the model already carrying the directory: silent.
+        for cwd in [serde_json::json!(["/tmp"]), serde_json::json!(["", "sub"])] {
+            let explicit = tool
+                .execute(
+                    "c4",
+                    serde_json::json!({"command": "cd /tmp && pwd", "cwd": cwd}),
+                    CancellationToken::new(),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert!(
+                !output_text(&explicit).contains("[harness]"),
+                "an explicit cwd is never nudged"
+            );
+        }
+
+        // Targets the shell would expand, and bare `cd`, are not static.
+        for command in ["cd $HOME && pwd", "cd - && pwd", "cd"] {
+            let unsupported = tool
+                .execute(
+                    "c5",
+                    serde_json::json!({"command": command}),
+                    CancellationToken::new(),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert!(
+                !output_text(&unsupported).contains("[harness]"),
+                "{command:?} must stay silent"
+            );
+        }
+
         let unrelated = tool
             .execute(
-                "c4",
-                serde_json::json!({"command": "echo hi", "cwd": [""]}),
+                "c6",
+                serde_json::json!({"command": "echo hi"}),
                 CancellationToken::new(),
                 &ctx,
             )
